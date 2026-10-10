@@ -47,8 +47,14 @@ fi
 
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+# ⚠️ 必须转成 **POSIX** 形态（`/d/a/...`）——**不能**用 `cygpath -m` 的 `D:/a/...`：
+#    GNU tar 把 `host:path` 当**远程归档**语法，于是 `D:/...` 会被理解成
+#    「连一台叫 D 的主机」，直接失败：
+#        tar (child): Cannot connect to D: resolve failed
+#    Windows runner 上踩过（打 Windows 资产那一步整个挂掉）。
+#    在 Linux/macOS 上没有 cygpath，也就没有冒号，这段自然跳过。
 if command -v cygpath >/dev/null 2>&1; then
-  ARCHIVE_PATH="$(cygpath -m "$ARCHIVE_PATH")"
+  ARCHIVE_PATH="$(cygpath -u "$ARCHIVE_PATH")"
 fi
 mkdir -p "$(dirname "$ARCHIVE_PATH")"
 

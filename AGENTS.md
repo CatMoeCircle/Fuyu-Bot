@@ -189,6 +189,11 @@ TDLib 便捷封装、更新分发管线都已就绪并有测试；`fuyubot-plugi
     `crates/fuyubot-tdlib/tests/release_assets.rs` 会**读 workflow 来双向比对**（表→CI、CI→表），
     漂了就红。踩过一次：CI 从别的项目搬来，tag / 资产名 / 扩展名 / 架构名**四处都不同**。
     改完记得用 `git show <旧提交>:<workflow>` 跑一次负向对照（**两个方向都要**）。
+    两条**只在 Windows runner 上才会犯**的坑（都踩过，见 HANDOFF 坑 77）：
+    - **给 `tar` 的路径必须是 POSIX 形态**（`/d/a/...`）：GNU tar 把 `host:path` 当**远程归档**，
+      `D:/a/...` 会被理解成「连主机 D」而直接失败。脚本里用 `cygpath -u`，**别用 `cygpath -m`**。
+    - **workflow 里别手抄 matrix 的内容**（runner label、资产名…）：手抄的那份和 matrix 对不上过一次
+      （汇总表写 `windows-latest`，matrix 里是另一个 label）。要用就从 matrix 现算。
 
 ## 构建与验证
 

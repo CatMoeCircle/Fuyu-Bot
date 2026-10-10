@@ -580,7 +580,7 @@ jobs:
             echo "Each package contains only \`tdjson\` (+ \`VERSION.json\` / README)."
             echo "No separate \`libssl\` / \`libcrypto\` / \`libz\` runtime files."
             echo
-            echo "Also attached: \`td_api.tl\`, \`SCHEMA_INFO.json\`, \`SHA256SUMS\`, \`MANIFEST.txt\`, combined \`tdlib-v${VER}-all.tar.gz\`."
+            echo "Also attached: \`td_api.tl\`, \`SCHEMA_INFO.json\`, \`SHA256SUMS\`, \`MANIFEST.txt\`, combined \`tdlib-${VER}-all.tar.gz\`."
             echo
             echo "## Schema / bindings"
             echo
@@ -663,6 +663,7 @@ jobs:
         env:
           VERSION: ${{ needs.resolve-tdlib.outputs.tdlib_version }}
           COMMIT: ${{ needs.resolve-tdlib.outputs.tdlib_commit }}
+          BUILD_MATRIX: ${{ needs.resolve-tdlib.outputs.build_matrix }}
           BUILD: ${{ needs.build.result }}
           ASSEMBLE: ${{ needs.assemble.result }}
           SCHEMA: ${{ needs.export-schema.result }}
@@ -679,22 +680,26 @@ jobs:
             echo "|-------|-------|"
             echo "| TDLib version | \`${VERSION}\` |"
             echo "| TDLib commit | \`${COMMIT:-n/a}\` |"
-            echo "| Release tag | \`tdlib-${VER}\` |"
+            # ⚠️ tag 必须与 loader 的 release_url() 一致（AGENTS 约束 46）。
+            echo "| Release tag | \`TDLib V${VER}\` |"
             echo "| Publish | \`${PUBLISH}\` |"
             echo "| Selected targets | \`${TARGETS}\` |"
             echo "| Schema export | \`${SCHEMA}\` |"
             echo "| Matrix builds | \`${BUILD}\` |"
             echo "| Assemble | \`${ASSEMBLE}\` |"
             echo
-            echo "Release includes \`td_api.tl\` + \`SCHEMA_INFO.json\` for Publish Rust crate."
+            echo "Release includes \`td_api.tl\` + \`SCHEMA_INFO.json\`."
             echo
             echo "### Matrix"
             echo
-            echo "| Platform | Arch | Runner |"
-            echo "|----------|------|--------|"
-            echo "| Linux | x86_64 | ubuntu-22.04 |"
-            echo "| Linux | arm64 | ubuntu-24.04-arm |"
-            echo "| macOS | arm64 | macos-14 |"
-            echo "| Windows | x86_64 | windows-latest |"
-            echo "| Windows | arm64 | windows-latest |"
+            echo "| Platform | Arch | Runner | Asset |"
+            echo "|----------|------|--------|-------|"
           } >> "$GITHUB_STEP_SUMMARY"
+          # 从 matrix 现算，不手抄：手抄过一次，arm64 那行写的是 windows-latest，
+          # 而 matrix 里其实是另一个 label——两边直接对不上。
+          python3 - "$BUILD_MATRIX" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          matrix = json.loads(sys.argv[1])
+          for item in matrix["include"]:
+              print(f"| {item['platform']} | {item['arch']} | {item['runner']} | `{item['asset']}` |")
+          PY

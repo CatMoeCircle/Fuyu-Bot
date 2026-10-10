@@ -24,6 +24,13 @@ if [[ -n "$ASSET_NAME" && "$(basename "$ARCHIVE")" != "$ASSET_NAME" ]]; then
   exit 1
 fi
 
+# ⚠️ 同 `package-tdlib.sh`：Windows runner 传进来的是 `D:/...`，而 GNU tar 把
+#    `host:path` 当**远程归档**（`tar (child): Cannot connect to D: resolve failed`）。
+#    统一转成 POSIX 形态再用。
+if command -v cygpath >/dev/null 2>&1; then
+  ARCHIVE="$(cygpath -u "$ARCHIVE")"
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
