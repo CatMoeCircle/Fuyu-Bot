@@ -381,6 +381,43 @@ mod tests {
         path
     }
 
+    /// 测试用的临时目录。**故意不用 `%TEMP%` / `tempfile`**——理由见 `AGENTS.md` 的测试约定：
+    /// MSYS（git bash）把 `TEMP` 改成 `/tmp`，而受限环境里往真实 `%TEMP%` 建目录会被拒
+    /// （`OS error 5`），一批测试就莫名其妙红了。放在 workspace 的 `target/` 下最稳。
+    ///
+    /// 形状模仿 `tempfile::TempDir`（只提供 `.path()`），所以调用处只改构造那一句。
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 每次给一个**唯一**目录（进程号 + 自增），所以并行的测试不会互相踩。
+    fn scratch() -> Scratch {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let name = format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(env!("CARGO_PKG_NAME"))
+            .join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("建测试临时目录失败");
+        Scratch(dir)
+    }
+
     fn env_with(os: &str) -> LoadEnv {
         LoadEnv {
             os: os.to_owned(),
@@ -390,7 +427,7 @@ mod tests {
 
     #[test]
     fn priority_1_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch();
         let path = touch(dir.path(), "tdjson.dll");
         let env = LoadEnv {
             tdlib_path: Some(path.clone()),
@@ -404,7 +441,7 @@ mod tests {
 
     #[test]
     fn priority_1_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch();
         let path = touch(dir.path(), "libtdjson.so");
         let env = LoadEnv {
             tdlib_path: Some(dir.path().to_owned()),
@@ -419,7 +456,7 @@ mod tests {
     #[cfg(feature = "vendored")]
     #[test]
     fn priority_2_vendored() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch();
         let path = touch(dir.path(), "tdjson.dll");
         let env = LoadEnv {
             vendored_dir: Some(dir.path().to_owned()),
@@ -446,7 +483,7 @@ mod tests {
 
     #[test]
     fn priority_3_picks_highest_compatible_version() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch();
         let expected = vendored::parse_version(TDLIB_VERSION).unwrap();
         let highest = format!("libtdjson.so.{}.{}.{}", expected.0, expected.1, expected.2);
         touch(dir.path(), &highest);
@@ -466,8 +503,8 @@ mod tests {
 
     #[test]
     fn all_missing_reports_every_attempt() {
-        let dir = tempfile::tempdir().unwrap();
-        let empty = tempfile::tempdir().unwrap();
+        let dir = scratch();
+        let empty = scratch();
         let env = LoadEnv {
             tdlib_path: Some(dir.path().join("nope")),
             system_dirs: vec![empty.path().to_owned()],

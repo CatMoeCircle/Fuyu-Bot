@@ -580,6 +580,29 @@ fn attach_tdlib(pipeline: &Arc<UpdatePipeline>, configured: Option<&str>) -> boo
     }
 }
 
+/// 测试用的小工具（只在 `cargo test` 里编译）。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::PathBuf;
+
+    /// 测试用的临时目录。
+    ///
+    /// ⚠️ **不许用 `std::env::temp_dir()`**：MSYS（git bash）会把 `TEMP` 改成 `/tmp`，
+    /// 这个值在 Windows 上解析成「**当前盘的根**」（`F:\tmp`），在盘根建目录会被拒绝
+    /// （`OS error 5 PermissionDenied`）——于是一批测试**换个 shell 就红**（踩过一次）。
+    ///
+    /// 放 workspace 的 `target/` 下：一定可写、不依赖任何环境变量、也不污染系统临时目录。
+    pub fn temp(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(env!("CARGO_PKG_NAME"))
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建测试临时目录失败");
+        dir
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

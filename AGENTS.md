@@ -244,6 +244,12 @@ cargo build -p fuyubot-cli   --features vendored --offline
   - `object`（0.40，关掉默认特性里的 `compression`）：`fuyubot-sdk check` 要**不加载**就读出
     动态库的导出符号（约束 44），只允许出现在 `fuyubot-sdk-cli` 里。
 - 非平凡逻辑（分支、循环、解析、钱/安全路径）留**一个**可运行的自检：`#[cfg(test)]` 里一个 `assert` 测试即可，不引测试框架。
+- **测试必须自洽：不依赖 shell、不依赖环境变量、不依赖「先跑过别的命令」。**
+  具体一条硬规矩——**临时目录不许用 `%TEMP%`**（`std::env::temp_dir()` / `tempfile`），
+  一律放 workspace 的 `target/test-tmp/<crate>/<名字>` 下
+  （照 `fuyubot-cli` 的 `test_support::temp` 或 `fuyubot-loader/tests/plugins.rs` 的 `Scratch` 写）。
+  理由：MSYS（git bash）把 `TEMP` 改成 `/tmp`，而受限环境里往真实 `%TEMP%` 建目录会被拒
+  （`OS error 5`）——**一批测试会换个 shell 就红**（踩过两次，见 HANDOFF 坑 70）。
 - 刻意留下的简化用 `# ponytail: <天花板是什么>，<什么时候升级>` 注释标记，别让后手猜。
 - 错误类型用 `thiserror`，不要 `Box<dyn Error>`。**唯一例外**是回调签名统一的 `fuyubot_core::Result<T>` / `fuyubot_core::BoxError`：四个机制 crate 不能互相依赖，回调的错误类型只能由 core 定。
 - Edition 2024 细节：`#[unsafe(no_mangle)]`（不是 `#[no_mangle]`）、`unsafe extern "C" { ... }` 块。

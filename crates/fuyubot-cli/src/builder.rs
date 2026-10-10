@@ -283,11 +283,11 @@ fn offline() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::temp;
 
     #[test]
     fn detect_says_cargo_when_there_is_a_manifest() {
-        let dir = std::env::temp_dir().join("fuyubot-detect-cargo");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp("detect-cargo");
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
         assert_eq!(detect(&dir).unwrap(), Kind::Cargo);
         std::fs::remove_file(dir.join("Cargo.toml")).unwrap();

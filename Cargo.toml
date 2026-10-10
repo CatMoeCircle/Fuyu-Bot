@@ -36,7 +36,6 @@ serde_json = "1.0.151"
 semver = "1.0.28"
 sha2 = "0.10.9"
 tar = "0.4.46"
-tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml = "0.9.12"

@@ -353,7 +353,12 @@ fn open_library_finds_the_libraries_sibling_dependencies() {
     };
 
     // 只拷动态库（td_api.tl 之类不参与加载）；拷到临时目录就等于「库在别处、依赖在旁边」。
-    let dir = tempfile::tempdir().expect("建临时目录失败");
+    //
+    // 注意：**不用 `tempfile` / `%TEMP%`**——理由见 `AGENTS.md` 的测试约定（换 shell /
+    // 受限环境下 `%TEMP%` 可能建不了目录）。放 workspace 的 `target/` 下最稳。
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp/open-library");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("建临时目录失败");
     let mut copied = 0;
     for entry in std::fs::read_dir(&source_dir)
         .expect("读不了 TDLIB_TDJSON_PATH")
@@ -365,13 +370,13 @@ fn open_library_finds_the_libraries_sibling_dependencies() {
             ext == "dll" || ext == "so" || ext == "dylib"
         });
         if is_library {
-            std::fs::copy(&path, dir.path().join(path.file_name().unwrap())).expect("拷贝失败");
+            std::fs::copy(&path, dir.join(path.file_name().unwrap())).expect("拷贝失败");
             copied += 1;
         }
     }
     assert!(copied > 0, "{} 里没有动态库", source_dir.display());
 
-    let target = std::fs::read_dir(dir.path())
+    let target = std::fs::read_dir(&dir)
         .expect("读不了临时目录")
         .flatten()
         .map(|entry| entry.path())

@@ -448,7 +448,6 @@ dependencies = [
  "fuyubot-tool",
  "libloading",
  "serde_json",
- "tempfile",
  "thiserror",
 ]
 
@@ -533,7 +532,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
- "tempfile",
  "thiserror",
  "tokio",
  "toml",

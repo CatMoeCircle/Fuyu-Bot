@@ -19,6 +19,44 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// 测试用的临时目录。**故意不用 `%TEMP%` / `tempfile`**——理由见 `AGENTS.md` 的测试约定：
+/// MSYS（git bash）把 `TEMP` 改成 `/tmp`，而受限环境里往真实 `%TEMP%` 建目录会被拒
+/// （`OS error 5`），一批测试就莫名其妙红了。放 workspace 的 `target/` 下最稳。
+///
+/// 形状模仿 `tempfile::TempDir`（只提供 `.path()` + drop 清理），所以调用处只改构造那一句。
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // 目录里可能有**已加载的 DLL**，Windows 上删不掉——忽略即可。
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 每次给一个**唯一**目录（进程号 + 自增），所以并行的测试不会互相踩。
+fn scratch() -> Scratch {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let name = format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let dir = workspace_root()
+        .join("target/test-tmp")
+        .join(env!("CARGO_PKG_NAME"))
+        .join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("建测试临时目录失败");
+    Scratch(dir)
+}
+
 /// cdylib 的产物路径。Windows 是 `名字.dll`，其它平台带 `lib` 前缀。
 fn artifact_path(package: &str) -> PathBuf {
     let name = package.replace('-', "_");
@@ -277,7 +315,7 @@ fn refuses_a_plugin_with_an_incompatible_abi() {
 /// 不是插件的东西：要么打不开，要么缺 `plugin_init`，两种都不 panic。
 #[test]
 fn rejects_things_that_are_not_plugins() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scratch();
     let loader = PluginLoader::new(Context::new()).unwrap();
 
     // 内容不是动态库
@@ -303,7 +341,7 @@ fn rejects_things_that_are_not_plugins() {
 /// 目录扫描：只挑对应平台的动态库，单个失败不影响其它。
 #[test]
 fn load_dir_skips_non_plugins() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scratch();
     let demo = build_fixture("fuyubot-plugin-demo");
     std::fs::copy(&demo, dir.path().join(demo.file_name().unwrap())).unwrap();
     std::fs::write(dir.path().join("readme.txt"), b"ignored").unwrap();
