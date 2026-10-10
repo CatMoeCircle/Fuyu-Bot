@@ -58,12 +58,10 @@ struct InitArgs {
     /// bot 名字（只影响配置里的一行）
     #[arg(long, default_value = "fuyubot")]
     name: String,
-    /// TDLib api_id（到 https://my.telegram.org 申请）
+    /// TDLib api_id（到 https://my.telegram.org 申请）。**不是**秘密，可以写进配置。
+    /// api_hash 是凭据，**不给这个命令传**——用环境变量 `TG_API_HASH`。
     #[arg(long, default_value_t = 0)]
     api_id: i64,
-    /// TDLib api_hash
-    #[arg(long, default_value = "")]
-    api_hash: String,
 }
 
 #[derive(Args, Debug)]
@@ -159,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init(args) => {
-            let config = scaffold::init(&args.dir, &args.name, args.api_id, &args.api_hash)?;
+            let config = scaffold::init(&args.dir, &args.name, args.api_id)?;
             println!("已生成 {}", config.display());
             println!("插件目录：{}", args.dir.join("plugins").display());
             println!("下一步：fuyubot-sdk init demo --lang rust（插件脚手架由开发 CLI 生成）");
@@ -412,17 +410,21 @@ fn plugin_install(args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 配置里给了凭据就提醒一句：**真实登录流程还没接**（见 HANDOFF 缺口 4）。
+/// 凭据齐了就提醒一句：**真实登录流程还没接**（见 HANDOFF 缺口 4）。
 ///
-/// 别把 `api_hash` 打出来——它是凭据。这里只读它来判断「配没配」。
+/// ⚠️ `api_hash` **只从环境变量 `TG_API_HASH` 读**——它是凭据，不许写进 `fuyubot.toml`
+/// （硬约束 41）。这里只判断「配没配」，**绝不打出来**。
 fn login_note(config: &scaffold::Config) -> Option<String> {
-    let api_id = config.bot.api_id?;
-    let api_hash = config.bot.api_hash.as_deref()?;
+    let api_id = std::env::var("TG_API_ID")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .or(config.bot.api_id)?;
+    let api_hash = std::env::var("TG_API_HASH").ok()?;
     if api_id == 0 || api_hash.is_empty() {
         return None;
     }
     Some(format!(
-        "配置里有 api_id={api_id}，但真实登录流程还没接（见 HANDOFF 缺口 4）；\
+        "环境变量里有 api_id={api_id} + TG_API_HASH，但真实登录流程还没接（见 HANDOFF 缺口 4）；\
          现在只在接入 TDLib 后收发更新"
     ))
 }

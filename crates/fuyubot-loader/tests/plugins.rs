@@ -70,10 +70,27 @@ fn artifact_path(package: &str) -> PathBuf {
     workspace_root().join("target").join("debug").join(file)
 }
 
+/// 给嵌套 cargo 一个**可写**的临时目录。
+///
+/// MSVC 的 `link.exe` 会在 `%TEMP%` 里建 `lnk*.tmp`；受限环境（沙箱 / `%TEMP%` 不可写）下会报
+/// `LNK1104: cannot open file '...\Temp\lnk{GUID}.tmp'`，于是**插件根本编不出来**、
+/// 一批测试跟着红（见 HANDOFF 坑 73）。仓库约定测试的临时目录一律放 `target/test-tmp`
+/// （见 AGENTS「测试必须自洽」），这里把同一个约定**传给子进程**。
+fn cargo_temp() -> PathBuf {
+    let dir = workspace_root()
+        .join("target")
+        .join("test-tmp")
+        .join("cargo-temp");
+    std::fs::create_dir_all(&dir).expect("建 cargo 临时目录失败");
+    dir
+}
+
 fn build_fixture(package: &str) -> PathBuf {
     let status = Command::new(env!("CARGO"))
         .args(["build", "--offline", "-p", package])
         .current_dir(workspace_root())
+        .env("TEMP", cargo_temp())
+        .env("TMP", cargo_temp())
         .status()
         .expect("启动 cargo 失败");
     assert!(status.success(), "构建 fixture {package} 失败");

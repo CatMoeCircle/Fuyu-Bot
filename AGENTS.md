@@ -200,7 +200,7 @@ TDLib 便捷封装、更新分发管线都已就绪并有测试；`fuyubot-plugi
 $env:FUYUBOT_TDLIB_VENDORED_CACHE = "F:\Rust\FuyuBot\.tdlib-cache"
 
 cargo build --workspace --offline          # 必须 0 退出、0 warning
-cargo test  --workspace --offline          # 所有自检必须绿（174 passed；另有 10 个 #[ignore]）
+cargo test  --workspace --offline          # 所有自检必须绿（176 passed；另有 10 个 #[ignore]）
 cargo tree  --workspace --offline          # 必须无环
 
 # 插件开发 CLI（`fuyubot-sdk`）：脚手架 / 绑定落盘 / 查 TDLib 方法 / 静态检查
@@ -269,7 +269,15 @@ cargo build -p fuyubot-cli   --features vendored --offline
   （照 `fuyubot-cli` 的 `test_support::temp` 或 `fuyubot-loader/tests/plugins.rs` 的 `Scratch` 写）。
   理由：MSYS（git bash）把 `TEMP` 改成 `/tmp`，而受限环境里往真实 `%TEMP%` 建目录会被拒
   （`OS error 5`）——**一批测试会换个 shell 就红**（踩过两次，见 HANDOFF 坑 70）。
+  **测试里嵌套调用 cargo / 编译器时，也要把子进程的 `TEMP`/`TMP` 指到那里**：
+  MSVC 的 `link.exe` 建不了 `%TEMP%` 里的 `lnk*.tmp` 会直接 `LNK1104`，插件/夹具根本编不出来，
+  依赖它们的一批测试会一起红（踩过，见 HANDOFF 坑 73/76）。
 - 刻意留下的简化用 `# ponytail: <天花板是什么>，<什么时候升级>` 注释标记，别让后手猜。
+- **文档里出现的命令必须在本仓库真跑过**，带输出的示例要**抄真实输出**（README / `docs/*.md` 都算）。
+  踩过两次，都是「写文档时顺手跑一遍」才发现的：文档里写了 `init --api-hash`，真跑才发现它把凭据
+  **落盘**（违反约束 41）；写了 `plugin install examples/ts-counter`，真跑才发现它报错
+  （workspace 成员的产物在仓库根 `target/` 下）。**没跑过的命令不要写进文档**——
+  读文档的人会比你更相信它。
 - 错误类型用 `thiserror`，不要 `Box<dyn Error>`。**唯一例外**是回调签名统一的 `fuyubot_core::Result<T>` / `fuyubot_core::BoxError`：四个机制 crate 不能互相依赖，回调的错误类型只能由 core 定。
 - Edition 2024 细节：`#[unsafe(no_mangle)]`（不是 `#[no_mangle]`）、`unsafe extern "C" { ... }` 块。
 
@@ -328,6 +336,8 @@ cargo build -p fuyubot-cli   --features vendored --offline
 - [ ] 新 crate 有 `Cargo.toml`（全部 `.workspace = true`）+ `src/lib.rs` 或 `src/main.rs` + `README.md`
 - [ ] 新增的简化点已用 `# ponytail:` 标注
 - [ ] 动了 `fuyubot-tdlib` 的 `build.rs` 或 `src/loader/vendored.rs` 时，`--features vendored` 那条测试也跑过
+- [ ] **`README.md`（仓库根）已同步**：它是对外的第一份文档，「现状 / 缺什么」那两节不能落后于
+      `docs/HANDOFF.md`；里面每条命令都必须是真跑过的（见「代码风格」里那条规矩）
 - [ ] `[package.metadata.fuyubot]` 里的值仍与事实一致：`releases-repo` 要等于 **`git remote origin`**
       （现在是 `xiaoqvan/Fuyu-Bot`），`tdlib-version` 要等于**CI 跑 build-tdlib 时填的 `tdlib_version`**
       （现在 `1.8.66`——资产放在 tag `TDLib V<tdlib-version>` 下，填错就是 404）

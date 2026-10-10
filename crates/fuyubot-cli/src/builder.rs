@@ -64,14 +64,21 @@ fn build_cargo(dir: &Path, release: bool) -> Result<PathBuf, String> {
         .output()
         .map_err(|e| format!("起不了 cargo：{e}（PATH 里有 cargo 吗？）"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // 编译日志照旧给人看：只把 JSON 行挑掉。
+    // ⚠️ **两份都要转出去**：cargo 的人读日志（`Compiling …`）走 **stderr**，
+    // 而 `--message-format=json` 之下 rustc 的诊断在 **stdout 的 JSON 里**。
+    // `Command::output()` 把两条流都捕获了——不转出去，用户就什么都看不到。
+    // 踩过一次：失败时只打印一句「上面是它的输出」，上面却**空空如也**，根本没法查。
+    eprint!("{stderr}");
+    // 人读日志照旧给人看：只把 JSON 行挑掉。
     for line in stdout.lines() {
         if !line.trim_start().starts_with('{') {
-            eprint!("{line}");
+            eprintln!("{line}");
         }
     }
     if !output.status.success() {
+        eprint!("{}", cargo_diagnostics(&stdout));
         return Err(format!(
             "cargo build 失败（{}）。上面是它的输出。",
             output.status
@@ -280,10 +287,61 @@ fn offline() -> bool {
     })
 }
 
+/// 从 `--message-format=json` 的 stdout 里把人读的诊断抠出来。
+///
+/// 为什么非有它不可：JSON 模式下 **rustc 的报错只存在于 stdout 的 JSON 里**
+/// （`reason == "compiler-message"`），cargo 自己的进度在 stderr。不抠出来，
+/// 失败时用户只会看到一句「cargo build 失败（exit code: 101）。上面是它的输出」，
+/// **而上面什么都没有**——踩过一次，查了半天。
+fn cargo_diagnostics(stdout: &str) -> String {
+    let mut out = String::new();
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("reason").and_then(|reason| reason.as_str()) != Some("compiler-message") {
+            continue;
+        }
+        if let Some(rendered) = value.pointer("/message/rendered").and_then(|r| r.as_str()) {
+            out.push_str(rendered);
+        } else if let Some(message) = value.pointer("/message/message").and_then(|r| r.as_str()) {
+            out.push_str(message);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::temp;
+
+    #[test]
+    fn cargo_diagnostics_pulls_the_rendered_error_out_of_the_json() {
+        // 真实形状：报错在 `/message/rendered`，其余 reason 要么无关要么不是 JSON。
+        let stdout = concat!(
+            r#"{"reason":"compiler-artifact","package_id":"x"}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"rendered":"error[E0425]: cannot find value `x`\n"}}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":false}"#,
+            "\n",
+        );
+        let text = cargo_diagnostics(stdout);
+        assert!(text.contains("E0425"), "没抠出诊断：{text:?}");
+        assert!(
+            !text.contains("compiler-artifact"),
+            "带出了非诊断行：{text:?}"
+        );
+
+        // 没有 `rendered` 时退回 `message`。
+        let fallback = r#"{"reason":"compiler-message","message":{"message":"something broke"}}"#;
+        assert!(cargo_diagnostics(fallback).contains("something broke"));
+
+        // 不是 JSON 的行（cargo 的进度）不该炸，也不该被当成诊断。
+        assert_eq!(cargo_diagnostics("Compiling foo v1.0.0\n"), "");
+    }
 
     #[test]
     fn detect_says_cargo_when_there_is_a_manifest() {

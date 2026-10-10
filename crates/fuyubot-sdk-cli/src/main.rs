@@ -457,6 +457,10 @@ mod tests {
         let status = std::process::Command::new(env!("CARGO"))
             .args(["build", "--offline", "-p", "fuyubot-plugin-demo"])
             .current_dir(root)
+            // MSVC 的 link.exe 要在 `%TEMP%` 里建临时文件；受限环境下那里不可写就会
+            // `LNK1104` 而编不出插件。给它一个可写目录（同 AGENTS 的测试临时目录约定）。
+            .env("TEMP", crate::test_support::temp("nested-cargo-temp"))
+            .env("TMP", crate::test_support::temp("nested-cargo-temp"))
             .status()
             .expect("启动 cargo 失败");
         assert!(status.success(), "构建 fixture 失败");

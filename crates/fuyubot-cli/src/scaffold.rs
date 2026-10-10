@@ -30,8 +30,11 @@ pub struct Config {
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct Bot {
     pub name: Option<String>,
+    /// TDLib api_id（**不是**秘密，放配置里可以）。
+    ///
+    /// `api_hash` 这里**故意没有**字段：它是凭据，只允许从环境变量 `TG_API_HASH`
+    /// 或交互式输入来（硬约束 41）。写了也会被 serde 忽略。
     pub api_id: Option<i64>,
-    pub api_hash: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -77,7 +80,9 @@ pub fn find_config(start: &Path) -> Option<PathBuf> {
 // ── init ───────────────────────────────────────────────────────────
 
 /// 生成 `fuyubot.toml` 与插件目录。
-pub fn init(root: &Path, name: &str, api_id: i64, api_hash: &str) -> Result<PathBuf, String> {
+///
+/// ⚠️ 只写 `api_id`：`api_hash` 是凭据，**不许**落进配置文件（硬约束 41）。
+pub fn init(root: &Path, name: &str, api_id: i64) -> Result<PathBuf, String> {
     let config = root.join(CONFIG_FILE);
     if config.exists() {
         return Err(format!("{} 已经存在了，先挪走它", config.display()));
@@ -85,8 +90,7 @@ pub fn init(root: &Path, name: &str, api_id: i64, api_hash: &str) -> Result<Path
     std::fs::create_dir_all(root).map_err(|e| format!("建不了 {}: {e}", root.display()))?;
     let rendered = TEMPLATE_CONFIG
         .replace("__NAME__", name)
-        .replace("__API_ID__", &api_id.to_string())
-        .replace("__API_HASH__", api_hash);
+        .replace("__API_ID__", &api_id.to_string());
     write(&config, &rendered)?;
 
     let plugins = root.join("plugins");
@@ -243,14 +247,32 @@ mod tests {
     #[test]
     fn init_writes_a_config_that_parses_back() {
         let root = temp("init");
-        let path = init(&root, "mybot", 12345, "hash").unwrap();
+        let path = init(&root, "mybot", 12345).unwrap();
         let config = load_config(&path).unwrap();
         assert_eq!(config.bot.name.as_deref(), Some("mybot"));
         assert_eq!(config.bot.api_id, Some(12345));
-        assert_eq!(config.bot.api_hash.as_deref(), Some("hash"));
         assert!(root.join("plugins").is_dir());
         // 第二次要被挡住，不能把用户改过的配置冲掉。
-        assert!(init(&root, "mybot", 1, "x").is_err());
+        assert!(init(&root, "mybot", 1).is_err());
+    }
+
+    #[test]
+    fn init_never_writes_the_api_hash_into_the_config() {
+        // 硬约束 41：api_hash 是凭据，不许落盘。
+        let root = temp("init-no-secret");
+        let path = init(&root, "mybot", 12345).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // 只查**键**：注释里提到 `api_hash` 是故意的（要提醒用户别往这儿写）。
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.trim_start().starts_with("api_hash")),
+            "配置里出现了 api_hash 键：\n{text}"
+        );
+        assert!(
+            !text.contains("__API_HASH__"),
+            "模板占位符没被换掉：\n{text}"
+        );
     }
 
     #[test]
