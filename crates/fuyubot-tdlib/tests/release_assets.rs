@@ -57,9 +57,30 @@ fn the_release_workflow_publishes_exactly_the_asset_names_we_download() {
         assert!(
             compact.contains(&format!("\"asset\":\"{asset}\"")),
             "workflow 的 matrix 里没有 `\"asset\": \"{asset}\"`：\
-             资产名必须**精确等于** loader 的 ASSET_* 常量（它被原样拼进下载 URL）"
+             资产名必须**精确等于** loader 的 ASSETS 表（它被原样拼进下载 URL）"
         );
     }
+
+    // **反方向也要查**：CI 里出现的资产名必须都在表里。
+    // 少了这一半就漏掉「CI 建了、loader 却叫不出名字」的错配——
+    // Windows arm64 原来就是这个问题（CI 建它，loader 表里没有 → 资产没人下得到）。
+    let mut from_workflow: Vec<String> = Vec::new();
+    let mut rest = compact.as_str();
+    while let Some(start) = rest.find("\"asset\":\"") {
+        let after = &rest[start + "\"asset\":\"".len()..];
+        let Some(end) = after.find('"') else { break };
+        from_workflow.push(after[..end].to_owned());
+        rest = &after[end..];
+    }
+    from_workflow.sort();
+    from_workflow.dedup();
+    let mut from_loader: Vec<String> = assets.iter().map(|name| (*name).to_owned()).collect();
+    from_loader.sort();
+    assert_eq!(
+        from_workflow, from_loader,
+        "workflow 的 matrix 资产名与 loader 的 ASSETS 表必须**完全一致**（两个方向都要）：\
+         左边是 CI 会产出的，右边是 loader 会去找的"
+    );
 
     // 每个平台的**打包 + 校验**两步都要用 `dist/${{ matrix.asset }}` 当路径——
     // 只有真的用它当文件名，上面那条「matrix 里有名字」才等于「发布出来的就是这个名字」。

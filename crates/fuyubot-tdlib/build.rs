@@ -316,8 +316,14 @@ fn acquire(version: &str, releases_repo: Option<&str>) -> Result<std::path::Path
     let vendored_dir = std::path::PathBuf::from(out_dir).join("vendored");
     let root = vendored::cache_root();
 
-    let library_asset = vendored::asset_name(&os, &arch)
-        .ok_or_else(|| format!("平台 {os}/{arch} 在 Releases 里没有对应资产"))?;
+    let library_asset = vendored::asset_name(&os, &arch).ok_or_else(|| {
+        format!(
+            "平台 {os}/{arch} 没有对应的 Releases 资产（目前支持：{}）——\
+             要加平台得**同时**改 src/loader/vendored.rs 的 ASSETS 表与 \
+             .github/workflows/build-tdlib.yml 的 matrix（有守卫测试比对两者）",
+            vendored::supported_targets()
+        )
+    })?;
     let cached_library = vendored::cached_library(&root, version, &os, &arch);
 
     // 只有真需要下载时才要求配仓库：缓存命中时不该因为没配 repo 就失败。

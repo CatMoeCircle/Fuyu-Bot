@@ -5,11 +5,36 @@
 
 use std::path::{Path, PathBuf};
 
-/// Releases 资产名 → 平台动态库文件名。
-pub const ASSET_LINUX_X86_64: &str = "TDLib-x86_64-linux";
-pub const ASSET_LINUX_AARCH64: &str = "TDLib-aarch64-linux";
-pub const ASSET_MACOS_ARM64: &str = "TDLib-macos-arm64";
+/// Releases 资产名。
+///
+/// **命名约定**：`TDLib-<os>-<arch>`，其中 `arch` 一律用 **cargo `CARGO_CFG_TARGET_ARCH` 的口径**
+/// （`x86_64` / `aarch64`）——别再混用 `arm64`。
+/// 踩过一次：macOS 写成 `TDLib-macos-arm64`、Linux 写成 `TDLib-aarch64-linux`
+/// （一个用 `arm64` 一个用 `aarch64`，顺序还一个是 os-arch 一个是 arch-os），读起来分不清。
+///
+/// 资产名会被 [`asset_name`] **原样**拼进下载 URL，所以改这里必须同步改 CI（AGENTS 约束 46）。
+pub const ASSET_LINUX_X86_64: &str = "TDLib-linux-x86_64";
+pub const ASSET_LINUX_AARCH64: &str = "TDLib-linux-aarch64";
+pub const ASSET_MACOS_AARCH64: &str = "TDLib-macos-aarch64";
 pub const ASSET_WINDOWS_X86_64: &str = "TDLib-windows-x86_64";
+pub const ASSET_WINDOWS_AARCH64: &str = "TDLib-windows-aarch64";
+
+/// `(os, arch, 资产名)`——**加/减平台只动这一张表**：
+/// [`asset_name`] 与报错里的「支持哪些」都从它来，不会各自漂。
+///
+/// `crates/fuyubot-tdlib/tests/release_assets.rs` 会把表里的名字与
+/// `.github/workflows/build-tdlib.yml` 的 matrix 对起来——**表里有、CI 不建的组合会让它红**，
+/// 于是「CI 会不会产出来」与「loader 能不能下到」永远是同一件事。
+///
+/// 目前**故意不覆盖** `macos/x86_64`（Intel Mac）：CI 没有那个 runner，
+/// 加了表反而会在构建期变成一个含糊的 404。真要支持得先给 CI 加平台。
+pub const ASSETS: &[(&str, &str, &str)] = &[
+    ("linux", "x86_64", ASSET_LINUX_X86_64),
+    ("linux", "aarch64", ASSET_LINUX_AARCH64),
+    ("macos", "aarch64", ASSET_MACOS_AARCH64),
+    ("windows", "x86_64", ASSET_WINDOWS_X86_64),
+    ("windows", "aarch64", ASSET_WINDOWS_AARCH64),
+];
 
 /// 缓存根目录环境变量。
 pub const CACHE_ENV: &str = "FUYUBOT_TDLIB_VENDORED_CACHE";
@@ -33,15 +58,22 @@ pub fn library_filename(os: &str) -> Option<&'static str> {
     }
 }
 
-/// `(os, arch)` → Releases 资产名。
+/// `(os, arch)` → Releases 资产名；没有这个组合就是 `None`
+/// （构建期会报错并列出**支持的组合**，不用去翻代码）。
 pub fn asset_name(os: &str, arch: &str) -> Option<&'static str> {
-    match (os, arch) {
-        ("linux", "x86_64") => Some(ASSET_LINUX_X86_64),
-        ("linux", "aarch64") => Some(ASSET_LINUX_AARCH64),
-        ("macos", "aarch64") => Some(ASSET_MACOS_ARM64),
-        ("windows", "x86_64") => Some(ASSET_WINDOWS_X86_64),
-        _ => None,
-    }
+    ASSETS
+        .iter()
+        .find(|(o, a, _)| *o == os && *a == arch)
+        .map(|(_, _, name)| *name)
+}
+
+/// 报错时用：把支持的组合列出来（形如 `linux-x86_64 / linux-aarch64 / …`）。
+pub fn supported_targets() -> String {
+    ASSETS
+        .iter()
+        .map(|(os, arch, _)| format!("{os}-{arch}"))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// 文件名是否像某个平台的 tdjson。
@@ -171,14 +203,59 @@ mod tests {
 
     #[test]
     fn asset_and_library_names() {
-        assert_eq!(asset_name("linux", "x86_64"), Some("TDLib-x86_64-linux"));
-        assert_eq!(asset_name("linux", "aarch64"), Some("TDLib-aarch64-linux"));
-        assert_eq!(asset_name("macos", "aarch64"), Some("TDLib-macos-arm64"));
+        assert_eq!(asset_name("linux", "x86_64"), Some("TDLib-linux-x86_64"));
+        assert_eq!(asset_name("linux", "aarch64"), Some("TDLib-linux-aarch64"));
+        assert_eq!(asset_name("macos", "aarch64"), Some("TDLib-macos-aarch64"));
         assert_eq!(
             asset_name("windows", "x86_64"),
             Some("TDLib-windows-x86_64")
         );
-        assert_eq!(asset_name("windows", "aarch64"), None);
+        assert_eq!(
+            asset_name("windows", "aarch64"),
+            Some("TDLib-windows-aarch64")
+        );
+
+        // 命名约定：`TDLib-<os>-<arch>`，arch 一律 cargo 口径（`aarch64`，不是 `arm64`）。
+        for &(os, arch, name) in ASSETS {
+            assert_eq!(asset_name(os, arch), Some(name), "{os}/{arch} 查不到");
+            assert!(name.starts_with("TDLib-"), "{name} 前缀不对");
+            assert!(
+                name.ends_with(arch),
+                "资产名必须以 cargo 的 arch 结尾：{name} vs {arch}"
+            );
+            assert!(
+                !name.contains("arm64"),
+                "{name} 混用了 `arm64`——统一用 cargo 的 `aarch64`"
+            );
+        }
+        assert_eq!(
+            ASSETS.len(),
+            5,
+            "表里有几行就要和 CI 的 matrix 一样多（守卫测试会逐行比对）"
+        );
+
+        // **故意不支持**的组合必须是 None：构建期会报「目前支持：…」，
+        // 而不是让人以为能下、结果 404。
+        assert_eq!(
+            asset_name("macos", "x86_64"),
+            None,
+            "Intel Mac：CI 没有对应 runner，别往表里加"
+        );
+        assert_eq!(asset_name("windows", "x86"), None);
+        assert_eq!(asset_name("freebsd", "x86_64"), None);
+
+        // 报错里能列出支持的组合，且不多列。
+        let list = supported_targets();
+        for &(os, arch, _) in ASSETS {
+            assert!(
+                list.contains(&format!("{os}-{arch}")),
+                "{list} 少了 {os}-{arch}"
+            );
+        }
+        assert!(
+            !list.contains("macos-x86_64"),
+            "{list} 不该包含没支持的组合"
+        );
 
         assert_eq!(library_filename("windows"), Some("tdjson.dll"));
         assert_eq!(library_filename("macos"), Some("libtdjson.dylib"));

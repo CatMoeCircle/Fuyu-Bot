@@ -74,17 +74,19 @@ jobs:
           #    https://github.com/<repo>/releases/download/TDLib%20V<版本>/<资产名>
           TAG="TDLib V${VER}"
 
-          # ⚠️ `asset` 必须**精确等于** crates/fuyubot-tdlib/src/loader/vendored.rs 里的
-          #    ASSET_* 常量——`asset_name()` 的返回值原样拼进下载 URL（**不带扩展名**）。
-          #    crates/fuyubot-tdlib/tests/release_assets.rs 会读本文件比对，漂了就红。
+          # ⚠️ `asset` 必须**精确等于** crates/fuyubot-tdlib/src/loader/vendored.rs 里 ASSETS 表的值
+          #    ——`asset_name()` 的返回值原样拼进下载 URL（**不带扩展名**）。
+          #    命名约定：`TDLib-<os>-<arch>`，其中 arch 用 cargo 口径（`aarch64`，不是 `arm64`）。
+          #    注意矩阵里的 `arch` 是 CI 自己的口径（runner/打包/校验用），**不参与**资产名。
+          #    crates/fuyubot-tdlib/tests/release_assets.rs 会读本文件逐行比对，漂了就红。
           MATRIX="$(python3 - <<'PY'
           import json
           include = [
-              {"platform": "linux", "arch": "x86_64", "runner": "ubuntu-22.04", "asset": "TDLib-x86_64-linux"},
-              {"platform": "linux", "arch": "arm64", "runner": "ubuntu-24.04-arm", "asset": "TDLib-aarch64-linux"},
-              {"platform": "macos", "arch": "arm64", "runner": "macos-14", "asset": "TDLib-macos-arm64"},
+              {"platform": "linux", "arch": "x86_64", "runner": "ubuntu-22.04", "asset": "TDLib-linux-x86_64"},
+              {"platform": "linux", "arch": "arm64", "runner": "ubuntu-24.04-arm", "asset": "TDLib-linux-aarch64"},
+              {"platform": "macos", "arch": "arm64", "runner": "macos-14", "asset": "TDLib-macos-aarch64"},
               {"platform": "windows", "arch": "x86_64", "runner": "windows-latest", "asset": "TDLib-windows-x86_64"},
-              {"platform": "windows", "arch": "arm64", "runner": "windows-11-vs2026-arm", "asset": "TDLib-windows-arm64"},
+              {"platform": "windows", "arch": "arm64", "runner": "windows-11-vs2026-arm", "asset": "TDLib-windows-aarch64"},
           ]
           print(json.dumps({"include": include}, separators=(",", ":")))
           PY
