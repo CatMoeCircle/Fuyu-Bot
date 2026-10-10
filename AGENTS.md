@@ -320,4 +320,6 @@ cargo build -p fuyubot-cli   --features vendored --offline
 - [ ] 新 crate 有 `Cargo.toml`（全部 `.workspace = true`）+ `src/lib.rs` 或 `src/main.rs` + `README.md`
 - [ ] 新增的简化点已用 `# ponytail:` 标注
 - [ ] 动了 `fuyubot-tdlib` 的 `build.rs` 或 `src/loader/vendored.rs` 时，`--features vendored` 那条测试也跑过
-- [ ] `[package.metadata.fuyubot]` 里的 `tdlib-version` 与 `releases-repo` 仍是真实值（`releases-repo` 是占位符，见 HANDOFF）
+- [ ] `[package.metadata.fuyubot]` 里的值仍与事实一致：`releases-repo` 要等于 **`git remote origin`**
+      （现在是 `xiaoqvan/Fuyu-Bot`），`tdlib-version` 要等于**CI 跑 build-tdlib 时填的 `tdlib_version`**
+      （现在 `1.8.66`——资产放在 tag `TDLib V<tdlib-version>` 下，填错就是 404）
