@@ -18,33 +18,8 @@ on:
         description: "Exact TDLib source commit SHA (40-character hexadecimal hash)"
         required: true
         type: string
-      build_linux_x86_64:
-        description: "Build Linux x86_64"
-        required: true
-        type: boolean
-        default: true
-      build_linux_arm64:
-        description: "Build Linux ARM64"
-        required: true
-        type: boolean
-        default: true
-      build_macos_arm64:
-        description: "Build macOS ARM64"
-        required: true
-        type: boolean
-        default: true
-      build_windows_x86_64:
-        description: "Build Windows x86_64"
-        required: true
-        type: boolean
-        default: true
-      build_windows_arm64:
-        description: "Build Windows ARM64"
-        required: true
-        type: boolean
-        default: true
       publish_release:
-        description: "Publish/update the GitHub Release (requires all 5 platforms; turn off for partial/test builds)"
+        description: "Publish/update the GitHub Release (all 5 platforms are always built; turn off to only run the build)"
         required: true
         type: boolean
         default: true
@@ -56,26 +31,6 @@ on:
       tdlib_commit:
         required: true
         type: string
-      build_linux_x86_64:
-        required: false
-        type: boolean
-        default: true
-      build_linux_arm64:
-        required: false
-        type: boolean
-        default: true
-      build_macos_arm64:
-        required: false
-        type: boolean
-        default: true
-      build_windows_x86_64:
-        required: false
-        type: boolean
-        default: true
-      build_windows_arm64:
-        required: false
-        type: boolean
-        default: true
       publish_release:
         required: false
         type: boolean
@@ -101,11 +56,6 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.tdlib_version }}
           INPUT_COMMIT: ${{ inputs.tdlib_commit }}
-          BUILD_LINUX_X86_64: ${{ inputs.build_linux_x86_64 }}
-          BUILD_LINUX_ARM64: ${{ inputs.build_linux_arm64 }}
-          BUILD_MACOS_ARM64: ${{ inputs.build_macos_arm64 }}
-          BUILD_WINDOWS_X86_64: ${{ inputs.build_windows_x86_64 }}
-          BUILD_WINDOWS_ARM64: ${{ inputs.build_windows_arm64 }}
           PUBLISH_RELEASE: ${{ inputs.publish_release }}
         run: |
           set -euo pipefail
@@ -123,20 +73,14 @@ jobs:
           TAG="tdlib-${VER}"
 
           MATRIX="$(python3 - <<'PY'
-          import json, os
-          targets = [
-              ("linux", "x86_64", "ubuntu-22.04", "BUILD_LINUX_X86_64"),
-              ("linux", "arm64", "ubuntu-24.04-arm", "BUILD_LINUX_ARM64"),
-              ("macos", "arm64", "macos-14", "BUILD_MACOS_ARM64"),
-              ("windows", "x86_64", "windows-latest", "BUILD_WINDOWS_X86_64"),
-              ("windows", "arm64", "windows-11-vs2026-arm", "BUILD_WINDOWS_ARM64"),
+          import json
+          include = [
+              {"platform": "linux", "arch": "x86_64", "runner": "ubuntu-22.04"},
+              {"platform": "linux", "arch": "arm64", "runner": "ubuntu-24.04-arm"},
+              {"platform": "macos", "arch": "arm64", "runner": "macos-14"},
+              {"platform": "windows", "arch": "x86_64", "runner": "windows-latest"},
+              {"platform": "windows", "arch": "arm64", "runner": "windows-11-vs2026-arm"},
           ]
-          include = []
-          for platform, arch, runner, env_name in targets:
-              if os.environ.get(env_name, "true").lower() == "true":
-                  include.append({"platform": platform, "arch": arch, "runner": runner})
-          if not include:
-              raise SystemExit("error: select at least one platform to build")
           print(json.dumps({"include": include}, separators=(",", ":")))
           PY
           )"
