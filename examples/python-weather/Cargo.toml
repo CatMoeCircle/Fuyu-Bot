@@ -1,0 +1,16 @@
+[package]
+name = "fuyubot-example-weather"
+description = "示例插件：Python 写逻辑，Rust 只做 ABI 胶水"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+# 名字要和 weather.py 对齐：宿主是**按动态库的文件名**去找同名脚本的
+# （见 fuyubot-cli 的 find_script）。默认会叫 fuyubot_example_weather.dll，
+# 那样就找不到 weather.py 了。
+name = "weather"
+
+[dependencies]
+fuyubot-sdk-script.workspace = true

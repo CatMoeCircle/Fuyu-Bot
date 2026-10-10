@@ -1,0 +1,52 @@
+[workspace]
+members = ["crates/*", "examples/rust-echo", "examples/python-weather", "examples/ts-counter"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.0" }
+fuyubot-cli = { path = "crates/fuyubot-cli", version = "0.1.0" }
+fuyubot-core = { path = "crates/fuyubot-core", version = "0.1.0" }
+fuyubot-event = { path = "crates/fuyubot-event", version = "0.1.0" }
+fuyubot-loader = { path = "crates/fuyubot-loader", version = "0.1.0" }
+fuyubot-middleware = { path = "crates/fuyubot-middleware", version = "0.1.0" }
+fuyubot-plugin-api = { path = "crates/fuyubot-plugin-api", version = "0.1.0" }
+fuyubot-sdk-script = { path = "crates/fuyubot-sdk-script", version = "0.1.0" }
+fuyubot-sdk-cli = { path = "crates/fuyubot-sdk-cli", version = "0.1.0" }
+fuyubot-service = { path = "crates/fuyubot-service", version = "0.1.0" }
+fuyubot-simplify = { path = "crates/fuyubot-simplify", version = "0.1.0" }
+fuyubot-tdlib = { path = "crates/fuyubot-tdlib", version = "0.1.0" }
+fuyubot-tool = { path = "crates/fuyubot-tool", version = "0.1.0" }
+
+cbindgen = "0.29.4"
+clap = { version = "4.6.7", features = ["derive"] }
+flate2 = "1.1.10"
+jsonschema = { version = "0.58.6", default-features = false }
+libloading = "0.9.0"
+# 只用来**静态**读动态库的导出符号（`fuyubot-sdk check`）：规格要求「不加载、不运行」，
+# 所以不能 dlopen 之后再 dlsym。关掉默认特性里的 `compression`；`names` 是读符号名必需的。
+object = { version = "0.40.0", default-features = false, features = ["read", "names", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+semver = "1.0.28"
+sha2 = "0.10.9"
+tar = "0.4.46"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time"] }
+toml = "0.9.12"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+
+# 开发迭代用：比 dev 略高优化，保留完整调试信息。
+[profile.debug]
+inherits = "dev"
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,48 @@
+# ── AI / 开发过程文档：留在本机干活，**不进仓库** ─────────────────────
+# 这些记的是「东西是怎么做出来的」（路线图、交接说明、会话账、验收记录），
+# 不是**源代码的文档**。源代码的文档照常入库，见下面的说明。
+# 用 .gitignore 而不是删掉：本机的开发流还要读它们。
+/docs/HANDOFF.md
+/docs/ROADMAP.md
+/docs/SESSION-SUMMARY.md
+/docs/acceptance-phase-*.md
+
+# ── 本机工具数据 ──────────────────────────────────────────────────────
+/.serena/
+
+# ── 构建产物 ───────────────────────────────────────────────────────────
+# target/ 里还放着**真登录态**（target/tdlib-login-test/ 里有真 session），
+# 所以这一条同时是「凭据不许进仓库」的防线（AGENTS.md 约束 41）。
+/target/
+
+# ── 本机开发缓存：**不是源码** ─────────────────────────────────────────
+# 28MB 的 tdjson + 兄弟 DLL + 真 td_api.tl。build.rs 拿不到时会自己下载，
+# 所以没有构建依赖它存在。
+# 要离线构建就在本机放一份，或者用 TDLIB_TD_API_TL / FUYUBOT_TDLIB_VENDORED_CACHE 指过去。
+/.tdlib-cache/
+
+# ── 运行时状态（`fuyubot run` 生成）───────────────────────────────────
+/.fuyubot/
+
+# ── 装好的插件目录（`fuyubot plugin add` 往里拷产物）───────────────────
+/plugins/
+
+# ── 生成的绑定与编译产物 ──────────────────────────────────────────────
+# `fuyubot_plugin.h` 是**产物不是源码**（AGENTS.md 约束 35）：谁要落盘就
+# `fuyubot-sdk codegen --lang c` / `init --lang c` 现写一份。
+fuyubot_plugin.h
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.so
+*.dylib
+*.node
+
+# ── 编辑器 / 系统垃圾 ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp

@@ -1,0 +1,12 @@
+# 仓库统一 LF。
+#
+# 本机 `core.autocrlf=true`：不加这条的话，git 每次 checkout / `git add` 都会把工作区
+# 换成 CRLF（会刷一大片「LF 将被 CRLF 替换」警告），于是
+# 「工作区里是什么」与「提交进去的是什么」不再一一对应，diff 也难看。
+# 这个仓是跨平台的 Rust/C/Python/JS 源码，钉 LF 就是它现在的状态。
+* text=auto eol=lf
+
+# Windows 脚本例外：cmd / PowerShell 对 LF 的容忍度不如下面那些语言。
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf

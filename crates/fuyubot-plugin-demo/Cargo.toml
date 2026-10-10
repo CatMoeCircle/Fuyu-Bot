@@ -1,0 +1,12 @@
+[package]
+name = "fuyubot-plugin-demo"
+description = "最小 Rust 插件示例：用 define_plugin! 导出 C ABI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fuyubot-abi.workspace = true

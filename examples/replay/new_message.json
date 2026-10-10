@@ -1,0 +1,50 @@
+[
+  {
+    "@type": "updateNewMessage",
+    "message": {
+      "@type": "message",
+      "id": 1001,
+      "chat_id": -1001234567890,
+      "is_outgoing": false,
+      "content": {
+        "@type": "messageText",
+        "text": {
+          "@type": "formattedText",
+          "text": "/ping"
+        }
+      }
+    }
+  },
+  {
+    "@type": "updateNewMessage",
+    "message": {
+      "@type": "message",
+      "id": 1002,
+      "chat_id": -1001234567890,
+      "is_outgoing": false,
+      "content": {
+        "@type": "messageText",
+        "text": {
+          "@type": "formattedText",
+          "text": "你好，echo 插件"
+        }
+      }
+    }
+  },
+  {
+    "@type": "updateNewMessage",
+    "message": {
+      "@type": "message",
+      "id": 1003,
+      "chat_id": -1001234567890,
+      "is_outgoing": true,
+      "content": {
+        "@type": "messageText",
+        "text": {
+          "@type": "formattedText",
+          "text": "这条是自己发的，插件必须跳过它，否则会自激"
+        }
+      }
+    }
+  }
+]

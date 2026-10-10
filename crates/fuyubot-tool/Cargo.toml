@@ -1,0 +1,13 @@
+[package]
+name = "fuyubot-tool"
+description = "工具注册表（JSON Schema 描述，跨语言调用）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fuyubot-core.workspace = true
+jsonschema.workspace = true
+semver.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

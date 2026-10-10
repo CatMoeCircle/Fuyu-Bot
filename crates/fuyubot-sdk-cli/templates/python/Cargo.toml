@@ -1,0 +1,17 @@
+# 由 `fuyubot-sdk init --lang python` 生成。
+#
+# 这个 crate 只是**胶水**：它编出来的 cdylib 会在 `plugin_start` 时启动 python
+# 解释器执行 `__SCRIPT__`。业务逻辑全在 .py 里。
+[workspace]
+
+[package]
+name = "__CRATE__"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fuyubot-sdk-script = { path = "__SDK_PATH__", version = "0.1.0" }

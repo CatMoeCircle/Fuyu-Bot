@@ -1,0 +1,12 @@
+[package]
+name = "fuyubot-core"
+description = "Cordis 内核：生命周期、依赖解析与 Context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

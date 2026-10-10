@@ -1,0 +1,18 @@
+[
+  {
+    "@type": "updateNewMessage",
+    "message": {
+      "@type": "message",
+      "id": 2001,
+      "chat_id": -1001234567890,
+      "is_outgoing": false,
+      "content": {
+        "@type": "messageText",
+        "text": {
+          "@type": "formattedText",
+          "text": "/weather 上海"
+        }
+      }
+    }
+  }
+]

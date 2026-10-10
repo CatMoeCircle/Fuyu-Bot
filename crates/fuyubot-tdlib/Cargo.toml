@@ -1,0 +1,45 @@
+[package]
+name = "fuyubot-tdlib"
+description = "TDLib FFI、原生库加载与 td_receive 循环"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# 适配的 TDLib 版本与 Releases 仓库：build.rs 与运行时加载器都从这里读。
+[package.metadata.fuyubot]
+tdlib-version = "1.8.66"
+releases-repo = "fuyubot/fuyubot"
+
+[features]
+default = []
+# 编译期把原生库放到位，并允许运行时优先级 2 使用它。
+# 注意：`td_api.tl` 的获取**不**在这个 feature 里——它是必需输入，任何构建都要下载。
+vendored = ["dep:sha2", "dep:tar", "dep:flate2"]
+
+[dependencies]
+libloading.workspace = true
+# 编译期生成的 td_api 类型带 serde 派生，所以运行时也要 serde（不只是 serde_json）。
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+# 校验与解包只在 build.rs 用到，但留在共享模块里以便被单元测试覆盖。
+flate2 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+
+[build-dependencies]
+serde.workspace = true
+# build.rs 用它在编译期把 td_api.tl 的转换结果写成 JSON（形状与运行时共用，见 src/tl_schema.rs）。
+serde_json.workspace = true
+toml.workspace = true
+# ureq 只用于构建期下载：运行时本体不该链接 HTTP/TLS。
+# 它是**常开**的——`td_api.tl` 是必需输入，任何构建都要能把它下载下来（见 build.rs 的 acquire_schema）。
+ureq = { workspace = true, optional = false }
+flate2 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

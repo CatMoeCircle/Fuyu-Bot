@@ -1,0 +1,19 @@
+[package]
+name = "fuyubot-simplify"
+description = "TDLib 便捷封装层"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fuyubot-abi.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+fuyubot-core.workspace = true
+fuyubot-event.workspace = true
+fuyubot-loader.workspace = true
+# 用真 `td_api.tl` 烤出来的元数据校验自己拼的方法名/参数名（见 tests 里的
+# `every_request_simplify_builds_passes_the_real_schema`）。只在测试期，运行时不依赖。
+fuyubot-tdlib.workspace = true

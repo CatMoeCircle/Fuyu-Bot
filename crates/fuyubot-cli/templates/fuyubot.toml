@@ -1,0 +1,18 @@
+# fuyubot 项目配置。
+#
+# `fuyubot run` 会读它；所有键都有默认值，最简可以只有 [bot] 一节。
+
+[bot]
+name = "__NAME__"
+# 到 https://my.telegram.org 申请。填了才会走真实登录流程。
+api_id = __API_ID__
+api_hash = "__API_HASH__"
+
+[plugins]
+# 插件目录：`fuyubot run` 从这里加载所有动态库。
+dir = "plugins"
+
+[tdlib]
+# 留空 = 按 fuyubot-tdlib 的四级优先级自动找（环境变量 → 自带 → 系统库 → 裸库名）。
+# 指定时给 tdjson 的**目录**或文件路径，例如 ".tdlib-cache/1.8.66/windows-x86_64"。
+path = ""

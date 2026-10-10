@@ -1,0 +1,10 @@
+[package]
+name = "fuyubot-service"
+description = "服务容器"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fuyubot-core.workspace = true
+thiserror.workspace = true

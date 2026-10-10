@@ -1,0 +1,13 @@
+[package]
+name = "fuyubot-example-echo"
+description = "示例插件：把收到的消息原样回过去"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fuyubot-plugin-api.workspace = true
+serde_json.workspace = true

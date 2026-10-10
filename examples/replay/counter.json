@@ -1,0 +1,50 @@
+[
+  {
+    "@type": "updateNewMessage",
+    "message": {
+      "@type": "message",
+      "id": 3001,
+      "chat_id": -1001234567890,
+      "is_outgoing": false,
+      "content": {
+        "@type": "messageText",
+        "text": {
+          "@type": "formattedText",
+          "text": "第一条"
+        }
+      }
+    }
+  },
+  {
+    "@type": "updateNewMessage",
+    "message": {
+      "@type": "message",
+      "id": 3002,
+      "chat_id": -1001234567890,
+      "is_outgoing": false,
+      "content": {
+        "@type": "messageText",
+        "text": {
+          "@type": "formattedText",
+          "text": "第二条"
+        }
+      }
+    }
+  },
+  {
+    "@type": "updateNewMessage",
+    "message": {
+      "@type": "message",
+      "id": 3003,
+      "chat_id": 424242,
+      "is_outgoing": false,
+      "content": {
+        "@type": "messageText",
+        "text": {
+          "@type": "formattedText",
+          "text": "另一个聊天的第一条"
+        }
+      }
+    }
+  }
+]

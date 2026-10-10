@@ -1,0 +1,12 @@
+[package]
+name = "fuyubot-plugin-badabi"
+description = "手写导出的插件样例：故意报不兼容的 ABI 版本，供加载器测试"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fuyubot-abi.workspace = true
