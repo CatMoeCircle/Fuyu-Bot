@@ -1,35 +1,45 @@
 #!/usr/bin/env bash
 # Verify a packaged tdjson archive: magic bytes, arch match, static-link notes.
-# Args: <archive> <platform> <arch>
+#
+# ⚠️ **不按扩展名判断格式**：发布资产的名字就是 loader 的 `asset_name()`
+#    （例如 `TDLib-windows-x86_64`，**不带扩展名**），所以只能看内容。
+#    zip 会被**直接拒绝**：`extract_library` 只认裸库和 `.tar.gz`，
+#    收到 zip 会当裸库原样写出（坏文件且不报错）。
+#
+# Args: <archive> <platform> <arch> [asset-name]
 set -euo pipefail
 
 ARCHIVE="${1:?archive path}"
 PLATFORM="${2:?platform}"
 ARCH="${3:?arch}"
+ASSET_NAME="${4:-}"
 
 if [[ ! -f "$ARCHIVE" ]]; then
   echo "error: archive not found: $ARCHIVE" >&2
   exit 1
 fi
 
+if [[ -n "$ASSET_NAME" && "$(basename "$ARCHIVE")" != "$ASSET_NAME" ]]; then
+  echo "error: archive basename '$(basename "$ARCHIVE")' != expected asset name '$ASSET_NAME'" >&2
+  exit 1
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-case "$ARCHIVE" in
-  *.tar.gz|*.tgz) tar -xzf "$ARCHIVE" -C "$WORK" ;;
-  *.zip)
-    if command -v unzip >/dev/null 2>&1; then
-      unzip -q "$ARCHIVE" -d "$WORK"
-    else
-      python3 - "$ARCHIVE" "$WORK" <<'PY'
-import sys, zipfile
-with zipfile.ZipFile(sys.argv[1]) as zf:
-    zf.extractall(sys.argv[2])
-PY
-    fi
+# 看内容，不看扩展名。
+MAGIC="$(head -c2 "$ARCHIVE" | od -An -tx1 | tr -d ' \n')"
+case "$MAGIC" in
+  1f8b)
+    tar -xzf "$ARCHIVE" -C "$WORK"
+    ;;
+  504b)
+    echo "error: $ARCHIVE 是 zip——loader 的 extract_library 只认「裸库」和 .tar.gz" >&2
+    echo "       zip 会被当成裸库原样写出，得到一个坏文件而且**不报错**；请改用 tar.gz" >&2
+    exit 1
     ;;
   *)
-    echo "unsupported archive: $ARCHIVE" >&2
+    echo "error: $ARCHIVE 既不是 gzip 也不是 zip（magic=$MAGIC）" >&2
     exit 1
     ;;
 esac

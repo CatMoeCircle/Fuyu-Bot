@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
-# Package tdjson artifacts into a versioned archive and write VERSION.json.
-# Args: <tdjson-dir> <output-archive-path> <platform> <arch> <tdlib-version> <tdlib-commit>
+# 把 tdjson 打成**fuyubot 的 loader 能直接吃**的发布资产。
+#
+# ⚠️ 名字和格式是**契约**，不要随手改：
+#   - 资产文件名必须**精确等于** `crates/fuyubot-tdlib/src/loader/vendored.rs` 里的
+#     `ASSET_*` 常量——`asset_name()` 的返回值是**原样**拼进下载 URL 的，
+#     所以文件名**不带扩展名**（例如 `TDLib-windows-x86_64`）。
+#   - 内容必须是 **.tar.gz**：loader 的 `extract_library` 只认「裸库」和「.tar.gz」，
+#     收到 .zip 会**当裸库原样写出** → 得到一个坏文件，而且**不报错**。
+#   这两条由 `crates/fuyubot-tdlib/tests/release_assets.rs` 盯着（它读本 workflow 来比对）。
+#
+# Args: <tdjson-dir> <archive-path> <platform> <arch> <tdlib-version> <tdlib-commit> <asset-name>
 set -euo pipefail
 
 TDLIB_JSON_DIR="${1:?tdjson dir}"
@@ -9,9 +18,17 @@ PLATFORM="${3:?platform}"
 ARCH="${4:?arch}"
 TDLIB_VERSION="${5:?tdlib version}"
 TDLIB_COMMIT="${6:?tdlib commit}"
+ASSET_NAME="${7:?asset name（必须等于 vendored.rs 里 ASSET_* 常量的值）}"
 
 if [[ ! -d "$TDLIB_JSON_DIR" ]]; then
   echo "error: missing tdjson dir $TDLIB_JSON_DIR" >&2
+  exit 1
+fi
+
+# 归档文件名必须**就是**资产名——loader 按这个名字找它。
+if [[ "$(basename "$ARCHIVE_PATH")" != "$ASSET_NAME" ]]; then
+  echo "error: archive basename '$(basename "$ARCHIVE_PATH")' != asset name '$ASSET_NAME'" >&2
+  echo "       loader 的 asset_name() 会把这个名字原样拼进下载 URL，两者必须一致" >&2
   exit 1
 fi
 
@@ -28,20 +45,6 @@ if [[ -z "$LIB_NAME" ]]; then
   exit 1
 fi
 
-# Use stable, platform-specific directory names inside each archive.
-# Keep the outer archive filenames versioned for release compatibility.
-case "${PLATFORM}:${ARCH}" in
-  linux:x86_64) PKG_NAME="TDLib-x86_64-linux" ;;
-  linux:arm64|linux:aarch64) PKG_NAME="TDLib-aarch64-linux" ;;
-  macos:arm64|macos:aarch64) PKG_NAME="TDLib-macos-arm64" ;;
-  windows:x86_64) PKG_NAME="TDLib-windows-x86_64" ;;
-  windows:arm64|windows:aarch64) PKG_NAME="TDLib-windows-arm64" ;;
-  *)
-    echo "unsupported platform/architecture: ${PLATFORM}/${ARCH}" >&2
-    exit 1
-    ;;
-esac
-
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 if command -v cygpath >/dev/null 2>&1; then
@@ -49,11 +52,13 @@ if command -v cygpath >/dev/null 2>&1; then
 fi
 mkdir -p "$(dirname "$ARCHIVE_PATH")"
 
+# 内层目录名 = 资产名。loader 用 `file_name()` 找库，所以层级本身无所谓，
+# 但内外一致更好读（也方便人肉核对）。
 STAGE_ROOT="$(mktemp -d)"
-STAGE_DIR="$STAGE_ROOT/$PKG_NAME"
+STAGE_DIR="$STAGE_ROOT/$ASSET_NAME"
 mkdir -p "$STAGE_DIR"
 
-# Ship ONLY the tdjson binary (+ optional import lib). OpenSSL/zlib are merged in.
+# 只带 tdjson 本身（+ Windows 的导入库）。OpenSSL/zlib 是静态并进去的，没有独立运行时依赖。
 cp -a "$TDLIB_JSON_DIR/$LIB_NAME" "$STAGE_DIR/"
 if [[ -f "$TDLIB_JSON_DIR/tdjson.lib" ]]; then
   cp -a "$TDLIB_JSON_DIR/tdjson.lib" "$STAGE_DIR/"
@@ -61,12 +66,7 @@ fi
 if [[ -f "$TDLIB_JSON_DIR/build-info.txt" ]]; then
   cp -a "$TDLIB_JSON_DIR/build-info.txt" "$STAGE_DIR/"
 fi
-if [[ -f "$TDLIB_JSON_DIR/VERSION.json" ]]; then
-  # Keep any pre-written meta; we rewrite a canonical VERSION.json below.
-  true
-fi
 
-# Linkage note from build-info (if present)
 LINKAGE="static"
 if [[ -f "$STAGE_DIR/build-info.txt" ]]; then
   if grep -q '^linkage=' "$STAGE_DIR/build-info.txt" 2>/dev/null; then
@@ -74,7 +74,6 @@ if [[ -f "$STAGE_DIR/build-info.txt" ]]; then
   fi
 fi
 
-# Optional non-runtime companion (import lib for MSVC link-time consumers).
 LINK_LIB_JSON="null"
 if [[ -f "$STAGE_DIR/tdjson.lib" ]]; then
   LINK_LIB_JSON="\"tdjson.lib\""
@@ -84,6 +83,7 @@ cat > "$STAGE_DIR/VERSION.json" <<EOF
 {
   "tdlib_version": "${TDLIB_VERSION}",
   "tdlib_commit": "${TDLIB_COMMIT}",
+  "asset_name": "${ASSET_NAME}",
   "platform": "${PLATFORM}",
   "arch": "${ARCH}",
   "library": "${LIB_NAME}",
@@ -92,84 +92,48 @@ cat > "$STAGE_DIR/VERSION.json" <<EOF
   "import_lib": ${LINK_LIB_JSON},
   "runtime_deps": [],
   "build_date_utc": "${BUILD_DATE}",
-  "consumed_by": "fuyutd (dynamic load via libloading)"
+  "consumed_by": "fuyubot (dynamically loaded by fuyubot-tdlib::loader)"
 }
 EOF
 
 cat > "$STAGE_DIR/README.md" <<EOF
-# TDLib binary package
+# TDLib binary package（给 fuyubot 用）
 
-- **Platform**: ${PLATFORM}
-- **Arch**: ${ARCH}
-- **TDLib version**: ${TDLIB_VERSION}
-- **TDLib commit**: ${TDLIB_COMMIT}
-- **Library**: \`${LIB_NAME}\`
-- **Linkage**: ${LINKAGE}
-- **Built (UTC)**: ${BUILD_DATE}
+- **资产名**：\`${ASSET_NAME}\` —— **必须**长这样，\`fuyubot-tdlib\` 的 loader 会把它原样拼进下载 URL
+- **平台 / 架构**：${PLATFORM} / ${ARCH}
+- **TDLib 版本 / commit**：${TDLIB_VERSION} / ${TDLIB_COMMIT}
+- **动态库**：\`${LIB_NAME}\`
+- **链接方式**：${LINKAGE}（OpenSSL/zlib 静态并入，不需要额外的 libssl / libcrypto / libz）
+- **构建时间 (UTC)**：${BUILD_DATE}
 
-## Static merge
+## fuyubot 怎么用它
 
-OpenSSL and zlib are **statically linked into** \`${LIB_NAME}\`.
-You do **not** need to ship `libssl` / `libcrypto` / `libz` next to the library.
+\`fuyubot-tdlib\` 在**构建期**按
+\`https://github.com/<repo>/releases/download/TDLib V<版本>/<资产名>\` 取这个资产，
+解包后把 \`${LIB_NAME}\` 落到缓存目录（见 \`src/loader/vendored.rs\`）。
+所以它**必须是 .tar.gz 的内容、且文件名就是这个资产名**——
+换成 .zip 会被当成裸库原样写出，得到一个坏文件而且**不会报错**。
 
-This follows the same approach as [eilvelia/tdl prebuilt-tdlib](https://github.com/eilvelia/tdl/blob/main/.github/workflows/prebuilt-tdlib.yml)
-(`OPENSSL_USE_STATIC_LIBS=TRUE`, `ZLIB_USE_STATIC_LIBS=TRUE`, static vcpkg triplets on Windows).
-
-## Usage with fuyutd
-
-```rust
-use fuyutd::Client;
-
-let client = Client::builder()
-    .tdjson("${LIB_NAME}")
-    .libdir("./tdlib")
-    .verbosity_level(1)
-    .build()?;
-```
-
-## Layout
+## 归档布局
 
 \`\`\`
-${PKG_NAME}/
+${ASSET_NAME}/
   ${LIB_NAME}
   VERSION.json
   README.md
 \`\`\`
 
-## Notes
+## 备注
 
-- Linux: \`libtdjson.so\` carries OpenSSL/zlib inside; system libc/libstdc++ still apply.
-- macOS: \`libtdjson.dylib\` linked against static OpenSSL/zlib; \`@rpath\` id + ad-hoc codesign applied.
-- Windows: \`tdjson.dll\` built with vcpkg **static** triplets (\`*-windows-static\`); OpenSSL/zlib merged in. Optional \`tdjson.lib\` is import-lib only (not a runtime dep).
+- Linux：\`libtdjson.so\` 内含 OpenSSL/zlib；系统 libc/libstdc++ 仍然适用。
+- macOS：\`libtdjson.dylib\` 链的是静态 OpenSSL/zlib；带 \`@rpath\` id 与 ad-hoc codesign。
+- Windows：\`tdjson.dll\` 用 vcpkg **static** triplet 构建；可选的 \`tdjson.lib\` 只是导入库，
+  **不是**运行时依赖。
 EOF
 
-case "$ARCHIVE_PATH" in
-  *.tar.gz|*.tgz)
-    tar -czf "$ARCHIVE_PATH" -C "$STAGE_ROOT" "$PKG_NAME"
-    ;;
-  *.zip)
-    if command -v zip >/dev/null 2>&1; then
-      (cd "$STAGE_ROOT" && zip -qr "$ARCHIVE_PATH" "$PKG_NAME")
-    else
-      python3 - "$STAGE_ROOT" "$PKG_NAME" "$ARCHIVE_PATH" <<'PY'
-import os, sys, zipfile
-stage_root, pkg, archive = sys.argv[1], sys.argv[2], sys.argv[3]
-base = os.path.join(stage_root, pkg)
-with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-    for root, _, files in os.walk(base):
-        for f in files:
-            full = os.path.join(root, f)
-            rel = os.path.relpath(full, stage_root)
-            zf.write(full, rel.replace(os.sep, "/"))
-PY
-    fi
-    ;;
-  *)
-    echo "unsupported archive type: $ARCHIVE_PATH" >&2
-    exit 1
-    ;;
-esac
+# 一律 tar.gz。**不要**按扩展名分派：资产名本身不带扩展名。
+tar -czf "$ARCHIVE_PATH" -C "$STAGE_ROOT" "$ASSET_NAME"
 
 rm -rf "$STAGE_ROOT"
-echo "==> packaged $ARCHIVE_PATH (static-linked tdjson only)"
+echo "==> packaged $ARCHIVE_PATH (asset=$ASSET_NAME, tar.gz, static-linked tdjson only)"
 ls -lh "$ARCHIVE_PATH"

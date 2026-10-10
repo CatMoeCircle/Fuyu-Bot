@@ -70,16 +70,21 @@ jobs:
             exit 1
           fi
           VER="$VERSION"
-          TAG="tdlib-${VER}"
+          # ⚠️ tag 必须**精确**是 `TDLib V<版本>`：fuyubot-tdlib 的 `release_url()` 拼的是
+          #    https://github.com/<repo>/releases/download/TDLib%20V<版本>/<资产名>
+          TAG="TDLib V${VER}"
 
+          # ⚠️ `asset` 必须**精确等于** crates/fuyubot-tdlib/src/loader/vendored.rs 里的
+          #    ASSET_* 常量——`asset_name()` 的返回值原样拼进下载 URL（**不带扩展名**）。
+          #    crates/fuyubot-tdlib/tests/release_assets.rs 会读本文件比对，漂了就红。
           MATRIX="$(python3 - <<'PY'
           import json
           include = [
-              {"platform": "linux", "arch": "x86_64", "runner": "ubuntu-22.04"},
-              {"platform": "linux", "arch": "arm64", "runner": "ubuntu-24.04-arm"},
-              {"platform": "macos", "arch": "arm64", "runner": "macos-14"},
-              {"platform": "windows", "arch": "x86_64", "runner": "windows-latest"},
-              {"platform": "windows", "arch": "arm64", "runner": "windows-11-vs2026-arm"},
+              {"platform": "linux", "arch": "x86_64", "runner": "ubuntu-22.04", "asset": "TDLib-x86_64-linux"},
+              {"platform": "linux", "arch": "arm64", "runner": "ubuntu-24.04-arm", "asset": "TDLib-aarch64-linux"},
+              {"platform": "macos", "arch": "arm64", "runner": "macos-14", "asset": "TDLib-macos-arm64"},
+              {"platform": "windows", "arch": "x86_64", "runner": "windows-latest", "asset": "TDLib-windows-x86_64"},
+              {"platform": "windows", "arch": "arm64", "runner": "windows-11-vs2026-arm", "asset": "TDLib-windows-arm64"},
           ]
           print(json.dumps({"include": include}, separators=(",", ":")))
           PY
@@ -105,7 +110,7 @@ jobs:
     needs: resolve-tdlib
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout fuyutd-rs
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Fetch td_api.tl from TDLib at resolved commit
@@ -188,7 +193,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve-tdlib.outputs.build_matrix) }}
     steps:
-      - name: Checkout fuyutd-rs
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Checkout TDLib source
@@ -240,15 +245,17 @@ jobs:
             "$ARCH"
           .github/scripts/package-tdlib.sh \
             "$GITHUB_WORKSPACE/out/tdjson" \
-            "$GITHUB_WORKSPACE/dist/tdlib-${VERSION}-linux-${ARCH}.tar.gz" \
+            "$GITHUB_WORKSPACE/dist/${{ matrix.asset }}" \
             linux \
             "$ARCH" \
             "$VERSION" \
-            "$TDLIB_COMMIT"
+            "$TDLIB_COMMIT" \
+            "${{ matrix.asset }}"
           .github/scripts/verify-tdlib.sh \
-            "$GITHUB_WORKSPACE/dist/tdlib-${VERSION}-linux-${ARCH}.tar.gz" \
+            "$GITHUB_WORKSPACE/dist/${{ matrix.asset }}" \
             linux \
-            "$ARCH"
+            "$ARCH" \
+            "${{ matrix.asset }}"
 
       # ---------------- macOS ----------------
       - name: Build TDLib (macOS)
@@ -267,16 +274,17 @@ jobs:
             "$ARCH"
           .github/scripts/package-tdlib.sh \
             "$GITHUB_WORKSPACE/out/tdjson" \
-            "$GITHUB_WORKSPACE/dist/tdlib-${VERSION}-macos-${ARCH}.tar.gz" \
+            "$GITHUB_WORKSPACE/dist/${{ matrix.asset }}" \
             macos \
             "$ARCH" \
             "$VERSION" \
             "$TDLIB_COMMIT" \
-            ""
+            "${{ matrix.asset }}"
           .github/scripts/verify-tdlib.sh \
-            "$GITHUB_WORKSPACE/dist/tdlib-${VERSION}-macos-${ARCH}.tar.gz" \
+            "$GITHUB_WORKSPACE/dist/${{ matrix.asset }}" \
             macos \
-            "$ARCH"
+            "$ARCH" \
+            "${{ matrix.asset }}"
 
       # ---------------- Windows ----------------
       - name: Setup vcpkg (Windows x64)
@@ -372,21 +380,20 @@ jobs:
           VERSION="${{ needs.resolve-tdlib.outputs.tdlib_version }}"
           ARCH="${{ matrix.arch }}"
           COMMIT="${{ needs.resolve-tdlib.outputs.tdlib_commit }}"
+          # tar.gz，**不是 zip**：loader 的 extract_library 只认裸库和 .tar.gz。
           .github/scripts/package-tdlib.sh \
             "$GITHUB_WORKSPACE/out/tdjson" \
-            "$GITHUB_WORKSPACE/dist/tdlib-${VERSION}-windows-${ARCH}.zip" \
-            windows "$ARCH" "$VERSION" "$COMMIT"
+            "$GITHUB_WORKSPACE/dist/${{ matrix.asset }}" \
+            windows "$ARCH" "$VERSION" "$COMMIT" "${{ matrix.asset }}"
 
       - name: Verify TDLib (Windows)
         if: matrix.platform == 'windows'
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ needs.resolve-tdlib.outputs.tdlib_version }}"
-          ARCH="${{ matrix.arch }}"
           .github/scripts/verify-tdlib.sh \
-            "$GITHUB_WORKSPACE/dist/tdlib-${VERSION}-windows-${ARCH}.zip" \
-            windows "$ARCH"
+            "$GITHUB_WORKSPACE/dist/${{ matrix.asset }}" \
+            windows "$ARCH" "${{ matrix.asset }}"
       - name: Upload TDLib artifact
         uses: actions/upload-artifact@v4
         with:
@@ -401,7 +408,7 @@ jobs:
     if: ${{ always() && needs.build.result == 'success' && needs.export-schema.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout fuyutd-rs
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Download all TDLib artifacts
@@ -422,7 +429,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp -v {} dist/ \;
+          # 资产名没有扩展名（就是 loader 的 ASSET_*），所以按名字前缀收集。
+          find artifacts -type f -name 'TDLib-*' -exec cp -v {} dist/ \;
           # Schema assets required for Publish Rust crate gating
           if [[ ! -f schema/td_api.tl ]]; then
             echo "error: schema/td_api.tl missing from schema artifact" >&2
@@ -441,7 +449,7 @@ jobs:
           fi
           echo "==> dist contents"
           ls -lah dist
-          COUNT="$(find dist -type f \( -name 'tdlib-*.tar.gz' -o -name 'tdlib-*.zip' \) | wc -l)"
+          COUNT="$(find dist -type f -name 'TDLib-*' | wc -l)"
           echo "==> found $COUNT package(s)"
           EXPECTED="${{ needs.resolve-tdlib.outputs.build_count }}"
           if [[ "$COUNT" -lt "$EXPECTED" ]]; then
@@ -456,10 +464,10 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          # Some selected-platform test builds contain only .zip or only .tar.gz.
-          # Ignore unmatched globs instead of passing literal wildcard strings to sha256sum.
+          # 资产名没有扩展名（= loader 的 ASSET_*），所以用 `TDLib-*` 收集。
+          # 未匹配的通配保留成字面量再传给 sha256sum 会报错，所以开 nullglob。
           shopt -s nullglob
-          FILES=(tdlib-*.tar.gz tdlib-*.zip td_api.tl SCHEMA_INFO.json)
+          FILES=(TDLib-* td_api.tl SCHEMA_INFO.json)
           if [[ ! -f td_api.tl ]]; then
             echo "error: required schema file td_api.tl is missing" >&2
             exit 1
@@ -490,7 +498,7 @@ jobs:
           VER="${VERSION#v}"
           STABLE="dist/tdlib-${VER}-all.tar.gz"
           shopt -s nullglob
-          PACKAGES=(dist/tdlib-*.tar.gz dist/tdlib-*.zip)
+          PACKAGES=(dist/TDLib-*)
           if [[ "${#PACKAGES[@]}" -eq 0 ]]; then
             echo "error: no platform packages found in dist/" >&2
             ls -lah dist
@@ -513,8 +521,8 @@ jobs:
         with:
           name: tdlib-${{ needs.resolve-tdlib.outputs.tdlib_version }}-all
           path: |
-            dist/tdlib-*.tar.gz
-            dist/tdlib-*.zip
+            dist/TDLib-*
+            dist/tdlib-*-all.tar.gz
             dist/td_api.tl
             dist/SCHEMA_INFO.json
             dist/SHA256SUMS
@@ -533,15 +541,16 @@ jobs:
         run: |
           set -euo pipefail
           VER="${VERSION#v}"
-          TAG="tdlib-${VER}"
-          TITLE="tdlib ${VER}"
+          # 与 loader 的 `release_url()` 一致：tag 是 `TDLib V<版本>`（中间有个空格）。
+          TAG="TDLib V${VER}"
+          TITLE="TDLib V${VER}"
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
           NOTES="$(mktemp)"
           {
             echo "# ${TITLE}"
             echo
-            echo "TDLib prebuilt binaries + schema for fuyutd."
+            echo "TDLib prebuilt binaries + schema for fuyubot."
             echo
             echo "| Field | Value |"
             echo "|-------|-------|"
@@ -556,23 +565,14 @@ jobs:
             echo
             echo "| Platform | Arch | Archive | Directory inside archive | Dynamic library |"
             echo "|----------|------|---------|--------------------------|-----------------|"
-            python3 - "$BUILD_MATRIX" "$VERSION" <<'PY' >> "$NOTES"
+            python3 - "$BUILD_MATRIX" <<'PY' >> "$NOTES"
           import json, sys
           matrix = json.loads(sys.argv[1])
-          version = sys.argv[2]
-          layouts = {
-              ("linux", "x86_64"): ("TDLib-x86_64-linux", "libtdjson.so", "x86_64"),
-              ("linux", "arm64"): ("TDLib-aarch64-linux", "libtdjson.so", "arm64"),
-              ("macos", "arm64"): ("TDLib-macos-arm64", "libtdjson.dylib", "arm64"),
-              ("windows", "x86_64"): ("TDLib-windows-x86_64", "tdjson.dll", "x86_64"),
-              ("windows", "arm64"): ("TDLib-windows-arm64", "tdjson.dll", "arm64"),
-          }
+          libraries = {"linux": "libtdjson.so", "macos": "libtdjson.dylib", "windows": "tdjson.dll"}
+          # 资产名与归档内容由 matrix.asset 决定（= loader 的 ASSET_*，不带扩展名）。
           for item in matrix["include"]:
-              platform, arch = item["platform"], item["arch"]
-              directory, library, archive_arch = layouts[(platform, arch)]
-              ext = "zip" if platform == "windows" else "tar.gz"
-              archive_arch = "arm64" if platform == "linux" and arch == "arm64" else arch
-              print(f"| {platform} | {arch} | `tdlib-{version}-{platform}-{archive_arch}.{ext}` | `{directory}/` | `{library}` |")
+              platform, arch, asset = item["platform"], item["arch"], item["asset"]
+              print(f"| {platform} | {arch} | `{asset}` | `{asset}/` | `{libraries[platform]}` |")
           PY
             echo
             echo "Each package contains only \`tdjson\` (+ \`VERSION.json\` / README)."
@@ -582,17 +582,14 @@ jobs:
             echo
             echo "## Schema / bindings"
             echo
-            echo "\`td_api.tl\` on this release is the schema used for fuyutd bindings."
-            echo "**Publish Rust crate** workflow checks this release first, downloads \`td_api.tl\`,"
-            echo "then generates bindings and commits/pushes."
+            echo "\`td_api.tl\` on this release is the schema \`fuyubot-tdlib\` converts at **build time**"
+            echo "(it is baked into the binary as \`TdApiSchema::compiled()\`, so the runtime never parses it)."
             echo
             echo "## Rebuild policy"
             echo
             echo "Re-running this workflow for the **same** \`${TITLE}\` **updates** this release in place."
             echo
-            echo "Fuyutd loads \`tdjson\` dynamically at runtime."
-            echo
-            echo "Rust crate releases are separate (\`fuyutd-vX.Y.Z\` via the Publish Rust crate workflow)."
+            echo "fuyubot loads \`tdjson\` **dynamically at runtime** (\`fuyubot-tdlib::loader\`)."
           } > "$NOTES"
 
           # Upload the plain, uncompressed schema first so it is easy to find on the Release page.
@@ -612,7 +609,7 @@ jobs:
                 ;;
               *-all.tar.gz)
                 ;;
-              tdlib-*.tar.gz|tdlib-*.zip)
+              TDLib-*)
                 UPLOAD+=("$f")
                 ;;
               *)
