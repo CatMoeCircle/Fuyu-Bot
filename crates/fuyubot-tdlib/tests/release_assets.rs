@@ -1,7 +1,7 @@
 //! 守住「发布资产」这条**跨文件契约**。
 //!
 //! `src/loader/vendored.rs` 里那几个 `ASSET_*` 常量是**原样**拼进下载 URL 的
-//! （`release_url()` → `https://github.com/<repo>/releases/download/TDLib%20V<版本>/<资产名>`），
+//! （`release_url()` → `https://github.com/<repo>/releases/download/TDLib-v<版本>/<资产名>`），
 //! 而真正产出这些文件的是 `.github/workflows/build-tdlib.yml`（配 `.github/scripts/*.sh`）。
 //!
 //! 两边一旦漂掉，症状是「自动下载 TDLib 永远 404，或者写出一个坏文件却**不报错**」——
@@ -94,8 +94,8 @@ fn the_release_workflow_publishes_exactly_the_asset_names_we_download() {
 
     // tag 也必须一致：loader 拼的是 `TDLib V<版本>`（中间有空格，URL 里编码成 %20）。
     assert!(
-        workflow.contains("TAG=\"TDLib V${VER}\""),
-        "workflow 的 release tag 必须与 loader 的 release_url() 一致（`TDLib V<版本>`）"
+        workflow.contains("TAG=\"TDLib-v${VER}\""),
+        "workflow 的 release tag 必须与 loader 的 release_url() 一致（`TDLib-v<版本>`）"
     );
 
     // Windows **不能**再用 zip：`extract_library` 只认「裸库」和 `.tar.gz`，
