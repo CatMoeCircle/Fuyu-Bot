@@ -393,6 +393,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Each GitHub Actions run step starts a fresh shell; define ARCH here.
+          ARCH="${{ matrix.arch }}"
           .github/scripts/verify-tdlib.sh \
             "$GITHUB_WORKSPACE/dist/${{ matrix.asset }}" \
             windows "$ARCH" "${{ matrix.asset }}"
