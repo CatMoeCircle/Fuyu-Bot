@@ -114,9 +114,9 @@ pub fn cached_schema(root: &Path, version: &str) -> PathBuf {
     root.join(version).join(SCHEMA_ASSET)
 }
 
-/// Releases 下载 URL。Tag 是 `TDLib V{version}`，用户名里必须带空格，所以做百分号编码。
+/// Releases 下载 URL。Tag 使用无空格的 `TDLib-v{version}`，避免 Git tag 非法。
 pub fn release_url(repo: &str, version: &str, asset: &str) -> String {
-    format!("https://github.com/{repo}/releases/download/TDLib%20V{version}/{asset}")
+    format!("https://github.com/{repo}/releases/download/TDLib-v{version}/{asset}")
 }
 
 /// SHA256 十六进制小写。
@@ -285,7 +285,7 @@ mod tests {
     fn release_url_encodes_the_space_in_the_tag() {
         assert_eq!(
             release_url("fuyubot/fuyubot", "1.8.66", "TDLib-windows-x86_64"),
-            "https://github.com/fuyubot/fuyubot/releases/download/TDLib%20V1.8.66/TDLib-windows-x86_64"
+            "https://github.com/fuyubot/fuyubot/releases/download/TDLib-v1.8.66/TDLib-windows-x86_64"
         );
     }
 
