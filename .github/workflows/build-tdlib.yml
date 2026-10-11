@@ -72,7 +72,7 @@ jobs:
           VER="$VERSION"
           # ⚠️ tag 必须**精确**是 `TDLib V<版本>`：fuyubot-tdlib 的 `release_url()` 拼的是
           #    https://github.com/<repo>/releases/download/TDLib%20V<版本>/<资产名>
-          TAG="TDLib V${VER}"
+          TAG="TDLib-v${VER}"
 
           # ⚠️ `asset` 必须**精确等于** crates/fuyubot-tdlib/src/loader/vendored.rs 里 ASSETS 表的值
           #    ——`asset_name()` 的返回值原样拼进下载 URL（**不带扩展名**）。
@@ -291,6 +291,7 @@ jobs:
       # ---------------- Windows ----------------
       - name: Setup vcpkg (Windows x64)
         if: matrix.platform == 'windows' && matrix.arch == 'x86_64'
+        id: vcpkg
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -298,10 +299,30 @@ jobs:
           git clone https://github.com/Microsoft/vcpkg.git
           Set-Location vcpkg
           .\bootstrap-vcpkg.bat
+          "commit=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Windows x64 vcpkg packages
+        if: matrix.platform == 'windows' && matrix.arch == 'x86_64'
+        uses: actions/cache@v4
+        with:
+          path: |
+            td-src/vcpkg/installed
+            td-src/vcpkg/downloads
+          key: windows-vcpkg-x86_64-${{ steps.vcpkg.outputs.commit }}-${{ hashFiles('.github/workflows/build-tdlib.yml') }}
+          restore-keys: |
+            windows-vcpkg-x86_64-${{ steps.vcpkg.outputs.commit }}-
+
+      - name: Install vcpkg dependencies (Windows x64)
+        if: matrix.platform == 'windows' && matrix.arch == 'x86_64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location "$env:GITHUB_WORKSPACE/td-src/vcpkg"
           .\vcpkg.exe install gperf:x64-windows-static openssl:x64-windows-static zlib:x64-windows-static
 
       - name: Setup vcpkg (Windows ARM64)
         if: matrix.platform == 'windows' && matrix.arch == 'arm64'
+        id: vcpkg
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -309,7 +330,35 @@ jobs:
           git clone https://github.com/Microsoft/vcpkg.git
           Set-Location vcpkg
           .\bootstrap-vcpkg.bat
+          "commit=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Windows ARM64 vcpkg packages
+        if: matrix.platform == 'windows' && matrix.arch == 'arm64'
+        uses: actions/cache@v4
+        with:
+          path: |
+            td-src/vcpkg/installed
+            td-src/vcpkg/downloads
+          key: windows-vcpkg-arm64-${{ steps.vcpkg.outputs.commit }}-${{ hashFiles('.github/workflows/build-tdlib.yml') }}
+          restore-keys: |
+            windows-vcpkg-arm64-${{ steps.vcpkg.outputs.commit }}-
+
+      - name: Install vcpkg dependencies (Windows ARM64)
+        if: matrix.platform == 'windows' && matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location "$env:GITHUB_WORKSPACE/td-src/vcpkg"
           .\vcpkg.exe install gperf:x64-windows-static openssl:arm64-windows-static zlib:arm64-windows-static
+
+      - name: Cache Windows x64 CMake build project
+        if: matrix.platform == 'windows' && matrix.arch == 'x86_64'
+        uses: actions/cache@v4
+        with:
+          path: td-src/build
+          key: windows-cmake-x86_64-${{ needs.resolve-tdlib.outputs.tdlib_commit }}-${{ steps.vcpkg.outputs.commit }}-${{ hashFiles('.github/workflows/build-tdlib.yml') }}
+          restore-keys: |
+            windows-cmake-x86_64-${{ needs.resolve-tdlib.outputs.tdlib_commit }}-${{ steps.vcpkg.outputs.commit }}-
 
       - name: Build TDLib shared library (Windows x64)
         if: matrix.platform == 'windows' && matrix.arch == 'x86_64'
@@ -317,7 +366,6 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Set-Location "$env:GITHUB_WORKSPACE/td-src"
-          Remove-Item build -Force -Recurse -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path build | Out-Null
           Set-Location build
           cmake -A x64 `
@@ -330,13 +378,21 @@ jobs:
             ..
           cmake --build . --target install --config Release
 
+      - name: Cache Windows ARM64 CMake build project
+        if: matrix.platform == 'windows' && matrix.arch == 'arm64'
+        uses: actions/cache@v4
+        with:
+          path: td-src/build
+          key: windows-cmake-arm64-${{ needs.resolve-tdlib.outputs.tdlib_commit }}-${{ steps.vcpkg.outputs.commit }}-${{ hashFiles('.github/workflows/build-tdlib.yml') }}
+          restore-keys: |
+            windows-cmake-arm64-${{ needs.resolve-tdlib.outputs.tdlib_commit }}-${{ steps.vcpkg.outputs.commit }}-
+
       - name: Build TDLib shared library (Windows ARM64)
         if: matrix.platform == 'windows' && matrix.arch == 'arm64'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Set-Location "$env:GITHUB_WORKSPACE/td-src"
-          Remove-Item build -Force -Recurse -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path build | Out-Null
           Set-Location build
 
@@ -546,7 +602,7 @@ jobs:
           set -euo pipefail
           VER="${VERSION#v}"
           # 与 loader 的 `release_url()` 一致：tag 是 `TDLib V<版本>`（中间有个空格）。
-          TAG="TDLib V${VER}"
+          TAG="TDLib-v${VER}"
           TITLE="TDLib V${VER}"
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
@@ -683,7 +739,7 @@ jobs:
             echo "| TDLib version | \`${VERSION}\` |"
             echo "| TDLib commit | \`${COMMIT:-n/a}\` |"
             # ⚠️ tag 必须与 loader 的 release_url() 一致（AGENTS 约束 46）。
-            echo "| Release tag | \`TDLib V${VER}\` |"
+            echo "| Release tag | \`TDLib-v${VER}\` |"
             echo "| Publish | \`${PUBLISH}\` |"
             echo "| Selected targets | \`${TARGETS}\` |"
             echo "| Schema export | \`${SCHEMA}\` |"
