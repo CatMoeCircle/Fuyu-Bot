@@ -173,9 +173,9 @@ TDLib 便捷封装、更新分发管线都已就绪并有测试；`fuyubot-plugi
 46. **发布资产的 tag / 文件名 / 格式是「CI ↔ loader」之间的契约**，改一边必须同步另一边。
     **消费方**：`crates/fuyubot-tdlib/src/loader/vendored.rs` 的
     **`ASSETS: &[(os, arch, 资产名)]` 表** + `release_url()`
-    （下载 URL 是 `https://github.com/<repo>/releases/download/TDLib%20V<版本>/<资产名>`）。
+    （下载 URL 是 `https://github.com/<repo>/releases/download/TDLib-v<版本>/<资产名>`）。
     **生产方**：`.github/workflows/build-tdlib.yml` + `.github/scripts/*.sh`。四条硬要求：
-    ① tag 必须是 **`TDLib V<版本>`**（`release_url` 把它编码成 `TDLib%20V<版本>`）；
+    ① tag 必须是 **`TDLib-v<版本>`**（tag 不含空格，避免 GitHub Release 创建时报 `tag_name is not well-formed`）；
     ② 资产名必须**精确等于** `ASSETS` 表里的值，所以**不带扩展名**；
        **命名一律 `TDLib-<os>-<arch>`，`arch` 用 cargo `CARGO_CFG_TARGET_ARCH` 的口径**
        （`x86_64` / `aarch64`）——**别混用 `arm64`，也别一会 arch-os 一会 os-arch**
