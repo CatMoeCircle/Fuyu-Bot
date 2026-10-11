@@ -289,9 +289,8 @@ jobs:
             "${{ matrix.asset }}"
 
       # ---------------- Windows ----------------
-      - name: Setup vcpkg (Windows x64)
+      - name: Setup vcpkg and install dependencies (Windows x64)
         if: matrix.platform == 'windows' && matrix.arch == 'x86_64'
-        id: vcpkg
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -299,30 +298,10 @@ jobs:
           git clone https://github.com/Microsoft/vcpkg.git
           Set-Location vcpkg
           .\bootstrap-vcpkg.bat
-          "commit=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
-
-      - name: Cache Windows x64 vcpkg packages
-        if: matrix.platform == 'windows' && matrix.arch == 'x86_64'
-        uses: actions/cache@v4
-        with:
-          path: |
-            td-src/vcpkg/installed
-            td-src/vcpkg/downloads
-          key: windows-vcpkg-x86_64-${{ steps.vcpkg.outputs.commit }}-${{ hashFiles('.github/workflows/build-tdlib.yml') }}
-          restore-keys: |
-            windows-vcpkg-x86_64-${{ steps.vcpkg.outputs.commit }}-
-
-      - name: Install vcpkg dependencies (Windows x64)
-        if: matrix.platform == 'windows' && matrix.arch == 'x86_64'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Location "$env:GITHUB_WORKSPACE/td-src/vcpkg"
           .\vcpkg.exe install gperf:x64-windows-static openssl:x64-windows-static zlib:x64-windows-static
 
-      - name: Setup vcpkg (Windows ARM64)
+      - name: Setup vcpkg and install dependencies (Windows ARM64)
         if: matrix.platform == 'windows' && matrix.arch == 'arm64'
-        id: vcpkg
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -330,35 +309,7 @@ jobs:
           git clone https://github.com/Microsoft/vcpkg.git
           Set-Location vcpkg
           .\bootstrap-vcpkg.bat
-          "commit=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
-
-      - name: Cache Windows ARM64 vcpkg packages
-        if: matrix.platform == 'windows' && matrix.arch == 'arm64'
-        uses: actions/cache@v4
-        with:
-          path: |
-            td-src/vcpkg/installed
-            td-src/vcpkg/downloads
-          key: windows-vcpkg-arm64-${{ steps.vcpkg.outputs.commit }}-${{ hashFiles('.github/workflows/build-tdlib.yml') }}
-          restore-keys: |
-            windows-vcpkg-arm64-${{ steps.vcpkg.outputs.commit }}-
-
-      - name: Install vcpkg dependencies (Windows ARM64)
-        if: matrix.platform == 'windows' && matrix.arch == 'arm64'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Location "$env:GITHUB_WORKSPACE/td-src/vcpkg"
           .\vcpkg.exe install gperf:x64-windows-static openssl:arm64-windows-static zlib:arm64-windows-static
-
-      - name: Cache Windows x64 CMake build project
-        if: matrix.platform == 'windows' && matrix.arch == 'x86_64'
-        uses: actions/cache@v4
-        with:
-          path: td-src/build
-          key: windows-cmake-x86_64-${{ needs.resolve-tdlib.outputs.tdlib_commit }}-${{ steps.vcpkg.outputs.commit }}-${{ hashFiles('.github/workflows/build-tdlib.yml') }}
-          restore-keys: |
-            windows-cmake-x86_64-${{ needs.resolve-tdlib.outputs.tdlib_commit }}-${{ steps.vcpkg.outputs.commit }}-
 
       - name: Build TDLib shared library (Windows x64)
         if: matrix.platform == 'windows' && matrix.arch == 'x86_64'
@@ -377,15 +328,6 @@ jobs:
             -DBUILD_SHARED_LIBS=ON `
             ..
           cmake --build . --target install --config Release
-
-      - name: Cache Windows ARM64 CMake build project
-        if: matrix.platform == 'windows' && matrix.arch == 'arm64'
-        uses: actions/cache@v4
-        with:
-          path: td-src/build
-          key: windows-cmake-arm64-${{ needs.resolve-tdlib.outputs.tdlib_commit }}-${{ steps.vcpkg.outputs.commit }}-${{ hashFiles('.github/workflows/build-tdlib.yml') }}
-          restore-keys: |
-            windows-cmake-arm64-${{ needs.resolve-tdlib.outputs.tdlib_commit }}-${{ steps.vcpkg.outputs.commit }}-
 
       - name: Build TDLib shared library (Windows ARM64)
         if: matrix.platform == 'windows' && matrix.arch == 'arm64'
