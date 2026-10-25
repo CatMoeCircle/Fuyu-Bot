@@ -17,15 +17,26 @@
 //!
 //! ## 文本格式（Markdown / HTML）
 //!
-//! **没有自己的 Markdown 解析器**：带标记的文本经 [`Simplify::formatted`] 交给 TDLib 的
-//! `parseTextEntities`，走的是**同步**的 [`HostApi::td_execute`]（`td_json_client_execute`）。
-//! 同步很关键——`parseTextEntities` 不碰服务器，TDLib 允许这么调；换成「发请求 + 等响应通道」
-//! 就会把投递线程卡住（插件通常正是在更新回调里发消息）。拿不到结果就退回纯文本。
+//! `formattedText` 那条链路**没有自己的 Markdown 解析器**：带标记的文本经 [`Simplify::formatted`]
+//! 交给 TDLib 的 `parseTextEntities`，走的是**同步**的 [`HostApi::td_execute`]
+//! （`td_json_client_execute`）。同步很关键——`parseTextEntities` 不碰服务器，TDLib 允许这么调；
+//! 换成「发请求 + 等响应通道」就会把投递线程卡住（插件通常正是在更新回调里发消息）。
+//! 拿不到结果就退回纯文本。
+//!
+//! 富消息（`messageRichMessage`）是另一回事：它的 Markdown/HTML 源**由服务端解析、且仅 bot 可用**，
+//! 本地连中间态都没有。为了让用户号也能写 Markdown，本 crate 带了一份**受控子集**转换器
+//! （[`markdown`]，产出 `InputPageBlock` 块树）。它只认自己文档里列出的语法，
+//! 认不出的一律退回普通文本——**不是** Telegram 方言的完整实现，两者别混用。
+//!
+//! 富消息的行内表达式是独立体系（`RichText`，31 个构造器，**没有** offset/length）。
+//! Markdown 覆盖其中 21 个（含行内 HTML 标签）；剩下 10 个（`mention` / `hashtag` /
+//! `cashtag` / `bankCardNumber` / `tonAddress` / `botCommand` / `icon` / `button` /
+//! `diff` / `anchor`）没有 md 语法，用 [`richtext`] 结构化拼，再塞进块里。
 //!
 //! ## 两条必须知道的时间线
 //!
 //! - `td_invoke*` 返回的是**请求号**，真正的 JSON 从响应通道回来（事件类型
-//!   [`RESPONSE_EVENT`](fuyubot_abi::RESPONSE_EVENT)，只发给发起请求的那个插件）。
+//!   [`RESPONSE_EVENT`]，只发给发起请求的那个插件）。
 //!   编辑类方法也一样：改完的 `Message`、以及 `Message is not modified` 这类错误都是响应。
 //! - [`WaitHandle::payload_json`](fuyubot_abi::WaitHandle) 是宿主临时的线程局部缓冲，
 //!   **只在下一次宿主调用之前有效**。要拿数据就立刻读，或者用本文的 `*_json` / `wait_response`
@@ -50,6 +61,14 @@ use serde_json::{Map, Value, json};
 /// 这里重导 `td_api`，让只依赖本 crate 的调用方也有类型提示。
 pub use fuyubot_tdlib_sys::td_api;
 
+mod rich;
+
+pub use rich::{
+    RichButton, RichButtonAction, RichButtonAlign, RichButtonStyle, RichMedia, RichMessage,
+    RichMessageParams, RichSource, markdown, rich_content_json, rich_edit_params, rich_send_params,
+    richtext,
+};
+
 /// 封装层的错误。
 #[derive(Debug, thiserror::Error)]
 pub enum SimplifyError {
@@ -59,6 +78,12 @@ pub enum SimplifyError {
     BadString,
     #[error("相册只能放 2–10 项，收到 {0} 项")]
     AlbumSize(usize),
+    #[error("富消息不能为空（blocks 或源文本至少要有内容）")]
+    EmptyRichMessage,
+    #[error("块 / 按钮行只能挂在 Blocks 源上：md / html 源由服务端解析，本地插不进块")]
+    RichSourceNotBlocks,
+    #[error("按钮行不能为空")]
+    EmptyButtonRow,
 }
 
 type Result<T> = std::result::Result<T, SimplifyError>;
@@ -1291,8 +1316,10 @@ impl Simplify {
 
     /// 把一段文本交给 **TDLib 的 `parseTextEntities`** 解析成 `formattedText`。
     ///
-    /// 这是本 crate 唯一的 Markdown / HTML 转换入口：没有第二套解析器，
+    /// 这是 `formattedText` 链路唯一的转换入口：没有第二套解析器，
     /// 也就不存在「我们认的语法」和「Telegram 认的语法」漂移这回事。
+    /// （富消息走的是另一条路：本地块树见 [`RichMessage::from_markdown`]，
+    /// 服务端解析见 [`RichMessage::server_markdown`]。）
     ///
     /// 走的是**同步**的 `td_execute`（`td_json_client_execute`）：`parseTextEntities` 不碰服务器，
     /// TDLib 允许同步跑它。这一点很关键——等响应那套会卡住投递线程，
@@ -2369,6 +2396,38 @@ mod tests {
                 },
             )
             .unwrap();
+        // 富消息：本地 md → blocks、服务端 md 源、以及编辑
+        simplify
+            .send_rich_message(
+                7,
+                &RichMessageParams {
+                    reply_to_message_id: Some(9),
+                    topic_id: Some(3),
+                    reply_markup: markup.clone(),
+                    clear_draft: true,
+                    ..RichMessageParams::markdown(
+                        "# 标题\n\n**粗** 与 [链接](https://example.com)\n\n- 一\n- 二\n\n```rust\nfn main() {}\n```",
+                    )
+                },
+            )
+            .unwrap();
+        simplify
+            .send_rich_message(
+                7,
+                &RichMessageParams::new(
+                    RichMessage::server_markdown("*hi*")
+                        .with_media(vec![RichMedia::new("cover", Media::photo("/tmp/a.jpg"))]),
+                ),
+            )
+            .unwrap();
+        simplify
+            .edit_rich_message(7, 9, &RichMessageParams::markdown("改过"))
+            .unwrap();
+        // 空富消息在本地就被挡住，不会白跑一次往返
+        assert!(matches!(
+            simplify.send_rich_message(7, &RichMessageParams::default()),
+            Err(SimplifyError::EmptyRichMessage)
+        ));
         simplify
             .edit_message_text(
                 7,
