@@ -1,4 +1,4 @@
-# 本仓的开发用 cargo 配置（不进产物的逻辑都在这儿，别写进两个 CLI——约束 40）。
+# 本仓的开发用 cargo 配置（不进产物的逻辑都在这儿，别写进 CLI——约束 40）。
 #
 # `[env]` 与 `[alias]` 都只影响**本仓**里的 cargo 调用，不影响下游把它当依赖用。
 
@@ -12,6 +12,7 @@ bot = "run -p fuyubot-cli -- run"
 # tdjson.dll（+ 兄弟 DLL）由 build.rs 一并放到 exe 旁边（loader 优先级 2 认「可执行文件目录」），
 # 内置插件则被 `fuyubot init` / `run` 复制进项目的 `plugins/`（只装缺的，不覆盖）。
 # 所以 `target/release/` 整个拷走、配一份 `fuyubot.toml` 就能跑。
+# SDK 不在这个仓库：`fuyubot-sdk` 由 FuyuBot-SDK 仓库编（`cargo build -p fuyubot-sdk-cli`）。
 package-bot = [
     "build",
     "--release",
@@ -24,10 +25,6 @@ package-bot = [
     "-p",
     "fuyubot-plugin-manage",
 ]
-
-# SDK 打包：release 构建插件开发 CLI `fuyubot-sdk`。
-# **和上面那条分开**：SDK 是给插件作者的（不需要 tdjson），本地 bot 才需要。
-package-sdk = "build --release -p fuyubot-sdk-cli"
 
 [env]
 # 本机开发缓存（真 td_api.tl + 真 tdjson），两个 build.rs 都从这里拿。

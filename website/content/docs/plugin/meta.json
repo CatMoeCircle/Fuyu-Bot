@@ -1,7 +1,0 @@
-{
-  "title": "插件开发",
-  "description": "Rust / C / C++ / Go / Python / JS / TS 写插件",
-  "icon": "Puzzle",
-  "root": true,
-  "pages": ["index", "rust", "native", "go", "python", "js-ts", "events", "tdlib", "tools", "abi", "testing"]
-}

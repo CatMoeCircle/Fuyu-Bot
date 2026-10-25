@@ -2,8 +2,8 @@
 
 结论先说：**一个插件 = 一个 cdylib**（`.dll` / `.so` / `.dylib`），四个导出符号
 `plugin_init` / `plugin_start` / `plugin_stop` / `plugin_free_string` 就是全部契约。
-Rust / C / C++ 直接写它；Python / JS 用 `fuyubot-sdk-script` 生成的胶水 cdylib
-去启动解释器。契约细节见 [`abi-contract.md`](abi-contract.md)。
+Rust / C / C++ 直接写它；Python / JS 用 `fuyubot-sdk-script`（在 **FuyuBot-SDK** 仓库）
+生成的胶水 cdylib 去启动解释器。契约细节见 [`abi-contract.md`](abi-contract.md)。
 
 ## 0. 通用流程
 
@@ -31,8 +31,8 @@ fuyubot run                                          # 加载插件
 ### 产物该放哪：workspace 成员要 `--target-dir`
 
 `plugin install <工程目录>` 只看 `<工程>/target/{release,debug}` 与工程目录本身。
-如果插件是**当前 workspace 的成员**（比如本仓的 `examples/*`），`cargo build -p <crate>`
-默认把产物放在**仓库根**的 `target/`，于是它找不到。两种写法都行：
+如果插件是**当前 workspace 的成员**（比如 SDK 仓库的 `examples/*`），`cargo build -p <crate>`
+默认把产物放在**仓库根**的 `target/`，于是它找不到。两种写法都行（在 SDK 仓库根敲）：
 
 ```powershell
 # A. 让产物落在工程自己的 target/ 下（脚本同伴也会被一起拷）
@@ -48,7 +48,7 @@ fuyubot plugin install target\debug\fuyubot_example_echo.dll
 
 | 变量 | 作用 |
 |---|---|
-| `FUYUBOT_SDK_PATH` | 指向**装着 SDK crate 的那个目录**（仓库里就是 `crates/`）。生成的插件用 `path = "..."` 依赖 SDK，因为这两个 crate 还没发到 crates.io。一个变量管 `fuyubot-plugin-api` 与 `fuyubot-sdk-script` 两个。没设就按仓库布局（`CARGO_MANIFEST_DIR` 的上一级）找 |
+| `FUYUBOT_SDK_PATH` | **可选**：指向装着 SDK crate 的目录（FuyuBot-SDK 仓库的 `crates/`）。生成的插件用 `path = "..."` 依赖 SDK；不设就写 crates.io 版本号（默认）。一个变量管 `fuyubot-plugin-api` 与 `fuyubot-sdk-script` 两个 |
 
 ### 脚本插件的一条硬约定
 
@@ -62,7 +62,7 @@ fuyubot plugin install target\debug\fuyubot_example_echo.dll
 > （Node ≥ 23.6 默认开；22.6+ 要 `--experimental-strip-types`）。所以 TS 里只能用能剥掉的语法
 > （注解 / `interface` / `type` / `as`），**不能用** `enum` / `namespace` / 构造器参数属性。
 > Node 太老就自己 `tsc` 编成 `.js`——**编译与打包是插件作者自己的工具链**。
-> 完整可跑的例子见 [`../examples/ts-counter`](../examples/ts-counter)。
+> 完整可跑的例子见 [FuyuBot-SDK 的 `examples/ts-counter`](https://github.com/xiaoqvan/FuyuBot-SDK/tree/main/examples/ts-counter)。
 
 ## 1. Rust
 
@@ -106,12 +106,12 @@ define_plugin!(MyPlugin, "demo");
 
 - `define_plugin!` **一个 crate 只能展开一次**（四个符号名是 ABI 定死的）。
 - 回调签名必须 `extern "C-unwind"`：`extern "C"` 边界上逃出去的 panic 直接 abort。
-- 回调没有捕获环境，状态经 `user_data` 传（示例见 [`../examples/rust-echo`](../examples/rust-echo)）。
+- 回调没有捕获环境，状态经 `user_data` 传（示例见 [FuyuBot-SDK 的 `examples/rust-echo`](https://github.com/xiaoqvan/FuyuBot-SDK/tree/main/examples/rust-echo)）。
 
 ## 2. C
 
 `fuyubot-sdk init ping --lang c` 会写出 `ping.c` 与 `fuyubot_plugin.h`。
-四个导出符号的骨架（完整模板见 `crates/fuyubot-sdk-cli/templates/c/plugin.c`，逻辑是 `/ping` → 回 `pong`）：
+四个导出符号的骨架（完整模板见 SDK 仓库的 `crates/fuyubot-sdk-cli/templates/c/plugin.c`，逻辑是 `/ping` → 回 `pong`）：
 
 ```c
 #include "fuyubot_plugin.h"
@@ -230,11 +230,11 @@ host.run();
 
 ```bash
 fuyubot init --dir . --name demo                     # 建项目（生成 fuyubot.toml + plugins/）
-# 编 + 装（作者工具链；workspace 成员要 --target-dir，见上面「产物该放哪」）
-cargo build -p fuyubot-example-echo --target-dir examples/rust-echo/target
-fuyubot plugin install examples/rust-echo
-fuyubot-sdk codegen --lang c --dir examples/c-ping   # C 插件先刷头文件，再自己调 cl/gcc
-fuyubot plugin install examples/c-ping
+# 编 + 装（作者工具链；示例工程在 FuyuBot-SDK 仓库，产物落在那边仓库根的 target/）
+cargo build -p fuyubot-example-echo --target-dir <SDK仓库>/examples/rust-echo/target
+fuyubot plugin install <SDK仓库>/examples/rust-echo
+fuyubot-sdk codegen --lang c --dir <SDK仓库>/examples/c-ping   # C 插件先刷头文件，再自己调 cl/gcc
+fuyubot plugin install <SDK仓库>/examples/c-ping
 fuyubot run --replay examples/replay/new_message.json
 fuyubot run --replay examples/replay/weather.json    # python-weather 要联网访问 wttr.in
 ```
@@ -245,4 +245,4 @@ fuyubot run --replay examples/replay/weather.json    # python-weather 要联网�
 `--replay-wait <MS>` 是「回放后等插件的静默窗口」，不填时按插件形态自动选：有脚本插件 2000ms，
 纯原生插件 150ms。脚本在另一个进程里、反应要经管道回来，还可能捎带网络请求，窗口太短会把
 最终答复漏掉（上限 60 秒）。两个样例文件的内容与预期结果见
-[`../examples/README.md`](../examples/README.md)。
+[FuyuBot-SDK 的 examples/README](https://github.com/xiaoqvan/FuyuBot-SDK/blob/main/examples/README.md)。

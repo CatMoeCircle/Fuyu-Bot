@@ -19,7 +19,7 @@ fuyubot-abi ─────────────────────► f
                                     ▲
                               fuyubot-cli（二进制 fuyubot）
 
-插件侧（不依赖宿主）：
+插件侧（**在 FuyuBot-SDK 仓库**，通过 crates.io 依赖本仓的 `fuyubot-abi`）：
 fuyubot-plugin-api ──► fuyubot-abi                 Rust 插件只用这一个 crate
 fuyubot-sdk-script ──► fuyubot-plugin-api          Python / JS / TS 插件的 cdylib 用它
 fuyubot-simplify   ──► fuyubot-tdlib-sys           TDLib 便捷封装（可选糖，重导 td_api）
@@ -214,11 +214,11 @@ Markdown，真文件产物里 `<b>/<code>/<a>/<br>` 残留 **0**。`check_reques
 | 类型 / 函数 | 位置 | 作用 |
 |---|---|---|
 | `HostApiVTable` / `PluginHandle` / `HostApi` | `fuyubot-abi` | 函数表（18 字段） / `plugin_init` 的返回值（`abi_version == 0` = 失败） / 插件侧门面（解包一次，之后没有 `Option`） |
-| `HostExt` / `Bridge` | `fuyubot-plugin-api` / `fuyubot-sdk-script` | 日志简写、`subscribe_json`、`wait_for_update_json`、`invoke_value` / 脚本插件的桥（spawn 解释器 + pump + 订阅转发） |
+| `HostExt` / `Bridge` | `fuyubot-plugin-api` / `fuyubot-sdk-script`（**FuyuBot-SDK 仓库**） | 日志简写、`subscribe_json`、`wait_for_update_json`、`invoke_value` / 脚本插件的桥（spawn 解释器 + pump + 订阅转发） |
 | `HostRuntime` / `UpdatePipeline` / `PluginLoader` / `LoadedPlugin` | `fuyubot-loader` | 15 个桥的落点、请求留档、响应回投、`rollback_owner` / 六阶段（实跑 4 个）+ 双通道路由 + `attach_tdlib`/`spawn_dispatch` / dlopen、`plugin_init`/`plugin_start`/`plugin_stop`、drop 即卸载 |
 | `TdClient` / `Routed` / `ReceiveLoop` | `fuyubot-tdlib` | TDLib 客户端；`route()` 分出 `Update`/`Response`；停止把手（`stop()`/`join()`，drop **不会**停） |
 | `Simplify` | `fuyubot-simplify` | `send_message` / `send_message_album` / `edit_message_*` / `delete_message` / `formatted`（Markdown→entities，走同步 `td_execute`）/ `wait_response` / `wait_for_update` / `resolve_entities` / `download_file`；参数是**每个方法一个结构体**（`SendMessageParams` 等），调用方不拼 TDLib 嵌套 JSON |
-| `Bridge` | `fuyubot-sdk-script` | 脚本插件的桥：spawn 解释器 + pump + 订阅转发 |
+| `Bridge` | `fuyubot-sdk-script`（**FuyuBot-SDK 仓库**） | 脚本插件的桥：spawn 解释器 + pump + 订阅转发 |
 | `TdApiSchema::compiled()` | `fuyubot-tdlib-sys` | 编译期烘焙的元数据；`check_request` 做本地方法名/参数名校验 |
 
 **没验证的部分**全在 [`gaps.md`](gaps.md)（那里是唯一台账，本文不再复制一份）。

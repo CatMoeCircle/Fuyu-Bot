@@ -2,6 +2,14 @@
 
 **基于 TDLib 的 Telegram bot / user 框架**：Rust 内核 + C ABI 插件 + 多语言 SDK。
 
+代码分成三个仓库：
+
+| 仓库 | 放什么 |
+| --- | --- |
+| **本仓**（[Fuyu-Bot](https://github.com/xiaoqvan/Fuyu-Bot)） | 运行时本体（`fuyubot` CLI）、内置插件、插件 ABI（`fuyubot-abi`）、TDLib 绑定 |
+| [FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK) | 插件作者 SDK（`fuyubot-plugin-api`、`fuyubot-sdk-script`）与 `fuyubot-sdk` CLI |
+| [FuyuBot-Docs](https://github.com/xiaoqvan/FuyuBot-Docs) | 文档站（Fumadocs） |
+
 - **插件是动态库**（`.dll` / `.so` / `.dylib`）。Rust / C / C++ / Python / JS / TypeScript 都能写，
   一个 cdylib 就是一个插件。
 - **TDLib 运行时动态加载**，不静态链接。`td_api.tl` 在**编译期**被转成元数据烤进二进制，
@@ -9,7 +17,7 @@
   `.tdlib-cache/` 那份都是 **3178 条（函数 1010 / 构造器 2165 / 未归类 3）**
   ——**别把条数当常量**，以前本机另一份是 3214 条（见 [gaps.md 缺口 30](docs/gaps.md)）。
 - 两个 CLI，职责严格分离：**`fuyubot`** 跑框架（`init` / `run` / `status` / `stop` / `config` / `plugin`），
-  **`fuyubot-sdk`** 写插件（脚手架 / 生成绑定 / 静态检查）。**两个都不编译、不打包插件**——
+  **`fuyubot-sdk`** 写插件（脚手架 / 生成绑定 / 静态检查，在 SDK 仓库）。**两个都不编译、不打包插件**——
   打包归插件作者自己的语言工具链。
 - **离线也能验插件**：`fuyubot run --replay` 把一批更新的 JSON 灌进整条管线，**不需要 Telegram 账号**。
 - 内核是 Cordis 式的：`Context` 只暴露 `&self`，注册返回 `Effect`，**drop 即回滚**。
@@ -51,8 +59,10 @@ cd fuyubot-windows-x86_64
 | Linux（ARM64） | `fuyubot-linux-aarch64.zip` |
 | macOS（Apple Silicon） | `fuyubot-macos-aarch64.zip` |
 
-插件开发 CLI 另有 `fuyubot-sdk-<系统>-<架构>.zip`。完整的使用文档（下载 / 配置 / 运行 / 回放 / 排错）在
-[`website/`](website/)；发布包由 [`.github/workflows/release-bot.yml`](.github/workflows/release-bot.yml) 产出。
+插件开发 CLI 在 [FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK/releases) 的
+`fuyubot-sdk-<系统>-<架构>.zip` 里。完整的使用文档（下载 / 配置 / 运行 / 回放 / 排错）在
+[FuyuBot-Docs](https://github.com/xiaoqvan/FuyuBot-Docs)；本仓的发布包由
+[`.github/workflows/release-bot.yml`](.github/workflows/release-bot.yml) 产出。
 下面是从源码构建的**开发者**路线。
 
 ## 5 分钟跑起来（不需要账号）
@@ -112,9 +122,13 @@ path = ""          # 留空 = 按加载优先级自动找 tdjson
 
 ### ② 生成一个插件（或者直接跳到 ③ 用自带的示例）
 
+插件脚手架由 **`fuyubot-sdk`** 生成——它和 SDK crate 在
+[FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK)。默认写 crates.io 依赖
+（`fuyubot-plugin-api = "0.1.0"`）；对着 SDK 源码开发时设 `FUYUBOT_SDK_PATH` 指向 SDK 仓库的
+`crates/`，生成器会改写成 `path = …`。
+
 ```bash
-export FUYUBOT_SDK_PATH="$PWD/crates"     # 插件用 path 依赖 SDK（那两个 crate 还没发到 crates.io）
-cargo run -q -p fuyubot-sdk-cli -- init mybot --lang rust --dir demo
+fuyubot-sdk init mybot --lang rust --dir demo
 ```
 
 ```
@@ -138,8 +152,8 @@ cargo run -q -p fuyubot-cli -- plugin install demo/plugins/mybot --plugin-dir de
 
 > 传**工程目录**时，工程根目录里的 `.py` / `.js` / `.ts` / `.pyi` 会一起拷过去
 > （脚本插件要求脚本与 cdylib 同目录）；传单个 `.dll` 时看不到脚本在哪，所以脚本插件请传目录。
-> 各语言怎么编见 [`docs/plugin-guide.md`](docs/plugin-guide.md)；`examples/` 五个示例的
-> 逐条命令见 [`examples/README.md`](examples/README.md)。
+> 各语言怎么编见 [`docs/plugin-guide.md`](docs/plugin-guide.md)；五个示例工程在
+> [FuyuBot-SDK 的 `examples/`](https://github.com/xiaoqvan/FuyuBot-SDK/tree/main/examples)。
 
 ### ④ 离线回放，看插件干活
 
@@ -163,7 +177,7 @@ mybot: 收到 updateNewMessage
 插件发出去的请求：
 ```
 
-回放是**离线**的，所以插件发出去的请求只**留档**（`examples/` 里的 echo / counter 会列出
+回放是**离线**的，所以插件发出去的请求只**留档**（SDK 仓库里的 echo / counter 示例会列出
 `#请求号 sendMessage {…}`），不会真的发到 Telegram。退出码 0 表示回放成功。
 
 自带的工具：`cargo run -q -p fuyubot-cli -- plugin list --plugin-dir demo/plugins`
@@ -222,12 +236,14 @@ demo：没有运行中的实例
 
 ## 写一个插件
 
+用 **`fuyubot-sdk`**（在 [FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK)）：
+
 ```bash
-cargo run -q -p fuyubot-sdk-cli -- init <名字> --lang <rust|c|cpp|python|js> --dir <项目目录>   # 落在 <项目目录>/plugins/<名字>
-cargo run -q -p fuyubot-sdk-cli -- codegen --lang <…> --dir <工程目录>                          # 刷新 C 头 / .pyi / .d.ts
-cargo run -q -p fuyubot-sdk-cli -- check <产物路径>                                             # 静态检查（不加载、不运行）
-cargo run -q -p fuyubot-sdk-cli -- td-methods --filter sendMessage                              # 查 TDLib 方法
-cargo run -q -p fuyubot-sdk-cli -- td-method sendMessage                                        # 看签名与参数
+fuyubot-sdk init <名字> --lang <rust|c|cpp|python|js> --dir <项目目录>   # 落在 <项目目录>/plugins/<名字>
+fuyubot-sdk codegen --lang <…> --dir <工程目录>                          # 刷新 C 头 / .pyi / .d.ts
+fuyubot-sdk check <产物路径>                                             # 静态检查（不加载、不运行）
+fuyubot-sdk td-methods --filter sendMessage                              # 查 TDLib 方法
+fuyubot-sdk td-method sendMessage                                        # 看签名与参数
 ```
 
 `check` 是**静态**读导出符号（`object` 解析 PE / ELF / Mach-O，**绝不 dlopen**——那会在宿主里跑插件的
@@ -247,16 +263,12 @@ cargo run -q -p fuyubot-sdk-cli -- td-method sendMessage                        
 你传进去的**工程目录**、以及**产物所在目录**——所以传 `.dll` 就只扫 dll 旁边，传工程目录就只扫工程目录。
 
 ```bash
-# 普通情况（产物就在工程自己的 target/ 下）：直接给工程目录
-cargo run -q -p fuyubot-cli -- plugin install <插件工程目录> --plugin-dir <插件目录>
-
-# ⚠️ examples/ 下的示例是 **workspace 成员**，产物落在**仓库根**的 target/，不在工程自己的 target/ 里
-#    （直接 `plugin install examples/ts-counter` 会报「里面没找到 .dll」）。
-#    这种情况把 dll 和脚本拷进同一个目录最简单：
-cargo build -p fuyubot-example-counter
-mkdir demo-ts && cp target/debug/counter.dll examples/ts-counter/counter.ts examples/ts-counter/fuyubot_plugin.js demo-ts/
-cargo run -q -p fuyubot-cli -- run --replay examples/replay/counter.json --plugin-dir demo-ts
+# 产物在工程自己的 target/ 下：直接给工程目录
+fuyubot plugin install <插件工程目录> --plugin-dir <插件目录>
 ```
+
+> 示例工程在 [SDK 仓库的 `examples/`](https://github.com/xiaoqvan/FuyuBot-SDK/tree/main/examples)；
+> 它们不是本仓库的 workspace 成员，所以产物落在 SDK 仓库自己的 `target/` 下。
 
 TS 靠 **Node 自带的类型剥离**跑（`node x.ts`，需要 Node ≥ 23.6），所以不需要 `tsc`，
 但只能用能剥掉的语法（注解 / `interface` / `type` / `as`；**不能用** `enum` / `namespace` / 构造器参数属性）。
@@ -317,20 +329,19 @@ cargo tree  --workspace --offline     # 必须无环
 cargo fmt --all --check               # 0 diff（整仓 rustfmt-clean）
 ```
 
-**一键命令**（同样来自 `.cargo/config.toml`，三条都真跑过）：
+**一键命令**（同样来自 `.cargo/config.toml`，都真跑过）：
 
 ```powershell
 cargo bot                             # = fuyubot run：一键启动当前目录的 bot
 cargo bot --no-login                  # 参数照常往后接（--config / --plugin-dir / --no-login…）
 cargo package-bot                     # 本地打包：target\release\fuyubot.exe
                                       # （tdjson.dll + 兄弟 DLL 由 build.rs 放到它同级）
-cargo package-sdk                     # SDK 打包：target\release\fuyubot-sdk.exe（给插件作者，不需要 tdjson）
 ```
 
-**本地打包与 SDK 打包分开**：`package-bot` 出运行时本体（exe + 同级的 TDLib 库），
-`package-sdk` 出插件开发 CLI。两个都只是 `cargo build --release -p <对应 CLI>`，
-产物目录 `target/release/` 直接拷走就能用——**`cargo install` 是唯一例外**（安装目录不受构建脚本管，
-tdjson 得自己放，见 [gaps.md 缺口 3](docs/gaps.md)）。
+**SDK 不在这里**：`fuyubot-sdk` 由 [FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK) 仓库
+`cargo build --release -p fuyubot-sdk-cli` 编出来（它不需要 tdjson）。
+本地打包出的是运行时本体（exe + 同级的 TDLib 库），产物目录 `target/release/` 直接拷走就能用——
+**`cargo install` 是唯一例外**（安装目录不受构建脚本管，tdjson 得自己放，见 [gaps.md 缺口 3](docs/gaps.md)）。
 
 要临时换缓存位置就照旧设环境变量（**手写必须绝对路径**，相对路径会被解析到各自的 crate 根）：
 
@@ -400,7 +411,7 @@ $env:TEMP = "$PWD\target\linktmp"; $env:TMP = $env:TEMP; New-Item -ItemType Dire
 | `TDLIB_TD_API_TL` | `build.rs` | 显式指定 `td_api.tl`（优先级最高） |
 | `FUYUBOT_TDLIB_RELEASES_REPO` | `build.rs` | 覆盖 `[package.metadata.fuyubot] releases-repo` |
 | `TG_API_ID` / `TG_API_HASH` | `fuyubot run` / 集成测试 | **凭据只走环境变量**（`TG_BOT_TOKEN` 也认，`run` 与测试都用） |
-| `FUYUBOT_SDK_PATH` | `fuyubot-sdk` | 脚手架里 `path = …` 指向 SDK 的目录 |
+| `FUYUBOT_SDK_PATH` | `fuyubot-sdk`（在 SDK 仓库） | **可选**：脚手架里 `path = …` 指向 SDK 源码目录；不设就写 crates.io 版本号 |
 
 > 插件的编译是**作者自己的工具链**的事（`cargo build`、`cl /LD`、`gcc -shared`……），
 > 两个 CLI 都不读 `CC` 之类的编译器开关——`build-plugin` 已按新规格拆掉。
@@ -409,31 +420,32 @@ $env:TEMP = "$PWD\target\linktmp"; $env:TMP = $env:TEMP; New-Item -ItemType Dire
 
 ## 仓库结构
 
+本仓只放**运行时**。插件 SDK 在 [FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK)，
+文档站在 [FuyuBot-Docs](https://github.com/xiaoqvan/FuyuBot-Docs)。
+
 ```
 crates/
   fuyubot-core         Cordis 内核（Context / Effect / Plugin / PluginManager）。不认识 Telegram
-  fuyubot-abi          C ABI：HostApiVTable、PluginHandle、define_plugin!、cbindgen 生成的头
-  fuyubot-plugin-api   插件作者唯一要依赖的 crate（重导出 ABI + 安全包装）
-  fuyubot-sdk-script   Python / JS / TS SDK（cdylib 起解释器 + 行 JSON 协议 + script_plugin!）
-  fuyubot-tdlib-sys    TDLib 绑定（-sys）：td_api.tl 编译期生成的类型 + 元数据 + ffi 声明
+  fuyubot-abi          C ABI：HostApiVTable、PluginHandle、define_plugin!、cbindgen 生成的头（发 crates.io）
+  fuyubot-tdlib-sys    TDLib 绑定（-sys）：td_api.tl 编译期生成的类型 + 元数据 + ffi 声明（发 crates.io）
   fuyubot-tdlib        TDLib 运行时：loader / client / authorize（状态机），并重导出绑定
   fuyubot-event        事件总线          fuyubot-service    命名服务容器
   fuyubot-tool         工具注册表        fuyubot-middleware 六阶段洋葱管线
   fuyubot-loader       宿主层：VTable 桥 + 更新管线 + 插件加载
   fuyubot-simplify     发消息 / 编辑消息 / Markdown 转 entities / 命令解析等便捷封装
-  fuyubot-cli          `fuyubot` CLI      fuyubot-sdk-cli  `fuyubot-sdk` CLI
+  fuyubot-cli          `fuyubot` 运行时 CLI
   fuyubot-plugin-demo  最小 Rust 插件（集成测试真的 dlopen 它）
   fuyubot-plugin-start 内置插件：/start   fuyubot-plugin-help  /help   fuyubot-plugin-manage  /plugins
-examples/              rust-echo / python-weather / ts-counter / c-ping / go-ping + 回放用的 JSON
+examples/replay/       离线回放用的更新 JSON
 docs/                  架构、ABI 契约、插件指南、进度台账、交接文档
-website/               文档站（Fumadocs = Next.js + MDX）：`cd website && pnpm install && pnpm dev`
 ```
 
 ## 文档地图
 
 | 文件 | 什么时候看 |
 |---|---|
-| [`website/`](website/) | **给使用者看的文档站**（Fumadocs）：使用文档 + 插件开发文档 |
+| [FuyuBot-Docs](https://github.com/xiaoqvan/FuyuBot-Docs) | **给使用者看的文档站**（Fumadocs）：使用文档 + 插件开发文档 |
+| [FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK) | SDK crate、`fuyubot-sdk` CLI、五种语言的示例插件 |
 | [`docs/plugin-guide.md`](docs/plugin-guide.md) | 写插件（各语言模板、构建、调试） |
 | [`docs/abi-contract.md`](docs/abi-contract.md) | 插件 ABI 的正式契约（VTable、字符串归属、版本协商） |
 | [`docs/architecture.md`](docs/architecture.md) | 内核与更新管线的设计（结构 / 数据流 / ABI 契约 / 两种插件形态） |
@@ -441,7 +453,7 @@ website/               文档站（Fumadocs = Next.js + MDX）：`cd website && 
 | [`docs/HANDOFF.md`](docs/HANDOFF.md) | **入口**：当前状态 / 构建契约 / 每个 crate 有什么 |
 | [`docs/gaps.md`](docs/gaps.md) | 未验证的部分与已知缺口（编号是引用锚） |
 | [`docs/pitfalls.md`](docs/pitfalls.md) | 踩过的坑（编号是引用锚，别再踩回去） |
-| [`docs/decisions.md`](docs/decisions.md) | 被拍板的架构变更 1–7 + 核心原则 |
+| [`docs/decisions.md`](docs/decisions.md) | 被拍板的架构变更 + 核心原则 |
 | [`docs/tech-debt.md`](docs/tech-debt.md) | 技术债清单 |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | 进度台账（新规格与验收补跑） |
 | [`AGENTS.md`](AGENTS.md) | 仓库硬约束（改代码前必读） |

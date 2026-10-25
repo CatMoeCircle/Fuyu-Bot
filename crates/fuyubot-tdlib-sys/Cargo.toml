@@ -4,6 +4,9 @@ description = "TDLib 类型与 FFI 绑定：编译期从 td_api.tl 生成，运�
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+# 这个 crate 会发到 crates.io：SDK 仓库的 `fuyubot-sdk td-methods` 依赖它。
+license.workspace = true
+repository.workspace = true
 
 # `td_api.tl` 的来源（schema 下载用）。**两处必须一致**：
 # 这里与 crates/fuyubot-tdlib/Cargo.toml 的 [package.metadata.fuyubot]

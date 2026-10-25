@@ -4,6 +4,9 @@ description = "HostApi VTable 定义与插件导出宏"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+# 这个 crate 会发到 crates.io：SDK 仓库（FuyuBot-SDK）依赖它。
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 thiserror.workspace = true

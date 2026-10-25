@@ -1,9 +1,0 @@
-# 生成物：`fuyubot-sdk codegen --lang c --dir .` 落的头文件
-fuyubot_plugin.h
-# cgo 生成的头
-ping.h
-go-ping.h
-# 编译产物
-*.dll
-*.so
-*.dylib

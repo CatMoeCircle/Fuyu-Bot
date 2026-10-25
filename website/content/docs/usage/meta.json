@@ -1,7 +1,0 @@
-{
-  "title": "使用文档",
-  "description": "下载即用、配置、运行与排错",
-  "icon": "BookOpen",
-  "root": true,
-  "pages": ["index", "build", "config", "run", "replay", "env", "troubleshooting"]
-}

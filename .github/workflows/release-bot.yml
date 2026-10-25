@@ -2,6 +2,9 @@
 # 最后由 publish 把两份叠成用户下载的各平台 zip：
 #   fuyubot-<系统>-<架构>.zip = fuyubot + tdjson + plugins/（内置插件）
 #
+# 本仓库只发**运行时**。插件开发 CLI（`fuyubot-sdk`）在 FuyuBot-SDK 仓库的
+# `release-sdk.yml` 里发；文档站在 FuyuBot-Docs。
+#
 # 平台集合 = `crates/fuyubot-tdlib/src/loader/vendored.rs` 的 `ASSETS` 表：
 #   Windows x86_64 / aarch64、Linux x86_64 / aarch64、macOS **只有 aarch64**
 #   （Intel Mac 没有 runner，见 ASSETS 的注释）。
@@ -12,7 +15,7 @@
 # 改之前先看 `crates/fuyubot-tdlib/src/loader/vendored.rs` 的 ASSETS 表与
 # `crates/fuyubot-tdlib/build.rs` 的 `stage_next_to_binary`。
 #
-# 中间产物（本体 / 插件 / SDK 各一份 .tar.gz）只留在 Actions artifacts 里；
+# 中间产物（本体 / 内置插件各一份 .tar.gz）只留在 Actions artifacts 里；
 # zip 只在 publish（Linux）里生成——Windows runner 的 bash 没有 zip 命令，
 # 别为它分叉。
 #
@@ -85,13 +88,13 @@ jobs:
           # 归档内层目录就是资产名；`td_api.tl` 不在这里（它由 build.rs 自己下）
           cp -a "${{ matrix.tdlib }}/." "$dest/"
 
-      - name: Build fuyubot + fuyubot-sdk + 内置插件
+      - name: Build fuyubot + 内置插件
         shell: bash
         env:
           FUYUBOT_TDLIB_VENDORED_CACHE: ${{ github.workspace }}/.tdlib-cache
         run: >-
           cargo build --release
-          -p fuyubot-cli -p fuyubot-sdk-cli
+          -p fuyubot-cli
           -p fuyubot-plugin-start -p fuyubot-plugin-help -p fuyubot-plugin-manage
 
       # 三份中间包，各自独立：本体（可执行文件 + tdjson）、内置插件（plugins/）、SDK。
@@ -140,12 +143,6 @@ jobs:
           done
           tar -czf "dist/$plugins.tar.gz" -C "dist/$plugins" plugins
 
-          # ③ SDK 包：只放 fuyubot-sdk，它不需要 tdjson
-          sdk="fuyubot-sdk-${asset#fuyubot-}"
-          mkdir -p "dist/$sdk"
-          cp "target/release/fuyubot-sdk${ext}" "dist/$sdk/"
-          tar -czf "dist/$sdk.tar.gz" -C dist "$sdk"
-
           ls -lh dist
 
       - uses: actions/upload-artifact@v4
@@ -185,12 +182,6 @@ jobs:
             tar -xzf "$plugins" -C "$stage/$asset" # → $stage/$asset/plugins/
             ( cd "$stage" && zip -q -r -X "$out/$asset.zip" "$asset" )
           done
-          # SDK 也统一发 zip（各平台的 fuyubot-sdk 单独一个包，不塞进本体 zip）
-          for sdk in dist/fuyubot-sdk-*.tar.gz; do
-            asset="$(basename "$sdk" .tar.gz)"
-            tar -xzf "$sdk" -C "$stage"
-            ( cd "$stage" && zip -q -r -X "$out/$asset.zip" "$asset" )
-          done
           rm -rf "$stage"
           ls -lh dist/*.zip
 
@@ -226,7 +217,7 @@ jobs:
             "| --- | --- |" \
             "$table" \
             "" \
-            "插件开发 CLI 另有 \`fuyubot-sdk-<系统>-<架构>.zip\`（不需要 tdjson）。")
+            "插件开发 CLI（\`fuyubot-sdk\`）在 FuyuBot-SDK 仓库的 Release 里单独发布（不需要 tdjson）。")
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/*.zip --clobber
             gh release edit "$TAG" --notes "$notes"
