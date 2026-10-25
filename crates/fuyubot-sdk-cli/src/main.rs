@@ -1,6 +1,6 @@
 //! `fuyubot-sdk`：插件**开发** CLI。
 //!
-//! 与运行时 CLI（`fuyubot`）职责严格分离（见 `docs/ROADMAP.md` 变更 4）：
+//! 与运行时 CLI（`fuyubot`）职责严格分离（见 `docs/decisions.md` 变更 4）：
 //!
 //! - `fuyubot`（给运维者）：初始化实例、登录、运行、管插件、看状态——**不编译任何东西**。
 //! - `fuyubot-sdk`（给插件作者）：脚手架、ABI 绑定、静态检查、开发调试、查 TDLib 方法
@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use fuyubot_tdlib::{EntryKind, TdApiSchema, TlEntry};
+use fuyubot_tdlib_sys::{EntryKind, TdApiSchema, TlEntry};
 // `Object` 是 trait（format/architecture/kind/exports 都由它提供），`ObjectKind` 判「是不是动态库」。
 use object::{Object, ObjectKind};
 
@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let dir = scaffold::new_plugin(&args.dir, &args.name, lang)?;
             println!("已生成 {} 插件脚手架：{}", lang.as_str(), dir.display());
             println!("下一步：用你自己的工具链编译它（cargo build --release / gcc -shared / …）");
-            println!("        打包不归 fuyubot-sdk 管——见 docs/ROADMAP.md 变更 5");
+            println!("        打包不归 fuyubot-sdk 管——见 docs/decisions.md 变更 5");
         }
         Command::Codegen(args) => {
             let lang: scaffold::Lang = args.lang.into();
@@ -290,7 +290,7 @@ fn check(path: &Path) -> Result<CheckReport, String> {
 
 /// 方法名列表（已排序）。`filter` 是**忽略大小写的子串**匹配。
 ///
-// ponytail: 每次全量扫一遍那 3214 条；1022 个函数扫一遍是微秒级，需要索引时再说。
+// ponytail: 每次全量扫一遍那三千多条；上千个函数扫一遍是微秒级，需要索引时再说。
 fn method_names(filter: Option<&str>) -> Vec<&'static str> {
     let filter = filter.map(str::to_lowercase);
     let mut names: Vec<&'static str> = TdApiSchema::compiled()

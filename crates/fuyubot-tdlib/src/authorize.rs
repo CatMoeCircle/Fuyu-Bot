@@ -448,7 +448,7 @@ pub trait Prompter {
     /// 展示二维码/链接。
     ///
     /// **默认只把链接打出来**：真正的终端二维码要引一个 QR 编码依赖（那件事定了再补，
-    /// 见 `ROADMAP.md`）。补的时候只覆盖这个方法，状态机一行都不用动。
+    /// 见 `docs/ROADMAP.md`）。补的时候只覆盖这个方法，状态机一行都不用动。
     fn show_qr(&mut self, link: &str) {
         let message = format!("用手机 Telegram 的「设置 → 设备 → 扫描二维码」扫这个链接：{link}");
         self.notify(&message);
@@ -493,6 +493,13 @@ fn ask_and_send(
     prompter: &mut dyn Prompter,
     awaiting: &mut Option<AuthState>,
 ) -> Result<(), LoginError> {
+    // `WaitTdlibParameters` 这类状态**不用问**（参数是我们直接给的）：答案是空串，
+    // 但请求必须照发。用这个标志把「不用问」与「该问却没答」分开——
+    // ⚠️ 以前只判「答案是不是空」，于是 `setTdlibParameters` **永远发不出去**，
+    // 真库上直接卡在 `authorizationStateWaitTdlibParameters`。
+    // 这个 bug 一直藏着，是因为验收测试用的是它**自己的夹具**驱动状态机，
+    // 从没跑过这个产品函数（见 pitfalls 坑 83）。
+    let mut needed_input = true;
     let answer = loop {
         break match question_for(state, account, *chosen) {
             // 先选登录方式，选完重新算这一问
@@ -506,7 +513,10 @@ fn ask_and_send(
                 *awaiting = None;
                 return Ok(());
             }
-            Question::Nothing => String::new(),
+            Question::Nothing => {
+                needed_input = false;
+                String::new()
+            }
             Question::BotToken => prompter.ask("Bot Token（@BotFather 给的那串）")?,
             Question::PhoneNumber => prompter.ask("手机号（带国家码，例如 +8613800138000）")?,
             Question::Code { length } => {
@@ -526,7 +536,7 @@ fn ask_and_send(
         };
     };
 
-    if answer.trim().is_empty() {
+    if needed_input && answer.trim().is_empty() {
         return Err(LoginError::NoInput {
             question: state.name().to_owned(),
         });
@@ -543,12 +553,35 @@ fn ask_and_send(
 ///
 /// 调用方给一个**已经建好、还没发过参数**的客户端——第一条 `setTdlibParameters`
 /// 由本函数在 `WaitTdlibParameters` 时发出（那时才知道要发）。
+///
+/// 等价于 [`log_in_with`] 传一个丢弃用的 `bypass`（登录期别的东西一律不看）。
 pub fn log_in(
     client: &TdClient,
     parameters: &TdlibParameters,
     account: AccountType,
     prompter: &mut dyn Prompter,
     budget: Duration,
+) -> Result<LoginOutcome, LoginError> {
+    log_in_with(client, parameters, account, prompter, budget, &mut |_| {})
+}
+
+/// 同 [`log_in`]，但把**登录期间**收到的、与授权无关的东西交给 `bypass`。
+///
+/// 为什么需要：`fuyubot run` 的顺序是「**先加载插件，再发 `setTdlibParameters`**」
+/// （插件要在 TDLib 开始产出之前就订阅好）。而登录窗口里 TDLib 已经在发东西了
+/// （`updateOption`、`updateConnectionState`……还有插件 `start` 期那些请求的响应）。
+/// 这些如果被登录循环直接丢掉，插件就**漏掉登录窗口里的更新与自己的响应**——
+/// 正是「插件提前加载」想避免的那件事。
+///
+/// `bypass` 收到的是**原样的** [`Routed`]，调用方一般直接喂给
+/// `UpdatePipeline::dispatch`（那条路不 panic、更新处理不了只打日志）。
+pub fn log_in_with(
+    client: &TdClient,
+    parameters: &TdlibParameters,
+    account: AccountType,
+    prompter: &mut dyn Prompter,
+    budget: Duration,
+    bypass: &mut dyn FnMut(Routed),
 ) -> Result<LoginOutcome, LoginError> {
     let deadline = Instant::now() + budget;
     let mut chosen: Option<LoginMethod> = None;
@@ -562,6 +595,8 @@ pub fn log_in(
         match routed {
             Routed::Response(response) => {
                 let Some(message) = response.error_message() else {
+                    // 不是错误：多半是插件 `start` 期发的请求的响应——交回去，别吞掉。
+                    bypass(Routed::Response(response));
                     continue;
                 };
                 let message = message.to_owned();
@@ -581,6 +616,9 @@ pub fn log_in(
             }
             Routed::Update(update) => {
                 if update.kind != "updateAuthorizationState" {
+                    // 登录窗口里的别的更新（`updateOption` / `updateConnectionState`…）
+                    // 也要交出去：插件这时候已经加载好了，吞掉就是漏更新。
+                    bypass(Routed::Update(update));
                     continue;
                 }
                 let state = AuthState::from_update(&update.payload);

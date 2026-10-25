@@ -1,13 +1,21 @@
 # fuyubot 项目配置。
 #
-# `fuyubot run` 会读它；所有键都有默认值，最简可以只有 [bot] 一节。
+# `fuyubot run` 会读它；所有键都有默认值。缺这个文件时 `fuyubot run` 会**自动**
+# 按本模板生成一份（等价于先跑一次 `fuyubot init`），所以不建也能直接起。
 
 [bot]
 name = "__NAME__"
+
+[telegram]
+# 账号类型：`bot`（默认）或 `user`。它决定登录走哪条路——
+# bot → Bot Token；user → 手机号 / 扫码。**写错会报错**，不会静默当 bot。
+account_type = "bot"
 # TDLib api_id：到 https://my.telegram.org 申请。它**不是**秘密，放配置里没问题。
 api_id = __API_ID__
+# TDLib 的数据目录：database 与 files **都**指它（相对项目根目录）。
+data_dir = "data"
 # ⚠️ api_hash 是**凭据**，不许写进这个文件（硬约束 41）——只走环境变量 `TG_API_HASH`，
-#    或 `fuyubot run` 的交互式输入。配置里写了也会被忽略。
+#    或 `fuyubot run` 的交互式输入。配置里写了也会被忽略（serde 里根本没这个字段）。
 
 [plugins]
 # 插件目录：`fuyubot run` 从这里加载所有动态库。
@@ -17,3 +25,6 @@ dir = "plugins"
 # 留空 = 按 fuyubot-tdlib 的四级优先级自动找（环境变量 → 自带 → 系统库 → 裸库名）。
 # 指定时给 tdjson 的**目录**或文件路径，例如 ".tdlib-cache/1.8.66/windows-x86_64"。
 path = ""
+# 日志详细度：默认 **1**（保留警告与错误）。TDLib 自己的默认更啰嗦——每轮 `td_receive`
+# 的超时、`Begin to wait for updates…` 之类都会打到 stderr。要排查问题就调大。
+log_verbosity = 1

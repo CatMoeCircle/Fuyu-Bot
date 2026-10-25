@@ -1,0 +1,7 @@
+{
+  "title": "开发文档",
+  "description": "改框架本身：架构、构建、陷阱、发布",
+  "icon": "Wrench",
+  "root": true,
+  "pages": ["index", "architecture", "build-test", "pitfalls", "release"]
+}

@@ -1,0 +1,67 @@
+[
+  {
+    "@type": "updateNewMessage",
+    "message": {
+      "@type": "message",
+      "id": 2001,
+      "chat_id": 7,
+      "is_outgoing": false,
+      "content": {
+        "@type": "messageText",
+        "text": { "@type": "formattedText", "text": "/start" }
+      }
+    }
+  },
+  {
+    "@type": "updateNewMessage",
+    "message": {
+      "@type": "message",
+      "id": 2002,
+      "chat_id": 7,
+      "is_outgoing": false,
+      "content": {
+        "@type": "messageText",
+        "text": { "@type": "formattedText", "text": "/help@FuyuBot" }
+      }
+    }
+  },
+  {
+    "@type": "updateNewMessage",
+    "message": {
+      "@type": "message",
+      "id": 2003,
+      "chat_id": 7,
+      "is_outgoing": false,
+      "content": {
+        "@type": "messageText",
+        "text": { "@type": "formattedText", "text": "/plugins" }
+      }
+    }
+  },
+  {
+    "@type": "updateNewMessage",
+    "message": {
+      "@type": "message",
+      "id": 2004,
+      "chat_id": 7,
+      "is_outgoing": false,
+      "content": {
+        "@type": "messageText",
+        "text": { "@type": "formattedText", "text": "普通聊天，插件不该理它" }
+      }
+    }
+  },
+  {
+    "@type": "updateNewMessage",
+    "message": {
+      "@type": "message",
+      "id": 2005,
+      "chat_id": 7,
+      "is_outgoing": true,
+      "content": {
+        "@type": "messageText",
+        "text": { "@type": "formattedText", "text": "/start 自己发的，必须跳过" }
+      }
+    }
+  }
+]

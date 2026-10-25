@@ -18,6 +18,13 @@
 //!   生成器面对的是外部文件，遇到没见过的类型名字能退化，不能炸。
 //! - Rust 关键字做转义（TDLib 里真有 `type` 这种参数名 → `r#type`）。
 //!
+//! ## 文档注释
+//!
+//! 类、变体、函数、字段**都**带文档：文本取自 `td_api.tl` 的注释（[`crate::tl_schema`]
+//! 解析出的 `description` / `field_docs` / `class_description`），经 [`crate::docs`] 把
+//! HTML 风格标记转成 rustdoc Markdown 后逐行发射。没有 TL 文档的字段退化成
+//! `` /// `名字: 类型` `` 一行，不至于裸奔。
+//!
 //! ## 为什么没有分区标记就什么都不生成
 //!
 //! 函数与构造器只能靠 `---functions---` / `---types---` 区分（见 [`crate::tl_schema`]）。
@@ -27,6 +34,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use crate::docs;
 use crate::tl_schema::{EntryKind, TlEntry};
 
 /// 生成整个模块体（只有 items，交给 `include!`）。
@@ -84,6 +92,13 @@ fn generate_class(
     classes: &BTreeSet<String>,
 ) {
     let _ = writeln!(out);
+    // 类文档：`//@class … @description …`（通常记在第一个构造器上）优先，机械行垫底。
+    if let Some(description) = variants
+        .iter()
+        .find_map(|variant| variant.class_description.as_deref())
+    {
+        docs::emit_doc(out, description, "");
+    }
     let _ = writeln!(
         out,
         "/// TDLib 的 `{class}` 类（{} 个构造器）。",
@@ -98,7 +113,7 @@ fn generate_class(
 
     for variant in variants {
         if let Some(description) = &variant.description {
-            let _ = writeln!(out, "    /// {}", escape_doc(description));
+            docs::emit_doc(out, description, "    ");
         }
         let _ = writeln!(out, "    #[serde(rename = \"{}\")]", variant.name);
         let variant_name = pascal(&variant.name);
@@ -108,6 +123,7 @@ fn generate_class(
         }
         let _ = writeln!(out, "    {variant_name} {{");
         for param in &variant.params {
+            emit_field_doc(out, variant, param, "        ");
             let ty = field_type(&shape_of(&param.ty, classes));
             let _ = writeln!(out, "        {}", field_attrs(&ty));
             let rust_name = field_name(&param.name, out, "        ");
@@ -116,6 +132,20 @@ fn generate_class(
         let _ = writeln!(out, "    }},");
     }
     let _ = writeln!(out, "}}");
+}
+
+/// 一个字段的文档行：TL 文档（经 `docs` 转 rustdoc）优先，退化成 `` `名字: 类型` ``。
+fn emit_field_doc(
+    out: &mut String,
+    owner: &TlEntry,
+    param: &crate::tl_schema::TlParam,
+    indent: &str,
+) {
+    if let Some(doc) = owner.field_doc(&param.name) {
+        docs::emit_doc(out, doc, indent);
+    } else {
+        let _ = writeln!(out, "{indent}/// `{}: {}`", param.name, param.ty);
+    }
 }
 
 fn generate_function(
@@ -132,7 +162,7 @@ fn generate_function(
 
     let _ = writeln!(out);
     if let Some(description) = &function.description {
-        let _ = writeln!(out, "/// {}", escape_doc(description));
+        docs::emit_doc(out, description, "");
     }
     let _ = writeln!(
         out,
@@ -150,8 +180,8 @@ fn generate_function(
     } else {
         let _ = writeln!(out, "pub struct {name} {{");
         for param in &function.params {
+            emit_field_doc(out, function, param, "    ");
             let ty = field_type(&shape_of(&param.ty, classes));
-            let _ = writeln!(out, "    /// `{}: {}`", param.name, param.ty);
             let _ = writeln!(out, "    {}", field_attrs(&ty));
             let rust_name = field_name(&param.name, out, "    ");
             let _ = writeln!(out, "    pub {rust_name}: {ty},");
@@ -303,15 +333,6 @@ fn field_name(name: &str, out: &mut String, indent: &str) -> String {
     rust
 }
 
-/// 文档注释里的 `[`/`]` 会被当成 rustdoc 链接，转义掉；顺带压掉换行。
-fn escape_doc(text: &str) -> String {
-    text.replace('[', "\\[")
-        .replace(']', "\\]")
-        .replace(['\r', '\n'], " ")
-        .trim()
-        .to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,14 +448,46 @@ mod tests {
     }
 
     #[test]
-    fn descriptions_become_doc_comments_with_brackets_escaped() {
+    fn docs_become_rustdoc_markdown_on_classes_variants_and_fields() {
         let entries = tl_schema::parse(
-            "---types---\n//@description Uses [brackets] and stuff\nfoo id:int53 = Foo;\n\
-             ---functions---\nbar = Foo;\n",
+            "---types---\n\
+             //@class Foo @description Describes a foo\n\
+             //@description A foo with <b>style</b> @id The identifier\n\
+             //@extra Something extra\n\
+             foo id:int53 extra:string = Foo;\n\
+             ---functions---\n\
+             //@description Uses [brackets] and <code>code</code>.\n\
+             //@chat_id Chat identifier\n\
+             getChat chat_id:int53 = Foo;\n",
         )
         .unwrap();
         let code = generate(&entries);
-        assert!(code.contains(r"/// Uses \[brackets\] and stuff"), "{code}");
+
+        // 类描述（//@class）进 enum 文档
+        assert!(code.contains("/// Describes a foo"), "{code}");
+        // HTML 标记转成 rustdoc Markdown；方括号**不**转义（链接要活着）
+        assert!(code.contains("/// A foo with **style**"), "{code}");
+        assert!(code.contains("/// Uses [brackets] and `code`."), "{code}");
+        // 独立字段行进字段文档
+        assert!(code.contains("/// Something extra"), "{code}");
+        assert!(code.contains("/// Chat identifier"), "{code}");
+        // 行内 `@参数 …` 片段剥进字段文档，主文里不再留尾巴
+        assert!(code.contains("/// The identifier"), "{code}");
+        assert!(!code.contains("@id The"), "{code}");
+    }
+
+    #[test]
+    fn fields_without_tl_docs_fall_back_to_the_name_type_line() {
+        let entries = tl_schema::parse(
+            "---types---\nuser id:int53 = User;\n---functions---\n\
+             //@description Sends a message\n\
+             sendMessage chat_id:int53 = Message;\n",
+        )
+        .unwrap();
+        let code = generate(&entries);
+        // 没有 TL 文档的字段不能裸奔
+        assert!(code.contains("        /// `id: int53`"), "{code}");
+        assert!(code.contains("    /// `chat_id: int53`"), "{code}");
     }
 
     #[test]

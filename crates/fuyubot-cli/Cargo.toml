@@ -16,7 +16,6 @@ vendored = ["fuyubot-tdlib/vendored"]
 
 [dependencies]
 clap.workspace = true
-fuyubot-abi.workspace = true
 fuyubot-core.workspace = true
 fuyubot-loader.workspace = true
 fuyubot-tdlib.workspace = true

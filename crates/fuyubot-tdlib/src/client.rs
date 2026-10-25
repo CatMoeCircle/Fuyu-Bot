@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_void};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -147,6 +147,14 @@ impl TdClient {
 
         // SAFETY: lib 是刚加载的 TDLib，随后由 self 持有。
         let api = unsafe { loader::resolve_symbols(&lib) }?;
+
+        // 日志详细度先压到默认值（**在 create 之前**）：TDLib 自己的默认太啰嗦，
+        // 每轮 `td_receive` 的超时、`Begin to wait for updates…` 之类全打 stderr。
+        // 这是全局设置，所以在这里设一次对所有客户端都生效；要更详细就随后调
+        // `set_log_verbosity`（`[tdlib] log_verbosity`）。
+        // SAFETY: 符号已解析，且这是 TDLib 允许在任何初始化之前调用的全局设置。
+        unsafe { (api.set_log_verbosity)(crate::ffi::DEFAULT_LOG_VERBOSITY) };
+
         // SAFETY: 符号已解析；客户端句柄由 TDLib 分配。
         let raw = unsafe { (api.create)() };
         if raw.is_null() {
@@ -172,6 +180,16 @@ impl TdClient {
             next_id: AtomicU64::new(1),
             _lib: None,
         }
+    }
+
+    /// 覆盖日志详细度（默认 [`crate::ffi::DEFAULT_LOG_VERBOSITY`] = 1，在 [`new`](Self::new) 里设好）。
+    ///
+    /// **全局设置**，不带 client 句柄：调一次对所有客户端都生效。
+    /// `0` = 只打致命错误，`1` = 加警告（默认），越大越啰嗦。
+    pub fn set_log_verbosity(&self, level: i32) {
+        // 负数没有意义（TDLib 会当 0 处理），但别静默吞掉调用方的意图——钳到 0。
+        // SAFETY: 符号在 new() 里已解析；这是 TDLib 的全局日志设置。
+        unsafe { (self.api.set_log_verbosity)(level.max(0)) };
     }
 
     /// 发起请求：注入 `@extra`、登记 pending、交给 `td_send`。
@@ -237,22 +255,28 @@ impl TdClient {
         routed
     }
 
-    /// 起一个阻塞线程跑接收循环，把每条结果交给 `callback`。
+    /// 起一个阻塞线程跑接收循环，把每条结果交给 `callback`，返回**停止把手**。
     ///
-    /// 循环不会退出（也不该退出）：TDLib 的接收线程生命周期等于进程。
-    pub fn spawn_receive_loop<F>(self: &Arc<Self>, mut callback: F) -> tokio::task::JoinHandle<()>
+    /// 循环会一直跑到 [`ReceiveLoop::stop`] 被调用为止（gaps 缺口 8：以前它没有退出条件，
+    /// 于是「重启 TDLib」「退回登录」「Ctrl-C 退出」都做不到）。
+    #[must_use = "不收下这个把手就永远停不掉接收循环"]
+    pub fn spawn_receive_loop<F>(self: &Arc<Self>, mut callback: F) -> ReceiveLoop
     where
         F: FnMut(Routed) + Send + 'static,
     {
         let this = Arc::clone(self);
-        // ponytail: 固定 1s 轮询；要低延迟就换 TDLib 的 update callback 注册
-        tokio::task::spawn_blocking(move || {
-            loop {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        // ponytail: 固定 1s 轮询；要低延迟就换 TDLib 的 update callback 注册。
+        // 代价是 stop() 之后最长还要 1s 才真的停下（见 ReceiveLoop::stop）。
+        let handle = tokio::task::spawn_blocking(move || {
+            while !flag.load(Ordering::Relaxed) {
                 if let Some(routed) = this.receive(Duration::from_secs(1)) {
                     callback(routed);
                 }
             }
-        })
+        });
+        ReceiveLoop { stop, handle }
     }
 
     /// 已发出、还没收到响应的请求（`RequestId`、方法名、等了多久）。
@@ -267,6 +291,30 @@ impl TdClient {
             .collect();
         list.sort_by_key(|(id, _, _)| *id);
         list
+    }
+}
+
+/// 接收循环的停止把手（gaps 缺口 8）。
+///
+/// **停止是显式的 [`stop`](Self::stop)，不是 drop 即停** —— 这点刻意和 `Effect` /
+/// `Subscription` 那套「drop 即注销」相反：后台任务被静默丢掉时，调用方很容易误以为
+/// 「还在收更新」，而一个明确的 `stop()` 让「谁在什么时候停的」在代码里看得见。
+#[derive(Debug)]
+pub struct ReceiveLoop {
+    stop: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ReceiveLoop {
+    /// 请求循环退出。**最多再等一个轮询周期（1s）**才真正停下——`stop()` 返回不代表已经停了，
+    /// 要确认就紧接着 `join().await`。
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// 等循环真的退出。`stop()` 之后调；**没 stop 就 await 会一直等下去**。
+    pub async fn join(self) {
+        let _ = self.handle.await;
     }
 }
 
@@ -313,6 +361,8 @@ mod tests {
         std::ptr::null()
     }
 
+    unsafe extern "C" fn noop_set_log_verbosity(_: i32) {}
+
     #[test]
     fn send_injects_and_records_extra() {
         let sent = Arc::new(StdMutex::new(Vec::new()));
@@ -325,6 +375,7 @@ mod tests {
             send: capture_send,
             receive: noop_receive,
             execute: noop_execute,
+            set_log_verbosity: noop_set_log_verbosity,
         };
         let client = TdClient::from_parts(api, capture.as_ref() as *const Capture as *mut c_void);
 

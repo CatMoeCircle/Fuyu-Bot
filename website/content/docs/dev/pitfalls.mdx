@@ -1,0 +1,41 @@
+---
+title: 常见陷阱
+description: 编号即引用锚：这些坑真踩过，别再踩回去
+---
+
+仓库里有一份完整台账 [`docs/pitfalls.md`](https://github.com/xiaoqvan/Fuyu-Bot/blob/main/docs/pitfalls.md)
+（**编号是跨文件引用锚，不许重排**）。这里挑最容易复发的几条。
+
+## ABI 与回调
+
+- **`extern "C"` 边界逃出去的 panic 直接 abort**，宿主来不及 `catch_unwind`：插件与中间件回调必须是
+  `unsafe extern "C-unwind"`，`define_plugin!` 自己也要包一层。
+- **一个 crate 只能展开一次 `define_plugin!`**：四个导出符号名是 ABI 定死的，展开两次必然重复定义。
+- **订阅句柄必须活着**：每轮循环里 `let _h = …` 就是每轮退订；`for` 里注册要把句柄收进循环外的 `Vec`。
+- **`Effect` / `Subscription` 是 `#[must_use]`**：`let _ =` 会立刻回滚；`drop` 就是注销。
+
+## 事件语义
+
+- **归属（scope）不是「排除广播」**：第一版写成「全局 `emit` 只发 scope 0」，插件永远收不到更新。
+  正确语义是「`emit` 发给所有人；`emit_scoped(scope)` 额外定向给该归属」。
+- **过滤器里的 `event_type` 键只选通道**，不参与负载匹配。
+
+## TDLib
+
+- **方法名/字段路径按 TDLib 来，不按 Bot API**：只有 `sendMessage` + `input_message_content`；
+  `updateFile` 的 file id 在 `file.id` 不是顶层 `file_id`；`user` 没有 `is_bot` / `username`。
+- **`td_api.tl` 的「函数 vs 构造器」只认 `---functions---` / `---types---` 标记**：
+  `updateNewMessage … = Update` 是构造器，任何按首字母大写的启发式都会误判。
+- **写死 TDLib 方法名/参数名的模块必须留一条 `check_request` 测试**（离线就能红）。
+
+## Rust / Windows
+
+- **`Context` 的固有方法会遮蔽扩展 trait 的同名方法**：命名服务只能叫 `provide_named` / `resolve`。
+- **thiserror 把名为 `source` 的字段当错误链**：存额外文本的字段叫 `detail`。
+- **Windows 文件锁是强制锁**：锁住的字节范围别人 `read` 会 `ERROR_LOCK_VIOLATION`，
+  所以实例状态把「锁」与「内容」分成两个文件（`.fuyubot/lock` 与 `.fuyubot/status`）。
+- **PowerShell 的 `Get-Content` 在本机按 cp936 解码 UTF-8**：中文注释会毁，还会吞换行导致行号错位。
+  改源码一律用编辑器工具，shell 只用来跑命令。
+- **`tar` 在 Windows runner 上要 POSIX 路径**（`/d/a/…`）：GNU tar 会把 `D:/…` 当成「连主机 D」。
+
+> 看全量（含症状、根因、规矩三段）去仓库 `docs/pitfalls.md`；新踩的坑要补进去并给新编号。

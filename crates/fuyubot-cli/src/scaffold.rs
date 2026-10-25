@@ -1,6 +1,6 @@
 //! 运行时 CLI 的脚手架：`fuyubot init`（项目配置）与 `plugin install`。
 //!
-//! **插件的脚手架不在这里**——那是开发 CLI `fuyubot-sdk init` 的事（`ROADMAP.md` 变更 4）。
+//! **插件的脚手架不在这里**——那是开发 CLI `fuyubot-sdk init` 的事（`docs/decisions.md` 变更 4）。
 //! 这里只剩「项目配置」与「把编好的插件装进插件目录」两件事。
 //!
 //! 项目模板用 `include_str!` 嵌进二进制，所以 `fuyubot init` 在任何目录都能跑，
@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::builder::DLL_EXTENSION;
+use fuyubot_loader::DLL_EXTENSION;
 
 /// 项目配置文件名。
 pub const CONFIG_FILE: &str = "fuyubot.toml";
@@ -22,6 +22,8 @@ pub struct Config {
     #[serde(default)]
     pub bot: Bot,
     #[serde(default)]
+    pub telegram: Telegram,
+    #[serde(default)]
     pub plugins: Plugins,
     #[serde(default)]
     pub tdlib: Tdlib,
@@ -30,11 +32,58 @@ pub struct Config {
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct Bot {
     pub name: Option<String>,
-    /// TDLib api_id（**不是**秘密，放配置里可以）。
+    /// TDLib api_id 的**旧位置**（[`Telegram::api_id`] 优先）。新配置写进 `[telegram]`。
     ///
     /// `api_hash` 这里**故意没有**字段：它是凭据，只允许从环境变量 `TG_API_HASH`
     /// 或交互式输入来（硬约束 41）。写了也会被 serde 忽略。
     pub api_id: Option<i64>,
+}
+
+/// `[telegram]`：TDLib 参数与**账号类型**。
+///
+/// ⚠️ 凭据（`api_hash` / token / 手机号）**不在这里**（硬约束 41）——只落**类型**。
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct Telegram {
+    /// `"bot"`（默认）或 `"user"`——决定登录走哪条路（Bot Token / 手机号 / 扫码）。
+    pub account_type: Option<String>,
+    /// TDLib 的 `database_directory` 与 `files_directory` **都**指它（decisions 变更 1：
+    /// 只建 `data/`，不拆 `data/db`）。相对项目根目录。
+    pub data_dir: Option<String>,
+    /// TDLib api_id（应用凭据，不是秘密）。两处都没写就用 0。
+    pub api_id: Option<i64>,
+}
+
+impl Telegram {
+    /// 认账号类型。**写错就报错指路**，不静默当 bot——否则用户会拿着错的登录方式
+    /// 一直等不到验证码，而错误信息完全不指向配置。
+    ///
+    /// 大小写与首尾空格都容忍（`" User "` 也认）：手写配置里这两种很常见，
+    /// 而 `Bot` / `User` 本来就无歧义——trim 了却不忽略大小写是自相矛盾的。
+    pub fn account_type(&self) -> Result<fuyubot_tdlib::AccountType, String> {
+        let raw = self
+            .account_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("bot");
+        match raw.to_ascii_lowercase().as_str() {
+            "bot" => Ok(fuyubot_tdlib::AccountType::Bot),
+            "user" => Ok(fuyubot_tdlib::AccountType::User),
+            _ => Err(format!(
+                "[telegram].account_type = \"{raw}\" 认不出来，只能写 \"bot\" 或 \"user\""
+            )),
+        }
+    }
+
+    /// `[telegram].api_id` 优先，退回旧的 `[bot].api_id`。
+    pub fn api_id(&self, bot: &Bot) -> i64 {
+        self.api_id.or(bot.api_id).unwrap_or(0)
+    }
+
+    /// TDLib 的数据目录（配置里没写就 `<root>/data`）。
+    pub fn data_dir(&self, root: &Path) -> PathBuf {
+        root.join(self.data_dir.as_deref().unwrap_or("data"))
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -45,6 +94,18 @@ pub struct Plugins {
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct Tdlib {
     pub path: Option<String>,
+    /// TDLib 的日志详细度。**配置里没写就用 1**（框架的默认值，见
+    /// [`fuyubot_tdlib::DEFAULT_LOG_VERBOSITY`]）——TDLib 自己的默认太啰嗦。
+    pub log_verbosity: Option<i32>,
+}
+
+impl Tdlib {
+    /// 日志详细度：配置优先，否则默认 1。**负数钳到 0**（TDLib 只认非负）。
+    pub fn log_verbosity(&self) -> i32 {
+        self.log_verbosity
+            .unwrap_or(fuyubot_tdlib::DEFAULT_LOG_VERBOSITY)
+            .max(0)
+    }
 }
 
 impl Config {
@@ -65,8 +126,18 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
 }
 
 /// 从 `start` 往上找 `fuyubot.toml`。
+///
+/// ⚠️ **相对路径必须先变绝对**：`Path::new(".").parent()` 是 `Some("")`，`""` 又已经没有父目录，
+/// 于是从相对路径出发爬一步就到底了——在子目录里跑 `fuyubot status` 会谎报「这里没有配置」。
+/// 而默认的 `--config fuyubot.toml` 走的正是相对路径（踩过一次：`config` 在子目录里
+/// 报「文件不存在，全是默认值」，其实上层就有）。
 pub fn find_config(start: &Path) -> Option<PathBuf> {
-    let mut dir = Some(start.to_path_buf());
+    let start: PathBuf = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(start)
+    };
+    let mut dir = Some(start);
     while let Some(current) = dir {
         let candidate = current.join(CONFIG_FILE);
         if candidate.is_file() {
@@ -75,6 +146,59 @@ pub fn find_config(start: &Path) -> Option<PathBuf> {
         dir = current.parent().map(Path::to_path_buf);
     }
     None
+}
+
+// ── config list ────────────────────────────────────────────────────
+
+/// `fuyubot config` 的几行输出：**生效值**（缺省已填好），外加这份文件到底在哪。
+///
+/// 纯函数，不碰环境。文件不存在时如实说「全是默认值」——`run` 本来就是按默认值起的。
+pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<String> {
+    let missing = if config_path.is_file() {
+        ""
+    } else {
+        "（不存在，下面全是默认值）"
+    };
+    let account = match config.telegram.account_type() {
+        Ok(kind) => kind.as_str().to_owned(),
+        // 写错就**把原因原样报出来**：这正是「我改的那行生效了吗」要回答的东西。
+        Err(e) => format!("⚠️ {e}"),
+    };
+    let tdlib_path = config
+        .tdlib
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("自动（TDLIB_TDJSON_PATH → 自带 → exe 同级 → 系统库 → 裸库名）");
+    vec![
+        format!("配置文件  {}{missing}", config_path.display()),
+        format!("项目根    {}", root.display()),
+        format!(
+            "[bot]       name         = {}",
+            config.bot.name.as_deref().unwrap_or("(未设置)")
+        ),
+        format!("[telegram]  account_type = {account}"),
+        format!(
+            "[telegram]  api_id       = {}",
+            config.telegram.api_id(&config.bot)
+        ),
+        format!(
+            "[telegram]  data_dir     = {}",
+            config.telegram.data_dir(root).display()
+        ),
+        format!(
+            "[plugins]   dir          = {}",
+            config.plugin_dir(root).display()
+        ),
+        format!("[tdlib]     path         = {tdlib_path}"),
+        format!(
+            "[tdlib]     log_verbosity= {}",
+            config.tdlib.log_verbosity()
+        ),
+        "凭据        api_hash / token / 手机号不读配置（TG_API_HASH 等环境变量或交互输入）"
+            .to_owned(),
+    ]
 }
 
 // ── init ───────────────────────────────────────────────────────────
@@ -95,7 +219,58 @@ pub fn init(root: &Path, name: &str, api_id: i64) -> Result<PathBuf, String> {
 
     let plugins = root.join("plugins");
     std::fs::create_dir_all(&plugins).map_err(|e| format!("建不了 {}: {e}", plugins.display()))?;
+    // 内置插件（/start、/help、/plugins）跟可执行文件一起打包，顺手复制进来：
+    // 「构建/解包之后直接跑就有基础命令」，不用再 `plugin install` 三遍。
+    match install_builtins(&plugins) {
+        Ok(copied) if !copied.is_empty() => {
+            println!("已安装 {} 个内置插件到 {}", copied.len(), plugins.display());
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("装内置插件失败（继续）: {error}"),
+    }
     Ok(config)
+}
+
+/// 内置插件的文件名主干：`fuyubot_plugin_start` → `fuyubot_plugin_start.{dll,so,dylib}`。
+///
+/// 这三个由 `cargo package-bot`（以及 release 流程）编出来，跟可执行文件放在一起。
+pub const BUILTIN_PLUGINS: &[&str] = &[
+    "fuyubot_plugin_start",
+    "fuyubot_plugin_help",
+    "fuyubot_plugin_manage",
+];
+
+/// 把内置插件装进插件目录：先看**可执行文件旁边**，再看它下面的 `plugins/`
+/// （发布包里是后者，`cargo package-bot` 出来的是前者）。
+///
+/// **只装缺的**：目标已存在就跳过，不覆盖用户换过的版本。返回这次真的拷过去的文件。
+///
+/// 这只是「复制一个已经编好的产物」，不碰编译——和 `plugin install` 同一件事（约束 40）。
+pub fn install_builtins(plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("拿不到可执行文件路径: {e}"))?;
+    let Some(exe_dir) = exe.parent() else {
+        return Ok(Vec::new());
+    };
+    let sources = [exe_dir.to_path_buf(), exe_dir.join("plugins")];
+    std::fs::create_dir_all(plugin_dir)
+        .map_err(|e| format!("建不了 {}: {e}", plugin_dir.display()))?;
+
+    let mut copied = Vec::new();
+    for stem in BUILTIN_PLUGINS {
+        let file = format!("{stem}.{DLL_EXTENSION}");
+        let Some(source) = sources
+            .iter()
+            .map(|dir| dir.join(&file))
+            .find(|path| path.is_file())
+        else {
+            continue;
+        };
+        if plugin_dir.join(&file).exists() {
+            continue;
+        }
+        copied.push(copy(&source, plugin_dir)?);
+    }
+    Ok(copied)
 }
 
 // ── plugin install ─────────────────────────────────────────────────
@@ -113,7 +288,7 @@ pub fn install(source: &Path, plugin_dir: &Path) -> Result<Vec<PathBuf>, String>
 ///
 /// `extra_dirs` 是**同伴文件的额外搜索目录**：
 /// - `plugin install <工程目录>` 走 [`companion_dirs`]（工程目录 + 产物所在目录）；
-/// - `build-plugin` 直接把自己知道的工程目录传进来（它已经拿到产物的真实路径了）。
+/// - 别处要装一个已知路径的产物时，把它的工程目录传进来即可。
 ///
 /// 只搬「像插件同伴」的文件（`.py` / `.js` / `.ts` / `.pyi`），别的（README、`target/`……）不动。
 ///
@@ -167,7 +342,9 @@ pub fn find_artifact(source: &Path) -> Result<PathBuf, String> {
     match candidates.len() {
         0 => Err(format!(
             "{} 里没找到 .{DLL_EXTENSION}。\
-             在插件工程目录里跑 `fuyubot build-plugin`（它会编译并装进插件目录）；\
+             本 CLI **不编译插件**（打包归作者自己的语言工具链）：先用 `cargo build`（Rust / \
+             Python / JS 插件的 cdylib 都是 Rust 编的）或 `cl /LD`（C/C++）编出来，\
+             再把产物或工程目录交给本命令。\
              注意 workspace 成员的产物落在**仓库根**的 target/ 下，本命令只查工程自己的 target/。",
             source.display()
         )),
@@ -250,10 +427,72 @@ mod tests {
         let path = init(&root, "mybot", 12345).unwrap();
         let config = load_config(&path).unwrap();
         assert_eq!(config.bot.name.as_deref(), Some("mybot"));
-        assert_eq!(config.bot.api_id, Some(12345));
+        // api_id 现在写在 `[telegram]`；`[bot].api_id` 仍认（兼容位置），两者都能取到。
+        assert_eq!(config.telegram.api_id, Some(12345));
+        assert_eq!(config.telegram.api_id(&config.bot), 12345);
+        // 模板默认 bot + `data/`；账号类型与数据目录都要能从生成的配置里读回来。
+        assert_eq!(
+            config.telegram.account_type().unwrap(),
+            fuyubot_tdlib::AccountType::Bot
+        );
+        assert_eq!(config.telegram.data_dir(&root), root.join("data"));
         assert!(root.join("plugins").is_dir());
         // 第二次要被挡住，不能把用户改过的配置冲掉。
         assert!(init(&root, "mybot", 1).is_err());
+    }
+
+    /// 账号类型写错必须**报错指路**，不能静默当 bot——否则用户会拿着错的登录方式
+    /// 一直等不到验证码，而错误信息完全不指向配置。
+    #[test]
+    fn a_bogus_account_type_is_rejected_with_a_hint() {
+        let telegram = Telegram {
+            account_type: Some("robot".to_owned()),
+            ..Telegram::default()
+        };
+        let error = telegram.account_type().unwrap_err();
+        assert!(error.contains("robot"), "报错要带上写错的值：{error}");
+        assert!(
+            error.contains("bot") && error.contains("user"),
+            "报错要说清只能写哪两个：{error}"
+        );
+        // 大写/带空格不算错（手写配置很常见），`user` 要真的认成 user。
+        let telegram = Telegram {
+            account_type: Some(" User ".to_owned()),
+            ..Telegram::default()
+        };
+        assert_eq!(
+            telegram.account_type().unwrap(),
+            fuyubot_tdlib::AccountType::User
+        );
+    }
+
+    /// 日志详细度的默认值与钳位：**没配就是 1**（TDLib 自己的默认太啰嗦），
+    /// 负数当 0（TDLib 只认非负，别把负值原样丢过去）。
+    #[test]
+    fn log_verbosity_defaults_to_one_and_clamps_negatives() {
+        assert_eq!(Tdlib::default().log_verbosity(), 1);
+        assert_eq!(
+            Tdlib {
+                path: None,
+                log_verbosity: Some(5)
+            }
+            .log_verbosity(),
+            5
+        );
+        assert_eq!(
+            Tdlib {
+                path: None,
+                log_verbosity: Some(-3)
+            }
+            .log_verbosity(),
+            0
+        );
+        // 模板里写出来的那个值也要等于默认值，否则「默认 1」只存在于代码注释里。
+        let rendered = TEMPLATE_CONFIG;
+        assert!(
+            rendered.contains("log_verbosity = 1"),
+            "模板里的 log_verbosity 必须与默认值一致：\n{rendered}"
+        );
     }
 
     #[test]

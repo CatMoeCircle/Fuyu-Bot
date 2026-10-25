@@ -774,6 +774,9 @@ mod tests {
         fuyubot_plugin_api::WaitHandle::INVALID
     }
     unsafe extern "C" fn cancel(_h: *mut c_void, _w: fuyubot_plugin_api::WaitHandle) {}
+    unsafe extern "C" fn execute(_h: *mut c_void, _r: *const c_char) -> *const c_char {
+        core::ptr::null()
+    }
 
     type VTable = fuyubot_plugin_api::HostApiVTable;
 
@@ -794,6 +797,7 @@ mod tests {
             get_service: Some(get),
             td_invoke: Some(td),
             td_invoke_simplified: Some(invoke),
+            td_execute: Some(execute),
             use_middleware: Some(middleware),
             wait_for_update: Some(wait),
             cancel_wait: Some(cancel),

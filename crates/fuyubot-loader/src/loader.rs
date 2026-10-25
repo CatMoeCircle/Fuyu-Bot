@@ -57,8 +57,12 @@ pub enum LoadError {
 
 /// 一个已加载并已启动的插件。
 ///
-/// **drop 即卸载**：先 `plugin_stop`，再把该插件注册到宿主的资源整批回滚，
-/// 最后才卸载动态库（字段声明顺序保证了这一点）。
+/// **drop 即停用**：先 `plugin_stop`，再把该插件注册到宿主的资源整批回滚，
+/// 最后释放动态库（字段声明顺序保证了这一点）。
+///
+/// 例外：**Go 编出来的 c-shared 库不能卸载**——它的运行时有线程/信号处理器，
+/// `FreeLibrary` / `dlclose` 之后进程立刻 access violation（0xC0000005）。
+/// 所以对这类库故意泄漏句柄，让它在进程生命周期内一直映射着（见 `go_runtime`）。
 pub struct LoadedPlugin {
     pub name: String,
     pub path: PathBuf,
@@ -68,7 +72,10 @@ pub struct LoadedPlugin {
     /// 这次加载在宿主侧注册的所有东西的归属 id。
     owner: u64,
     /// 保证动态库活到最后：插件代码在 drop 之前一直可用。
-    _lib: Library,
+    _lib: Option<Library>,
+    /// 这个库是不是 Go 的 c-shared（`crosscall2` 是 Go 运行时符号）。
+    /// 是的话 drop 时只 `forget`、不卸载。
+    go_runtime: bool,
     /// 保证宿主运行时比插件活得久。
     _runtime: Arc<HostRuntime>,
 }
@@ -98,7 +105,12 @@ impl Drop for LoadedPlugin {
         }
         // 插件停掉之后，把它注册的订阅/工具/服务/中间件一次性撤掉。
         self._runtime.rollback_owner(self.owner);
-        // _lib 随后 drop —— 到这里动态库才真正卸载。
+        // 动态库这时才真正卸载；Go 的 c-shared 除外——卸载它会让进程崩（见类型文档）。
+        if self.go_runtime {
+            if let Some(lib) = self._lib.take() {
+                std::mem::forget(lib);
+            }
+        }
     }
 }
 
@@ -153,7 +165,7 @@ impl PluginLoader {
         // 先规范化成绝对路径：`open_library` 只对绝对路径开 Windows 的
         // `LOAD_WITH_ALTERED_SEARCH_PATH`，**插件旁边的兄弟 DLL 就靠这个才找得到**。
         // 用 `Library::new`（flags = 0）时系统只查 exe 目录 + System32 + PATH，
-        // 会报 `ERROR_MOD_NOT_FOUND`，而那个错误完全不指向真正的原因（见 AGENTS 约束 30 / 坑 43）。
+        // 会报 `ERROR_MOD_NOT_FOUND`，而那个错误完全不指向真正的原因（见 AGENTS 约束 30 / pitfalls 坑 43）。
         // 规范化失败（文件不存在之类）就退回原路径，让下面的加载报出正常的 `Library` 错误。
         let location = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
         // SAFETY: 加载动态库就等于执行其中的代码，只加载可信文件。
@@ -163,6 +175,11 @@ impl PluginLoader {
                 source,
             }
         })?;
+
+        // Go 的 c-shared 库卸载即崩（运行时限制），所以要先认出它。
+        // 不能靠导出符号：Go 只导出 `//export` 出来的那几个 + `_cgo_dummy_export`，
+        // `crosscall2` 之类并不在导出表里。可靠的标记是文件末尾的 `Go buildinf:` 头。
+        let go_runtime = looks_like_go_binary(&location);
 
         // 先把符号取成裸函数指针，再让库可以被移动进 LoadedPlugin。
         let (init, start, stop) = {
@@ -198,7 +215,7 @@ impl PluginLoader {
 
         if handle.abi_version != ABI_VERSION {
             // 版本不兼容时**不能**调 plugin_stop：那是对一个我们不认识的 ABI 下手。
-            // 只能回滚宿主侧资源；插件在 init 里自己分配的状态这一版无法回收（见 HANDOFF）。
+            // 只能回滚宿主侧资源；插件在 init 里自己分配的状态这一版无法回收（见 docs/gaps.md 缺口 7）。
             return Err(LoadError::AbiMismatch {
                 path: path.to_owned(),
                 plugin: handle.abi_version,
@@ -232,7 +249,8 @@ impl PluginLoader {
             handle,
             stop,
             owner,
-            _lib: lib,
+            _lib: Some(lib),
+            go_runtime,
             _runtime: Arc::clone(&self.runtime),
         })
     }
@@ -254,19 +272,6 @@ impl PluginLoader {
         }
         Ok(results)
     }
-}
-
-/// 目录名归一成能被 cargo 当 crate 名 / 当文件名用的东西。
-///
-/// 住在宿主层是因为「**插件文件名 = 插件名**」这条规矩两边都要用：运行时 CLI
-/// （`plugin add` / `plugin info`）与开发 CLI（`init` 生成脚手架、`check` 找产物）。
-/// 放两份迟早会漂移，所以和 [`plugin_files`]、[`DLL_EXTENSION`] 待在一起。
-pub fn plugin_file_name(dir: &Path) -> String {
-    let stem = dir
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "plugin".to_owned());
-    stem.replace(['.', '-'], "_")
 }
 
 /// 目录下的候选插件文件（按扩展名筛），已排序。
@@ -296,17 +301,43 @@ fn plugin_name(handle: &PluginHandle, path: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// 这个动态库是不是 Go 编出来的（Go 的库不能卸载，见 [`LoadedPlugin`]）。
+///
+/// 判据是 Go 的构建信息魔数 `\xff Go buildinf:`。**不能靠导出符号**：Go 的 c-shared
+/// 只导出 `//export` 的那几个函数，`crosscall2` 之类并不在导出表里（踩过）；
+/// 也不能只看文件末尾——PE 里这段在中间的数据段（也踩过）。
+///
+/// ponytail: 整份读进内存找魔数，插件就几 MB，加载一次的开销可以忽略；
+/// 真到「插件动辄上百 MB」再改成带重叠加窗的分块扫描。
+fn looks_like_go_binary(path: &Path) -> bool {
+    const MAGIC: &[u8] = b"\xff Go buildinf:";
+
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    bytes.windows(MAGIC.len()).any(|window| window == MAGIC)
+}
+
 #[cfg(test)]
-mod tests {
+mod go_runtime_tests {
     use super::*;
 
     #[test]
-    fn plugin_file_names_are_usable_as_crate_names() {
-        assert_eq!(plugin_file_name(Path::new("/x/demo")), "demo");
-        assert_eq!(
-            plugin_file_name(Path::new("/x/fuyubot.weather")),
-            "fuyubot_weather"
-        );
-        assert_eq!(plugin_file_name(Path::new("/x/my-plugin")), "my_plugin");
+    fn detects_go_build_info_magic() {
+        // 造一个中间带 Go buildinfo 魔数的文件，和一份普通文件做对照。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp/fuyubot-loader");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let go_like = dir.join("go-like.bin");
+        let mut bytes = vec![0_u8; 4096];
+        bytes.extend_from_slice(b"\xff Go buildinf:");
+        bytes.extend_from_slice(&[0_u8; 64]);
+        std::fs::write(&go_like, &bytes).unwrap();
+        assert!(looks_like_go_binary(&go_like));
+
+        let plain = dir.join("plain.bin");
+        std::fs::write(&plain, vec![7_u8; 4096]).unwrap();
+        assert!(!looks_like_go_binary(&plain));
     }
 }

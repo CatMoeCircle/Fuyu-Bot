@@ -1,0 +1,140 @@
+---
+title: 下载与安装
+description: 下载对应平台的包，解压就能跑
+---
+
+不用装 Rust、不用编译：到 [Releases](https://github.com/xiaoqvan/Fuyu-Bot/releases) 下对应平台的 zip，
+解压后里面就是可执行文件，**TDLib 动态库已经和它放在同一个目录**（运行时按「可执行文件所在目录」
+自动找到，不用配环境变量、不用单独装 TDLib），内置插件在同级的 `plugins/`。
+
+## 下载哪个包
+
+| 系统 | 下载 | 包里有什么 |
+| --- | --- | --- |
+| Windows 10/11（x64） | `fuyubot-windows-x86_64.zip` | `fuyubot.exe` + `tdjson.dll` + `plugins/` + `README.txt` |
+| Windows 11（ARM64） | `fuyubot-windows-aarch64.zip` | `fuyubot.exe` + `tdjson.dll` + `plugins/` + `README.txt` |
+| Linux（x86_64） | `fuyubot-linux-x86_64.zip` | `fuyubot` + `libtdjson.so` + `plugins/` + `README.txt` |
+| Linux（ARM64） | `fuyubot-linux-aarch64.zip` | `fuyubot` + `libtdjson.so` + `plugins/` + `README.txt` |
+| macOS（Apple Silicon） | `fuyubot-macos-aarch64.zip` | `fuyubot` + `libtdjson.dylib` + `plugins/` + `README.txt` |
+
+- 资产名里的 `<系统>-<架构>` 用 cargo 那套口径（`x86_64` / `aarch64`），和 TDLib 自己的资产同名同序。
+- 归档一律 `.zip`（Windows 资源管理器双击就能解，Linux / macOS 用 `unzip`）。
+- **上面没有的平台**（Intel Mac 等）暂时没有包，自己编：见 [从源码构建](./build.mdx)。
+- 插件开发 CLI（`fuyubot-sdk`）是另一个包：`fuyubot-sdk-<系统>-<架构>.zip`，它**不需要** `tdjson`。
+
+## 解压、验证
+
+Windows（PowerShell）：
+
+```powershell
+Expand-Archive -Path fuyubot-windows-x86_64.zip -DestinationPath .
+cd fuyubot-windows-x86_64
+.\fuyubot.exe --version
+```
+
+Linux / macOS：
+
+```bash
+unzip fuyubot-linux-x86_64.zip
+cd fuyubot-linux-x86_64
+chmod +x fuyubot        # 从网盘 / 别的机器转手后可能丢执行位
+./fuyubot --version
+```
+
+macOS 从网上下载的二进制会被 Gatekeeper 拦住，解一次隔离属性：
+
+```bash
+xattr -d com.apple.quarantine ./fuyubot ./libtdjson.dylib
+```
+
+```text
+fuyubot 0.1.0
+```
+
+`--version` 能打印版本号，说明这个可执行文件本身没坏；真正加载 TDLib 是在 `run` 的时候
+（日志里会有一行 `TDLib 1.8.66 命中「可执行文件所在目录」`）。加载失败按
+[常见问题](./troubleshooting.mdx) 排查。
+
+## 起一个 bot 项目
+
+```powershell
+.\fuyubot.exe init --dir demo --name mybot --api-id 12345
+```
+
+```text
+已生成 demo\fuyubot.toml
+插件目录：demo\plugins
+下一步：fuyubot-sdk init demo --lang rust（插件脚手架由开发 CLI 生成）
+```
+
+`api_id` 到 [my.telegram.org](https://my.telegram.org) 申请，**它不是秘密**，可以直接写进配置；`api_hash` 是凭据，
+不落盘——只认环境变量 `TG_API_HASH` 或运行时的交互式输入（见 [配置文件](./config.mdx)）。
+
+## 跑起来
+
+```powershell
+# 前台：会问 api_id / api_hash（或读 TG_API_ID / TG_API_HASH），然后走登录
+.\fuyubot.exe run --config demo\fuyubot.toml
+```
+
+<Callout type="warn">
+  真账号的最后一环**没有端到端验过**：`run` 会问凭据、驱动授权状态机、`getMe` 打印账户，然后才开分发；
+  真库上的登录与 session 复用是在 `fuyubot-tdlib` 的 `-- --ignored` 自检里验的，但「收真更新 → 插件回一条」
+  还没有真账号证据。想先确认插件行为，用下面的 `--replay` 或 `--no-login`。
+</Callout>
+
+**没有插件也能起**（「插件 0 个」），插件是后装的：拿到编好的 `.dll` / `.so` / `.dylib` 之后
+
+```powershell
+.\fuyubot.exe plugin install path\to\myplugin.dll --plugin-dir demo\plugins
+.\fuyubot.exe plugin list --plugin-dir demo\plugins
+```
+
+插件怎么编见 [插件总览](../plugin/index.mdx)。
+
+## 不接账号先验一遍
+
+回放是**离线**的：把一批更新 JSON 灌进整条管线，请求只留档、不发到 Telegram。先写一条最小的回放文件：
+
+```powershell
+@'
+{"@type":"updateNewMessage","message":{"@type":"message","id":1,"chat_id":-1001234567890,
+ "is_outgoing":false,"content":{"@type":"messageText",
+ "text":{"@type":"formattedText","text":"/ping","entities":[]}}}}
+'@ | Set-Content -Encoding utf8 ping.json
+.\fuyubot.exe run --replay ping.json --plugin-dir demo\plugins
+```
+
+```text
+--replay：本次不接 TDLib（回放是离线的，请求只留档）
+fuyubot（fuyubot 0.1.0）已启动：插件 0 个，工具 0 个
+回放 updateNewMessage → UpdateOutcome { update_type: "updateNewMessage", listeners: 0, warnings: [] }
+插件打出来的日志：
+插件发出去的请求：
+```
+
+退出码 0 表示回放成功。细节（`--replay-wait`、脚本插件要等静默窗口）见 [离线回放](./replay.mdx)。
+
+## 目录布局
+
+`fuyubot init` 建出来的项目：
+
+```text
+demo/
+  fuyubot.toml        ← 配置（所有键都有默认值）
+  plugins/            ← 插件目录，run 从这里加载动态库
+  data/               ← TDLib 的 session / database
+  logs/fuyubot.log    ← --background 的日志
+  .fuyubot/           ← 实例状态（lock / status / stop），别手工编辑
+```
+
+## 下一步
+
+<Cards>
+  <Card title="配置文件" href="/docs/usage/config/" />
+  <Card title="运行与实例管理" href="/docs/usage/run/" />
+  <Card title="离线回放" href="/docs/usage/replay/" />
+  <Card title="CLI 参考" href="/docs/cli/" />
+  <Card title="常见问题" href="/docs/usage/troubleshooting/" />
+  <Card title="从源码构建" href="/docs/usage/build/" />
+</Cards>

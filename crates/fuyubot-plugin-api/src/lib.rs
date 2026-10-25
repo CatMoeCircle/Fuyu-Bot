@@ -270,6 +270,9 @@ mod tests {
             WaitHandle::INVALID
         }
         unsafe extern "C" fn cancel(_h: *mut c_void, _w: WaitHandle) {}
+        unsafe extern "C" fn execute(_h: *mut c_void, _r: *const c_char) -> *const c_char {
+            core::ptr::null()
+        }
 
         pub fn api() -> HostApi {
             // 每次调都新建一份静态 VTable：地址稳定，插件侧只读。
@@ -287,6 +290,7 @@ mod tests {
                 get_service: Some(get),
                 td_invoke: Some(td),
                 td_invoke_simplified: Some(td2),
+                td_execute: Some(execute),
                 use_middleware: Some(middleware),
                 wait_for_update: Some(wait),
                 cancel_wait: Some(cancel),

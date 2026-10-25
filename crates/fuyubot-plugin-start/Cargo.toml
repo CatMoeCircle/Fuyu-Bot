@@ -1,0 +1,13 @@
+[package]
+name = "fuyubot-plugin-start"
+description = "内置插件：/start 回一句欢迎语"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fuyubot-abi.workspace = true
+fuyubot-simplify.workspace = true

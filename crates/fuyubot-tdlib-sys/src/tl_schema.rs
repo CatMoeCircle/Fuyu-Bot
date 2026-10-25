@@ -24,6 +24,20 @@
 //! - 开头有一段**内建前奏**：`double ? = Double;` 这种裸 `?` 参数，以及
 //!   `vector {t:Type} # [ t ] = Vector t;` 这种显式泛型定义。它们不是 TDLib 的类
 //!   （标量已在 `tl_codegen` 里硬编码），归为 [`EntryKind::Unknown`]，见 [`is_builtin_prelude`]。
+//!
+//! ## 文档注释的四种形态（都要认，少认一种就静默丢文档）
+//!
+//! - `//@description 主文 [@参数 文档]…` —— 主文；行尾的 `@参数 …` 片段在条目定稿时
+//!   **按真参数名**剥进 [`TlEntry::field_docs`]（主文里不再留一截 `@chat_id …` 的尾巴）。
+//! - `//-续行` —— 接到主文后面；如果上一条是独立字段行，就接到那个字段的文档后面。
+//! - `//@字段名 文档` —— 参数文档本体。
+//! - `//@class 类名 @description …` —— 所属类的说明，通常只出现在第一个构造器上，
+//!   由 `tl_codegen` 汇到类 enum 的文档里。
+//!
+//! 真实 `td_api.tl` 里 `//` 注释**只有这四种**（普通 `//` 注释 0 条），其余形态一律
+//! 当主文片段兜底，不丢信息。
+
+use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
@@ -59,8 +73,12 @@ pub struct TlParam {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlEntry {
     pub name: String,
-    /// 文件里 `//@description` 那行；没有就是 `None`。
+    /// `//@description` 主文 + `//-` 续行拼成的一段（**已剥离**行内参数文档）；没有就是 `None`。
     pub description: Option<String>,
+    /// 参数文档：`//@字段名 文本` 行与描述行尾部的 `@字段 文本` 片段。
+    pub field_docs: BTreeMap<String, String>,
+    /// `//@class … @description …`：所属类的说明（通常只在第一个构造器上有）。
+    pub class_description: Option<String>,
     pub params: Vec<TlParam>,
     pub result: String,
     pub kind: EntryKind,
@@ -70,6 +88,180 @@ impl TlEntry {
     pub fn has_param(&self, name: &str) -> bool {
         self.params.iter().any(|param| param.name == name)
     }
+
+    /// 这个参数的文档（生成代码时直接查它）。
+    pub fn field_doc(&self, name: &str) -> Option<&str> {
+        self.field_docs.get(name).map(String::as_str)
+    }
+}
+
+/// 条目之前的整块 `//@` / `//-` 注释，在条目定稿时消费掉。
+#[derive(Debug, Default)]
+struct DocBlock {
+    /// 主文与续行，按出现顺序。
+    description_lines: Vec<String>,
+    /// 独立字段行（`//@字段名 文本`），`//-` 续行会接到最近一个后面。
+    field_docs: BTreeMap<String, String>,
+    /// 上一条独立字段行的名字（决定 `//-` 接到哪）。
+    last_field: Option<String>,
+    /// `//@class … @description …`。
+    class_description: Option<String>,
+}
+
+impl DocBlock {
+    /// 喂一行注释（`//` 之后的部分，未 trim 也行）。
+    ///
+    /// 认得的形态：`-…`（续行）、`@description …`、`@class … @description …`、
+    /// `@字段名 …`；`@` 是这些指令的一部分，所以先分支再剥 `@`。
+    fn push_comment(&mut self, body: &str) {
+        let body = body.trim();
+        if body.is_empty() {
+            return;
+        }
+
+        // `//-续行`：接到上一条独立字段后面，否则接主文。
+        if let Some(rest) = body.strip_prefix('-') {
+            let rest = rest.trim();
+            if let Some(field) = self.last_field.clone() {
+                let entry = self.field_docs.entry(field).or_default();
+                if !entry.is_empty() {
+                    entry.push(' ');
+                }
+                entry.push_str(rest);
+            } else {
+                self.description_lines.push(rest.to_owned());
+            }
+            return;
+        }
+        // 非续行一律重置「上一条字段」：后续 `//-` 不该再往旧字段上接。
+        self.last_field = None;
+
+        if let Some(rest) = body.strip_prefix('@') {
+            // `@description 主文…`——要求整词边界，别把 `@descriptionXxx` 也吃进来。
+            if let Some(tail) = rest.strip_prefix("description")
+                && (tail.is_empty() || tail.starts_with(char::is_whitespace))
+            {
+                let tail = tail.trim();
+                if !tail.is_empty() {
+                    self.description_lines.push(tail.to_owned());
+                }
+                return;
+            }
+
+            // `@class 类名 @description …`（类名本身不进产物，只要描述）。
+            if let Some(tail) = rest.strip_prefix("class ") {
+                if let Some((_, desc)) = tail.trim().split_once("@description") {
+                    let desc = desc.trim();
+                    if !desc.is_empty() {
+                        self.class_description = Some(desc.to_owned());
+                    }
+                }
+                return;
+            }
+
+            // `@字段名 文本`：字段形名字（小写/下划线开头）才算文档行。
+            let name_end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            let name = &rest[..name_end];
+            let tail = &rest[name_end..];
+            if is_doc_field_name(name) && (tail.is_empty() || tail.starts_with(char::is_whitespace))
+            {
+                let text = tail.trim().to_owned();
+                self.field_docs.insert(name.to_owned(), text);
+                self.last_field = Some(name.to_owned());
+                return;
+            }
+        }
+
+        // 其余形态（真实文件里 0 条）当主文片段兜底，不丢信息。
+        self.description_lines.push(body.to_owned());
+    }
+
+    /// 条目定稿：逐行剥行内参数文档、拼主文、交出三样东西。
+    ///
+    /// 剥离**按行进行**：`@参数 文档` 片段到**本行行尾**为止，绝不吃进下一行——
+    /// 否则主文行尾的 `@source …` 会把后面的 `//-续行` 一起吞掉。
+    fn finish(
+        mut self,
+        params: &[TlParam],
+    ) -> (Option<String>, BTreeMap<String, String>, Option<String>) {
+        let param_names: std::collections::BTreeSet<&str> =
+            params.iter().map(|param| param.name.as_str()).collect();
+        for line in &mut self.description_lines {
+            if !line.is_empty() {
+                strip_inline_param_docs(line, &param_names, &mut self.field_docs);
+            }
+        }
+        // 拼接并折叠空白（剥除可能留下双空格）。
+        let description = self
+            .description_lines
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let description = (!description.is_empty()).then_some(description);
+        (description, self.field_docs, self.class_description)
+    }
+}
+
+/// 是否是「字段文档」的名字形（小写/下划线开头的标识符，且不是保留字）。
+///
+/// `description` / `class` 要排除：它们是 `//@` 的指令词，不是字段。
+/// （TDLib 里叫 description 的参数写作 `param_description`，实测不冲突。）
+fn is_doc_field_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name != "description"
+        && name != "class"
+}
+
+/// 把主文里 `@参数名 文档` 的行内片段剥进 `field_docs`，主文里不再留尾巴。
+///
+/// **只认真参数名**：`email@example.com` 里的 `example` 不是参数，原样保留——
+/// 这就是不在注释行处理时剥离、非要等到定稿（参数已知）才剥离的原因。
+fn strip_inline_param_docs(
+    description: &mut String,
+    param_names: &std::collections::BTreeSet<&str>,
+    field_docs: &mut BTreeMap<String, String>,
+) {
+    let text = std::mem::take(description);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(pos) = rest.find('@') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        let name_end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let name = &after[..name_end];
+        if name.is_empty() || !param_names.contains(name) {
+            // 不是参数：`@` 原样放回，指针只前进一个字符，继续找。
+            out.push('@');
+            rest = after;
+            continue;
+        }
+        // 文档文本到下一个 `@`（无论是不是参数）为止。
+        let body_start = name_end;
+        let body_end = after[body_start..]
+            .find('@')
+            .map(|i| body_start + i)
+            .unwrap_or(after.len());
+        let doc = after[body_start..body_end].trim();
+        if !doc.is_empty() {
+            // 独立字段行已经写过的一律不覆盖（它是作者单独成行的完整版本）。
+            field_docs
+                .entry(name.to_owned())
+                .or_insert_with(|| doc.to_owned());
+        }
+        rest = &after[body_end..];
+    }
+    out.push_str(rest);
+    *description = out;
 }
 
 /// 解析 `td_api.tl` 的全文。错误信息里带行号。
@@ -84,7 +276,7 @@ pub fn parse(text: &str) -> Result<Vec<TlEntry>, String> {
 
     let mut entries = Vec::new();
     let mut section: Option<EntryKind> = None;
-    let mut description: Option<String> = None;
+    let mut docs = DocBlock::default();
     let mut pending = String::new();
 
     for (index, raw) in text.lines().enumerate() {
@@ -103,11 +295,9 @@ pub fn parse(text: &str) -> Result<Vec<TlEntry>, String> {
             continue;
         }
 
-        // 注释：只有 @description 有用
+        // 注释：四种形态都在 DocBlock 里认（见模块文档）。
         if let Some(comment) = line.strip_prefix("//") {
-            if let Some(rest) = comment.trim().strip_prefix("@description") {
-                description = Some(rest.trim().to_owned());
-            }
+            docs.push_comment(comment);
             continue;
         }
 
@@ -124,7 +314,8 @@ pub fn parse(text: &str) -> Result<Vec<TlEntry>, String> {
         } else {
             EntryKind::Unknown
         };
-        let entry = parse_entry(&pending, description.take(), section.unwrap_or(fallback))
+        let docs = std::mem::take(&mut docs);
+        let entry = parse_entry(&pending, docs, section.unwrap_or(fallback))
             .map_err(|e| format!("第 {} 行附近: {e}", index + 1))?;
         entries.push(entry);
         pending.clear();
@@ -162,12 +353,8 @@ fn is_builtin_prelude(left: &str) -> bool {
         || left.split_whitespace().skip(1).any(|token| token == "?")
 }
 
-/// `name params = Result;` 里的一行（可能由多行拼起来）。
-fn parse_entry(
-    text: &str,
-    description: Option<String>,
-    kind: EntryKind,
-) -> Result<TlEntry, String> {
+/// `name params = Result;` 里的一行（可能由多行拼起来）+ 它之前的文档块。
+fn parse_entry(text: &str, docs: DocBlock, kind: EntryKind) -> Result<TlEntry, String> {
     let text = text.trim().trim_end_matches(';').trim();
     let (left, result) = text
         .split_once('=')
@@ -182,9 +369,12 @@ fn parse_entry(
 
     // 内建前奏：归类成 Unknown（既不当类生成，也不当函数调）。
     if is_builtin_prelude(left) {
+        let (description, field_docs, class_description) = docs.finish(&[]);
         return Ok(TlEntry {
             name,
             description,
+            field_docs,
+            class_description,
             params: Vec::new(),
             result,
             kind: EntryKind::Unknown,
@@ -202,9 +392,14 @@ fn parse_entry(
         });
     }
 
+    // 文档定稿放在参数已知之后：行内 `@参数 …` 只认真参数名（见 strip_inline_param_docs）。
+    let (description, field_docs, class_description) = docs.finish(&params);
+
     Ok(TlEntry {
         name,
         description,
+        field_docs,
+        class_description,
         params,
         result,
         kind,
@@ -235,6 +430,8 @@ fn entry_to_json(entry: &TlEntry) -> Value {
     json!({
         "name": entry.name,
         "description": entry.description,
+        "field_docs": entry.field_docs,
+        "class_description": entry.class_description,
         "params": entry
             .params
             .iter()
@@ -303,10 +500,35 @@ fn entry_from_json(value: &Value, kind: EntryKind) -> Result<TlEntry, String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
 
+    let field_docs = value
+        .get("field_docs")
+        .and_then(Value::as_object)
+        .map(|object| {
+            object
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        key.clone(),
+                        value
+                            .as_str()
+                            .ok_or_else(|| format!("{name} 的 field_docs.{key} 不是字符串"))?
+                            .to_owned(),
+                    ))
+                })
+                .collect::<Result<BTreeMap<String, String>, String>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
     Ok(TlEntry {
         name,
         description: value
             .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        field_docs,
+        class_description: value
+            .get("class_description")
             .and_then(Value::as_str)
             .map(str::to_owned),
         params,
@@ -457,6 +679,87 @@ sendMessage chat_id:int53 message_thread_id:int53 input_message_content:InputMes
         let entries = parse("\u{feff}//@description hi\ngetMe = User;\n").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].description.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn all_four_doc_forms_are_captured() {
+        // 四种形态：主文 + //- 续行、独立字段行（含续行）、//@class、行内参数片段。
+        let entries = parse(
+            "---types---\n\
+             //@class RichMessage @description Describes a rich message\n\
+             //@description First part of the text @source Source of the message\n\
+             //-Second part of the text\n\
+             //@limit The limit\n\
+             //-extending the limit\n\
+             richMessage source:string limit:int32 = RichMessage;\n\
+             ---functions---\n\
+             //@description Returns a chat @chat_id Chat identifier\n\
+             getChat chat_id:int53 = Chat;\n",
+        )
+        .unwrap();
+
+        let rich = entries.iter().find(|e| e.name == "richMessage").unwrap();
+        // 主文与 //- 续行按序拼接，行内 @source 剥进字段文档
+        assert_eq!(
+            rich.description.as_deref(),
+            Some("First part of the text Second part of the text")
+        );
+        assert_eq!(
+            rich.field_docs.get("source").map(String::as_str),
+            Some("Source of the message")
+        );
+        // 独立字段行 + 它自己的 //- 续行
+        assert_eq!(
+            rich.field_docs.get("limit").map(String::as_str),
+            Some("The limit extending the limit")
+        );
+        // //@class 的描述挂在条目上，供生成器汇进类文档
+        assert_eq!(
+            rich.class_description.as_deref(),
+            Some("Describes a rich message")
+        );
+
+        let chat = entries.iter().find(|e| e.name == "getChat").unwrap();
+        // 行内 @chat_id 从主文剥掉
+        assert_eq!(chat.description.as_deref(), Some("Returns a chat"));
+        assert_eq!(
+            chat.field_docs.get("chat_id").map(String::as_str),
+            Some("Chat identifier")
+        );
+    }
+
+    #[test]
+    fn inline_at_words_that_are_not_params_stay_in_the_description() {
+        // 只有**真参数名**才会被剥：邮箱、getOption("x") 之类原样保留。
+        let entries = parse(
+            "---functions---\n\
+             //@description Mail admin@example.com or call getOption(\"x\")\n\
+             getSomething chat_id:int53 = Ok;\n",
+        )
+        .unwrap();
+        assert_eq!(
+            entries[0].description.as_deref(),
+            Some("Mail admin@example.com or call getOption(\"x\")")
+        );
+        assert!(entries[0].field_docs.is_empty());
+    }
+
+    #[test]
+    fn json_round_trips_docs_fields_too() {
+        let entries = parse(
+            "---types---\n\
+             //@class Foo @description Foo class\n\
+             //@description A foo @id The id\n\
+             foo id:int53 = Foo;\n\
+             ---functions---\ngetChat chat_id:int53 = Chat;\n",
+        )
+        .unwrap();
+        let (mut back, _) = from_json(&to_json(&entries, None)).unwrap();
+        // 桶顺序与入参顺序不同（函数桶在前），按名字比对
+        back.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut expected = entries;
+        expected.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(back, expected, "field_docs / class_description 必须跟着走");
     }
 
     #[test]

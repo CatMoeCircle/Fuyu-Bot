@@ -1,15 +1,17 @@
 [package]
 name = "fuyubot-tdlib"
-description = "TDLib FFI、原生库加载与 td_receive 循环"
+description = "TDLib 原生库加载与 td_receive 循环（类型绑定在 fuyubot-tdlib-sys）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-# 适配的 TDLib 版本与 Releases 仓库：build.rs 与运行时加载器都从这里读。
+# 适配的 TDLib 版本与 Releases 仓库：build.rs（vendored 动态库）与运行时加载器都从这里读。
 #
+# ⚠️ 与 crates/fuyubot-tdlib-sys/Cargo.toml 的同名元数据**必须一致**
+#    （schema 与动态库要来自同一版本、同一仓库；守卫测试在 sys 的 build_support 里）。
 # ⚠️ `releases-repo` 必须与 `git remote origin` 一致（现在就是 xiaoqvan/Fuyu-Bot）。
 # ⚠️ `tdlib-version` 必须与 **CI 跑 build-tdlib 时填的 `tdlib_version` 输入**一致：
-#    资产放在 tag `TDLib V<tdlib-version>` 下（见 build.rs 的 release_url 与
+#    资产放在 tag `TDLib-v<tdlib-version>` 下（见 build.rs 与
 #    .github/workflows/build-tdlib.yml），填错就是 404。
 [package.metadata.fuyubot]
 tdlib-version = "1.8.66"
@@ -18,13 +20,13 @@ releases-repo = "xiaoqvan/Fuyu-Bot"
 [features]
 default = []
 # 编译期把原生库放到位，并允许运行时优先级 2 使用它。
-# 注意：`td_api.tl` 的获取**不**在这个 feature 里——它是必需输入，任何构建都要下载。
+# 注意：`td_api.tl` 的获取**不**在这个 feature 里——那是 fuyubot-tdlib-sys 的必需输入。
 vendored = ["dep:sha2", "dep:tar", "dep:flate2"]
 
 [dependencies]
+# 类型、元数据（TdApiSchema）与 FFI 声明都在 sys；本 crate 负责加载与循环。
+fuyubot-tdlib-sys.workspace = true
 libloading.workspace = true
-# 编译期生成的 td_api 类型带 serde 派生，所以运行时也要 serde（不只是 serde_json）。
-serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -34,12 +36,11 @@ sha2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 
 [build-dependencies]
+# build_support::read_metadata 用它读 [package.metadata.fuyubot]（与 sys 的构建脚本共用那份实现）。
 serde.workspace = true
-# build.rs 用它在编译期把 td_api.tl 的转换结果写成 JSON（形状与运行时共用，见 src/tl_schema.rs）。
-serde_json.workspace = true
 toml.workspace = true
-# ureq 只用于构建期下载：运行时本体不该链接 HTTP/TLS。
-# 它是**常开**的——`td_api.tl` 是必需输入，任何构建都要能把它下载下来（见 build.rs 的 acquire_schema）。
+# ureq 只用于构建期下载 vendored 动态库：运行时本体不该链接 HTTP/TLS。
+# （`td_api.tl` 的下载在 sys 那边，同样是构建期。）
 ureq = { workspace = true, optional = false }
 flate2 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }

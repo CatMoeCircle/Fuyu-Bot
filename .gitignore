@@ -2,10 +2,15 @@
 # 这些记的是「东西是怎么做出来的」（路线图、交接说明、会话账、验收记录），
 # 不是**源代码的文档**。源代码的文档照常入库，见下面的说明。
 # 用 .gitignore 而不是删掉：本机的开发流还要读它们。
+# 2026：交接文档按分工拆成了几份（入口 / 坑 / 缺口 / 决定 / 欠账），它们同样是过程文档。
 /docs/HANDOFF.md
 /docs/ROADMAP.md
 /docs/SESSION-SUMMARY.md
 /docs/acceptance-phase-*.md
+/docs/pitfalls.md
+/docs/gaps.md
+/docs/decisions.md
+/docs/tech-debt.md
 
 # ── 本机工具数据 ──────────────────────────────────────────────────────
 /.serena/
@@ -13,7 +18,10 @@
 # ── 构建产物 ───────────────────────────────────────────────────────────
 # target/ 里还放着**真登录态**（target/tdlib-login-test/ 里有真 session），
 # 所以这一条同时是「凭据不许进仓库」的防线（AGENTS.md 约束 41）。
-/target/
+# ⚠️ **不带前导斜杠**：插件作者自己的工具链会把产物写进 `<插件工程>/target/`
+# （见 examples/README.md 的 `cargo build --target-dir <工程>/target`），
+# 只挡仓库根那一层会让 `git status` 全是噪音。
+target/
 
 # ── 本机开发缓存：**不是源码** ─────────────────────────────────────────
 # 28MB 的 tdjson + 兄弟 DLL + 真 td_api.tl。build.rs 拿不到时会自己下载，
@@ -22,7 +30,19 @@
 /.tdlib-cache/
 
 # ── 运行时状态（`fuyubot run` 生成）───────────────────────────────────
-/.fuyubot/
+# `.fuyubot/` = 实例三件套（lock / status / stop）；`logs/` = `--background` 的日志。
+# 同样不带前导斜杠：Bot 项目可以在仓库子目录里（文档示例就是 `demo/`）。
+.fuyubot/
+logs/
+
+# ── TDLib 的数据库 / session（`data/` 由 `fuyubot init` 建）────────────
+# db.sqlite + td.binlog 里有真登录态，**绝不入库**（AGENTS.md 约束 41）。
+# 只挡仓库根那一份：插件自己的数据目录不在这个仓库里。
+/data/
+
+# ── 本机的实例配置（`fuyubot init` 生成，每个部署一份）────────────────
+# 只挡仓库根那一份：`crates/fuyubot-cli/templates/fuyubot.toml` 是模板，**要入库**。
+/fuyubot.toml
 
 # ── 装好的插件目录（`fuyubot plugin add` 往里拷产物）───────────────────
 /plugins/

@@ -1,0 +1,14 @@
+[package]
+name = "fuyubot-plugin-manage"
+description = "内置插件：/plugins 列出插件目录里装了哪些插件"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fuyubot-abi.workspace = true
+fuyubot-simplify.workspace = true
+serde_json.workspace = true

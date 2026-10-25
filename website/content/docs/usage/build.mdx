@@ -1,0 +1,69 @@
+---
+title: 从源码构建
+description: 开发者路线：自己编 fuyubot 与 fuyubot-sdk
+---
+
+普通用户请走 [下载与安装](./index.mdx)——发布包里有可执行文件和 `tdjson`，不用编译。
+这一页是给要改代码、或者平台没有发布包（比如 Intel Mac）的人。
+
+## 前置
+
+| 前置 | 要求 |
+| --- | --- |
+| Rust | 1.99+（`edition 2024`） |
+| Windows | MSVC 工具链（Rust / C / C++ 插件都用它链接） |
+| 构建输入 | 一份 `td_api.tl`（下面说明） |
+| 运行期 | `tdjson` 动态库（构建期会被拷到可执行文件同级） |
+
+## 构建
+
+```bash
+git clone https://github.com/xiaoqvan/Fuyu-Bot
+cd Fuyu-Bot
+cargo build --workspace --offline
+```
+
+<Callout type="info">
+  `td_api.tl` 是**构建的必需输入**：`fuyubot-tdlib-sys/build.rs` 无条件去拿它——`TDLIB_TD_API_TL`（显式指定，优先级最高）→ 缓存 → 从 GitHub Releases 下载，拿不到就让**构建失败**。缓存根顺序：`FUYUBOT_TDLIB_VENDORED_CACHE` → `$CARGO_HOME/fuyubot-tdlib-vendored` → 项目本地 `<工作区>/.tdlib-cache`。仓里的 `.cargo/config.toml` 已把最后一档指好，在仓库里敲命令不用先 export。
+
+  转换在**编译期**完成，构建日志里只有一条 `已转换 …\td_api.tl：共 N 条`。条数取决于构建时用的那份文件（本机三千多条），**不是常量**，别当断言用。
+</Callout>
+
+<Callout type="info">
+  `tdjson` 是**运行时**动态加载的，编译期不依赖它存在——所以构建成功不代表运行找得到。构建期 `fuyubot-tdlib/build.rs` 会把它（连同那个目录里的兄弟 DLL）拷到可执行文件同级目录，`target/debug/fuyubot.exe` 拷走就能跑。唯一例外是 `cargo install` 装出来的二进制：安装目录不受构建脚本管，tdjson 得自己放。
+</Callout>
+
+## 编出来的东西在哪
+
+| 命令 | 产物 | 说明 |
+| --- | --- | --- |
+| `cargo build -p fuyubot-cli` | `target\debug\fuyubot.exe` | 开发用 |
+| `cargo package-bot` | `target\release\fuyubot.exe` | 本地打包（tdjson 已在同级目录） |
+| `cargo package-sdk` | `target\release\fuyubot-sdk.exe` | 给插件作者，**不需要** tdjson |
+| `cargo bot` | — | 一键 `fuyubot run` 当前目录 |
+
+本文档其余页面里的 `fuyubot` / `fuyubot.exe` 指的就是这些产物；从发布包安装的用户手里就是解压出来的那个。
+
+## 发布包是怎么出的
+
+`.github/workflows/release-bot.yml` 在 `v*` tag 上按平台编 `fuyubot`、三个内置插件与 `fuyubot-sdk`，
+**分开**打三份中间包（本体 / 插件 / SDK），`publish` 再把本体 + 内置插件叠成各平台一个 zip：
+解压得到 `<资产名>/`，里面有可执行文件、该平台的 `tdjson`（从 `TDLib-v<版本>` 那个 Release 取）
+和 `plugins/`。SDK 是单独的 `fuyubot-sdk-<系统>-<架构>.zip`。
+名字与 `crates/fuyubot-tdlib/src/loader/vendored.rs` 的 `ASSETS` 表同一套口径（`x86_64` / `aarch64`），
+加平台时两边一起加。
+
+## 自检
+
+```bash
+cargo build --workspace --offline   # 0 warning
+cargo test  --workspace --offline   # 全绿
+cargo fmt --all --check             # 0 diff
+```
+
+真 TDLib 的端到端自检（要本机的 `tdjson`）：
+
+```powershell
+$env:TDLIB_TDJSON_PATH = ".tdlib-cache\1.8.66\windows-x86_64"
+cargo test -p fuyubot-tdlib --test integration --offline -- --ignored
+```

@@ -1,0 +1,39 @@
+[package]
+name = "fuyubot-tdlib-sys"
+description = "TDLib 类型与 FFI 绑定：编译期从 td_api.tl 生成，运行时不做任何生成"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# `td_api.tl` 的来源（schema 下载用）。**两处必须一致**：
+# 这里与 crates/fuyubot-tdlib/Cargo.toml 的 [package.metadata.fuyubot]
+# （build_support.rs 里有守卫测试比对两边，漂了就红）。
+#
+# ⚠️ `releases-repo` 必须与 `git remote origin` 一致（现在就是 xiaoqvan/Fuyu-Bot）。
+# ⚠️ `tdlib-version` 必须与 **CI 跑 build-tdlib 时填的 `tdlib_version` 输入**一致：
+#    资产放在 tag `TDLib-v<tdlib-version>` 下，填错就是 404。
+[package.metadata.fuyubot]
+tdlib-version = "1.8.66"
+releases-repo = "xiaoqvan/Fuyu-Bot"
+
+[dependencies]
+# 编译期生成的 td_api 类型带 serde 派生，所以运行时也要 serde（不只是 serde_json）。
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+# build.rs 用它们把 td_api.tl 的转换结果写成 JSON（形状与运行时共用，见 src/tl_schema.rs）。
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+# ureq 只用于构建期下载：运行时本体不该链接 HTTP/TLS。
+# 它是**常开**的——`td_api.tl` 是必需输入，任何构建都要能把它下载下来（见 build.rs 的 acquire_schema）。
+ureq.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+# src/build_support.rs 在 #[cfg(test)] 下编译（跑它自带的缓存/元数据测试），
+# read_metadata 需要 toml——纯 Rust 依赖，dev-dependency 不进运行时依赖图。
+# 刻意**不**放 ureq：http_get 在 cfg(test) 里被编译排除，测试用不到网络。
+toml.workspace = true

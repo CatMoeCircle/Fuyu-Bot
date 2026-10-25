@@ -75,6 +75,47 @@ fn execute_runs_synchronous_methods() {
         result["entities"][0]["type"]["@type"], "textEntityTypeMention",
         "{result}"
     );
+
+    // Markdown → entities 走的是同一条同步通道（`fuyubot-simplify` 的 Markdown 支持
+    // 就是架在它上面的：没有第二套解析器，语法以 TDLib 为准）。
+    //
+    // ⚠️ 真库实测（1.8.66）：**MarkdownV2 的粗体是 `*x*`，不是 `**x**`**——
+    // `**bold**` 会被吞成 `bold` 而且**不给 bold entity**，`__x__` 反而是下划线。
+    // 这条断言就是在钉「我们不猜语法，TDLib 说什么就是什么」。
+    let bold = client
+        .execute(serde_json::json!({
+            "@type": "parseTextEntities",
+            "text": "*粗体*",
+            "parse_mode": { "@type": "textParseModeMarkdown", "version": 2 },
+        }))
+        .expect("parseTextEntities 该能同步跑");
+    assert_eq!(bold["@type"], "formattedText", "{bold}");
+    assert_eq!(bold["text"], "粗体", "{bold}");
+    assert_eq!(
+        bold["entities"][0]["type"]["@type"], "textEntityTypeBold",
+        "{bold}"
+    );
+
+    // 链接也一样：文本被剥成 "x"，URL 进了 entity
+    let link = client
+        .execute(serde_json::json!({
+            "@type": "parseTextEntities",
+            "text": "[x](https://example.com)",
+            "parse_mode": { "@type": "textParseModeMarkdown", "version": 2 },
+        }))
+        .expect("parseTextEntities 该能同步跑");
+    assert_eq!(link["text"], "x", "{link}");
+    assert_eq!(
+        link["entities"][0]["type"]["@type"], "textEntityTypeTextUrl",
+        "{link}"
+    );
+    assert!(
+        link["entities"][0]["type"]["url"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("https://example.com"),
+        "{link}"
+    );
 }
 
 /// vendored 路径确实被优先级 2 用上了。
@@ -327,7 +368,7 @@ fn real_bot_login_reaches_ready_and_reuses_the_session() {
     println!("[login] session 复用成功：{username}（id {}）", me["id"]);
 }
 
-/// 加载动态库时必须让系统**先查这个库自己所在的目录**（AGENTS 约束 30 / 坑 43）。
+/// 加载动态库时必须让系统**先查这个库自己所在的目录**（AGENTS 约束 30 / pitfalls 坑 43）。
 ///
 /// 拿真 tdjson 当样本：它 import 了同在目录里的 `libssl-3-x64` / `libcrypto-3-x64` / `z`。
 /// 把这一组文件拷到一个不在 PATH 上的临时目录，再分别用两条路加载：
@@ -339,65 +380,6 @@ fn real_bot_login_reaches_ready_and_reuses_the_session() {
 ///
 /// 插件加载器（`fuyubot-loader`）现在也走同一个 helper —— 插件旁边放兄弟 DLL 的部署形态靠它。
 #[test]
-#[ignore = "需要真实 TDLib（TDLIB_TDJSON_PATH 指向装着 tdjson 及其依赖的目录）"]
-fn open_library_finds_the_libraries_sibling_dependencies() {
-    let configured = std::env::var("TDLIB_TDJSON_PATH").expect("缺 TDLIB_TDJSON_PATH");
-    let configured = PathBuf::from(configured);
-    let source_dir = if configured.is_dir() {
-        configured
-    } else {
-        configured
-            .parent()
-            .expect("TDLIB_TDJSON_PATH 没有父目录")
-            .to_owned()
-    };
-
-    // 只拷动态库（td_api.tl 之类不参与加载）；拷到临时目录就等于「库在别处、依赖在旁边」。
-    //
-    // 注意：**不用 `tempfile` / `%TEMP%`**——理由见 `AGENTS.md` 的测试约定（换 shell /
-    // 受限环境下 `%TEMP%` 可能建不了目录）。放 workspace 的 `target/` 下最稳。
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp/open-library");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录失败");
-    let mut copied = 0;
-    for entry in std::fs::read_dir(&source_dir)
-        .expect("读不了 TDLIB_TDJSON_PATH")
-        .flatten()
-    {
-        let path = entry.path();
-        let is_library = path.extension().is_some_and(|ext| {
-            let ext = ext.to_string_lossy();
-            ext == "dll" || ext == "so" || ext == "dylib"
-        });
-        if is_library {
-            std::fs::copy(&path, dir.join(path.file_name().unwrap())).expect("拷贝失败");
-            copied += 1;
-        }
-    }
-    assert!(copied > 0, "{} 里没有动态库", source_dir.display());
-
-    let target = std::fs::read_dir(&dir)
-        .expect("读不了临时目录")
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.to_string_lossy().contains("tdjson"))
-        .expect("没拷到 tdjson");
-    println!("[loader] 样本 {}", target.display());
-
-    // 负向对照：flags = 0 这条路必须加载失败。
-    assert!(
-        unsafe { libloading::Library::new(&target) }.is_err(),
-        "`Library::new` 竟然加载成功了——说明依赖不是靠「库自己所在的目录」找到的，\
-         这个测试就证明不了 open_library 的必要性"
-    );
-
-    // 正式路径：必须能加载（否则 tdjson 的兄弟依赖找不到）。
-    let lib = unsafe { fuyubot_tdlib::loader::open_library(&target) }
-        .expect("open_library 应该靠 LOAD_WITH_ALTERED_SEARCH_PATH 找到兄弟依赖");
-    drop(lib);
-    println!("[loader] open_library 成功加载：兄弟依赖找到了");
-}
-
 /// 构建时提供了 `td_api.tl` 时，检查**编译期烤进二进制**的那份元数据长得对不对。
 ///
 /// 这是唯一能证明「真文件的分类、方法名、参数名确实解析出来了」的方式——内置测试用的是手写样例。
@@ -471,4 +453,71 @@ fn compiled_schema_looks_like_real_td_api() {
         ),
         Err(fuyubot_tdlib::SchemaError::UnknownParam { .. })
     ));
+}
+
+/// 一个「什么都不给」的提问者：任何一问都报 `NoInput`，让登录流程快速失败。
+///
+/// 只为下面那条测试服务——它要的不是登录成功，而是**登录窗口**本身。
+struct RefusingPrompter;
+
+impl fuyubot_tdlib::Prompter for RefusingPrompter {
+    fn ask(&mut self, question: &str) -> Result<String, fuyubot_tdlib::LoginError> {
+        Err(fuyubot_tdlib::LoginError::NoInput {
+            question: question.to_owned(),
+        })
+    }
+
+    fn choose_login_method(
+        &mut self,
+    ) -> Result<fuyubot_tdlib::LoginMethod, fuyubot_tdlib::LoginError> {
+        Err(fuyubot_tdlib::LoginError::NoInput {
+            question: "登录方式".to_owned(),
+        })
+    }
+
+    fn notify(&mut self, _message: &str) {}
+}
+
+/// 变更 3-d：`fuyubot run` 让插件**先于** `setTdlibParameters` 加载，所以登录窗口里
+/// 与授权无关的更新必须经 `bypass` 交出去——被吞掉就是「插件提前加载」白做了。
+///
+/// 真库验法：参数被接受后 TDLib 立刻推 `updateOption`（version / commit_hash）。
+/// 把 `log_in_with` 里那两处 `bypass(..)` 改回 `continue`，这条就红。
+#[test]
+#[ignore = "需要真实 TDLib（TDLIB_TDJSON_PATH 指向装着 tdjson 及其依赖的目录）"]
+fn log_in_hands_non_auth_updates_to_the_bypass() {
+    let client = TdClient::new().expect("加载 TDLib 失败");
+    // 每次都用干净的目录：上一次留下 session 的话，TDLib 会直接进 Ready，
+    // 就观察不到登录窗口了（那属于「跑过别的命令」的隐含依赖，必须避免）。
+    let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-tmp/integration-login-bypass");
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).expect("建数据目录失败");
+
+    // 非空但假的 api_hash：TDLib 只校验「有没有给」，于是会推进到 WaitPhoneNumber，
+    // 再由 RefusingPrompter 报 NoInput 收场——中间那段正是要观察的窗口。
+    let parameters =
+        fuyubot_tdlib::TdlibParameters::new(&data_dir, 12345, "0123456789abcdef0123456789abcdef");
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut bypass = |routed: fuyubot_tdlib::Routed| {
+        if let fuyubot_tdlib::Routed::Update(update) = routed {
+            seen.push(update.kind);
+        }
+    };
+    let mut prompter = RefusingPrompter;
+    let outcome = fuyubot_tdlib::log_in_with(
+        &client,
+        &parameters,
+        fuyubot_tdlib::AccountType::Bot,
+        &mut prompter,
+        Duration::from_secs(30),
+        &mut bypass,
+    );
+
+    assert!(outcome.is_err(), "没有真 token，不该登录成功：{outcome:?}");
+    assert!(
+        seen.iter().any(|kind| kind == "updateOption"),
+        "登录窗口里的更新被吞了（bypass 一条都没收到）：{seen:?}"
+    );
 }

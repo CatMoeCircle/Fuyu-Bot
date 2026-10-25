@@ -71,7 +71,7 @@ jobs:
           fi
           VER="$VERSION"
           # ⚠️ tag 必须**精确**是 `TDLib-v<版本>`：fuyubot-tdlib 的 `release_url()` 拼的是
-          #    https://github.com/<repo>/releases/download/TDLib%20V<版本>/<资产名>
+          #    https://github.com/<repo>/releases/download/TDLib-v<版本>/<资产名>
           TAG="TDLib-v${VER}"
 
           # ⚠️ `asset` 必须**精确等于** crates/fuyubot-tdlib/src/loader/vendored.rs 里 ASSETS 表的值
@@ -118,13 +118,12 @@ jobs:
       - name: Fetch td_api.tl from TDLib at resolved commit
         env:
           COMMIT: ${{ needs.resolve-tdlib.outputs.tdlib_commit }}
-          VERSION: ${{ needs.resolve-tdlib.outputs.tdlib_version }}
         run: |
           set -euo pipefail
           WS="${GITHUB_WORKSPACE:?}"
           TDLIB_DIR="$WS/td-src"
           OUT_DIR="$WS/schema-out"
-          export COMMIT VERSION
+          export COMMIT
 
           rm -rf "$TDLIB_DIR" "$OUT_DIR"
           mkdir -p "$TDLIB_DIR" "$OUT_DIR"
@@ -149,34 +148,10 @@ jobs:
           fi
           cp "$SCHEMA_SRC" "$OUT_DIR/td_api.tl"
 
-          # Record the commit we actually extracted (from tarball dir name or git)
-          ACTUAL="$COMMIT"
-          if [[ -d "$TDLIB_DIR/.git" ]]; then
-            ACTUAL="$(git -C "$TDLIB_DIR" rev-parse HEAD)"
-          fi
-          export ACTUAL
-          echo "requested=$COMMIT actual=$ACTUAL"
-
-          python3 - <<'PY'
-          import json, os
-          out = os.path.join(os.environ["GITHUB_WORKSPACE"], "schema-out", "SCHEMA_INFO.json")
-          data = {
-              "tdlib_version": os.environ["VERSION"],
-              "tdlib_commit": os.environ["ACTUAL"],
-              "schema_path": "td/generate/scheme/td_api.tl",
-          }
-          with open(out, "w", encoding="utf-8") as f:
-              json.dump(data, f, indent=2)
-              f.write("\n")
-          print(out)
-          print(json.dumps(data, indent=2))
-          PY
-
           echo "==> schema-out contents:"
           ls -la "$OUT_DIR"
           wc -l "$OUT_DIR/td_api.tl"
           test -s "$OUT_DIR/td_api.tl"
-          test -s "$OUT_DIR/SCHEMA_INFO.json"
 
       - name: Upload schema artifact
         uses: actions/upload-artifact@v4
@@ -440,15 +415,6 @@ jobs:
             exit 1
           fi
           cp schema/td_api.tl dist/td_api.tl
-          if [[ -f schema/SCHEMA_INFO.json ]]; then
-            cp schema/SCHEMA_INFO.json dist/SCHEMA_INFO.json
-          fi
-          # Keep a copy in repo path for optional local use / commit later
-          mkdir -p assets
-          cp schema/td_api.tl assets/td_api.tl
-          if [[ -f schema/SCHEMA_INFO.json ]]; then
-            cp schema/SCHEMA_INFO.json assets/SCHEMA_INFO.json
-          fi
           echo "==> dist contents"
           ls -lah dist
           COUNT="$(find dist -type f -name 'TDLib-*' | wc -l)"
@@ -461,74 +427,13 @@ jobs:
           fi
           test -f dist/td_api.tl
 
-      - name: Generate checksums + manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd dist
-          # 资产名没有扩展名（= loader 的 ASSET_*），所以用 `TDLib-*` 收集。
-          # 未匹配的通配保留成字面量再传给 sha256sum 会报错，所以开 nullglob。
-          shopt -s nullglob
-          FILES=(TDLib-* td_api.tl SCHEMA_INFO.json)
-          if [[ ! -f td_api.tl ]]; then
-            echo "error: required schema file td_api.tl is missing" >&2
-            exit 1
-          fi
-          if [[ "${#FILES[@]}" -eq 0 ]]; then
-            echo "error: no files found for checksums" >&2
-            exit 1
-          fi
-          sha256sum "${FILES[@]}" > SHA256SUMS
-          {
-            echo "tdlib_version=${{ needs.resolve-tdlib.outputs.tdlib_version }}"
-            echo "tdlib_commit=${{ needs.resolve-tdlib.outputs.tdlib_commit }}"
-            echo "schema=td_api.tl"
-            echo "built_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "workflow=${{ github.workflow }}"
-            echo "run_id=${{ github.run_id }}"
-            echo "repository=${{ github.repository }}"
-          } > MANIFEST.txt
-          cat MANIFEST.txt
-          cat SHA256SUMS
-
-      - name: Create combined tarball
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${{ needs.resolve-tdlib.outputs.tdlib_version }}"
-          COMMIT="${{ needs.resolve-tdlib.outputs.tdlib_commit }}"
-          VER="${VERSION#v}"
-          STABLE="dist/tdlib-${VER}-all.tar.gz"
-          shopt -s nullglob
-          PACKAGES=(dist/TDLib-*)
-          if [[ "${#PACKAGES[@]}" -eq 0 ]]; then
-            echo "error: no platform packages found in dist/" >&2
-            ls -lah dist
-            exit 1
-          fi
-          # Pass only existing package paths, so partial/test builds also work.
-          PACKAGE_NAMES=()
-          for f in "${PACKAGES[@]}"; do PACKAGE_NAMES+=("$(basename "$f")"); done
-          tar -czf "$STABLE" -C dist \
-            SHA256SUMS MANIFEST.txt \
-            "${PACKAGE_NAMES[@]}" td_api.tl SCHEMA_INFO.json
-          if [[ -n "$COMMIT" ]]; then
-            SHORT="${COMMIT:0:12}"
-            cp -f "$STABLE" "dist/tdlib-${VER}-${SHORT}-all.tar.gz"
-          fi
-          ls -lah "${PACKAGES[@]}" "$STABLE"
-
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
         with:
           name: tdlib-${{ needs.resolve-tdlib.outputs.tdlib_version }}-all
           path: |
             dist/TDLib-*
-            dist/tdlib-*-all.tar.gz
             dist/td_api.tl
-            dist/SCHEMA_INFO.json
-            dist/SHA256SUMS
-            dist/MANIFEST.txt
           if-no-files-found: error
           retention-days: 90
 
@@ -561,7 +466,7 @@ jobs:
             echo "| TDLib commit | \`${COMMIT:-resolved from ref}\` |"
             echo "| Build run | \`${RUN_URL}\` |"
             echo "| Linkage | OpenSSL/zlib **statically merged into tdjson** |"
-            echo "| Schema | \`td_api.tl\` + \`SCHEMA_INFO.json\` |"
+            echo "| Schema | \`td_api.tl\` |"
             echo
             echo "## Packages"
             echo
@@ -580,7 +485,7 @@ jobs:
             echo "Each package contains only \`tdjson\` (+ \`VERSION.json\` / README)."
             echo "No separate \`libssl\` / \`libcrypto\` / \`libz\` runtime files."
             echo
-            echo "Also attached: \`td_api.tl\`, \`SCHEMA_INFO.json\`, \`SHA256SUMS\`, \`MANIFEST.txt\`, combined \`tdlib-${VER}-all.tar.gz\`."
+            echo "Also attached: \`td_api.tl\`（构建期转换用，loader 不下载它）。"
             echo
             echo "## Schema / bindings"
             echo
@@ -596,27 +501,9 @@ jobs:
 
           # Upload the plain, uncompressed schema first so it is easy to find on the Release page.
           UPLOAD=()
-          for f in dist/td_api.tl dist/SCHEMA_INFO.json dist/SHA256SUMS dist/MANIFEST.txt; do
+          [[ -f dist/td_api.tl ]] && UPLOAD+=("dist/td_api.tl")
+          for f in dist/TDLib-*; do
             [[ -f "$f" ]] && UPLOAD+=("$f")
-          done
-          for f in dist/*; do
-            [[ -f "$f" ]] || continue
-            base="$(basename "$f")"
-            case "$base" in
-              SHA256SUMS|MANIFEST.txt|td_api.tl|SCHEMA_INFO.json)
-                # Metadata was added first above, preserving td_api.tl at the top.
-                ;;
-              tdlib-${VER}-all.tar.gz)
-                UPLOAD+=("$f")
-                ;;
-              *-all.tar.gz)
-                ;;
-              TDLib-*)
-                UPLOAD+=("$f")
-                ;;
-              *)
-                ;;
-            esac
           done
           if [[ ${#UPLOAD[@]} -eq 0 ]]; then
             echo "error: no release assets found under dist/" >&2
@@ -688,7 +575,7 @@ jobs:
             echo "| Matrix builds | \`${BUILD}\` |"
             echo "| Assemble | \`${ASSEMBLE}\` |"
             echo
-            echo "Release includes \`td_api.tl\` + \`SCHEMA_INFO.json\`."
+            echo "Release assets: \`td_api.tl\` + per-platform \`TDLib-*\` packages."
             echo
             echo "### Matrix"
             echo

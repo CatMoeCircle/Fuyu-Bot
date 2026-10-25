@@ -37,8 +37,7 @@ const HEADER: &str = r#"/**
  *
  * Rust 1.99 的 `extern "C" fn(.., ...)` 已经稳定（可以写、cbindgen 也能生成），
  * 但**本 ABI 一个都没用**：`...` 会把参数类型和个数校验全部丢掉，而 VTable 里
- * 14 个函数的参数都是固定的，用 `...` 只会让 C 侧传错参数从编译错误降级成运行期 UB。
- * 如果将来真要加，正确的 C 声明形状是：
+ * 15 个函数的参数都是固定的，用 `...` 只会让 C 侧传错参数从编译错误降级成运行期 UB。 * 如果将来真要加，正确的 C 声明形状是：
  *
  *     typedef void (*FuyubotLogFn)(uint32_t level, const char *format, ...);
  *     // Rust 侧对应：unsafe extern "C" fn(level: u32, format: *const c_char, ...)

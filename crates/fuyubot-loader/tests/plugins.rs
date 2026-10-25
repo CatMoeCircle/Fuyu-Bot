@@ -74,7 +74,7 @@ fn artifact_path(package: &str) -> PathBuf {
 ///
 /// MSVC 的 `link.exe` 会在 `%TEMP%` 里建 `lnk*.tmp`；受限环境（沙箱 / `%TEMP%` 不可写）下会报
 /// `LNK1104: cannot open file '...\Temp\lnk{GUID}.tmp'`，于是**插件根本编不出来**、
-/// 一批测试跟着红（见 HANDOFF 坑 73）。仓库约定测试的临时目录一律放 `target/test-tmp`
+/// 一批测试跟着红（见 pitfalls 坑 73）。仓库约定测试的临时目录一律放 `target/test-tmp`
 /// （见 AGENTS「测试必须自洽」），这里把同一个约定**传给子进程**。
 fn cargo_temp() -> PathBuf {
     let dir = workspace_root()

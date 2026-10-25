@@ -183,6 +183,7 @@ impl HostRuntime {
                 get_service: Some(api_get_service),
                 td_invoke: Some(api_td_invoke),
                 td_invoke_simplified: Some(api_td_invoke_simplified),
+                td_execute: Some(api_td_execute),
                 use_middleware: Some(api_use_middleware),
                 wait_for_update: Some(api_wait_for_update),
                 cancel_wait: Some(api_cancel_wait),
@@ -802,6 +803,25 @@ unsafe extern "C" fn api_td_invoke_simplified(
     rt.td_send(params)
 }
 
+/// 同步执行（`td_json_client_execute`）：当场返回响应 JSON，不走接收循环。
+///
+/// 只在**不碰服务器**的方法上成立（`parseTextEntities` 之类）。宿主没接 TDLib 时返回 NULL，
+/// 调用方退回默认值即可——这也是离线测试下这条桥的行为。
+unsafe extern "C" fn api_td_execute(
+    host: *mut c_void,
+    request_json: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 host 来自本运行时。
+    let Some(rt) = (unsafe { runtime(host) }) else {
+        return core::ptr::null();
+    };
+    let request = parse_json(request_json).unwrap_or(Value::Null);
+    match rt.td_execute(request) {
+        Some(response) => host_string(&response.to_string()),
+        None => core::ptr::null(),
+    }
+}
+
 unsafe extern "C" fn api_use_middleware(
     host: *mut c_void,
     stage: u32,
@@ -959,6 +979,22 @@ impl HostRuntime {
         RequestId { id }
     }
 
+    /// **同步**执行一个不碰网络的 TDLib 方法（`TdClient::execute`）。
+    ///
+    /// 和 [`td_send`](Self::td_send) 刻意的区别：这里**不**留档、不分配请求号、不等响应
+    /// ——它当场就有结果，所以插件在事件回调里调它不会把投递线程卡住。
+    /// 没接 TDLib（离线测试）时返回 `None`，调用方自己退回默认值。
+    fn td_execute(&self, request: Value) -> Option<Value> {
+        let client = self.td.get()?;
+        match client.execute(request) {
+            Ok(response) => Some(response),
+            Err(e) => {
+                self.warn(&format!("td_execute 失败: {e}"));
+                None
+            }
+        }
+    }
+
     /// 给 [`crate::PluginLoader`] 用：一次插件加载的作用域。
     pub(crate) fn plugin_scope(&self) -> PluginScope<'_> {
         PluginScope {
@@ -1059,6 +1095,7 @@ mod tests {
         assert!(vtable.get_service.is_some());
         assert!(vtable.td_invoke.is_some());
         assert!(vtable.td_invoke_simplified.is_some());
+        assert!(vtable.td_execute.is_some());
         assert!(vtable.use_middleware.is_some());
         assert!(vtable.wait_for_update.is_some());
         assert!(vtable.cancel_wait.is_some());
@@ -1152,6 +1189,14 @@ mod tests {
         assert_eq!(sent[1].method, "getChatHistory");
         assert_eq!(sent[1].params["@type"], "getChatHistory");
         assert_eq!(sent[1].params["chat_id"], 1);
+
+        // 同步 `td_execute`：没接 TDLib 时宿主返回 NULL（调用方退回默认值），
+        // 而且它**不**进请求留档——它不是「发出去的请求」。
+        assert!(
+            api.td_execute(r#"{"@type":"parseTextEntities"}"#).is_none(),
+            "没接 TDLib 就该返回 None"
+        );
+        assert_eq!(rt.sent_requests().len(), 2, "td_execute 不该留档");
     }
 
     #[test]

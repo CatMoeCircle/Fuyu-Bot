@@ -1,0 +1,108 @@
+---
+title: Python 插件
+description: 脚本与 cdylib 同目录的行 JSON 协议
+---
+
+Python 插件的逻辑全写在 `.py` 里，cdylib 只是一层胶水：宿主加载它，它在 `plugin_start` 时
+启动解释器执行脚本，两边用**一行一个 JSON** 说话（见 [ABI 契约](./abi.mdx) 里的脚本形态）。
+
+## 胶水 crate
+
+```toml
+[workspace]
+
+[package]
+name = "fuyubot_weather"
+version = "0.1.0"
+edition = "2024"
+
+# ⚠️ 名字必须与脚本同名：宿主是按**动态库文件名**去找同名脚本的
+[lib]
+name = "weather"
+crate-type = ["cdylib"]
+
+[dependencies]
+fuyubot-sdk-script = { path = "…/crates/fuyubot-sdk-script", version = "0.1.0" }
+```
+
+```rust
+// src/lib.rs —— 这个插件的全部 Rust 代码
+fuyubot_sdk_script::script_plugin!("fuyubot.python.weather", python, "weather.py");
+```
+
+这一行展开出 `Plugin` 实现和四个 C ABI 导出符号；插件只依赖 `fuyubot-sdk-script` 一个 crate。
+
+## 脚本
+
+`fuyubot-sdk init demo --lang python` 生成的 `demo.py`：
+
+```python
+import fuyubot_plugin as host
+
+@host.on("updateNewMessage")
+def on_message(payload):
+    host.log("demo 收到一条更新")
+
+@host.on("updateNewMessage", filter={"message.content.text.text": "/hello"})
+def on_hello(payload):
+    host.log("有人说 /hello")
+
+host.run()
+```
+
+| 函数 | 签名 | 说明 |
+| --- | --- | --- |
+| `log` | `log(message, level="info")` | `level`：`error` / `warn` / `info` / `debug` / `trace` |
+| `on` | `on(event, handler=None, filter=None)` | 给了 `handler` 就是普通调用，没给就能当装饰器 |
+| `off` | `off(event, handler)` | 只影响脚本内的分发表；宿主订阅随插件停止一起撤 |
+| `invoke` | `invoke(method, params=None, on_response=None)` | 发 TDLib 请求；`on_response` 按 `request_id` 自动配对 |
+| `emit` | `emit(event, payload=None)` | 发自定义事件（**只送自己 + 全局订阅者**） |
+| `register_tool` | `register_tool(name, description="", input_schema=None)` | 只登记元数据 |
+| `config` | `config()` | 宿主传给 `plugin_start` 的配置 JSON，没给就是 `{}` |
+| `run` | `run()` | **必须是最后一行** |
+
+## 一行一个 JSON
+
+脚本 → 宿主（`op` 是动作名，`tag` 是脚本自己用的配对号，宿主原样带回）：
+
+| 行 | 宿主回什么 |
+| --- | --- |
+| `{"op":"ready"}` | 无 |
+| `{"op":"log","level":"info","message":"…"}` | 无 |
+| `{"op":"on","tag":1,"event":"updateNewMessage","filter":{…}}` | `{"op":"on","tag":1,"handle":N}` |
+| `{"op":"off","handle":N}` | 无 |
+| `{"op":"invoke","tag":2,"method":"sendMessage","params":{…}}` | `{"op":"invoked","tag":2,"request_id":R}` |
+| `{"op":"emit","event":"x","payload":{…}}` | 无 |
+| `{"op":"tool","descriptor":{…}}` | `{"op":"tool","tag":n,"handle":N}` |
+
+宿主 → 脚本：`{"op":"event","event":"…","payload":{…}}` 外加上面那几种回执。
+**事件带的是订阅号 `handle`，不是事件名**——同一个事件可以有多条带不同过滤器的订阅，
+按事件名分发会让不该响的回调也响。
+
+## 四条硬约定
+
+1. **脚本与 cdylib 同名、同目录**：`weather.dll` ↔ `weather.py`。宿主按动态库文件名去找，
+   依次试 `.py` / `.js` / `.ts`（cargo 在类 Unix 上加的 `lib` 前缀会被去掉），
+   把**绝对路径**写进配置 JSON（`{"script": "…"}`）——cdylib 自己不知道自己在哪。
+   所以 `[lib] name` 不能省。
+2. **`host.run()` 必须是最后一行**：宿主收到 `{"op":"ready"}` 才算加载完成，
+   `plugin_start` 会等它（上限 10 秒）。脚本早退 = 加载失败。
+3. **两侧 stdio 钉成 UTF-8**：Windows 上 Python 默认按系统代码页读管道，`上海` 会变成 `涓婃捣`。
+   桥自己会 reconfigure 三个流，脚本不用管。
+4. **解释器起不来 / 脚本早退要让 `plugin_start` 报错**，不能留一个「加载成功但什么都不干」的插件——
+   这条桥已经替你做了。
+
+## 调试
+
+```bash
+python demo.py            # 能跑，只是没有宿主可说话
+python fuyubot_plugin.py  # 桥自带自检：打印 fuyubot_plugin: self-test ok
+```
+
+`fuyubot_plugin.py` 与 `fuyubot_plugin.pyi`（桥 + 类型声明）由 `fuyubot-sdk init` 一起放进目录，
+与 `fuyubot-sdk-script` 里那份**逐字相同**——别自己改，改了就漂移。
+
+<Callout type="info">
+  解释器依次试 `python` / `python3` / `py`。`plugin_start` 起不来解释器会直接失败，
+  Python 的报错经脚本 stderr 原样透传到宿主控制台。
+</Callout>

@@ -17,7 +17,7 @@ use core::ffi::{c_char, c_void};
 use std::ffi::{CStr, CString};
 
 /// ABI 版本。字段只增不改，新增一律追加在尾部。
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// cbindgen 生成的头文件**原文**。
 ///
@@ -324,6 +324,17 @@ pub struct HostApiVTable {
             params_json: *const c_char,
         ) -> RequestId,
     >,
+    /// **同步**执行一个不需要网络的 TDLib 方法（`td_json_client_execute`），返回响应 JSON。
+    ///
+    /// 与 `td_invoke*` 的区别是「不等响应通道」：调用当场就有结果，所以可以在**回调里**
+    /// 安全使用（`td_invoke` + `wait_for_update` 那套会卡住投递线程）。
+    /// TDLib 允许这么调的方法只限不碰服务器的那些——`parseTextEntities`、
+    /// `getTextEntities`、`getFileMimeType` 之类；发消息、编辑消息**不能**走它。
+    ///
+    /// 返回的字符串是宿主线程局部缓冲（见 [`HostApi::td_execute`]），读完即弃。
+    pub td_execute: Option<
+        unsafe extern "C" fn(host: *mut c_void, request_json: *const c_char) -> *const c_char,
+    >,
     pub use_middleware: Option<
         unsafe extern "C" fn(
             host: *mut c_void,
@@ -343,7 +354,7 @@ pub struct HostApiVTable {
     pub log: Option<unsafe extern "C" fn(host: *mut c_void, level: u32, message: *const c_char)>,
 }
 
-/// VTable 就是「两个 u32 + 15 个指针」；布局一改，这里立刻编译不过。
+/// VTable 就是「两个 u32 + 16 个指针」；布局一改，这里立刻编译不过。
 const _: () = {
     use core::mem::{offset_of, size_of};
 
@@ -351,7 +362,7 @@ const _: () = {
     assert!(offset_of!(HostApiVTable, size) == 4);
     assert!(offset_of!(HostApiVTable, host_ctx) == 8);
     assert!(size_of::<Option<unsafe extern "C" fn()>>() == size_of::<*const c_void>());
-    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 15 * size_of::<*const c_void>());
+    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 16 * size_of::<*const c_void>());
 
     // 句柄要能按值跨 ABI：必须恰好一个 u64。
     assert!(size_of::<SubscriptionHandle>() == size_of::<u64>());
@@ -411,6 +422,7 @@ pub struct HostApi {
     td_invoke: unsafe extern "C" fn(*mut c_void, *const c_char) -> RequestId,
     td_invoke_simplified:
         unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> RequestId,
+    td_execute: unsafe extern "C" fn(*mut c_void, *const c_char) -> *const c_char,
     use_middleware: unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -483,6 +495,7 @@ impl HostApi {
             get_service: required!(get_service),
             td_invoke: required!(td_invoke),
             td_invoke_simplified: required!(td_invoke_simplified),
+            td_execute: required!(td_execute),
             use_middleware: required!(use_middleware),
             wait_for_update: required!(wait_for_update),
             cancel_wait: required!(cancel_wait),
@@ -609,6 +622,26 @@ impl HostApi {
         let params = CString::new(params_json).map_err(|_| AbiError::BadString)?;
         // SAFETY: 同 log。
         Ok(unsafe { (self.td_invoke_simplified)(self.host_ctx, name.as_ptr(), params.as_ptr()) })
+    }
+
+    /// **同步**执行一个不碰网络的 TDLib 方法，返回响应 JSON 文本。
+    ///
+    /// 宿主没接 TDLib、或 TDLib 自己返回空时是 `None`。
+    /// 结果放在宿主的**线程局部缓冲**里，所以这里当场拷成 `String`——
+    /// 别想着把返回的指针留到下一次调用之后。
+    pub fn td_execute(&self, request_json: &str) -> Option<String> {
+        let request = CString::new(request_json).ok()?;
+        // SAFETY: 构造时已校验非空；host_ctx 由宿主保证有效。
+        let raw = unsafe { (self.td_execute)(self.host_ctx, request.as_ptr()) };
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: 宿主保证这个指针在下次宿主调用前有效，这里立刻读完。
+        Some(
+            unsafe { CStr::from_ptr(raw) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     pub fn use_middleware(
@@ -870,6 +903,9 @@ mod tests {
     unsafe extern "C" fn noop_td2(_: *mut c_void, _: *const c_char, _: *const c_char) -> RequestId {
         RequestId::INVALID
     }
+    unsafe extern "C" fn noop_execute(_: *mut c_void, _: *const c_char) -> *const c_char {
+        core::ptr::null()
+    }
     unsafe extern "C" fn noop_middleware(
         _: *mut c_void,
         _: u32,
@@ -898,6 +934,7 @@ mod tests {
             get_service: Some(noop_get),
             td_invoke: Some(noop_td),
             td_invoke_simplified: Some(noop_td2),
+            td_execute: Some(noop_execute),
             use_middleware: Some(noop_middleware),
             wait_for_update: Some(noop_wait),
             cancel_wait: Some(noop_cancel),

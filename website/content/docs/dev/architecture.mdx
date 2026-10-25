@@ -1,0 +1,98 @@
+---
+title: 架构与数据流
+description: 一个宿主进程 + N 个动态库插件，以及它们之间的三段数据流
+---
+
+结论先说：**一个宿主进程 + N 个动态库插件（cdylib）**。插件不认识 Rust，只认识 `HostApiVTable`；
+宿主是**唯一**实现这张表的 crate（`fuyubot-loader`）。脚本插件（Python / JS / TS）不改变这个结构
+——它们的 cdylib 里只多了一个子进程。
+
+## crate 依赖方向
+
+```text
+                          fuyubot-core                （Cordis 内核，不认识 Telegram）
+                        ┌──────┬──────┬──────┬──────┐
+                        │      │      │      │      │
+                   event  service  tool  middleware │     四个机制 crate 只依赖 core，彼此不依赖
+                        └──────┴──────┴──────┴──────┘
+                                    ▲
+fuyubot-abi ─────────────────────► fuyubot-loader ◄───── fuyubot-tdlib ──► fuyubot-tdlib-sys
+（不依赖 core / 机制 crate）        （唯一宿主层）              （加载/循环/授权）（类型/元数据/FFI）
+                                    ▲
+                              fuyubot-cli（二进制 fuyubot）
+
+插件侧（不依赖宿主）：
+fuyubot-plugin-api ──► fuyubot-abi                 Rust 插件只用这一个 crate
+fuyubot-sdk-script ──► fuyubot-plugin-api          Python / JS / TS 插件的 cdylib 用它
+fuyubot-simplify   ──► fuyubot-tdlib-sys           TDLib 便捷封装（可选糖，重导 td_api）
+```
+
+| 边 | 允许吗 |
+| --- | --- |
+| `fuyubot-core` → `fuyubot-tdlib` | 禁止 |
+| `fuyubot-abi` → `fuyubot-core` | 禁止 |
+| 四个机制 crate 互相依赖 | 禁止 |
+| `fuyubot-tdlib-sys` → 任何 fuyu crate | 禁止（它是最底层） |
+| `fuyubot-loader` → 四个机制 + `tdlib` + `abi` + `core` | 允许（**只有它**） |
+
+组合只发生在两处：`HostRuntime::new`（把四个机制 `install` 进 `Context`）与 `HostRuntime` 里的
+15 个 `unsafe extern "C"` 桥。四个机制 crate 绝不彼此调用。
+
+## 启动顺序：先 attach TDLib，再 load 插件
+
+```text
+Kernel::new() → kernel.start()
+  → PluginLoader::new(kernel.context().clone())   // 装四个机制 + 生成 HostApiVTable
+  → pipeline.attach_tdlib(client)                 // 把 TdClient 挂进 HostRuntime（不起循环）
+  → loader.load_with_config(dll, {"script": …})   // 逐个 dlopen 插件
+  → pipeline.spawn_dispatch()                     // 拿到 ReceiveLoop，才开始分发
+```
+
+为什么不能反过来：`attach_tdlib` 之前 `td_send` 走「没接 TDLib」分支（请求只留档 + 合成请求号，
+起点 `1 << 48`），而插件在 `plugin_start` 里就发请求；分发排在插件加载之后，否则插件漏订阅。
+`--replay` / `--no-tdlib` 故意不 attach——回放是离线验证。
+
+## 主链路
+
+```text
+插件 ── host.on / invoke / emit / use_middleware / …
+  ▼ HostApiVTable：18 个字段 = version / size / host_ctx + 15 个函数指针（全 Option，首参 host）
+  ▼ HostRuntime：把每个桥翻译成「事件总线 / 服务容器 / 工具表 / 中间件管线 / TdClient」
+  ├── td_invoke* ──► td_send：接了走 TdClient::send（注入 @extra）／没接就留档 + 合成请求号
+  ├── td_execute ──► HostRuntime::td_execute ──► TdClient::execute：**同步**，只给不碰网络的方法用
+  ▼
+TdClient::spawn_receive_loop ──► Routed
+  ├─ Update   ──► process_value：PreUpdate → 解析 @type → PreRoute → InPlugin → 双通道发布 → PostResponse
+  │               publish_update：emit("update", …)（兜底）+ emit(@type, …)（具体）
+  └─ Response ──► deliver_response：按 request_id / @extra 找到发起者 → emit_scoped(owner, "response", …)
+```
+
+三条容易搞错的语义：
+
+- **归属是「额外定向」，不是「排除广播」**：`emit` 发给所有订阅者，`emit_scoped(owner, …)` 是
+  「全局 + 该归属」。响应因此对所有插件透明。
+- **中间件一条更新跑一遍，不是每个监听器跑一遍**：`InPlugin` 的产出就是所有监听器看到的版本。
+- **过滤器里的 `event_type` 键只用来选通道**，不参与负载匹配；等响应写
+  `{"event_type":"response","request_id":N}`。
+
+## 注册作用域与卸载
+
+`HostRuntime::plugin_scope()` 给这次加载分配一个 owner id，之后所有跨 ABI 的注册
+（订阅 / 工具 / 服务 / 中间件）都记在这个 owner 名下。`scope.commit()` 保留；提前 drop
+（init 失败、start 报错、ABI 不匹配）或 `LoadedPlugin` 被 drop 时，`rollback_owner(owner)`
+一次性撤掉这批注册；宿主自己（owner 0）不受影响。
+
+`LoadedPlugin` 的字段声明顺序就是卸载顺序：先 `plugin_stop`，再 `rollback_owner`，
+最后 `_lib: Library` 才 drop——到这一步动态库才真正卸载。
+
+## 两种插件形态
+
+| | 原生（Rust / C / C++） | 脚本（Python / JS / TS） |
+| --- | --- | --- |
+| 边界 | 同进程、C ABI 函数调用 | 一个插件一个解释器子进程，一行一个 JSON |
+| 数据 | 回调直接收宿主临时字符串（下次宿主调用前有效） | 管道，UTF-8，事件带订阅号 |
+| 崩溃 | 拖垮宿主 | 只有子进程死 |
+| 收益 | 零拷贝、零协议 | 热更新语言、生态 |
+
+> 更细的说明在仓库 [`docs/architecture.md`](https://github.com/xiaoqvan/Fuyu-Bot/blob/main/docs/architecture.md)；
+> 硬约束在 [`AGENTS.md`](https://github.com/xiaoqvan/Fuyu-Bot/blob/main/AGENTS.md)。

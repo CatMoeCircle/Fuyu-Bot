@@ -1,5 +1,5 @@
 # fuyubot-tdlib
 
-TDLib 接入层：`ffi` 声明 C 函数指针，`loader` 在运行时按优先级找到并加载原生库，`client` 提供 `TdClient`（`@extra` 注入 + `td_receive` 循环）。
+TDLib 接入层的**运行时半边**：`loader` 按四优先级定位并加载原生库（vendored 资产表、版本协商、`open_library`），`client` 提供 `TdClient`（`@extra` 注入 + `td_receive` 循环 + `ReceiveLoop` 停止把手），`authorize` 是登录状态机。
 
-`td_api.tl` 是**构建的必需输入**（拿不到就让构建失败），在编译期被转成两份产物：`schema`（可校验的元数据）与 `td_api`（Rust 类型，`tl_codegen` 生成）。运行时不读文件、不生成。
+类型绑定（`td_api` / `schema` / `ffi` / `tl_schema`）住在 [`fuyubot-tdlib-sys`](../fuyubot-tdlib-sys)：`td_api.tl` 在那边**编译期**转成 Rust 类型与可校验元数据（拿不到文件就构建失败，运行时不读文件、不生成）。本 crate 依赖并重导出 sys 的公开 API，`fuyubot_tdlib::TdApiSchema` 这些路径因此不变。

@@ -115,7 +115,7 @@ cat > "$STAGE_DIR/README.md" <<EOF
 ## fuyubot 怎么用它
 
 \`fuyubot-tdlib\` 在**构建期**按
-\`https://github.com/<repo>/releases/download/TDLib V<版本>/<资产名>\` 取这个资产，
+\`https://github.com/<repo>/releases/download/TDLib-v<版本>/<资产名>\` 取这个资产，
 解包后把 \`${LIB_NAME}\` 落到缓存目录（见 \`src/loader/vendored.rs\`）。
 所以它**必须是 .tar.gz 的内容、且文件名就是这个资产名**——
 换成 .zip 会被当成裸库原样写出，得到一个坏文件而且**不会报错**。

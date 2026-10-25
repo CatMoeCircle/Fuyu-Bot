@@ -1,0 +1,101 @@
+---
+title: fuyubot-sdk 命令参考
+description: 插件开发 CLI：脚手架 / 生成绑定 / 查 TDLib / 静态检查
+---
+
+写插件用的 CLI，和运行时**完全分开**：它不碰账号、不加载 TDLib，也不需要 `tdjson`。
+
+```text
+fuyubot-sdk <COMMAND>
+
+Commands:
+  init         生成插件脚手架（5 种语言）
+  codegen      把 ABI 绑定落盘（刷 C 头 / .pyi / .d.ts）
+  abi-version  显示 ABI 版本
+  td-methods   列 TDLib 方法
+  td-method    看某个方法的签名
+  check        静态检查产物（不加载、不运行）
+```
+
+## `init`
+
+```text
+fuyubot-sdk init <名字> --lang <rust|c|cpp|python|js> [--dir <DIR>]
+```
+
+生成到 `<dir>/plugins/<名字>/`；`--lang` 决定模板：
+
+| 语言 | 生成什么 |
+| --- | --- |
+| `rust` | 独立 crate（`Cargo.toml` 开头有空 `[workspace]`）+ `src/lib.rs`（`define_plugin!`） |
+| `c` / `cpp` | 源码 + `fuyubot_plugin.h`（从 `PLUGIN_HEADER` 落的盘，唯一权威源） |
+| `python` | `src/lib.rs`（`script_plugin!`）+ `plugin.py` + `fuyubot_plugin.py`(+`.pyi`) |
+| `js` | `src/lib.rs` + `plugin.js` + `fuyubot_plugin.js`(+`.d.ts`) |
+
+```text
+$ fuyubot-sdk init demo --lang rust
+已生成 rust 插件脚手架：plugins/demo
+下一步：用你自己的工具链编译它（cargo build --release / gcc -shared / …）
+```
+
+生成的 Rust 插件用 `path = "…"` 依赖 SDK，所以需要 `FUYUBOT_SDK_PATH` 指向放着 SDK crate 的目录
+（仓库里就是 `crates/`）；没设就按仓库布局找。
+
+## `codegen`
+
+```text
+fuyubot-sdk codegen --lang <c|cpp|python|js> [--dir <DIR>]
+```
+
+刷新某门语言的 ABI 绑定文件到 `<dir>`：C / C++ 是 `fuyubot_plugin.h`，Python 是
+`fuyubot_plugin.py` + `.pyi`，JS 是 `fuyubot_plugin.js` + `.d.ts`。**会覆盖同名文件**。
+所有语言都来自同一份权威源（`fuyubot_abi::PLUGIN_HEADER` 与 `fuyubot-sdk-script` 里的桥），
+不是手抄的第二份。`--lang rust` 没有可生成的绑定，命令会说明。
+
+## `check`
+
+```text
+fuyubot-sdk check <路径>
+```
+
+**静态**读 PE / ELF / Mach-O 的导出表（用 `object`，**绝不 dlopen**——加载会在宿主进程里跑插件的
+初始化代码，那已经算「运行」了）。非零退出码 = 宿主会拒绝加载（缺 `plugin_init`，或根本不是动态库）。
+
+```text
+$ fuyubot-sdk check target\debug\fuyubot_plugin_demo.dll
+文件：target\debug\fuyubot_plugin_demo.dll
+格式：Pe / X86_64 / Dynamic
+导出符号：
+  [ok] plugin_init          必需
+  [ok] plugin_start
+  [ok] plugin_stop
+```
+
+<Callout type="warn">
+  `check` 静态看不到 `PluginHandle.abi_version`——版本是 `plugin_init` 的**返回值**，不是静态符号。
+  它只会如实报「宿主是 vN，插件的版本只能运行时判定」，**别把它当兼容性结论**。
+</Callout>
+
+## `abi-version` / `td-methods` / `td-method`
+
+```text
+$ fuyubot-sdk abi-version
+1
+
+$ fuyubot-sdk td-methods --filter sendMessage
+$ fuyubot-sdk td-method sendMessage
+```
+
+`td-methods` / `td-method` 吃的是**编译期**烤进二进制的真 `td_api.tl` 元数据（`TdApiSchema::compiled()`），
+不读文件、不联网。`--filter` 是子串匹配、忽略大小写；构造器不能当方法调，`td-method` 会明确拒绝。
+
+<Callout type="info">
+  TDLib 的方法名 ≠ Telegram Bot API 的：所有发送都是 `sendMessage` + `input_message_content`，
+  `sendPhoto` / `sendDocument` 之类在 TDLib 里不存在。写请求前先用 `td-method` 核一遍。
+</Callout>
+
+## 相关页面
+
+- 各语言怎么写：[插件总览](../plugin/index.mdx)
+- 装进插件目录：[调试与安装](../plugin/testing.mdx)
+- 环境变量（`FUYUBOT_SDK_PATH`）：[环境变量](../usage/env.mdx)

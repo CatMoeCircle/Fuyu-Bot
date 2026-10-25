@@ -2,7 +2,8 @@
 //!
 //! 优先级从高到低，第一个命中者胜出：
 //! 1. `TDLIB_TDJSON_PATH` 指向的文件或目录；
-//! 2. vendored 目录（需要 `vendored` feature）；
+//! 2. vendored 目录（需要 `vendored` feature）→ **可执行文件所在目录**
+//!    （构建期 `build.rs` 会往那儿拷一份，见 `stage_next_to_binary`）；
 //! 3. Linux 系统目录里带版本号的 `libtdjson.so.*`，取与目标主版本兼容的最高版本；
 //! 4. 裸库名，交给操作系统动态链接器搜索。
 
@@ -13,7 +14,9 @@ use std::path::{Path, PathBuf};
 
 use libloading::Library;
 
-use crate::ffi::{SYM_CREATE, SYM_DESTROY, SYM_EXECUTE, SYM_RECEIVE, SYM_SEND, TdApi};
+use crate::ffi::{
+    SYM_CREATE, SYM_DESTROY, SYM_EXECUTE, SYM_RECEIVE, SYM_SEND, SYM_SET_LOG_VERBOSITY, TdApi,
+};
 
 /// 编译期绑定的 TDLib 版本，来自 `[package.metadata.fuyubot] tdlib-version`。
 pub const TDLIB_VERSION: &str = env!("FUYUBOT_TDLIB_VERSION");
@@ -52,6 +55,8 @@ pub enum LibrarySource {
     EnvDir,
     /// 优先级 2：vendored 目录。
     Vendored,
+    /// 优先级 2：可执行文件所在目录（构建期拷过来的那份，部署形态）。
+    ExeDir,
     /// 优先级 3：系统目录里带版本号的库。
     SystemVersioned,
     /// 优先级 4：裸库名，交给系统链接器。
@@ -64,6 +69,7 @@ impl fmt::Display for LibrarySource {
             Self::EnvFile => "TDLIB_TDJSON_PATH 文件",
             Self::EnvDir => "TDLIB_TDJSON_PATH 目录",
             Self::Vendored => "vendored",
+            Self::ExeDir => "可执行文件所在目录",
             Self::SystemVersioned => "系统已安装（带版本号）",
             Self::BareName => "裸库名（系统链接器）",
         };
@@ -93,6 +99,12 @@ pub struct LoadEnv {
     pub vendored_dir: Option<PathBuf>,
     /// 编译期注入的 vendored 版本。
     pub vendored_version: Option<String>,
+    /// 可执行文件所在目录（`current_exe` 的父目录）——「tdjson 跟二进制一起分发」的部署形态。
+    ///
+    /// 构建期由 `fuyubot-tdlib/build.rs` 的 `stage_next_to_binary` 拷一份过去，所以它旁边
+    /// 就有一份和二进制同版本的库。**这里不做版本校验**：部署形态的库是别人放的，
+    /// 校验所需的版本信息在那个目录里并不存在。
+    pub exe_dir: Option<PathBuf>,
     /// 优先级 3 的候选目录。
     pub system_dirs: Vec<PathBuf>,
     /// 目标平台，取值同 `std::env::consts::OS`。
@@ -108,6 +120,9 @@ impl LoadEnv {
                 .map(PathBuf::from),
             vendored_dir: compiled_vendored_dir(),
             vendored_version: compiled_vendored_version(),
+            exe_dir: std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf)),
             system_dirs: default_system_dirs(),
             os: std::env::consts::OS.to_owned(),
         }
@@ -219,6 +234,29 @@ pub fn resolve_with(
         None => attempts.push(
             "[2] 没有 vendored 目录：未启用 vendored feature，或构建期没能把库取回来".to_owned(),
         ),
+    }
+
+    // ── 优先级 2b：可执行文件所在目录（「tdjson 跟二进制一起分发」的部署形态）──
+    //
+    // 为什么要有这一条：vendored 目录烤的是**构建机**的 `target/.../out/vendored`，
+    // 二进制被拷到别的机器之后它就不在了；而 Windows 的裸库名（优先级 4）
+    // 只因为「exe 目录永远在系统搜索路径里」而侥幸命中，Linux 上则完全搜不到。
+    match &env.exe_dir {
+        Some(dir) => match wanted_name.and_then(|name| existing(dir.join(name))) {
+            Some(found) => {
+                notes.push(
+                    "[2] 用的是可执行文件旁边的库（构建期拷过来的部署形态），未做版本校验"
+                        .to_owned(),
+                );
+                return Ok(resolved(found, LibrarySource::ExeDir, notes));
+            }
+            None => attempts.push(format!(
+                "[2] 可执行文件目录 {} 里也没有 {}",
+                dir.display(),
+                wanted_name.unwrap_or("<未知平台无对应库名>")
+            )),
+        },
+        None => attempts.push("[2] 拿不到可执行文件目录".to_owned()),
     }
 
     // ── 优先级 3：Linux 系统目录里带版本号的库 ──────────────────────
@@ -365,6 +403,7 @@ pub unsafe fn resolve_symbols(lib: &Library) -> Result<TdApi, TdlibLoadError> {
             send: symbol(lib, SYM_SEND)?,
             receive: symbol(lib, SYM_RECEIVE)?,
             execute: symbol(lib, SYM_EXECUTE)?,
+            set_log_verbosity: symbol(lib, SYM_SET_LOG_VERBOSITY)?,
         })
     }
 }
@@ -479,6 +518,47 @@ mod tests {
             resolve_with(&env, &|_| false),
             Err(TdlibLoadError::VersionMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn priority_2_exe_dir() {
+        // 「tdjson 跟二进制一起分发」：vendored 目录不在（构建机的路径没了），
+        // 但可执行文件旁边有一份。
+        let dir = scratch();
+        let path = touch(dir.path(), "tdjson.dll");
+        let env = LoadEnv {
+            exe_dir: Some(dir.path().to_owned()),
+            os: "windows".into(),
+            ..LoadEnv::default()
+        };
+        let got = resolve_with(&env, &|_| false).unwrap();
+        assert_eq!(got.source, LibrarySource::ExeDir);
+        assert_eq!(got.target, path);
+
+        // 部署形态的库是别人放的，没有版本信息可校验——但要**说清**这一点，
+        // 不能让它看起来像是校验过了。
+        assert!(
+            got.notes.iter().any(|note| note.contains("未做版本校验")),
+            "notes 里没说清没校验版本：{:?}",
+            got.notes
+        );
+
+        // vendored 目录优先级仍在它前面（同一次构建里那份才是构建期认下来的）。
+        #[cfg(feature = "vendored")]
+        {
+            let vendored = scratch();
+            let vendored_path = touch(vendored.path(), "tdjson.dll");
+            let env = LoadEnv {
+                vendored_dir: Some(vendored.path().to_owned()),
+                vendored_version: Some(TDLIB_VERSION.to_owned()),
+                exe_dir: Some(dir.path().to_owned()),
+                os: "windows".into(),
+                ..LoadEnv::default()
+            };
+            let got = resolve_with(&env, &|_| false).unwrap();
+            assert_eq!(got.source, LibrarySource::Vendored);
+            assert_eq!(got.target, vendored_path);
+        }
     }
 
     #[test]

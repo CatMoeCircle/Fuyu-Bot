@@ -1,5 +1,9 @@
 [workspace]
 members = ["crates/*", "examples/rust-echo", "examples/python-weather", "examples/ts-counter"]
+# 裸 `cargo build` / `cargo test`（不带 `-p` 也不带 `--workspace`）**只编 crates/**：
+# 示例仍然是 workspace 成员，但要显式 `-p fuyubot-example-*` 或 `--workspace` 才编。
+# `cargo build --workspace` 不受影响（文档里的命令都带 `--workspace`）。
+default-members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
@@ -21,6 +25,7 @@ fuyubot-sdk-cli = { path = "crates/fuyubot-sdk-cli", version = "0.1.0" }
 fuyubot-service = { path = "crates/fuyubot-service", version = "0.1.0" }
 fuyubot-simplify = { path = "crates/fuyubot-simplify", version = "0.1.0" }
 fuyubot-tdlib = { path = "crates/fuyubot-tdlib", version = "0.1.0" }
+fuyubot-tdlib-sys = { path = "crates/fuyubot-tdlib-sys", version = "0.1.0" }
 fuyubot-tool = { path = "crates/fuyubot-tool", version = "0.1.0" }
 
 cbindgen = "0.29.4"

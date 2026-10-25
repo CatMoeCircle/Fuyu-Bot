@@ -387,7 +387,6 @@ name = "fuyubot-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "fuyubot-abi",
  "fuyubot-core",
  "fuyubot-loader",
  "fuyubot-tdlib",
@@ -483,13 +482,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuyubot-plugin-help"
+version = "0.1.0"
+dependencies = [
+ "fuyubot-abi",
+ "fuyubot-simplify",
+]
+
+[[package]]
+name = "fuyubot-plugin-manage"
+version = "0.1.0"
+dependencies = [
+ "fuyubot-abi",
+ "fuyubot-simplify",
+ "serde_json",
+]
+
+[[package]]
+name = "fuyubot-plugin-start"
+version = "0.1.0"
+dependencies = [
+ "fuyubot-abi",
+ "fuyubot-simplify",
+]
+
+[[package]]
 name = "fuyubot-sdk-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
  "fuyubot-abi",
- "fuyubot-loader",
- "fuyubot-tdlib",
+ "fuyubot-tdlib-sys",
  "object",
 ]
 
@@ -517,7 +540,7 @@ dependencies = [
  "fuyubot-core",
  "fuyubot-event",
  "fuyubot-loader",
- "fuyubot-tdlib",
+ "fuyubot-tdlib-sys",
  "serde_json",
  "thiserror",
 ]
@@ -527,6 +550,7 @@ name = "fuyubot-tdlib"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "fuyubot-tdlib-sys",
  "libloading",
  "serde",
  "serde_json",
@@ -534,6 +558,17 @@ dependencies = [
  "tar",
  "thiserror",
  "tokio",
+ "toml",
+ "ureq",
+]
+
+[[package]]
+name = "fuyubot-tdlib-sys"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
  "toml",
  "ureq",
 ]

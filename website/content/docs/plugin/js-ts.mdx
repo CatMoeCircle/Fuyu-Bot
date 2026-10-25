@@ -1,0 +1,126 @@
+---
+title: JS 与 TypeScript 插件
+description: Node 类型剥离、脚本约定
+---
+
+JS 与 Python 走的是**同一份 Rust 桥**（`fuyubot-sdk-script`），也共用同一套「一行一个 JSON」协议，
+差别只在解释器和你写脚本的语言。TypeScript **不需要 `tsc`**：宿主起的是 `node demo.ts`，
+靠 Node 自带的**类型剥离**直接跑。
+
+## 胶水 crate
+
+```toml
+[workspace]
+
+[package]
+name = "fuyubot_counter"
+version = "0.1.0"
+edition = "2024"
+
+# ⚠️ 名字必须与脚本同名：宿主按动态库文件名去找同名脚本
+[lib]
+name = "counter"
+crate-type = ["cdylib"]
+
+[dependencies]
+fuyubot-sdk-script = { path = "…/crates/fuyubot-sdk-script", version = "0.1.0" }
+```
+
+```rust
+// src/lib.rs —— 全部 Rust 代码
+fuyubot_sdk_script::script_plugin!("fuyubot.js.counter", js, "counter.js");
+```
+
+`js` 这一档同时服务 `.js` 与 `.ts`：宿主按文件名找脚本，找到 `.ts` 就直接把它交给 Node。
+
+## JS 脚本
+
+```js
+const host = require("./fuyubot_plugin.js");
+
+host.on("updateNewMessage", (payload) => {
+  host.log("demo 收到一条更新");
+});
+
+host.on("updateNewMessage", (payload) => {
+  host.log("有人说 /hello");
+}, { "message.content.text.text": "/hello" });
+
+host.run();
+```
+
+| 函数 | 签名 | 说明 |
+| --- | --- | --- |
+| `log` | `log(message, level = "info")` | `error` / `warn` / `info` / `debug` / `trace` |
+| `on` | `on(event, handler, filter)` | `filter` 可省；同一个事件可以订阅多次 |
+| `off` | `off(event, handler)` | 只影响脚本内的分发表 |
+| `invoke` | `invoke(method, params, onResponse)` | 给了 `onResponse` 就按 `request_id` 自动配对 |
+| `emit` | `emit(event, payload)` | **只送自己 + 全局订阅者**，不是广播 |
+| `registerTool` | `registerTool(name, description = "", inputSchema)` | 只登记元数据 |
+| `config` | `config()` | 宿主传给 `plugin_start` 的配置 JSON |
+| `run` | `run()` | **必须是最后一行** |
+
+类型声明在 `fuyubot_plugin.d.ts`，`node fuyubot_plugin.js` 会跑桥自带的自检。
+
+## TypeScript
+
+绑定文件与 JS 那份逐字相同，TS 只是多了一份 `fuyubot_plugin.d.ts` 可供补全：
+
+```bash
+fuyubot-sdk codegen --lang js --dir <工程目录>   # 落 fuyubot_plugin.js + fuyubot_plugin.d.ts
+```
+
+`examples/ts-counter/counter.ts` 的写法（按聊天计数然后回一条）：
+
+```ts
+import * as host from "./fuyubot_plugin.js";
+
+const counts = new Map<number, number>();
+
+host.on("updateNewMessage", (payload) => {
+  const message = object(object(payload)["message"]);
+  if (message["is_outgoing"] === true) return;      // 别回自己发的，否则自激
+
+  const content = object(message["content"]);
+  if (content["@type"] !== "messageText") return;
+  const body = text(object(content["text"])["text"]);
+  if (body === "") return;
+
+  const chatId = message["chat_id"];
+  if (typeof chatId !== "number") return;
+
+  const count = (counts.get(chatId) ?? 0) + 1;
+  counts.set(chatId, count);
+  host.invoke("sendMessage", {
+    chat_id: chatId,
+    input_message_content: {
+      "@type": "inputMessageText",
+      text: { "@type": "formattedText", text: `本聊天第 ${count} 条消息`, entities: [] },
+    },
+  });
+});
+
+host.run();
+```
+
+`object()` / `text()` 是示例里的两个窄化小函数（JS 侧没有 schema，取字段前先窄化成对象）。
+`sendMessage` 的参数形状以 TDLib 为准，见 [调用 TDLib](./tdlib.mdx)。
+
+<Callout type="warn">
+  类型剥离只认**能剥掉**的语法：注解、`interface` / `type`、`as`。
+  **不能用** `enum` / `namespace` / 构造器参数属性——那些需要真正的编译。
+  Node 要 ≥ 23.6（默认开）；22.6+ 得加 `--experimental-strip-types`。你本机的 Node 太老就自己
+  `tsc` 编成 `.js`：**编译与打包是作者自己的工具链**。
+</Callout>
+
+## 脚本约定（与 Python 完全一致）
+
+| 约定 | 说明 |
+| --- | --- |
+| 同名同目录 | `counter.dll` ↔ `counter.js`（或 `.ts`）；宿主依次试 `.py` / `.js` / `.ts` |
+| `run()` 最后一行 | 宿主收到 `{"op":"ready"}` 才算加载完成，`plugin_start` 等它（上限 10 秒） |
+| UTF-8 | 桥把 stdio 钉成 UTF-8；脚本自己的输出一律按 UTF-8 走 |
+| 起不来就失败 | 解释器缺失、脚本语法错都会让 `plugin_start` 返回错误，不会静默变成空插件 |
+
+解释器依次试 `node` / `bun`。`[lib] name` 必须与脚本同名，否则默认的
+`fuyubot_example_counter.dll` 找不到 `counter.ts`。

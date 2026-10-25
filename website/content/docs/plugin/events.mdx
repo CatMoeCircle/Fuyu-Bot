@@ -1,0 +1,109 @@
+---
+title: 订阅与事件
+description: on/off/emit、过滤器、双通道与归属
+---
+
+事件总线是插件拿到 TDLib 更新的唯一入口，也是插件之间说话的方式。三个动作：
+`on` 订阅（返回句柄）、`off` 退订（或让句柄 drop）、`emit` 发自定义事件。
+
+## 双通道：具体 `@type` 与兜底 `update`
+
+每条更新会被**同时**发到两条通道上：
+
+| 通道 | 谁收 | 什么时候用 |
+| --- | --- | --- |
+| 具体的 `@type`（`updateNewMessage` 等） | 精确订阅了它的监听器 | 你只关心一种更新 |
+| `"update"` | 订阅兜底通道的所有监听器 | 你要看全部，或不想追 TDLib 的类型名 |
+| `"response"` | **只发给发起那个请求的插件** | 收 `td_invoke*` 的结果 |
+
+`"update"` 与 `"response"` 是 ABI 常量（`UPDATE_EVENT` / `RESPONSE_EVENT`），别自己拼字符串。
+
+## 过滤器
+
+`on` 的第三个参数是一份过滤器 JSON：**点分路径 → 期望值**。
+
+```json
+{ "message.chat_id": -1001234567890 }
+```
+
+| 规则 | 说明 |
+| --- | --- |
+| `event_type` 键只用来**选通道** | `{"event_type":"response","request_id":5}` 表示等 5 号响应；它**不参与负载匹配** |
+| 其余键做负载字段相等匹配 | 字段位置随更新类型变：`updateNewMessage` 的 `chat_id` 在 `message.chat_id` |
+| 空 / `null` / 不传 | 该通道全收 |
+
+同一个事件可以订阅**多次**、各带各的过滤器。脚本侧按订阅号 `handle` 分发，所以不该响的回调不会响。
+
+## 归属：`emit` 不是广播
+
+插件里调 `emit` 走的是 `emit_scoped(自己, …)`：只送给**该插件自己 + 全局订阅者**。
+归属的语义是「**额外定向**」而不是「排除广播」——宿主 `emit` 的更新照旧发给所有订阅者，
+`emit_scoped(owner, …)` 只是在那份收件人之外**再加**上 `owner` 自己的订阅。
+
+| 谁发 | 谁收得到 |
+| --- | --- |
+| 宿主发更新 / `emit` | 所有匹配的订阅者 |
+| 插件 `emit("x", …)` | 该插件自己的订阅者 + 全局订阅者 |
+| 宿主的响应 | `emit_scoped(发起者, "response", …)`：全局 + 发起者 |
+
+要让别的插件收到你的事件，**让对方订阅全局事件**，不要指望你的 `emit` 是一次广播。
+
+<Callout type="warn">
+  订阅句柄必须活着。Rust 侧 `HostExt::subscribe_json` 返回的是 `#[must_use]` 的
+  `Subscription`，**drop 就是退订**；`let _ = …` 会立刻退订。插件卸载时宿主还会整批回滚，
+  但那已经是另一回事了。
+</Callout>
+
+## Rust
+
+```rust
+use fuyubot_plugin_api::{HostApi, HostExt, Subscription};
+use serde_json::json;
+
+struct MyPlugin {
+    host: HostApi,
+    _all: Option<Subscription>,
+    _mine: Option<Subscription>,
+}
+
+fn start(&mut self, _config_json: &str) -> Result<(), String> {
+    // 兜底通道 + 无条件
+    self._all = self.host.subscribe_json("update", None, on_any, std::ptr::null_mut());
+
+    // 具体 @type + 字段过滤
+    let filter = json!({ "message.chat_id": -1001234567890 });
+    self._mine = self.host.subscribe_json(
+        "updateNewMessage", Some(filter), on_mine, std::ptr::null_mut(),
+    );
+    Ok(())
+}
+
+fn emit_job_done(&self) {
+    // 只有「自己 + 全局订阅者」收得到
+    let _ = self.host.emit("job_done", &json!({ "ok": true }).to_string());
+}
+```
+
+回调用 `extern "C-unwind" fn(user_data, payload) -> i32`，返回 `0` 表示成功；`payload` 是宿主临时的
+NUL 结尾字符串，要留就当场拷走（`parse_payload` 已经替你解析成 `serde_json::Value`）。
+
+## Python / JS
+
+```python
+@host.on("updateNewMessage", filter={"message.content.text.text": "/hello"})
+def on_hello(payload):
+    host.log("有人说 /hello")
+
+host.emit("job_done", {"ok": True})
+```
+
+```js
+host.on("updateNewMessage", (payload) => {
+  host.log("有人说 /hello");
+}, { "message.content.text.text": "/hello" });
+```
+
+脚本侧的 `off(event, handler)` 只从脚本自己的分发表里摘掉回调；宿主的订阅随插件 `stop` 一起撤。
+
+要按固定次数等一条更新（阻塞式），用 `wait_for_update`，见 [调用 TDLib](./tdlib.mdx)。
+要改流经管线的负载，用中间件，见 [工具与中间件](./tools.mdx)。

@@ -14,8 +14,6 @@ mod runtime;
 /// 插件作者写 cdylib 时直接对着 ABI crate 编程。
 pub use fuyubot_abi as abi;
 
-pub use loader::{
-    DLL_EXTENSION, LoadError, LoadedPlugin, PluginLoader, plugin_file_name, plugin_files,
-};
+pub use loader::{DLL_EXTENSION, LoadError, LoadedPlugin, PluginLoader, plugin_files};
 pub use pipeline::{PipelineError, UpdateOutcome, UpdatePipeline};
 pub use runtime::{HostRuntime, RESPONSE_EVENT, SentRequest, UPDATE_EVENT};

@@ -5,13 +5,13 @@
 //!
 //! ```powershell
 //! $env:TDLIB_TD_API_TL = "C:\path\to\td_api.tl"
-//! cargo test -p fuyubot-tdlib --test generated_types
+//! cargo test -p fuyubot-tdlib-sys --test generated_types
 //! ```
 //!
 //! 断言故意只依赖 `td_api.tl` 里**一定存在**的东西（`message` / `messageText` / `id`），
 //! 所以真文件与样例文件都能跑。
 
-use fuyubot_tdlib::td_api;
+use fuyubot_tdlib_sys::td_api;
 
 /// TDLib 发过来的 JSON 能直接变成生成出来的 Rust 类型。
 #[test]

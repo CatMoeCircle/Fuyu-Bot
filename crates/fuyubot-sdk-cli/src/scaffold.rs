@@ -8,8 +8,6 @@
 
 use std::path::{Path, PathBuf};
 
-use fuyubot_loader::plugin_file_name;
-
 const TEMPLATE_RUST_MANIFEST: &str = include_str!("../templates/rust/Cargo.toml");
 const TEMPLATE_RUST_SOURCE: &str = include_str!("../templates/rust/src/lib.rs");
 const TEMPLATE_C_SOURCE: &str = include_str!("../templates/c/plugin.c");
@@ -62,6 +60,19 @@ fn check_name(name: &str) -> Result<(), String> {
             "插件名 {name:?} 不合法：只允许字母、数字和 . _ -（它会被写进源码）"
         ))
     }
+}
+
+/// 插件名归一成能当**目录名 / crate 名 / 文件名**用的东西（`.` 与 `-` 都换成 `_`）。
+///
+/// 原来住在 `fuyubot-loader`（宿主层），理由是「两个 CLI 都要用同一条规矩」——那条理由
+/// 已经不成立：`fuyubot-cli` 从来没调过它。开发 CLI 为了这 6 行把整套宿主层
+/// （event / service / tool / middleware / tdlib）拖进了**插件作者**的依赖图，所以搬回来。
+fn plugin_file_name(dir: &Path) -> String {
+    let stem = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "plugin".to_owned());
+    stem.replace(['.', '-'], "_")
 }
 
 /// 生成插件脚手架，返回插件目录。
@@ -154,7 +165,8 @@ fn script_extension(lang: Lang) -> &'static str {
 /// - C / C++ 头 → `fuyubot_abi::PLUGIN_HEADER`（cbindgen 的产物，编进 ABI crate 跟着分发）；
 /// - Python / JS 的桥与存根 → `fuyubot-sdk-script` 的源码目录，`include_str!` 直接引。
 ///
-/// **会覆盖**同名文件——「刷新」就是这个命令的本意（和 `build-plugin` 刷 C 头一个语义）。
+/// **会覆盖**同名文件——「刷新」就是这个命令的本意（C 头 / `.pyi` / `.d.ts` 都是**产物**，
+/// 不许签进仓库，所以每次编之前刷一份就行）。
 pub fn codegen(dir: &Path, lang: Lang) -> Result<Vec<PathBuf>, String> {
     let files: &[(&str, &str)] = match lang {
         Lang::C | Lang::Cpp => &[("fuyubot_plugin.h", fuyubot_abi::PLUGIN_HEADER)],
@@ -247,6 +259,18 @@ mod tests {
         assert!(check_name("de\"mo").is_err());
         assert!(check_name("de mo").is_err());
         assert!(check_name("../evil").is_err());
+    }
+
+    /// 归一化规则：`.` 与 `-` 都得换成 `_`，否则生成的 crate 名 / 文件名不合规。
+    /// （这条从 `fuyubot-loader` 搬过来时一并搬，别跟着函数一起丢了。）
+    #[test]
+    fn plugin_file_names_are_usable_as_crate_names() {
+        assert_eq!(plugin_file_name(Path::new("/x/demo")), "demo");
+        assert_eq!(
+            plugin_file_name(Path::new("/x/fuyubot.weather")),
+            "fuyubot_weather"
+        );
+        assert_eq!(plugin_file_name(Path::new("/x/my-plugin")), "my_plugin");
     }
 
     #[test]

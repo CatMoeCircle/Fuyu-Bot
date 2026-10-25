@@ -1,0 +1,235 @@
+# 发布 fuyubot：按平台编出可执行文件，**本体与内置插件分开打包**，
+# 最后由 publish 把两份叠成用户下载的各平台 zip：
+#   fuyubot-<系统>-<架构>.zip = fuyubot + tdjson + plugins/（内置插件）
+#
+# 平台集合 = `crates/fuyubot-tdlib/src/loader/vendored.rs` 的 `ASSETS` 表：
+#   Windows x86_64 / aarch64、Linux x86_64 / aarch64、macOS **只有 aarch64**
+#   （Intel Mac 没有 runner，见 ASSETS 的注释）。
+#
+# 用户视角（`website/content/docs/usage/index.mdx` 就是这么写的）：
+#   下载 `fuyubot-<系统>-<架构>.zip` → 解压 → `./fuyubot init` / `./fuyubot run`。
+# 所以资产名、归档里的布局、以及「tdjson 就在可执行文件旁边」这三件事都是**契约**，
+# 改之前先看 `crates/fuyubot-tdlib/src/loader/vendored.rs` 的 ASSETS 表与
+# `crates/fuyubot-tdlib/build.rs` 的 `stage_next_to_binary`。
+#
+# 中间产物（本体 / 插件 / SDK 各一份 .tar.gz）只留在 Actions artifacts 里；
+# zip 只在 publish（Linux）里生成——Windows runner 的 bash 没有 zip 命令，
+# 别为它分叉。
+#
+# 与 `build-tdlib.yml` 分工：那边产 TDLib 动态库（`TDLib-v<版本>` tag），
+# 这边只消费它，**不重新编 TDLib**。所以这里要等对应版本的 TDLib Release 已经存在。
+name: release bot
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TDLIB_VERSION: '1.8.66'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: package ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: fuyubot-windows-x86_64
+            tdlib: TDLib-windows-x86_64
+            platform_dir: windows-x86_64
+            bin: fuyubot.exe
+          # runner 标签与 build-tdlib.yml 的 matrix 保持一致（那边产的就是 ARM64 资产）
+          - os: windows-11-vs2026-arm
+            asset: fuyubot-windows-aarch64
+            tdlib: TDLib-windows-aarch64
+            platform_dir: windows-aarch64
+            bin: fuyubot.exe
+          - os: ubuntu-latest
+            asset: fuyubot-linux-x86_64
+            tdlib: TDLib-linux-x86_64
+            platform_dir: linux-x86_64
+            bin: fuyubot
+          - os: ubuntu-24.04-arm
+            asset: fuyubot-linux-aarch64
+            tdlib: TDLib-linux-aarch64
+            platform_dir: linux-aarch64
+            bin: fuyubot
+          # macOS 只出 aarch64（Intel Mac 没有 runner；与 ASSETS 表一致）
+          - os: macos-14
+            asset: fuyubot-macos-aarch64
+            tdlib: TDLib-macos-aarch64
+            platform_dir: macos-aarch64
+            bin: fuyubot
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # 把该平台的 tdjson 放进构建缓存的**约定布局** `<缓存根>/<版本>/<os>-<arch>/`：
+      # `fuyubot-tdlib/build.rs` 会从那儿把它拷到可执行文件同级目录。
+      - name: Fetch TDLib binaries into the build cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest=".tdlib-cache/${TDLIB_VERSION}/${{ matrix.platform_dir }}"
+          mkdir -p "$dest"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/TDLib-v${TDLIB_VERSION}/${{ matrix.tdlib }}"
+          curl -fsSL -o tdlib.tar.gz "$url"
+          tar -xzf tdlib.tar.gz
+          # 归档内层目录就是资产名；`td_api.tl` 不在这里（它由 build.rs 自己下）
+          cp -a "${{ matrix.tdlib }}/." "$dest/"
+
+      - name: Build fuyubot + fuyubot-sdk + 内置插件
+        shell: bash
+        env:
+          FUYUBOT_TDLIB_VENDORED_CACHE: ${{ github.workspace }}/.tdlib-cache
+        run: >-
+          cargo build --release
+          -p fuyubot-cli -p fuyubot-sdk-cli
+          -p fuyubot-plugin-start -p fuyubot-plugin-help -p fuyubot-plugin-manage
+
+      # 三份中间包，各自独立：本体（可执行文件 + tdjson）、内置插件（plugins/）、SDK。
+      # 都先打 .tar.gz（跨平台都能打、也不受 zip 命令有无影响），叠成 zip 是 publish 的事。
+      - name: Package runtime, builtin plugins and sdk (separate tarballs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          asset="${{ matrix.asset }}"
+          bin="${{ matrix.bin }}"
+          ext=""
+          [[ "$bin" == *.exe ]] && ext=".exe"
+
+          # ① 本体：可执行文件 + 该平台的 tdjson（loader 优先级 2 靠「可执行文件同级」命中）
+          mkdir -p "dist/$asset"
+          cp "target/release/${bin}" "dist/$asset/"
+          cp -a ".tdlib-cache/${TDLIB_VERSION}/${{ matrix.platform_dir }}/." "dist/$asset/"
+          # TDLib 资产里的说明是给 loader 看的，不该混进面向用户的包
+          rm -f "dist/$asset/README.md" "dist/$asset/VERSION.json" \
+                "dist/$asset/build-info.txt" "dist/$asset/tdjson.lib"
+          # 用 printf 而不是 heredoc：YAML 块标量会把内容整体缩进，缩进的 `EOF` 不会终止 heredoc
+          printf '%s\n' \
+            "$("./target/release/${bin}" --version) — 基于 TDLib 的 Telegram bot 框架" \
+            "TDLib ${TDLIB_VERSION} 已打包在同目录（不要删 tdjson）" \
+            "内置插件在同级的 plugins/（/start、/help、/plugins），init/run 会自动装进项目" \
+            "" \
+            "起步：" \
+            "  ./fuyubot${ext} init --dir demo --name mybot --api-id <你的 api_id>" \
+            "  ./fuyubot${ext} run  --config demo/fuyubot.toml" \
+            "" \
+            "文档：https://github.com/${GITHUB_REPOSITORY}" \
+            > "dist/$asset/README.txt"
+          tar -czf "dist/$asset.tar.gz" -C dist "$asset"
+
+          # ② 内置插件：单独一份包，归档顶层就是 plugins/，publish 直接叠进本体目录
+          case "$(uname -s)" in
+            MINGW*|MSYS*|CYGWIN*) lib="dll" ;;
+            Darwin) lib="dylib" ;;
+            *) lib="so" ;;
+          esac
+          plugins="fuyubot-plugins-${asset#fuyubot-}"
+          mkdir -p "dist/$plugins/plugins"
+          for name in fuyubot_plugin_start fuyubot_plugin_help fuyubot_plugin_manage; do
+            cp "target/release/${name}.${lib}" "dist/$plugins/plugins/"
+          done
+          tar -czf "dist/$plugins.tar.gz" -C "dist/$plugins" plugins
+
+          # ③ SDK 包：只放 fuyubot-sdk，它不需要 tdjson
+          sdk="fuyubot-sdk-${asset#fuyubot-}"
+          mkdir -p "dist/$sdk"
+          cp "target/release/fuyubot-sdk${ext}" "dist/$sdk/"
+          tar -czf "dist/$sdk.tar.gz" -C dist "$sdk"
+
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}-tarballs
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # 本体包 + 插件包叠成一个目录，再打 zip：用户下载一个文件、解压就得到
+      #   fuyubot-<os>-<arch>/{fuyubot, tdjson, README.txt, plugins/}
+      # 单独的本体/插件 tar.gz 不挂 Release——它们是构建产物，不是发布形态。
+      - name: Merge into per-platform zips
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$PWD/dist"
+          stage="$(mktemp -d)"
+          for runtime in dist/fuyubot-*.tar.gz; do
+            asset="$(basename "$runtime" .tar.gz)"
+            case "$asset" in
+              fuyubot-sdk-*|fuyubot-plugins-*) continue ;;
+            esac
+            plugins="dist/fuyubot-plugins-${asset#fuyubot-}.tar.gz"
+            [[ -f "$plugins" ]] || { echo "缺少配套的插件包：$plugins" >&2; exit 1; }
+            # 本体包顶层是 $asset/，插件包顶层是 plugins/，叠进去就是最终布局
+            tar -xzf "$runtime" -C "$stage"        # → $stage/$asset/
+            tar -xzf "$plugins" -C "$stage/$asset" # → $stage/$asset/plugins/
+            ( cd "$stage" && zip -q -r -X "$out/$asset.zip" "$asset" )
+          done
+          # SDK 也统一发 zip（各平台的 fuyubot-sdk 单独一个包，不塞进本体 zip）
+          for sdk in dist/fuyubot-sdk-*.tar.gz; do
+            asset="$(basename "$sdk" .tar.gz)"
+            tar -xzf "$sdk" -C "$stage"
+            ( cd "$stage" && zip -q -r -X "$out/$asset.zip" "$asset" )
+          done
+          rm -rf "$stage"
+          ls -lh dist/*.zip
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          # 下载表从实际产物生成——别手抄 matrix，加平台时它自己会多一行（AGENTS 约束 46 的教训）。
+          table="$(
+            for zipfile in dist/fuyubot-*.zip; do
+              name="$(basename "$zipfile" .zip)"
+              case "$name" in fuyubot-sdk-*) continue ;; esac
+              case "${name#fuyubot-}" in
+                windows-x86_64)  label="Windows 10/11（x64）" ;;
+                windows-aarch64) label="Windows 11（ARM64）" ;;
+                linux-x86_64)    label="Linux（x86_64）" ;;
+                linux-aarch64)   label="Linux（ARM64）" ;;
+                macos-aarch64)   label="macOS（Apple Silicon）" ;;
+                *)               label="${name#fuyubot-}" ;;
+              esac
+              printf '| %s | `%s.zip` |\n' "$label" "$name"
+            done
+          )"
+          notes=$(printf '%s\n' \
+            "## 下载" \
+            "" \
+            "每个平台一个 zip：解压后直接跑，TDLib 动态库与可执行文件同级，内置插件（/start、/help、/plugins）在 \`plugins/\` 里。" \
+            "" \
+            "| 系统 | 资产 |" \
+            "| --- | --- |" \
+            "$table" \
+            "" \
+            "插件开发 CLI 另有 \`fuyubot-sdk-<系统>-<架构>.zip\`（不需要 tdjson）。")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip --clobber
+            gh release edit "$TAG" --notes "$notes"
+          else
+            gh release create "$TAG" dist/*.zip --title "fuyubot $TAG" --notes "$notes"
+          fi

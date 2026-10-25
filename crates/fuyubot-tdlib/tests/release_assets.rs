@@ -92,7 +92,7 @@ fn the_release_workflow_publishes_exactly_the_asset_names_we_download() {
         "linux / macos / windows 的打包与校验都应当走 `dist/${{{{ matrix.asset }}}}`（3×2=6），实际找到 {uses} 处"
     );
 
-    // tag 也必须一致：loader 拼的是 `TDLib V<版本>`（中间有空格，URL 里编码成 %20）。
+    // tag 也必须一致：loader 拼的是 `TDLib-v<版本>`（连字符，无空格，不做百分号编码）。
     assert!(
         workflow.contains("TAG=\"TDLib-v${VER}\""),
         "workflow 的 release tag 必须与 loader 的 release_url() 一致（`TDLib-v<版本>`）"

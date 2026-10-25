@@ -19,7 +19,7 @@
  * 所以本文件只能用「能剥掉」的语法：注解、`interface`/`type`、`as`，
  * **不能用** `enum` / `namespace` / 构造器参数属性（那些需要真正的编译）。
  * 你的 Node 太老就自己 `tsc` 编成 `.js`，或者把引擎换掉——反正插件只管逻辑，
- * 打包与编译是作者自己的工具链（见 `docs/ROADMAP.md` 变更 5）。
+ * 打包与编译是作者自己的工具链（见 `docs/decisions.md` 变更 5）。
  */
 
 import * as host from "./fuyubot_plugin.js";

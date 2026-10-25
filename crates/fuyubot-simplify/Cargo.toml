@@ -7,6 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 fuyubot-abi.workspace = true
+# 只为把 `td_api` 类型重导给调用方（编辑器提示用）；纯类型 crate，
+# 不带加载/网络依赖——这正是拆 sys 的意义。
+fuyubot-tdlib-sys.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
@@ -15,5 +18,5 @@ fuyubot-core.workspace = true
 fuyubot-event.workspace = true
 fuyubot-loader.workspace = true
 # 用真 `td_api.tl` 烤出来的元数据校验自己拼的方法名/参数名（见 tests 里的
-# `every_request_simplify_builds_passes_the_real_schema`）。只在测试期，运行时不依赖。
-fuyubot-tdlib.workspace = true
+# `every_request_simplify_builds_passes_the_real_schema`）——元数据走上面的
+# fuyubot-tdlib-sys（普通依赖，运行时也在图里），运行时不依赖 fuyubot-tdlib。

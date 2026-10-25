@@ -4,9 +4,13 @@
 
 - **插件是动态库**（`.dll` / `.so` / `.dylib`）。Rust / C / C++ / Python / JS / TypeScript 都能写，
   一个 cdylib 就是一个插件。
-- **TDLib 运行时动态加载**，不静态链接。`td_api.tl` 在**编译期**被转成 3214 条元数据烤进二进制
-  （函数 1022 / 构造器 2189 / 未归类 3），所以运行时不读文件、不解析。
-- 两个 CLI，职责严格分离：**`fuyubot`** 跑框架，**`fuyubot-sdk`** 写插件（脚手架 / 生成绑定 / 静态检查）。
+- **TDLib 运行时动态加载**，不静态链接。`td_api.tl` 在**编译期**被转成元数据烤进二进制，
+  所以运行时不读文件、不解析。条数取决于构建时用的那份 `td_api.tl`：现在 Release 发布的与本机
+  `.tdlib-cache/` 那份都是 **3178 条（函数 1010 / 构造器 2165 / 未归类 3）**
+  ——**别把条数当常量**，以前本机另一份是 3214 条（见 [gaps.md 缺口 30](docs/gaps.md)）。
+- 两个 CLI，职责严格分离：**`fuyubot`** 跑框架（`init` / `run` / `status` / `stop` / `config` / `plugin`），
+  **`fuyubot-sdk`** 写插件（脚手架 / 生成绑定 / 静态检查）。**两个都不编译、不打包插件**——
+  打包归插件作者自己的语言工具链。
 - **离线也能验插件**：`fuyubot run --replay` 把一批更新的 JSON 灌进整条管线，**不需要 Telegram 账号**。
 - 内核是 Cordis 式的：`Context` 只暴露 `&self`，注册返回 `Effect`，**drop 即回滚**。
 
@@ -18,13 +22,38 @@
 > | 真 TDLib（真 `tdjson` + 真 `td_api.tl`）：`getMe` 往返、同步 `execute`、插件调 TDLib 收响应 | ✅ 验过（`-- --ignored`） |
 > | Rust / C / C++ / Python / JS / TS 插件脚手架 + 生成绑定 + 静态检查 | ✅ |
 > | 离线回放（`--replay`） | ✅ 本文档里所有命令都真跑过 |
-> | **真实登录 + `fuyubot run` 接 TDLib 跑起来** | ❌ **还没接**：授权状态机 `fuyubot-tdlib::authorize` 已就绪，CLI 还没串起来 |
-> | 打包/部署（把 tdjson 跟二进制一起分发） | ❌ 见 [还缺什么](#还缺什么) |
+> | 运行时 CLI 的实例三件套：单实例锁 / `run --background` / `status` / `stop` | ✅ 真跑过（见 ⑤） |
+> | **真实登录 + `fuyubot run` 接 TDLib 收真更新** | ⚠️ **接上了但没拿真账号端到端验过**：`run` 会问凭据、驱动授权状态机、`getMe` 打印账户，然后才开分发；真库上的登录 + session 复用是在 `fuyubot-tdlib` 的 `#[ignore]` 自检里验的 |
+> | 打包/部署（把 tdjson 跟二进制一起分发） | ✅ 构建期 `fuyubot-tdlib/build.rs` 把 tdjson（+ 兄弟 DLL）拷到 exe 同级目录，loader 优先级 2 认「可执行文件所在目录」；`cargo install` 装出来的二进制是唯一例外（见 [gaps.md 缺口 3](docs/gaps.md)） |
 >
-> 所以现在能完整跑通的路径是**离线回放**；`fuyubot run`（不带 `--replay`）会接上 TDLib 起接收循环，
-> 但因为没登录，收不到任何更新。
+> 所以现在能完整跑通的路径是**离线回放**与**实例三件套**；`fuyubot run`（不带 `--replay`）
+> 会接上 TDLib 走登录，但**真实收发的最后一环还没有真账号证据**。
 
 ---
+
+## 普通用户：下载即用（不用编译）
+
+到 [Releases](https://github.com/xiaoqvan/Fuyu-Bot/releases) 下对应平台的 zip，解压后 `tdjson` 就在
+可执行文件旁边、内置插件在 `plugins/`，直接跑：
+
+```powershell
+Expand-Archive -Path fuyubot-windows-x86_64.zip -DestinationPath .
+cd fuyubot-windows-x86_64
+.\fuyubot.exe init --dir demo --name mybot --api-id 12345
+.\fuyubot.exe run --config demo\fuyubot.toml
+```
+
+| 系统 | 资产 |
+| --- | --- |
+| Windows 10/11（x64） | `fuyubot-windows-x86_64.zip` |
+| Windows 11（ARM64） | `fuyubot-windows-aarch64.zip` |
+| Linux（x86_64） | `fuyubot-linux-x86_64.zip` |
+| Linux（ARM64） | `fuyubot-linux-aarch64.zip` |
+| macOS（Apple Silicon） | `fuyubot-macos-aarch64.zip` |
+
+插件开发 CLI 另有 `fuyubot-sdk-<系统>-<架构>.zip`。完整的使用文档（下载 / 配置 / 运行 / 回放 / 排错）在
+[`website/`](website/)；发布包由 [`.github/workflows/release-bot.yml`](.github/workflows/release-bot.yml) 产出。
+下面是从源码构建的**开发者**路线。
 
 ## 5 分钟跑起来（不需要账号）
 
@@ -36,16 +65,24 @@ cd Fuyu-Bot
 cargo build --workspace
 ```
 
-> **构建需要一份 `td_api.tl`**（`fuyubot-tdlib` 的必需输入，见 `AGENTS.md` 约束 25）。
-> 优先级：`TDLIB_TD_API_TL` → 缓存 `<cache>/<版本>/td_api.tl` → 从 Releases 下载。
-> 仓库里的 `.tdlib-cache/` 是本机开发缓存（**不入库**）：
+> **构建需要一份 `td_api.tl`**（`fuyubot-tdlib-sys` 的必需输入，见 `AGENTS.md` 约束 25）。
+> 优先级：`TDLIB_TD_API_TL` → 缓存 `<缓存根>/<版本>/td_api.tl` → 从 Releases 下载。
+> 缓存根按顺序找：`FUYUBOT_TDLIB_VENDORED_CACHE` → `$CARGO_HOME/fuyubot-tdlib-vendored` →
+> **项目本地 `<工作区>/.tdlib-cache`**（`$HOME` 只读的容器 / 受限沙箱里只有它写得进去）。
+> 仓库里的 `.tdlib-cache/` 就是这一档，**不入库**。仓里的 `.cargo/config.toml` 已经把它指好了
+> （`relative = true`，相对仓库根），所以在仓库里敲 `cargo build` 不用手写这条：
 >
 > ```powershell
-> # 本机已有缓存时，指一下就不用联网（必须写绝对路径）
+> # 要临时换缓存位置时手写（**必须绝对路径**：两个 build.rs 的 CWD 是各自的 crate 根）
 > $env:FUYUBOT_TDLIB_VENDORED_CACHE = "$PWD\.tdlib-cache"
 > ```
 >
-> 还没有缓存、也还没有 Releases 资产时，用 `TDLIB_TD_API_TL` 显式给一份文件。
+> 没有缓存时 `build.rs` 会自己从 Releases 下载，**下完一次就进缓存**（Release `TDLib-v1.8.66`
+> 已发布）。一次构建只会看到一条「已转换 …（N 条）」的提示；只有第一次下载才会多说几句。
+> ⚠️ 缓存根**全都**写不进去时才退到 `$OUT_DIR`——那个目录每次重跑构建脚本都会被清空，
+> 于是下次构建**会重新下载**（构建脚本会明确警告这一点）。要彻底避免就设
+> `FUYUBOT_TDLIB_VENDORED_CACHE` 指一个可写目录。
+> 要完全离线构建就用 `TDLIB_TD_API_TL` 显式给一份文件。
 
 ### ① 起一个项目
 
@@ -70,7 +107,7 @@ api_id = 12345
 dir = "plugins"
 
 [tdlib]
-path = ""          # 留空 = 按四级优先级自动找 tdjson
+path = ""          # 留空 = 按加载优先级自动找 tdjson
 ```
 
 ### ② 生成一个插件（或者直接跳到 ③ 用自带的示例）
@@ -85,22 +122,24 @@ cargo run -q -p fuyubot-sdk-cli -- init mybot --lang rust --dir demo
 下一步：用你自己的工具链编译它（cargo build --release / gcc -shared / …）
 ```
 
-### ③ 编译并装进插件目录
+### ③ 用它自己的工具链编译，再装进插件目录
+
+**`fuyubot` 不编译插件**（过渡期的 `build-plugin` 已按新规格拆掉）：编是插件作者自己的事，
+`fuyubot plugin install` 只负责把编好的东西**复制**进插件目录。
 
 ```bash
-cargo run -q -p fuyubot-cli -- build-plugin --dir demo/plugins/mybot
+cargo build --release --manifest-path demo/plugins/mybot/Cargo.toml   # 生成的插件是独立 crate
+cargo run -q -p fuyubot-cli -- plugin install demo/plugins/mybot --plugin-dir demo/plugins
 ```
 
 ```
-   Compiling mybot v0.1.0 (demo\plugins\mybot)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.69s
-编好了：demo\plugins\mybot\target\debug\mybot.dll
-已装进 demo\plugins：
-  demo\plugins\mybot.dll
+已安装 demo\plugins\mybot.dll
 ```
 
-> `build-plugin` 是**过渡期**命令（打包将来归作者自己的工具链）。它要**祖先目录里有 `fuyubot.toml`**
-> 才会把产物装进插件目录；找不到就只编译并告诉你「跳过安装」。
+> 传**工程目录**时，工程根目录里的 `.py` / `.js` / `.ts` / `.pyi` 会一起拷过去
+> （脚本插件要求脚本与 cdylib 同目录）；传单个 `.dll` 时看不到脚本在哪，所以脚本插件请传目录。
+> 各语言怎么编见 [`docs/plugin-guide.md`](docs/plugin-guide.md)；`examples/` 五个示例的
+> 逐条命令见 [`examples/README.md`](examples/README.md)。
 
 ### ④ 离线回放，看插件干活
 
@@ -110,23 +149,74 @@ cargo run -q -p fuyubot-cli -- run --replay examples/replay/new_message.json --p
 
 ```
 --replay：本次不接 TDLib（回放是离线的，请求只留档）
-已加载插件 fuyubot.demo (demo\plugins\mybot.dll)
-fuyubot（fuyubot 0.1.0）已启动：插件 1 个，工具 1 个
+已加载插件 mybot (demo\plugins\mybot.dll)
+fuyubot（fuyubot 0.1.0）已启动：插件 1 个，工具 0 个
+mybot: 收到 updateNewMessage
 回放 updateNewMessage → UpdateOutcome { update_type: "updateNewMessage", listeners: 1, warnings: [] }
+mybot: 收到 updateNewMessage
 回放 updateNewMessage → UpdateOutcome { update_type: "updateNewMessage", listeners: 1, warnings: [] }
+mybot: 收到 updateNewMessage
 回放 updateNewMessage → UpdateOutcome { update_type: "updateNewMessage", listeners: 1, warnings: [] }
 插件打出来的日志：
-  Info fuyubot.demo: init
-  Info fuyubot.demo: start()
-  Info fuyubot.demo: updateNewMessage {…"text":"/ping"…}
+  Info mybot: init
+  Info mybot: start()
 插件发出去的请求：
-  #281474976710656 getMe {"@type":"getMe"}
 ```
 
-回放是**离线**的，所以插件发出去的请求只**留档**（上面那行 `#281474976710656` 是合成请求号），
-不会真的发到 Telegram。退出码 0 表示回放成功。
+回放是**离线**的，所以插件发出去的请求只**留档**（`examples/` 里的 echo / counter 会列出
+`#请求号 sendMessage {…}`），不会真的发到 Telegram。退出码 0 表示回放成功。
 
 自带的工具：`cargo run -q -p fuyubot-cli -- plugin list --plugin-dir demo/plugins`
+
+### ⑤ 跑起来、后台跑、看状态、停掉（要 TDLib；真实更新还要账号）
+
+```powershell
+# 前台：会问 api_id / api_hash（或从 TG_API_ID / TG_API_HASH 读），然后驱动登录
+.\target\debug\fuyubot.exe run --config demo\fuyubot.toml
+
+# 后台：派生一个没有终端的自己，日志进 demo\logs\fuyubot.log，命令立刻返回
+.\target\debug\fuyubot.exe run --config demo\fuyubot.toml --no-login --background
+```
+
+```
+已在后台运行：pid 15252，日志 demo\logs\fuyubot.log
+`fuyubot status` 看状态，`fuyubot stop` 停掉它
+```
+
+```powershell
+.\target\debug\fuyubot.exe status --config demo\fuyubot.toml
+```
+
+```
+demo：运行中
+  pid        15252
+  已运行     0 秒
+  版本       0.1.0
+  名字       mybot
+  插件       0 个
+  日志       demo\logs\fuyubot.log
+```
+
+```powershell
+.\target\debug\fuyubot.exe stop --config demo\fuyubot.toml
+.\target\debug\fuyubot.exe status --config demo\fuyubot.toml
+```
+
+```
+已停止 mybot（pid 15252，优雅退出：插件 stop 与内核都已收摊）
+demo：没有运行中的实例
+（`lock` 文件还在，但没人在持有它——不用手工清理，下次 `fuyubot run` 自己接管）
+  上次：mybot pid 15252，启动于 1 秒前（版本 0.1.0，插件 0 个）
+  日志       demo\logs\fuyubot.log
+```
+
+- **一个目录一个实例**：第二次 `run`（前台或后台都算）会被拒，报错里带上在跑的那个 PID。
+- **`stop` 是优雅的**：它写一个停止请求（`.fuyubot/stop`），实例自己停接收循环 → 卸载插件
+  （跑 `plugin_stop`）→ 放锁；8 秒不理会才退回硬杀。状态放在 `.fuyubot/` 下，
+  陈旧的锁**不用手工清理**。
+- **后台跑不能交互**：没有 session 又没给 `TG_BOT_TOKEN` 时它会直接失败，并把日志尾巴打出来——
+  先用前台 `run` 登一次（session 落在 `data/`）。
+- 上面这段的 `--no-login` 是「只起框架、不接登录流程」，方便在没有账号的机器上验证实例三件套。
 
 ---
 
@@ -178,18 +268,21 @@ TS 靠 **Node 自带的类型剥离**跑（`node x.ts`，需要 Node ≥ 23.6）
 
 ## 接真 TDLib 跑（当前进度）
 
-`fuyubot run`（不带 `--replay` / `--no-tdlib`）会接 TDLib 并起接收循环。**但登录还没接**：
+`fuyubot run`（不带 `--replay` / `--no-tdlib`）会接 TDLib 并起接收循环，**登录也在里面**：
+自动 init → 问/读凭据 → attach → 加载插件 → 发 `setTdlibParameters` → 登录 → `getMe` → 才开分发
+（`--no-login` 跳过登录那几步）。下面这段是**旧版**的输出，只作历史参考：
 
 ```
 $ TG_API_ID=12345 TG_API_HASH=… cargo run -q -p fuyubot-cli -- run --plugin-dir demo/plugins
 TDLib 1.8.66 命中「TDLIB_TDJSON_PATH 目录」：…\tdjson.dll
 已加载插件 fuyubot.example.counter (…\counter.dll)
-环境变量里有 api_id=12345 + TG_API_HASH，但真实登录流程还没接（见 HANDOFF 缺口 4）；现在只在接入 TDLib 后收发更新
+环境变量里有 api_id=12345 + TG_API_HASH，但真实登录流程还没接（见 gaps 缺口 4）；现在只在接入 TDLib 后收发更新
 fuyubot（fuyubot 0.1.0）已启动：插件 1 个，工具 0 个
 开始接收 TDLib 更新（Ctrl-C 退出）
 ```
 
-两点要知道：**它就一直跑着**（接收循环没有停止位，只能 Ctrl-C，见缺口 8），而且**没登录就收不到任何更新**——
+两点要知道：**它就一直跑着**（停它用 `fuyubot stop`，或进程里持有 `ReceiveLoop` 停止把手；
+Ctrl-C 仍是硬杀，见 [gaps.md 缺口 8](docs/gaps.md)），而且**没登录就收不到任何更新**——
 所以要立刻验插件，用 `--replay`。
 
 凭据**只允许两个来源**（`AGENTS.md` 约束 41，配置里写了也会被忽略）：
@@ -202,7 +295,8 @@ export TG_API_HASH=…      # 只走环境变量，等 C1 做完还会支持交�
 tdjson 的四级查找顺序（`fuyubot-tdlib::loader`，不要重排）：
 
 1. `TDLIB_TDJSON_PATH`（指目录或文件）
-2. vendored（`FUYUBOT_TDLIB_VENDORED_CACHE` / `FUYUBOT_TDLIB_VENDORED_DIR`）
+2. vendored（`FUYUBOT_TDLIB_VENDORED_CACHE` / `FUYUBOT_TDLIB_VENDORED_DIR`）→ **可执行文件所在目录**
+   （构建期 `build.rs` 拷过去的 tdjson + 兄弟 DLL；`LibrarySource::ExeDir`）
 3. Linux 带版本号的系统库（`libtdjson.so.1.8.66` …）
 4. 裸库名（`tdjson.dll` / `libtdjson.so`，走 `PATH`）
 
@@ -213,13 +307,35 @@ tdjson 的四级查找顺序（`fuyubot-tdlib::loader`，不要重排）：
 
 ## 构建与测试（开发者）
 
-```powershell
-$env:FUYUBOT_TDLIB_VENDORED_CACHE = "F:\Rust\FuyuBot\.tdlib-cache"   # 绝对路径！
+仓里的 [`.cargo/config.toml`](.cargo/config.toml) 已经把开发缓存指好了（`FUYUBOT_TDLIB_VENDORED_CACHE`
+= 仓内 `.tdlib-cache`，相对仓库根），所以下面这些命令**直接敲就行**，不用先 export：
 
+```powershell
 cargo build --workspace --offline     # 0 退出、0 warning
-cargo test  --workspace --offline     # 176 passed / 0 failed / 10 ignored
+cargo test  --workspace --offline     # 201 passed / 0 failed / 12 ignored
 cargo tree  --workspace --offline     # 必须无环
 cargo fmt --all --check               # 0 diff（整仓 rustfmt-clean）
+```
+
+**一键命令**（同样来自 `.cargo/config.toml`，三条都真跑过）：
+
+```powershell
+cargo bot                             # = fuyubot run：一键启动当前目录的 bot
+cargo bot --no-login                  # 参数照常往后接（--config / --plugin-dir / --no-login…）
+cargo package-bot                     # 本地打包：target\release\fuyubot.exe
+                                      # （tdjson.dll + 兄弟 DLL 由 build.rs 放到它同级）
+cargo package-sdk                     # SDK 打包：target\release\fuyubot-sdk.exe（给插件作者，不需要 tdjson）
+```
+
+**本地打包与 SDK 打包分开**：`package-bot` 出运行时本体（exe + 同级的 TDLib 库），
+`package-sdk` 出插件开发 CLI。两个都只是 `cargo build --release -p <对应 CLI>`，
+产物目录 `target/release/` 直接拷走就能用——**`cargo install` 是唯一例外**（安装目录不受构建脚本管，
+tdjson 得自己放，见 [gaps.md 缺口 3](docs/gaps.md)）。
+
+要临时换缓存位置就照旧设环境变量（**手写必须绝对路径**，相对路径会被解析到各自的 crate 根）：
+
+```powershell
+$env:FUYUBOT_TDLIB_VENDORED_CACHE = "F:\Rust\FuyuBot\.tdlib-cache"
 ```
 
 git bash 里同样可以（MSYS 会把 `/f/...` 转成 `F:/...`）：
@@ -279,14 +395,15 @@ $env:TEMP = "$PWD\target\linktmp"; $env:TMP = $env:TEMP; New-Item -ItemType Dire
 
 | 变量 | 谁读 | 作用 |
 |---|---|---|
-| `FUYUBOT_TDLIB_VENDORED_CACHE` | `fuyubot-tdlib`（构建期 + 运行时） | vendored 缓存根目录（**要绝对路径**） |
+| `FUYUBOT_TDLIB_VENDORED_CACHE` | `build.rs`（**构建期**） | 缓存根（**要绝对路径**）：`td_api.tl` 与 vendored 动态库都放这儿。不设就按 `$CARGO_HOME` → 项目本地 `.tdlib-cache` 找。运行时的动态库位置是编译期烤进去的，**不是**运行期读这个变量 |
 | `TDLIB_TDJSON_PATH` | 加载器 | tdjson 的目录或文件（优先级 1） |
 | `TDLIB_TD_API_TL` | `build.rs` | 显式指定 `td_api.tl`（优先级最高） |
 | `FUYUBOT_TDLIB_RELEASES_REPO` | `build.rs` | 覆盖 `[package.metadata.fuyubot] releases-repo` |
-| `TG_API_ID` / `TG_API_HASH` | CLI / 集成测试 | **凭据只走环境变量**（`TG_BOT_TOKEN` 仅测试用） |
+| `TG_API_ID` / `TG_API_HASH` | `fuyubot run` / 集成测试 | **凭据只走环境变量**（`TG_BOT_TOKEN` 也认，`run` 与测试都用） |
 | `FUYUBOT_SDK_PATH` | `fuyubot-sdk` | 脚手架里 `path = …` 指向 SDK 的目录 |
-| `FUYUBOT_OFFLINE` / `CARGO_NET_OFFLINE` | `build-plugin` | 非空且非 `0`/`false` 时给 cargo 加 `--offline` |
-| `CC` | `build-plugin` | 覆盖 C/C++ 插件用的编译器 |
+
+> 插件的编译是**作者自己的工具链**的事（`cargo build`、`cl /LD`、`gcc -shared`……），
+> 两个 CLI 都不读 `CC` 之类的编译器开关——`build-plugin` 已按新规格拆掉。
 
 ---
 
@@ -298,39 +415,49 @@ crates/
   fuyubot-abi          C ABI：HostApiVTable、PluginHandle、define_plugin!、cbindgen 生成的头
   fuyubot-plugin-api   插件作者唯一要依赖的 crate（重导出 ABI + 安全包装）
   fuyubot-sdk-script   Python / JS / TS SDK（cdylib 起解释器 + 行 JSON 协议 + script_plugin!）
-  fuyubot-tdlib        TDLib：ffi / loader / client / authorize（状态机）/ tl_schema / tl_codegen
+  fuyubot-tdlib-sys    TDLib 绑定（-sys）：td_api.tl 编译期生成的类型 + 元数据 + ffi 声明
+  fuyubot-tdlib        TDLib 运行时：loader / client / authorize（状态机），并重导出绑定
   fuyubot-event        事件总线          fuyubot-service    命名服务容器
   fuyubot-tool         工具注册表        fuyubot-middleware 六阶段洋葱管线
   fuyubot-loader       宿主层：VTable 桥 + 更新管线 + 插件加载
-  fuyubot-simplify     发消息 / 内联键盘 / 下载进度等便捷封装
+  fuyubot-simplify     发消息 / 编辑消息 / Markdown 转 entities / 命令解析等便捷封装
   fuyubot-cli          `fuyubot` CLI      fuyubot-sdk-cli  `fuyubot-sdk` CLI
   fuyubot-plugin-demo  最小 Rust 插件（集成测试真的 dlopen 它）
-examples/              rust-echo / python-weather / ts-counter / c-ping + 回放用的 JSON
+  fuyubot-plugin-start 内置插件：/start   fuyubot-plugin-help  /help   fuyubot-plugin-manage  /plugins
+examples/              rust-echo / python-weather / ts-counter / c-ping / go-ping + 回放用的 JSON
 docs/                  架构、ABI 契约、插件指南、进度台账、交接文档
+website/               文档站（Fumadocs = Next.js + MDX）：`cd website && pnpm install && pnpm dev`
 ```
 
 ## 文档地图
 
 | 文件 | 什么时候看 |
 |---|---|
+| [`website/`](website/) | **给使用者看的文档站**（Fumadocs）：使用文档 + 插件开发文档 |
 | [`docs/plugin-guide.md`](docs/plugin-guide.md) | 写插件（各语言模板、构建、调试） |
 | [`docs/abi-contract.md`](docs/abi-contract.md) | 插件 ABI 的正式契约（VTable、字符串归属、版本协商） |
-| [`docs/architecture.md`](docs/architecture.md) | 内核与更新管线的设计 |
+| [`docs/architecture.md`](docs/architecture.md) | 内核与更新管线的设计（结构 / 数据流 / ABI 契约 / 两种插件形态） |
 | [`docs/tdlib-simplify.md`](docs/tdlib-simplify.md) | 便捷封装的用法 |
-| [`docs/HANDOFF.md`](docs/HANDOFF.md) | **当前状态 / 踩过的坑 / 未验证的缺口 / 下一步** |
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | **入口**：当前状态 / 构建契约 / 每个 crate 有什么 |
+| [`docs/gaps.md`](docs/gaps.md) | 未验证的部分与已知缺口（编号是引用锚） |
+| [`docs/pitfalls.md`](docs/pitfalls.md) | 踩过的坑（编号是引用锚，别再踩回去） |
+| [`docs/decisions.md`](docs/decisions.md) | 被拍板的架构变更 1–7 + 核心原则 |
+| [`docs/tech-debt.md`](docs/tech-debt.md) | 技术债清单 |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | 进度台账（新规格与验收补跑） |
 | [`AGENTS.md`](AGENTS.md) | 仓库硬约束（改代码前必读） |
 
 ## 还缺什么
 
-按优先级排的完整列表在 [`docs/HANDOFF.md`](docs/HANDOFF.md) 的「未验证的缺口」，这里只提三条最影响使用的：
+按优先级排的完整列表在 [`docs/gaps.md`](docs/gaps.md)（编号即引用锚），这里只提三条最影响使用的：
 
-1. **登录**（缺口 4）：`authorize` 状态机写好了（13 个真状态、`request_for` 有真 schema 校验），
-   但没接到 `fuyubot run` 上。这是「真能跑起来」的最后一环。
-2. **打包/部署**（缺口 3）：`FUYUBOT_TDLIB_VENDORED_DIR` 指向**构建机**的 `target/.../out/vendored`，
-   所以 `cargo install` 出来的二进制旁边没有 tdjson，优先级 2 会静默失效。
-3. **进程退出**（缺口 8）：接了 TDLib 的路径**停不下来**（接收循环没有停止位），只能 Ctrl-C；
-   侧效应是 `--replay` 故意不接 TDLib。
+1. **真实账号的最后一环**：`run` 已经会问凭据、驱动授权状态机、`getMe` 打印账户后再开分发，
+   真库上的登录 + session 复用也在 `#[ignore]` 自检里验过；但**没有拿真账号端到端跑过
+   「收真更新 → 插件回一条」**。手机号登录那条路同样没验过。
+2. **`cargo install` 出来的二进制旁边没有 tdjson**：构建期的拷贝管不到安装目录
+   （其余部署形态已经解决：构建产物同级目录就有 tdjson，见 [gaps.md 缺口 3](docs/gaps.md)）。
+3. **Ctrl-C 不是优雅退出**：`fuyubot stop` 是优雅的（插件 `plugin_stop` 会跑），
+   但终端里按 Ctrl-C 还是硬杀——要捕获它得开 tokio 的 `signal` feature，
+   会带进 `mio` + `signal-hook-registry` + `errno`（见 [`docs/decisions.md`](docs/decisions.md) 变更 3-c）。
 
 另外仓库目前**没有 `LICENSE` 文件**（未声明授权）。
 

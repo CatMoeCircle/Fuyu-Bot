@@ -1,7 +1,10 @@
-//! vendored 原生库的资产映射、缓存布局与校验。
+//! vendored 原生库的资产映射与校验。
 //!
 //! 这个文件**同时**被 `build.rs`（`#[path]` 引入）和库本体编译，
 //! 所以它只能依赖 std 和可选依赖，不得引用 crate 内其他模块。
+//!
+//! 缓存根、下载、`release_url` 这些**两个构建脚本共用**的设施不在这里——
+//! 它们住在 `../fuyubot-tdlib-sys/src/build_support.rs`（含 `td_api.tl` 那半）。
 
 use std::path::{Path, PathBuf};
 
@@ -35,18 +38,6 @@ pub const ASSETS: &[(&str, &str, &str)] = &[
     ("windows", "x86_64", ASSET_WINDOWS_X86_64),
     ("windows", "aarch64", ASSET_WINDOWS_AARCH64),
 ];
-
-/// 缓存根目录环境变量。
-pub const CACHE_ENV: &str = "FUYUBOT_TDLIB_VENDORED_CACHE";
-/// 覆盖 `[package.metadata.fuyubot] releases-repo` 的环境变量。
-pub const REPO_ENV: &str = "FUYUBOT_TDLIB_RELEASES_REPO";
-
-/// TDLib 的 API 定义文件，跟着动态库一起发布在同一个 release 里。
-///
-/// 它是**平台无关**的，所以缓存路径不带 `os-arch` 那一段。
-pub const SCHEMA_ASSET: &str = "td_api.tl";
-/// 覆盖 `td_api.tl` 位置的环境变量（不配就用 vendored / 库旁边那份）。
-pub const SCHEMA_ENV: &str = "TDLIB_TD_API_TL";
 
 /// 平台动态库文件名；不支持的平台返回 `None`。
 pub fn library_filename(os: &str) -> Option<&'static str> {
@@ -85,38 +76,62 @@ pub fn is_library_file(name: &str, os: &str) -> bool {
     }
 }
 
-/// 缓存根目录：环境变量优先，其次 `$CARGO_HOME/fuyubot-tdlib-vendored`。
-pub fn cache_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os(CACHE_ENV).filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir);
+/// 某个版本 + 平台在缓存里的目录（**相对缓存根**）：`<version>/<os>-<arch>`。
+pub fn relative_library_dir(version: &str, os: &str, arch: &str) -> PathBuf {
+    Path::new(version).join(format!("{os}-{arch}"))
+}
+
+/// 缓存里该平台库文件的**相对**路径（相对缓存根）。
+pub fn relative_library(version: &str, os: &str, arch: &str) -> PathBuf {
+    relative_library_dir(version, os, arch).join(library_filename(os).unwrap_or("tdjson"))
+}
+
+/// 构建产物目录（放可执行文件的地方）从 `OUT_DIR` 推出来：
+/// `<target>/<profile>/build/<crate>-<hash>/out` 往上三级。
+///
+/// cargo 没有「把文件放到产物旁边」的机制，只能这么算。形状对不上就返回 `None`
+/// ——**宁可不拷，也不往一个猜出来的目录里写**。（纯路径运算 + 一次 `is_dir`，所以能单测。）
+pub fn binary_dir_from(out_dir: &Path) -> Option<PathBuf> {
+    let mut ancestors = out_dir.ancestors();
+    ancestors.next()?; // out
+    ancestors.next()?; // <crate>-<hash>
+    if ancestors.next()?.file_name()? != "build" {
+        return None;
     }
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".cargo")))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
-        .unwrap_or_else(|| PathBuf::from(".cargo"));
-    cargo_home.join("fuyubot-tdlib-vendored")
+    let profile = ancestors.next()?;
+    profile.is_dir().then(|| profile.to_path_buf())
 }
 
-/// 某个版本 + 平台在缓存里的目录：`<root>/<version>/<os>-<arch>`。
-pub fn cache_dir(root: &Path, version: &str, os: &str, arch: &str) -> PathBuf {
-    root.join(version).join(format!("{os}-{arch}"))
-}
-
-/// 缓存里该平台库文件的完整路径。
-pub fn cached_library(root: &Path, version: &str, os: &str, arch: &str) -> PathBuf {
-    cache_dir(root, version, os, arch).join(library_filename(os).unwrap_or("tdjson"))
-}
-
-/// 缓存里 `td_api.tl` 的路径：`<root>/<version>/td_api.tl`（与平台无关）。
-pub fn cached_schema(root: &Path, version: &str) -> PathBuf {
-    root.join(version).join(SCHEMA_ASSET)
-}
-
-/// Releases 下载 URL。Tag 使用无空格的 `TDLib-v{version}`，避免 Git tag 非法。
-pub fn release_url(repo: &str, version: &str, asset: &str) -> String {
-    format!("https://github.com/{repo}/releases/download/TDLib-v{version}/{asset}")
+/// `source` 里要拷到二进制旁边的动态库文件。
+///
+/// - 文件来源：文件名等于 `lib_name` 才要（`TDLIB_TDJSON_PATH` 直接指文件时就是这种）；
+/// - 目录来源：**必须**含有 `lib_name`，连同**兄弟动态库**一起返回（`tdjson.dll` 可能 import
+///   `libssl-3-x64.dll` 之类，pitfalls 坑 44）；没有 `lib_name` 的目录整个跳过，免得把别处的 DLL 搬过来。
+///
+/// 只看扩展名、不猜依赖名字：真机上的依赖集随 TDLib 的构建方式变（静态并进去时一个都没有）。
+pub fn stageable_library_files(source: &Path, lib_name: &str) -> Vec<PathBuf> {
+    if source.is_file() {
+        return source
+            .file_name()
+            .is_some_and(|name| name == lib_name)
+            .then(|| vec![source.to_path_buf()])
+            .unwrap_or_default();
+    }
+    let Ok(entries) = std::fs::read_dir(source) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut has_library = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == lib_name {
+            has_library = true;
+            found.push(entry.path());
+        } else if name.ends_with(".dll") || name.ends_with(".dylib") || name.contains(".so") {
+            found.push(entry.path());
+        }
+    }
+    if has_library { found } else { Vec::new() }
 }
 
 /// SHA256 十六进制小写。
@@ -201,6 +216,16 @@ pub fn parse_version(version: &str) -> Option<(u32, u32, u32)> {
 mod tests {
     use super::*;
 
+    /// 测试用的临时目录（**不用 `%TEMP%`**，见 AGENTS 的测试规矩）。
+    fn temp(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp/fuyubot-tdlib")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建测试临时目录失败");
+        dir
+    }
+
     #[test]
     fn asset_and_library_names() {
         assert_eq!(asset_name("linux", "x86_64"), Some("TDLib-linux-x86_64"));
@@ -265,27 +290,15 @@ mod tests {
 
     #[test]
     fn cache_layout_is_version_scoped() {
-        let root = Path::new("/cache");
+        // 相对路径按 `<version>/<os>-<arch>` 分层：查缓存与落盘用的都是这一份
+        // （`build_support::find_cached` / `store_download`），布局漂了缓存就失效。
         assert_eq!(
-            cache_dir(root, "1.8.66", "windows", "x86_64"),
-            Path::new("/cache/1.8.66/windows-x86_64")
+            relative_library_dir("1.8.66", "windows", "x86_64"),
+            Path::new("1.8.66/windows-x86_64")
         );
         assert_eq!(
-            cached_library(root, "1.8.66", "linux", "x86_64"),
-            Path::new("/cache/1.8.66/linux-x86_64/libtdjson.so")
-        );
-        // td_api.tl 与平台无关，不带 os-arch 那一段
-        assert_eq!(
-            cached_schema(root, "1.8.66"),
-            Path::new("/cache/1.8.66/td_api.tl")
-        );
-    }
-
-    #[test]
-    fn release_url_encodes_the_space_in_the_tag() {
-        assert_eq!(
-            release_url("fuyubot/fuyubot", "1.8.66", "TDLib-windows-x86_64"),
-            "https://github.com/fuyubot/fuyubot/releases/download/TDLib-v1.8.66/TDLib-windows-x86_64"
+            relative_library("1.8.66", "linux", "x86_64"),
+            Path::new("1.8.66/linux-x86_64/libtdjson.so")
         );
     }
 
@@ -344,5 +357,71 @@ mod tests {
             extract_library(&tar_bytes, "linux").unwrap(),
             b"real library bytes"
         );
+    }
+
+    /// 「把库放到二进制旁边」这一半的路径推导：形状要认，形状不对要**拒绝**。
+    ///
+    /// 代价写反了就是往一个猜出来的目录里搬 28MB（甚至搬到仓库里去），所以这里的断言
+    /// 两个方向都要有。
+    #[test]
+    fn the_binary_directory_is_derived_from_out_dir() {
+        let root = temp("binary-dir");
+        let profile = root.join("debug");
+        let out_dir = profile
+            .join("build")
+            .join("fuyubot-tdlib-0123456789abcdef")
+            .join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        assert_eq!(binary_dir_from(&out_dir), Some(profile.clone()));
+
+        // `--target <triple>` 也是这样：`<目标目录>/<triple>/<profile>/build/.../out`
+        let triple_profile = root.join("x86_64-pc-windows-msvc").join("release");
+        let triple_out = triple_profile
+            .join("build")
+            .join("fuyubot-tdlib-0123456789abcdef")
+            .join("out");
+        std::fs::create_dir_all(&triple_out).unwrap();
+        assert_eq!(binary_dir_from(&triple_out), Some(triple_profile.clone()));
+
+        // 形状不对（没有 `build` 那一段）= 宁可什么都不拷。
+        let weird = root.join("a").join("b").join("c").join("out");
+        std::fs::create_dir_all(&weird).unwrap();
+        assert_eq!(binary_dir_from(&weird), None);
+        // profile 目录还不存在时也不能认（真到不了，但别默默往上一级写）。
+        let missing = root.join("nope").join("build").join("c").join("out");
+        assert_eq!(binary_dir_from(&missing), None);
+    }
+
+    /// 目录来源要把**兄弟动态库**一起带上（pitfalls 坑 44），没有 tdjson 的目录则整个跳过。
+    #[test]
+    fn stageable_files_follow_the_dynamic_library_shapes() {
+        let dir = temp("stageable-dir");
+        for name in [
+            "tdjson.dll",
+            "libssl-3-x64.dll",
+            "libcrypto-3.dll",
+            "tdjson.lib",
+            "build-info.txt",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let mut names: Vec<String> = stageable_library_files(&dir, "tdjson.dll")
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        // `tdjson.dll` + 兄弟 dll；导入库 `.lib` 与说明文件不是运行时依赖。
+        assert_eq!(names, ["libcrypto-3.dll", "libssl-3-x64.dll", "tdjson.dll"]);
+
+        // 目录里没有约定的库名 → 一个都不拷（免得把别处的 DLL 搬过来）。
+        assert!(stageable_library_files(&dir, "libtdjson.so").is_empty());
+
+        // 文件来源：名字对上才要。
+        assert_eq!(
+            stageable_library_files(&dir.join("tdjson.dll"), "tdjson.dll"),
+            vec![dir.join("tdjson.dll")]
+        );
+        assert!(stageable_library_files(&dir.join("tdjson.lib"), "tdjson.dll").is_empty());
+        assert!(stageable_library_files(&dir.join("不存在.dll"), "tdjson.dll").is_empty());
     }
 }

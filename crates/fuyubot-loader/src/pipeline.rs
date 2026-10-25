@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use fuyubot_event::{Filter, Payload, SubscriptionHandle};
 use fuyubot_middleware::{MiddlewareContext, Stage};
-use fuyubot_tdlib::{Routed, TdClient};
+use fuyubot_tdlib::{ReceiveLoop, Routed, TdClient};
 use serde_json::Value;
 
 use crate::runtime::HostRuntime;
@@ -84,22 +84,32 @@ impl UpdatePipeline {
         self.runtime.events().off(handle);
     }
 
-    /// 把 `TdClient` 接到宿主运行时，并起一个接收循环把两条路分开送进来。
+    /// 把 `TdClient` 挂进宿主运行时（**这一步不起接收循环**）。
+    ///
+    /// 拆成两步是为了满足 `fuyubot run` 的顺序要求：插件 `start` 期发出的请求必须能进真库
+    /// （所以 client 要**先**挂上，见 AGENTS 约束 31），而更新又不能在插件加载完之前开始分发
+    /// （否则插件会漏订阅）。于是「挂 client」与「开始分发」分成
+    /// [`attach_tdlib`](Self::attach_tdlib) 与 [`spawn_dispatch`](Self::spawn_dispatch)。
+    ///
+    /// 宿主已经接过客户端时返回 `Err`（带上原来那个），不覆盖。
+    pub fn attach_tdlib(self: &Arc<Self>, client: Arc<TdClient>) -> Result<(), Arc<TdClient>> {
+        self.runtime.attach_tdlib(client)
+    }
+
+    /// 开始把 `td_receive` 分流进管线（第 2 步）。
     ///
     /// - `Routed::Update` → [`process_value`](Self::process_value)（六阶段 + 双通道路由）
     /// - `Routed::Response` → [`deliver_response`](Self::deliver_response)（按 `@extra` 投给发起者）
     ///
-    /// **循环不返回句柄**：它不会自己退出（TDLib 的接收线程生命周期等于进程），
-    /// 而为了给一个永不结束的任务命名 `JoinHandle` 就得让本 crate 依赖 tokio——不值得。
-    /// 接收任务被 detach，随进程一起走。宿主已经接过客户端时返回 `Err`（带上原来那个），不覆盖。
-    pub fn attach_tdlib(self: &Arc<Self>, client: Arc<TdClient>) -> Result<(), Arc<TdClient>> {
-        self.runtime.attach_tdlib(Arc::clone(&client))?;
+    /// **只在插件全部加载完之后调**：早调会漏更新。返回停止把手（gaps 缺口 8）——
+    /// 调用方必须留好它，否则停不掉循环（`stop()` 后最多 1s 真正停下）。
+    #[must_use = "不收下这个把手就永远停不掉接收循环"]
+    pub fn spawn_dispatch(self: &Arc<Self>, client: &Arc<TdClient>) -> ReceiveLoop {
         let pipeline = Arc::clone(self);
-        drop(client.spawn_receive_loop(move |routed| pipeline.dispatch(routed)));
-        Ok(())
+        client.spawn_receive_loop(move |routed| pipeline.dispatch(routed))
     }
 
-    /// 把接收循环分流出来的一条东西送进对应出口。`attach_tdlib` 的循环调它。
+    /// 把接收循环分流出来的一条东西送进对应出口。[`spawn_dispatch`](Self::spawn_dispatch) 的循环调它。
     ///
     /// 这里**不 panic**：更新处理不了、响应投递失败都只打一行日志，接收循环必须继续跑。
     pub fn dispatch(&self, routed: Routed) {

@@ -1,117 +1,195 @@
 # TDLib 便捷封装对照表（`fuyubot-simplify`）
 
-结论先说：**封装只简化输入，不改变输出**。每个方法都经 `HostApi::td_invoke_simplified`
-（或 `td_invoke`）发出，不绕过 ABI、不碰 TDLib 的库；原始更新照旧全部对插件可见，
-封装只是可选糖。所有「实际发出的方法名」都由 `src/lib.rs` 里的常量表 / `method_for` 决定。
+结论先说：**封装只简化输入，不改变输出**。参数形状是「一个方法一个参数结构体 + 短字段名」
+（`text` / `media` / `topic_id` / `reply_to_message_id` / `reply_markup` / `link_preview` /
+`timeout_ms`），**不让调用方拼 TDLib 的嵌套 JSON**；请求本身照旧经 `td_invoke*` 发出，
+文本格式经同步的 `td_execute` 问 TDLib，原始更新对插件完全可见，封装只是可选糖。
 
-**验证状态**：方法名与字段路径**没有被真库验证过**（HANDOFF 缺口 11）。单元测试拿
-`fuyubot-loader::HostRuntime` 当假 TDLib 用（请求留档 + 合成请求号 + 手动投递响应），
-所以「拼装对不对」验过，「TDLib 认不认」没验过。
+**验证状态**：方法名与参数名由 `every_request_simplify_builds_passes_the_real_schema`
+拿真 `td_api.tl` 烤出来的元数据（`TdApiSchema::compiled()`）逐条校验，离线就能跑；
+Markdown → entities 的**真实行为**由
+`crates/fuyubot-tdlib/tests/integration.rs` 的 `execute_runs_synchronous_methods`
+（`-- --ignored`，要真库）钉住。单元测试拿 `fuyubot-loader::HostRuntime` 当假 TDLib 用。
 
 ## 1. 公开方法
 
 `Simplify::new(host)` / `Simplify::host()` 只是持有并交出 `HostApi`（`Simplify` 是 `Copy`）。
 
-| 封装方法 | 发出的 TDLib 方法（`@type`） | 关键参数 | 返回类型 | 备注 |
-|---|---|---|---|---|
-| `send_message(chat_id, content, options)` | `sendMessage` / `sendPhoto` / `sendDocument` / `sendLocation`——由 `method_for(options.account_type, &content)` 决定，`@type` 由宿主补 | `chat_id`；`Text` → `input_message_content`（`@type=inputMessageText`，`text.text`，`text.entities=[]`，非 Plain 时加 `parse_mode`）；`Photo`/`Document` → `photo`/`document`（`@type=inputFileLocal`，`path`）+ 可选 `caption`；`Location` → 顶层 `latitude`/`longitude`。选项：`message_thread_id`、`reply_to_message_id`、`disable_notification`、`protect_content`、`reply_markup` | `Result<RequestId>` | 只给请求号。TDLib 的临时消息 JSON 从 `"response"` 通道回来（只发给发起请求的那个插件） |
-| `send_message_wait_success(chat_id, content, options)` | 同上，之后在 `updateMessageSendSucceeded`（过滤 `message.chat_id == chat_id`）上等 | 同上 + `options.timeout_ms` 当等待上限 | `Result<SendConfirmation>` | 返回的不是裸 `RequestId`，也不是裸 `WaitHandle`：`WaitHandle::payload_json` 是宿主线程局部缓冲，只在下一次宿主调用前有效，直接把那个指针交给调用方是个坑。这里拷成 `Value` 再连同 `request_id` 一起返回 |
-| `send_message_with_keyboard(chat_id, text, buttons)` | `sendMessage` | 与 `send_message` 相同，另加 `reply_markup` = `{"@type":"replyMarkupInlineKeyboard","rows":[[…]]}` | `Result<RequestId>` | 内部就是 `SendOptions { reply_markup: Some(inline_keyboard(buttons)), ..Default::default() }` |
-| `answer_callback_query(callback_query_id, text, show_alert)` | `answerCallbackQuery` | `callback_query_id`；`text`（`None` → `""`）；`show_alert`；`url=""`；`cache_time=0` | `Result<RequestId>` | 点了内联按钮必须回，否则客户端一直转圈 |
-| `wait_for_update(filter, timeout_ms)` | 不发 TDLib 方法（纯订阅） | `filter` 由 `UpdateFilter::to_json()` 生成；其中 `event_type` 键**选通道**，其余键做负载字段匹配 | `WaitHandle` | **阻塞**当前线程，直到匹配 / 超时 / 被 `cancel_wait` 取消。⚠️ 返回的 `payload_json` 下次宿主调用前就失效 |
-| `wait_for_update_json(filter, timeout_ms)` | 同上 | 同上 | `Result<Option<Value>>` | 超时或被取消返回 `None`。内部 `payload_of` 当场把临时指针拷成 `Value` |
-| `cancel_wait(handle)` | 不发 | `WaitHandle` | `()` | 从另一个线程取消一个还没结束的等待 |
-| `resolve_entities(ids, timeout_ms)` | 每个 `EntityId` 一个请求：`EntityId::Chat(_)` → `getChat`（参数 `chat_id`）；`EntityId::User(_)` → `getUser`（参数 `user_id`） | 先把所有请求**并发发出去**，再逐个在 `"response"` 通道上按 `request_id` 等 | `Result<EntitiesResolution>` | 返回的不是裸 `RequestId`：每个实体带自己的 `request` 与 `value`（`value` 超时是 `Null`）。顺序是「请求并发发、响应逐个等」，每个的等待上限都是 `timeout_ms`。聚合结果另发一条 `"entities_resolved"` 事件；`EntitiesResolution::request_id` 是**最后一条发出的请求**，只为日志关联 |
-| `download_file(file_id, priority, timeout_ms)` | `downloadFile` | `file_id`；`priority`；`offset=0`；`limit=0` | `Result<FileDownload>` | 阻塞到完成或超时；每收到一条 `updateFile` 推一个 `"file_progress"` 事件。过滤器是 `{"event_type":"update","file.id":N}`——**file id 在 `file.id`，不是顶层**（TDLib 的嵌套结构） |
+| 方法 | 发出的 `@type` | 参数结构体 | 返回 |
+|---|---|---|---|
+| `send_message(chat_id, &SendMessageParams)` | `sendMessage` | `text` / `media` / `reply_to_message_id` / `topic_id` / `reply_markup` / `link_preview` / `timeout_ms` | `RequestId`（不阻塞） |
+| `send_message_wait_success(chat_id, &SendMessageParams)` | 同上，之后等 `updateMessageSendSucceeded` | 同上（`timeout_ms` 是等待上限） | `SendConfirmation`（⚠️ **阻塞**） |
+| `send_message_album(chat_id, &SendAlbumParams)` | `sendMessageAlbum` | `medias`（2–10 项）/ `caption` / `reply_to_message_id` / `topic_id` | `RequestId`；项数不对返回 `SimplifyError::AlbumSize`。⚠️ **相册没有 `reply_markup`**（真签名里就没有这个参数，schema 守卫抓出来的）：想给相册挂键盘用 `editMessageReplyMarkup` |
+| `edit_message_text(chat_id, message_id, &EditTextParams)` | `editMessageText` | `text` / `link_preview` / `reply_markup` | `RequestId` |
+| `edit_message_caption(chat_id, message_id, &EditCaptionParams)` | `editMessageCaption` | `text` / `reply_markup` | `RequestId` |
+| `edit_message_media(chat_id, message_id, &EditMediaParams)` | `editMessageMedia` | `text`（新内容标题）/ `media` / `reply_markup` | `RequestId` |
+| `delete_message(chat_id, ids, revoke)` | `deleteMessages` | `message_ids: [i53]` / `revoke` | `RequestId` |
+| `answer_callback_query(query_id, text, show_alert)` | `answerCallbackQuery` | `text`（`None` → `""`）/ `show_alert` / `url=""` / `cache_time=0` | `RequestId` |
+| `formatted(&Text)` | **`parseTextEntities`（同步，`td_execute`）** | `text` / `parse_mode` | `formattedText` 的 `Value` |
+| `wait_for_update` / `wait_for_update_json` | 不发方法（纯订阅） | `UpdateFilter` + `timeout_ms` | `WaitHandle` / `Option<Value>`（⚠️ 阻塞） |
+| `wait_response(request, timeout_ms)` | 不发方法（等 `"response"` 通道） | `RequestId` | `Option<Value>`（⚠️ 阻塞） |
+| `resolve_entities(ids, timeout_ms)` | `getChat` / `getUser` | `Vec<EntityId>` | `EntitiesResolution`（⚠️ 阻塞） |
+| `download_file(file_id, priority, timeout_ms)` | `downloadFile` | — | `FileDownload`（⚠️ 阻塞） |
+| `cancel_wait(handle)` | 不发 | `WaitHandle` | `()` |
 
-## 2. 过滤器与选择器
+**编辑的结果去哪了**：编辑后的 `Message`、以及 `Message is not modified` 这类错误都是**响应**
+（`"response"` 通道，`@type == "error"` 表示失败）。要拿就 `wait_response(request, timeout)`。
+封装层**刻意不重试**——限流等多久是调用方的事。
 
-| 项 | 产生的 JSON / 写法 | 备注 |
+**`send_message` 不阻塞、`send_message_wait_success` 阻塞**（对方的实现是一个方法里等完拿
+`message`）。分两个入口是因为：等更新要靠**投递线程**送回来，而插件通常正是在更新回调里发消息，
+在回调里等就是自己卡自己，等到的是超时。
+
+## 2. 内容与按钮
+
+`Media`（对应 TDLib 的 `inputMessage*`，形状只有一份实现 `content_json`）：
+
+| 变体 | 内容类型 | 必需/常用字段 |
 |---|---|---|
-| `UpdateFilter::new(type)` | `{"event_type":"<type>","message.chat_id":…}` | 字段包在 `message` 里的更新（`updateNewMessage` 等），前缀是 `message.` |
-| `UpdateFilter::flat(type)` | `{"event_type":"<type>","chat_id":…}` | 字段在顶层的更新（`updateNewCallbackQuery` 等），不加前缀 |
-| `UpdateFilter::any()` | `{"event_type":"update"}` | 不限定类型，走兜底通道 |
-| `UpdateFilter::to_json()` | `chat_id` / `sender_user_id` / `message_thread_id` 三个可选字段 | `event_type` 的值是具体 `@type` 或兜底 `update`；它**不参与负载匹配** |
-| `EntityId::to_json()` | `{"kind":"chat|user","id":N}` | 只用于 `EntitiesResolution::to_json` |
-| `Button::callback(text, data)` | `{"@type":"inlineKeyboardButton","text":…,"type":{"@type":"inlineKeyboardButtonTypeCallback","data":<base64>}}` | TDLib 的 callback data 是 **base64** 编码的字节串；`data` 由 `base64()` 就地编码 |
-| `Button::url(text, url)` | `…"@type":"inlineKeyboardButtonTypeUrl","url":…` | 用户账号不能发 URL 按钮，TDLib 会拒绝 |
+| `Media::photo(file)` | `inputMessagePhoto` | `caption` / `width` / `height` / `has_spoiler` |
+| `Media::Video { .. }` | `inputMessageVideo` | `duration` / `width` / `height` / `supports_streaming` / `has_spoiler` |
+| `Media::Audio { .. }` | `inputMessageAudio` | `duration` / `title` / `performer` |
+| `Media::document(file)` | `inputMessageDocument` | `caption` |
+| `Media::Animation { .. }` | `inputMessageAnimation` | `duration` / `width` / `height` / `has_spoiler` |
+| `Media::Sticker { .. }` | `inputMessageSticker` | `emoji`（**没有 caption**）/ `width` / `height` |
+| `Media::location(lat, lng)` | `inputMessageLocation` | — |
 
-## 3. `(账号类型, 内容) → 方法名` 路由表
+- `file` 一律是 `InputFile`：`InputFile::local(path)` → `inputFileLocal`，
+  `InputFile::remote(id)` → `inputFileRemote`。`&str` / `String` 会被当成**本地路径**。
+- `.caption(text)` 给媒体挂标题；`SendMessageParams.text` 优先于媒体自带的 caption。
+- 尺寸/时长填 `0` 也行（TDLib 自己读真实值）。
 
-`AccountType` 保留在签名里，但 **TDLib 1.8.66 里两种账号取值相同**——
-`sendMessage` / `sendPhoto` / `sendDocument` / `sendLocation` 对 Bot 与 User 通用。
-表在那里是为了将来分化时只改一处；单元测试把「两边一样」显式断言下来了。
+`ReplyButton`（`reply_markup` 是 `Vec<Vec<ReplyButton>>`，空 = 不带键盘）：
 
-| 内容 | `AccountType::Bot` | `AccountType::User` |
-|---|---|---|
-| `MessageContent::Text` | `sendMessage` | `sendMessage` |
-| `MessageContent::Photo` | `sendPhoto` | `sendPhoto` |
-| `MessageContent::Document` | `sendDocument` | `sendDocument` |
-| `MessageContent::Location` | `sendLocation` | `sendLocation` |
-
-`ParseMode` 的映射（`Text` 内容的 `input_message_content.text.parse_mode`）：
-
-| `ParseMode` | 写进请求的值 |
+| 构造 | 按钮类型 |
 |---|---|
-| `Plain`（默认） | 不写这个字段 |
-| `Markdown` | `"Markdown"` |
-| `MarkdownV2` | `"MarkdownV2"` |
-| `Html` | `"HTML"` |
+| `ReplyButton::callback(text, data)` | `inlineKeyboardButtonTypeCallback`（`data` 自动 base64） |
+| `ReplyButton::url(text, url)` | `inlineKeyboardButtonTypeUrl` |
+| `ReplyButton::user(text, user_id)` | `inlineKeyboardButtonTypeUser` |
+| `ReplyButton::web_app(text, url)` | `inlineKeyboardButtonTypeWebApp` |
 
-## 4. 不挂在 `Simplify` 上的公开函数
+链式修饰：`.emoji(custom_emoji_id)`（`icon_custom_emoji_id`）、
+`.style(ButtonStyle::{Default,Primary,Danger,Success})`。
 
-| 函数 | 签名 | 作用 |
-|---|---|---|
-| `method_for` | `(AccountType, &MessageContent) -> &'static str` | 上面那张路由表 |
-| `send_params` | `(i64, &MessageContent, &SendOptions) -> Value` | 组装参数，**不含 `@type`**（那是宿主补的） |
-| `inline_keyboard` | `(Vec<Vec<Button>>) -> Value` | 构造 `replyMarkupInlineKeyboard` |
+## 3. 文本格式（Markdown / HTML）→ entities
 
-`resolve_entities` 发 `getChat`/`getUser`、`answer_callback_query` 发
-`answerCallbackQuery`、`download_file` 发 `downloadFile`——这三处的 `sendMessage` 同类约定
-都成立：返回值是请求号或等待结果，**没有一个是裸 `WaitHandle`**。
+**没有第二套解析器**。带标记的文本经 TDLib 的 `parseTextEntities` 换成
+`formattedText { text, entities }`——语法以 TDLib 为准，我们只负责把请求送进去。
 
-## 5. 返回值长什么样
+| `ParseMode` | 发出的 `parse_mode` |
+|---|---|
+| `Plain`（默认） | **不发请求**（没有对应的 `TextParseMode`），直接 `formattedText { text, entities: [] }` |
+| `Markdown` | `{"@type":"textParseModeMarkdown","version":1}` |
+| `MarkdownV2` | `{"@type":"textParseModeMarkdown","version":2}` |
+| `Html` | `{"@type":"textParseModeHTML"}` |
 
-| 类型 | 字段 | 说明 |
-|---|---|---|
-| `SendConfirmation` | `request_id: RequestId`、`confirmed: bool`、`update: Value` | `confirmed` = 等到了 `updateMessageSendSucceeded`；`update` 是那条更新的原始 JSON，超时是 `Null` |
-| `FileDownload` | `request_id: RequestId`、`file_id: i32`、`completed: bool`、`last_update: Value` | `completed` 取自 `file.local.is_downloading_completed` |
-| `EntitiesResolution` | `request_id: RequestId`、`entities: Vec<EntityResult>` | `to_json()` 给出 `{"request_id":…,"entities":[…]}` |
-| `EntityResult` | `id: EntityId`、`request: RequestId`、`value: Value` | 每个实体自己的请求号与响应；超时 `value` 是 `Null` |
-| `SimplifyError` | `Abi(AbiError)`（`#[from]`，`transparent`）、`BadString` | 只有两种：宿主调用失败，或参数串里含 NUL 字节 |
+快捷方式：`Text::plain/markdown/markdown_v2/html`，`&str` / `String` → 纯文本。
+`SendMessageParams::text("hi")` / `SendMessageParams::media(Media::photo("/tmp/a.jpg"))`。
 
-`Simplify` 顺带推的几条简化事件（想看原始更新就直接订阅原始 `@type`，两者不冲突）：
+⚠️ **真库实测（TDLib 1.8.66）：MarkdownV2 的粗体是 `*x*`，不是 `**x**`。**
+`**bold**` 会被吞成 `bold` 并且**不给** bold entity，`__x__` 出来是下划线。
+别按 CommonMark 的直觉写——这正是「不自己实现解析」的理由。
+
+**为什么走同步的 `td_execute` 而不是「发请求 + 等响应」**：`parseTextEntities` 不碰服务器，
+TDLib 允许同步跑它（`td_json_client_execute`）。等响应那套会把**投递线程**卡住
+（插件通常正是在更新回调里发消息，响应又要靠同一个线程投递），同步调用没有这个问题。
+
+拿不到结果（没接 TDLib、TDLib 报错）就退回纯文本并打一条 `Warn` 日志：
+一条 Markdown 写错的消息不该整条发不出去。
+
+## 4. 参数名为什么是这几个
+
+真 `td_api.tl`：`sendMessage chat_id topic_id reply_to options reply_markup input_message_content`
+——**没有** `message_thread_id` / `reply_to_message_id` / 顶层 `disable_notification`
+（那三个是 Bot API 的名字），也**没有**顶层 `caption`（它在内容类型里）。
+短名字到 TDLib 字段的映射只有一处实现（`send_params` / `put_common`）：
+
+| 参数结构体的字段 | 落到的 TDLib 字段 |
+|---|---|
+| `topic_id: i64` | `topic_id` = `{"@type":"messageTopicThread","message_thread_id":…}` |
+| `reply_to_message_id: i64` | `reply_to` = `{"@type":"inputMessageReplyToMessage","message_id":…}` |
+| `reply_markup: Vec<Vec<ReplyButton>>` | `reply_markup` = `{"@type":"replyMarkupInlineKeyboard","rows":…}` |
+| `link_preview: Some(false)` | `inputMessageText.link_preview_options.is_disabled = true`（`None`/`Some(true)` 不写这个字段） |
+| `text` / `media.caption` | `formattedText`（经 `parseTextEntities`） |
+
+## 5. 不挂在 `Simplify` 上的公开函数
+
+| 函数 | 作用 |
+|---|---|
+| `send_params` / `album_params` / `edit_text_params` / `edit_caption_params` / `edit_media_params` | 组装参数，**不含 `@type`**（那是宿主补的）；最后一个参数是文本渲染器 |
+| `content_json(&Media, render)` | 媒体 → `InputMessageContent` |
+| `parse_text_request(&Text)` | `parseTextEntities` 的请求；`Plain` 返回 `None` |
+| `formatted_from(&Text, Option<&Value>)` / `is_formatted_text(...)` | 响应 → `formattedText`；拿不到退回纯文本 |
+| `plain_text(&Text)` | 纯文本 → `formattedText`（不花往返），也是默认渲染器 |
+| `command_of(&Value)` → `Command` | 从 `updateNewMessage` 解出 `chat_id` / `message_id` / `name` / `args` / `text`；跳过自己发的、非文本消息 |
+| `on_command(host, 闭包)` → `CommandSubscription` | 订阅 `updateNewMessage`，每条命令调一次闭包；**drop 即退订** |
+
+## 6. 返回值长什么样
+
+| 类型 | 字段 |
+|---|---|
+| `SendConfirmation` | `request_id`、`confirmed: bool`、`update: Value`（`update.message` 就是最终消息；超时是 `Null`） |
+| `FileDownload` | `request_id`、`file_id`、`completed`、`last_update`（`completed` 取自 `file.local.is_downloading_completed`） |
+| `EntitiesResolution` | `request_id`、`entities: Vec<EntityResult>`；`to_json()` 给出 `{"request_id":…,"entities":[…]}` |
+| `EntityResult` | `id`、`request: RequestId`、`value: Value`（超时是 `Null`） |
+| `SimplifyError` | `Abi(AbiError)`、`BadString`（参数串含 NUL）、`AlbumSize(usize)`（相册不是 2–10 项） |
+
+`Simplify` 顺带推的简化事件（想看原始更新就直接订阅原始 `@type`，两者不冲突）：
 
 | 事件 | 谁发 | 负载 |
 |---|---|---|
 | `entities_resolved` | `resolve_entities` 末尾 | `EntitiesResolution::to_json()` |
 | `file_progress` | `download_file` 每收到一条 `updateFile` | `{"file_id":…,"completed":…,"downloaded_size":…,"expected_size":…}` |
 
-## 6. 用法（Rust 插件侧）
+## 7. 用法（Rust 插件侧）
 
-`fuyubot-simplify` 只依赖 `fuyubot-abi`，所以插件 crate 可以直接依赖它：
+`fuyubot-simplify` 只依赖 `fuyubot-abi`（+ 生成类型所在的 `fuyubot-tdlib-sys`），插件 crate 可以直接依赖它：
 
 ```rust
-use fuyubot_simplify::{Simplify, MessageContent, SendOptions};
+use fuyubot_simplify::{
+    EditTextParams, Media, ReplyButton, SendMessageParams, Simplify, Text,
+};
 
 let simplify = Simplify::new(self.host);          // HostApi 是 Copy
-let request = simplify.send_message(
+
+// 纯文本：不花任何往返
+simplify.send_message(chat_id, &SendMessageParams::text("你好"))?;
+
+// Markdown + 回复 + 内联键盘
+simplify.send_message(
     chat_id,
-    MessageContent::text("你好"),
-    &SendOptions::default(),
+    &SendMessageParams {
+        text: Some(Text::markdown("*粗体*")),
+        reply_to_message_id: Some(message_id),
+        reply_markup: vec![vec![ReplyButton::callback("确认", "ok")]],
+        ..SendMessageParams::default()
+    },
 )?;
-self.host.info(&format!("发出去了：{}", request));
+
+// 图片 + 标题
+let photo = Media::photo("/tmp/a.jpg").caption(Text::plain("标题"));
+simplify.send_message(chat_id, &SendMessageParams::media(photo))?;
+
+// 编辑：结果从响应通道回来
+let request = simplify.edit_message_text(
+    chat_id,
+    message_id,
+    &EditTextParams { text: Some(Text::markdown_v2("*改了*")), ..Default::default() },
+)?;
+let edited = simplify.wait_response(request, 5_000);
+
+// 删除（对所有人撤回）
+simplify.delete_message(chat_id, [message_id], true)?;
 ```
 
-`MessageContent` / `SendOptions` / `Button` / `UpdateFilter` / `EntityId` 都是从
-`fuyubot_simplify` 根导出的。
-
-## 7. 与请求号有关的两条时间线
+## 8. 与请求号有关的两条时间线
 
 1. `td_invoke*` 返回的是**请求号**，真正的 JSON 从 `"response"` 通道回来
    （事件类型 `RESPONSE_EVENT`，只发给发起请求的那个插件）。
-2. `WaitHandle::payload_json` 是宿主临时的**线程局部缓冲**，只在下一次宿主调用之前有效。
-   要拿数据就立刻读，或者用 `*_json` 系列（它们已经替你拷好了）。
+2. `WaitHandle::payload_json` / `td_execute` 的返回串都是宿主临时的**线程局部缓冲**，
+   只在下一次宿主调用之前有效。要拿数据就立刻读，或者用 `*_json` / `wait_response`
+   （它们已经替你拷好了）。
 
 `HostRuntime::td_send` 在**没接 TDLib** 时只留档 + 发合成请求号（从 `1 << 48` 起），
-所以本文的每个方法在离线状态下都能被跑通、但不会真的到达 TDLib。
+`td_execute` 在同样情况下返回 `None`——所以本文的每个方法在离线状态下都能被跑通、
+但不会真的到达 TDLib（Markdown 会退回纯文本）。

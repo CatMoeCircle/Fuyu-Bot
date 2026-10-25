@@ -8,45 +8,47 @@ Rust / C / C++ 直接写它；Python / JS 用 `fuyubot-sdk-script` 生成的胶�
 ## 0. 通用流程
 
 ```bash
-fuyubot init --name mybot --api-id 0 --api-hash ""   # 生成 fuyubot.toml + plugins/（运行时 CLI）
+fuyubot init --name mybot --api-id 0                # 生成 fuyubot.toml + plugins/（运行时 CLI）
 fuyubot-sdk init demo --lang rust                    # 生成 plugins/demo/（开发 CLI）
 cd plugins/demo && cargo build --release             # 用**你自己的**工具链编译
-cd ../.. && fuyubot plugin install plugins/demo      # 把产物装进插件目录
+cd ../.. && fuyubot plugin install plugins/demo      # 把产物（连同脚本）装进插件目录
 fuyubot run                                          # 加载插件
 ```
 
-> **两个 CLI 分工**（`docs/ROADMAP.md` 变更 4/5）：`fuyubot` 管运行，`fuyubot-sdk` 管开发；
+> **两个 CLI 分工**（[`decisions.md`](decisions.md) 变更 4/5）：`fuyubot` 管运行，`fuyubot-sdk` 管开发；
 > **两个都不打包**——编译是插件作者用自己的语言工具链完成的事
-> （Rust `cargo build`、C/C++ `gcc -shared`、Python `maturin`、JS `napi build`）。
+> （Rust `cargo build`、C/C++ `gcc -shared` / `cl /LD`、Python `maturin`、JS `napi build`）。
+> 运行时 CLI 里**没有** `build-plugin`（2026 拆掉）：它只按 dll 同目录找脚本，不替你编译。
 
 - `fuyubot init` 生成的 `fuyubot.toml` 三个键都有默认值，最简可以只有 `[bot]`；
   重复 `init` 会被挡住（不覆盖你改过的配置）。`plugins.dir` 默认 `"plugins"`。
 - 插件名只允许字母、数字和 `.` `_` `-`（它会被拼进源码和 TOML）；目录名里的 `.` / `-`
   换成 `_` 当 crate 名（`fuyubot.weather` → `fuyubot_weather`）。
 - `fuyubot plugin list` 会**真的加载一次**再看名字（插件名只有 dlopen 之后才知道）；
-  `fuyubot plugin install <文件或工程目录>` 手动装一个（会连旁边的 `.py`/`.js` 一起拷）。
+  `fuyubot plugin install <文件或工程目录>` 手动装一个（**传工程目录**时会把旁边的
+  `.py`/`.js`/`.ts`/`.pyi` 一起拷；传单个 dll 时看不到脚本在哪，脚本插件请传目录）。
 
-### `fuyubot build-plugin`（**过渡期命令**）
+### 产物该放哪：workspace 成员要 `--target-dir`
 
-新规格里它不该存在（构建/打包不归两个 CLI）；它现在还在 `fuyubot` 里，因为 `examples/`
-的流程靠它。上表的流程用「作者工具链 + `plugin install`」就不需要它：
+`plugin install <工程目录>` 只看 `<工程>/target/{release,debug}` 与工程目录本身。
+如果插件是**当前 workspace 的成员**（比如本仓的 `examples/*`），`cargo build -p <crate>`
+默认把产物放在**仓库根**的 `target/`，于是它找不到。两种写法都行：
 
-| 行为 | 说明 |
-|---|---|
-| 找工程 | `--dir` 没给就取当前目录；当前目录不像插件工程时，去插件目录下找唯一的一个 |
-| 选编译路径 | 有 `Cargo.toml` → `cargo build --message-format=json`；否则找 `.c`/`.cpp` → 调 C 编译器。`--lang` 可强制 |
-| 读回产物 | cargo 那条用 JSON 消息拿**真正的 cdylib 路径**，不猜 `target/<profile>/` |
-| C/C++ 刷新头文件 | 每次编译前把 cbindgen 生成的 `fuyubot_plugin.h` 重新落到工程目录（头文件是产物，不该签进仓库） |
-| 装进插件目录 | 默认**顺手安装**（`--no-install` 关掉）：往上找到 `fuyubot.toml`，把 cdylib + 同目录的 `.py`/`.js`/`.pyi`/`.d.ts` 一起拷进 `plugins.dir` |
-| profile / 联网 | `--release` 走 release；cargo 那条会**自动**加 `--offline`（判据是 `FUYUBOT_OFFLINE` / `CARGO_NET_OFFLINE` 非空且不为 `0`/`false`），不是命令行开关 |
-| C/C++ 编译器 | 查找顺序 `CC` → `cc` / `gcc` / `clang` → MSVC（经 `vswhere` 找 `vcvars64.bat`）。MSVC 那条会加 `/utf-8`，不加会把 UTF-8 源码里的中文注释拆坏成看不懂的语法错误 |
+```powershell
+# A. 让产物落在工程自己的 target/ 下（脚本同伴也会被一起拷）
+cargo build -p fuyubot-example-weather --target-dir examples\python-weather\target
+fuyubot plugin install examples\python-weather
+
+# B. 直接指着产物装（适合单个原生插件；脚本插件用 A，否则脚本不会被拷）
+cargo build -p fuyubot-example-echo
+fuyubot plugin install target\debug\fuyubot_example_echo.dll
+```
 
 ### 环境变量
 
 | 变量 | 作用 |
 |---|---|
 | `FUYUBOT_SDK_PATH` | 指向**装着 SDK crate 的那个目录**（仓库里就是 `crates/`）。生成的插件用 `path = "..."` 依赖 SDK，因为这两个 crate 还没发到 crates.io。一个变量管 `fuyubot-plugin-api` 与 `fuyubot-sdk-script` 两个。没设就按仓库布局（`CARGO_MANIFEST_DIR` 的上一级）找 |
-| `FUYUBOT_OFFLINE` | 非空、且不是 `0`/`false` 时，`build-plugin` 给 cargo 加 `--offline` |
 
 ### 脚本插件的一条硬约定
 
@@ -142,7 +144,13 @@ FUYUBOT_EXPORT void plugin_free_string(char *ptr) { (void)ptr; }
 ```
 
 - `#define ABI_VERSION` 来自 `fuyubot_plugin.h`（cbindgen 从 Rust 定义生成，不要手改）。
-- 编译：`fuyubot build-plugin --lang c`（会先把头文件刷新到目录里）。
+- 编译（**用你自己的 C 工具链**，运行时 CLI 不编译插件）：
+  `fuyubot-sdk codegen --lang c --dir <工程目录>` 先把头文件刷新进去，然后
+  `cl /nologo /utf-8 /LD /I <工程目录> <工程目录>/ping.c /Fe:<工程目录>/target/debug/ping.dll`
+  （MSVC 要先 `call vcvars64.bat`；gcc/clang 则是 `cc -shared -fPIC -I <工程目录> … -o …`）。
+  编完 `fuyubot plugin install <工程目录>`。
+  ⚠️ MSVC 的 `/utf-8` **必须给**：源码与生成的头文件都是 UTF-8，不加会按系统代码页读，
+  中文注释被拆坏成「注释提前结束、后面全是语法错误」这种看不出原因的样子。
 - `plugin_start` / `plugin_stop` 可省略（只登记元数据的插件可以不写）；
   `plugin_init` 与 `plugin_free_string` 必须有。
 - 模板里那段 JSON 取值是**朴素查找**，不处理转义、不处理同名嵌套键；认真写就引一个 JSON 库。
@@ -151,7 +159,8 @@ FUYUBOT_EXPORT void plugin_free_string(char *ptr) { (void)ptr; }
 
 同 C，**头文件同一份**，唯一差别是四个导出符号必须放在 `extern "C"` 里——
 C++ 会改函数名，宿主就 dlsym 不到了。其余差异只是用 `std::string` 拼 JSON。
-完整模板见 `templates/cpp/plugin.cpp`。编译：`fuyubot build-plugin --lang cpp`。
+完整模板见 `templates/cpp/plugin.cpp`。编译同 C，也是两步：
+`fuyubot-sdk codegen --lang cpp --dir <工程目录>` → 你自己的 C++ 工具链（`cl /LD` / `g++ -shared`）。
 
 ## 4. Python
 
@@ -221,9 +230,11 @@ host.run();
 
 ```bash
 fuyubot init --dir . --name demo                     # 建项目（生成 fuyubot.toml + plugins/）
-fuyubot build-plugin --dir examples/rust-echo        # 编译 + 装进 plugins/
-fuyubot build-plugin --dir examples/c-ping --lang c
-fuyubot build-plugin --dir examples/python-weather
+# 编 + 装（作者工具链；workspace 成员要 --target-dir，见上面「产物该放哪」）
+cargo build -p fuyubot-example-echo --target-dir examples/rust-echo/target
+fuyubot plugin install examples/rust-echo
+fuyubot-sdk codegen --lang c --dir examples/c-ping   # C 插件先刷头文件，再自己调 cl/gcc
+fuyubot plugin install examples/c-ping
 fuyubot run --replay examples/replay/new_message.json
 fuyubot run --replay examples/replay/weather.json    # python-weather 要联网访问 wttr.in
 ```

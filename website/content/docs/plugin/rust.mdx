@@ -1,0 +1,123 @@
+---
+title: Rust 插件
+description: fuyubot-plugin-api 与 define_plugin! 的完整写法
+---
+
+Rust 插件只依赖一个 crate：`fuyubot-plugin-api`。它把 `fuyubot-abi` 的形状转成用着不疼的样子——
+`HostApi`（已解包、调用路径上没有 `Option` 和 panic 分支）、`HostExt` 便利方法、
+drop 即退订的 `Subscription`、以及 `define_plugin!` 宏。
+
+## 依赖
+
+```toml
+# 由 `fuyubot-sdk init` 生成：独立插件 crate，不属于任何 workspace
+[workspace]
+
+[package]
+name = "fuyubot_demo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[lib]
+crate-type = ["cdylib"]          # 宿主 dlopen 的就是它
+
+[dependencies]
+fuyubot-plugin-api = { path = "…/crates/fuyubot-plugin-api", version = "0.1.0" }
+```
+
+那个空的 `[workspace]` 不是多余的：没有它，cargo 会一路往上找父目录的 workspace 声明然后报错。
+
+## 最小可用插件
+
+这就是 `fuyubot-sdk init demo --lang rust` 生成的模板：
+
+```rust
+use fuyubot_plugin_api::{HostApi, HostExt, Plugin, Subscription, define_plugin};
+
+struct MyPlugin {
+    host: HostApi,
+    /// 订阅句柄**必须活着**：它 drop 的那一刻就退订了。
+    _updates: Option<Subscription>,
+}
+
+impl Plugin for MyPlugin {
+    fn init(host: HostApi) -> Result<Self, String> {
+        host.info("demo: init");
+        Ok(Self { host, _updates: None })
+    }
+
+    fn start(&mut self, config_json: &str) -> Result<(), String> {
+        self.host.info(&format!("demo: start({config_json})"));
+        // 兜底通道 "update" 收全部；要精确就换成 "updateNewMessage" 之类具体的 @type。
+        self._updates = self
+            .host
+            .subscribe_json("update", None, on_update, std::ptr::null_mut());
+        Ok(())
+    }
+}
+
+/// 回调没有捕获环境；要状态就放进插件字段、经 `user_data` 传进来。
+extern "C-unwind" fn on_update(
+    _user: *mut std::ffi::c_void,
+    payload: *const std::ffi::c_char,
+) -> i32 {
+    // SAFETY: 宿主按 ABI 契约传的是临时 NUL 结尾字符串。
+    let update = unsafe { fuyubot_plugin_api::parse_payload(payload) };
+    let update_type = update.get("@type").and_then(|v| v.as_str()).unwrap_or("?");
+    println!("demo: 收到 {update_type}");
+    0
+}
+
+define_plugin!(MyPlugin, "demo");
+```
+
+## `Plugin` trait
+
+| 方法 | 对应符号 | 说明 |
+| --- | --- | --- |
+| `init(host) -> Result<Self, String>` | `plugin_init` | 构造状态；返回 `Err` = 加载失败 |
+| `start(&mut self, config_json) -> Result<(), String>` | `plugin_start` | 宿主已把 VTable、插件目录都准备好；订阅/注册都写在这里 |
+| `stop(&mut self)` | `plugin_stop` | 可选；宏随后把状态收回 `Box` 释放 |
+
+`define_plugin!` 还会把插件代码包在 `catch_unwind` 里——和 `C-unwind` 是两层，
+**两层都要**：一层防 panic 逃出 ABI，一层防 panic 把宿主线程带走。
+
+## 回调里带状态
+
+回调是裸函数指针，没有捕获环境。状态要么放插件字段、经 `user_data` 传进去，要么像
+`examples/rust-echo` 那样把 `Box<HostApi>` 的地址当 `user_data`：
+
+```rust
+// 结构体里另加一个 state: usize 字段，stop 时清零。
+fn start(&mut self, _config_json: &str) -> Result<(), String> {
+    let state = Box::into_raw(Box::new(self.host));
+    self.state = state as usize;
+    self._updates = self.host.subscribe_json(
+        "updateNewMessage", None, on_message, state as *mut std::ffi::c_void,
+    );
+    Ok(())
+}
+```
+
+`stop` 里用 `Box::from_raw` 收回，只收一次；否则就是内存泄漏（或重复释放）。
+
+<Callout type="warn">
+  `Subscription` 是 `#[must_use]`：`let _ = host.subscribe_json(…)` 会**立刻退订**。
+  一定要存进插件字段。插件卸载时宿主还会整批回滚，但那时插件自己的状态已经漏了。
+</Callout>
+
+## 编译与安装
+
+```bash
+cargo build --release
+fuyubot plugin install target/release/fuyubot_demo.dll
+```
+
+<Callout type="error">
+  `define_plugin!` **一个 crate 只能展开一次**。一个 cdylib 就是一个插件——这不是限制，是设计：
+  四个导出符号名由 ABI 定死，展开两次就是重复定义。
+</Callout>
+
+要发消息、调 TDLib、等响应，见 [调用 TDLib](./tdlib.mdx)；要按字段过滤更新，见
+[订阅与事件](./events.mdx)；契约本身见 [ABI 契约](./abi.mdx)。

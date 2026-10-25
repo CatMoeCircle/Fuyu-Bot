@@ -49,7 +49,7 @@ node examples\ts-counter\counter.ts
 用的是 Node 的**类型剥离**，所以语法有限制：注解、`interface` / `type`、`as` 都行，
 **`enum` / `namespace` / 构造器参数属性不行**（那些需要真正的编译）。
 Node 太老（< 23.6）就自己 `tsc` 编成 `.js`——**编译与打包是插件作者自己的工具链**，
-两个 CLI 都不参与（见 `docs/ROADMAP.md` 变更 5）。
+两个 CLI 都不参与（见 `docs/decisions.md` 变更 5）。
 
 ## 相关文档
 
