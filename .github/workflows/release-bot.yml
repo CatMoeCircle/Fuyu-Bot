@@ -32,7 +32,7 @@ permissions:
   contents: write
 
 env:
-  TDLIB_VERSION: '1.8.66'
+  TDLIB_VERSION: '1.8.68'
   CARGO_TERM_COLOR: always
 
 jobs:

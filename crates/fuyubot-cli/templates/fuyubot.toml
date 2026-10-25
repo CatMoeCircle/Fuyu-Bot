@@ -23,7 +23,7 @@ dir = "plugins"
 
 [tdlib]
 # 留空 = 按 fuyubot-tdlib 的四级优先级自动找（环境变量 → 自带 → 系统库 → 裸库名）。
-# 指定时给 tdjson 的**目录**或文件路径，例如 ".tdlib-cache/1.8.66/windows-x86_64"。
+# 指定时给 tdjson 的**目录**或文件路径，例如 ".tdlib-cache/1.8.68/windows-x86_64"。
 path = ""
 # 日志详细度：默认 **1**（保留警告与错误）。TDLib 自己的默认更啰嗦——每轮 `td_receive`
 # 的超时、`Begin to wait for updates…` 之类都会打到 stderr。要排查问题就调大。

@@ -44,6 +44,9 @@ fn main() {
         println!("cargo:rerun-if-env-changed={key}");
     }
     println!("cargo:rerun-if-changed=build.rs");
+    // 版本号就在本清单里：不盯它的话，改完 `tdlib-version` 构建脚本不会重跑，
+    // 二进制里还是旧 schema（换版本时踩过）。
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=src/build_support.rs");
     // build.rs 与运行时共用这三个文件，它们变了要重新转换。
     println!("cargo:rerun-if-changed=src/tl_schema.rs");

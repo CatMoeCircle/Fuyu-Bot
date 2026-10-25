@@ -86,7 +86,7 @@ Markdown → entities 的**真实行为**由
 快捷方式：`Text::plain/markdown/markdown_v2/html`，`&str` / `String` → 纯文本。
 `SendMessageParams::text("hi")` / `SendMessageParams::media(Media::photo("/tmp/a.jpg"))`。
 
-⚠️ **真库实测（TDLib 1.8.66）：MarkdownV2 的粗体是 `*x*`，不是 `**x**`。**
+⚠️ **真库实测（TDLib 1.8.68，1.8.66 同结论）：MarkdownV2 的粗体是 `*x*`，不是 `**x**`。**
 `**bold**` 会被吞成 `bold` 并且**不给** bold entity，`__x__` 出来是下划线。
 别按 CommonMark 的直觉写——这正是「不自己实现解析」的理由。
 

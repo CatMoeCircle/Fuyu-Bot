@@ -14,8 +14,8 @@
   一个 cdylib 就是一个插件。
 - **TDLib 运行时动态加载**，不静态链接。`td_api.tl` 在**编译期**被转成元数据烤进二进制，
   所以运行时不读文件、不解析。条数取决于构建时用的那份 `td_api.tl`：现在 Release 发布的与本机
-  `.tdlib-cache/` 那份都是 **3178 条（函数 1010 / 构造器 2165 / 未归类 3）**
-  ——**别把条数当常量**，以前本机另一份是 3214 条（见 [gaps.md 缺口 30](docs/gaps.md)）。
+  `.tdlib-cache/1.8.68` 那份都是 **3325 条（函数 1065 / 构造器 2257 / 未归类 3）**
+  ——**别把条数当常量**，1.8.66 那份是 3178，以前还有一份 3214（见 [gaps.md 缺口 30](docs/gaps.md)）。
 - 两个 CLI，职责严格分离：**`fuyubot`** 跑框架（`init` / `run` / `status` / `stop` / `config` / `plugin`），
   **`fuyubot-sdk`** 写插件（脚手架 / 生成绑定 / 静态检查，在 SDK 仓库）。**两个都不编译、不打包插件**——
   打包归插件作者自己的语言工具链。
@@ -87,7 +87,7 @@ cargo build --workspace
 > $env:FUYUBOT_TDLIB_VENDORED_CACHE = "$PWD\.tdlib-cache"
 > ```
 >
-> 没有缓存时 `build.rs` 会自己从 Releases 下载，**下完一次就进缓存**（Release `TDLib-v1.8.66`
+> 没有缓存时 `build.rs` 会自己从 Releases 下载，**下完一次就进缓存**（Release `TDLib-v1.8.68`
 > 已发布）。一次构建只会看到一条「已转换 …（N 条）」的提示；只有第一次下载才会多说几句。
 > ⚠️ 缓存根**全都**写不进去时才退到 `$OUT_DIR`——那个目录每次重跑构建脚本都会被清空，
 > 于是下次构建**会重新下载**（构建脚本会明确警告这一点）。要彻底避免就设
@@ -309,7 +309,7 @@ tdjson 的四级查找顺序（`fuyubot-tdlib::loader`，不要重排）：
 1. `TDLIB_TDJSON_PATH`（指目录或文件）
 2. vendored（`FUYUBOT_TDLIB_VENDORED_CACHE` / `FUYUBOT_TDLIB_VENDORED_DIR`）→ **可执行文件所在目录**
    （构建期 `build.rs` 拷过去的 tdjson + 兄弟 DLL；`LibrarySource::ExeDir`）
-3. Linux 带版本号的系统库（`libtdjson.so.1.8.66` …）
+3. Linux 带版本号的系统库（`libtdjson.so.1.8.68` …）
 4. 裸库名（`tdjson.dll` / `libtdjson.so`，走 `PATH`）
 
 加载动态库时**先查库自己所在的目录**（Windows 上是 `LOAD_WITH_ALTERED_SEARCH_PATH`）——
@@ -324,7 +324,7 @@ tdjson 的四级查找顺序（`fuyubot-tdlib::loader`，不要重排）：
 
 ```powershell
 cargo build --workspace --offline     # 0 退出、0 warning
-cargo test  --workspace --offline     # 201 passed / 0 failed / 12 ignored
+cargo test  --workspace --offline     # 180 passed / 0 failed / 9 ignored
 cargo tree  --workspace --offline     # 必须无环
 cargo fmt --all --check               # 0 diff（整仓 rustfmt-clean）
 ```
@@ -359,7 +359,7 @@ FUYUBOT_TDLIB_VENDORED_CACHE=/f/Rust/FuyuBot/.tdlib-cache cargo test --workspace
 「全绿」只证明代码自洽，**与真 TDLib 对不对得上只有那几条 `--ignored` 能回答**：
 
 ```bash
-export TDLIB_TDJSON_PATH=".tdlib-cache/1.8.66/windows-x86_64"
+export TDLIB_TDJSON_PATH=".tdlib-cache/1.8.68/windows-x86_64"
 cargo test -p fuyubot-tdlib --test integration --offline -- --ignored
 
 # 真 bot 登录 + session 复用（要真凭据；先删 session 目录，否则验的是「复用」不是「首次登录」）

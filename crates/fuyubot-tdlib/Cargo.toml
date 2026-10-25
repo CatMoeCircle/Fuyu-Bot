@@ -14,7 +14,7 @@ rust-version.workspace = true
 #    资产放在 tag `TDLib-v<tdlib-version>` 下（见 build.rs 与
 #    .github/workflows/build-tdlib.yml），填错就是 404。
 [package.metadata.fuyubot]
-tdlib-version = "1.8.66"
+tdlib-version = "1.8.68"
 releases-repo = "CatMoeCircle/Fuyu-Bot"
 
 [features]

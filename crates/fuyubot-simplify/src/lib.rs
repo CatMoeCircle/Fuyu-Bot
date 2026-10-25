@@ -125,7 +125,7 @@ impl Text {
 
     /// MarkdownV2（也是各家 Bot API 的默认版本）。
     ///
-    /// ⚠️ **真库实测（TDLib 1.8.66）：粗体是 `*x*`，不是 `**x**`**。`**x**` 会被吞成
+    /// ⚠️ **真库实测（TDLib 1.8.68，1.8.66 同结论）：粗体是 `*x*`，不是 `**x**`**。`**x**` 会被吞成
     /// `x` 而且**不给** bold entity，`__x__` 出来的是下划线。别按 CommonMark 的直觉写——
     /// 语法以 TDLib 为准（`crates/fuyubot-tdlib/tests/integration.rs` 里那条
     /// `execute_runs_synchronous_methods` 钉着这件事）。

@@ -31,6 +31,8 @@ fn main() {
         println!("cargo:rerun-if-env-changed={key}");
     }
     println!("cargo:rerun-if-changed=build.rs");
+    // `tdlib-version` 在本清单里：不盯它就没法在换版本后重新解析 vendored 布局。
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=src/loader/vendored.rs");
     println!("cargo:rerun-if-changed=../fuyubot-tdlib-sys/src/build_support.rs");
 

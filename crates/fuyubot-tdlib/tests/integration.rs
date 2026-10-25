@@ -79,7 +79,7 @@ fn execute_runs_synchronous_methods() {
     // Markdown → entities 走的是同一条同步通道（`fuyubot-simplify` 的 Markdown 支持
     // 就是架在它上面的：没有第二套解析器，语法以 TDLib 为准）。
     //
-    // ⚠️ 真库实测（1.8.66）：**MarkdownV2 的粗体是 `*x*`，不是 `**x**`**——
+    // ⚠️ 真库实测（1.8.68，1.8.66 同结论）：**MarkdownV2 的粗体是 `*x*`，不是 `**x**`**——
     // `**bold**` 会被吞成 `bold` 而且**不给 bold entity**，`__x__` 反而是下划线。
     // 这条断言就是在钉「我们不猜语法，TDLib 说什么就是什么」。
     let bold = client
@@ -130,7 +130,7 @@ fn vendored_library_is_used() {
         fuyubot_tdlib::LibrarySource::Vendored,
         "没走 vendored 优先级（TDLIB_TDJSON_PATH 是否被设置了？）"
     );
-    assert_eq!(fuyubot_tdlib::TDLIB_VERSION, "1.8.66");
+    assert_eq!(fuyubot_tdlib::TDLIB_VERSION, "1.8.68");
 }
 
 // ── 真 Bot 登录（规格变更 3 的验收）──────────────────────────────────────
@@ -142,7 +142,7 @@ fn vendored_library_is_used() {
 // $env:TG_API_ID   = "12345678"
 // $env:TG_API_HASH = "..."
 // $env:TG_BOT_TOKEN = "123456:AA..."
-// $env:TDLIB_TDJSON_PATH = "F:\Rust\FuyuBot\.tdlib-cache\1.8.66\windows-x86_64"
+// $env:TDLIB_TDJSON_PATH = "F:\Rust\FuyuBot\.tdlib-cache\1.8.68\windows-x86_64"
 // cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_login --nocapture
 // ```
 
@@ -320,8 +320,9 @@ fn real_bot_login_reaches_ready_and_reuses_the_session() {
         Duration::from_secs(20),
     );
     println!("[login] getMe：{me}");
-    // 真库 1.8.66 的 `user` **没有 `is_bot` 字段**：bot 判定在 `type.@type`，
-    // 用户名也从 `username` 挪到了 `usernames.active_usernames`（按 TDLib 文档写会写错）。
+    // 真库到 1.8.68 的 `user` **仍然没有 `is_bot` 字段**（`td_api.tl` 的定义里就没有）：
+    // bot 判定在 `type.@type`，用户名也从 `username` 挪到了 `usernames.active_usernames`
+    // （按 TDLib 文档写会写错）。
     assert_eq!(
         me["type"]["@type"], "userTypeBot",
         "getMe 拿到的不是 bot：{}",
@@ -368,18 +369,6 @@ fn real_bot_login_reaches_ready_and_reuses_the_session() {
     println!("[login] session 复用成功：{username}（id {}）", me["id"]);
 }
 
-/// 加载动态库时必须让系统**先查这个库自己所在的目录**（AGENTS 约束 30 / pitfalls 坑 43）。
-///
-/// 拿真 tdjson 当样本：它 import 了同在目录里的 `libssl-3-x64` / `libcrypto-3-x64` / `z`。
-/// 把这一组文件拷到一个不在 PATH 上的临时目录，再分别用两条路加载：
-///
-/// - `libloading::Library::new`（`flags = 0`）→ **必须失败**：系统只查 exe 目录 + System32 + PATH，
-///   报 `LoadLibraryExW { source: 126 }`（ERROR_MOD_NOT_FOUND），而那个错误完全不指向真正的原因
-///   （库明明在目录里，缺的是它的依赖）。这条负向断言是让本测试有意义的关键。
-/// - `fuyubot_tdlib::loader::open_library` → **必须成功**（绝对路径走 `LOAD_WITH_ALTERED_SEARCH_PATH`）。
-///
-/// 插件加载器（`fuyubot-loader`）现在也走同一个 helper —— 插件旁边放兄弟 DLL 的部署形态靠它。
-#[test]
 /// 构建时提供了 `td_api.tl` 时，检查**编译期烤进二进制**的那份元数据长得对不对。
 ///
 /// 这是唯一能证明「真文件的分类、方法名、参数名确实解析出来了」的方式——内置测试用的是手写样例。

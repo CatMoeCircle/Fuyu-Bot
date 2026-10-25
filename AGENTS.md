@@ -14,11 +14,12 @@ TDLib 便捷封装、更新分发管线、`fuyubot` CLI 与内置插件。
 跨仓依赖只有一条、单向：SDK 通过 **crates.io** 依赖本仓的 `fuyubot-abi` / `fuyubot-tdlib-sys`；
 **本仓不得依赖 SDK 仓库的任何 crate**（见约束 51）。
 `fuyubot-plugin-demo` 会被集成测试真的 dlopen 起来，走一遍「VTable → 更新管线 → 响应回投」。
-**真 TDLib 已经跑通**（本机 1.8.66 的 `tdjson.dll` + 真 `td_api.tl`）：编译期转换出三千多条、
+**真 TDLib 已经跑通**（本机 1.8.68 的 `tdjson.dll` + 真 `td_api.tl`）：编译期转换出三千多条、
 `getMe` 往返、同步 `execute`、以及「插件 `td_invoke` → 真库 → 响应按归属回投」都验过；
 没接 TDLib 时请求仍只留档 + 合成请求号，整条链路照样能被测通。
-（条数**取决于构建时用的那份 `td_api.tl`**：本机 `.tdlib-cache/` 现存这份与 Release 发布的
-那份都是 3178 条，以前本机另一份是 3214——换文件条数就变，别把某个数字当成常量写进断言。）
+（条数**取决于构建时用的那份 `td_api.tl`**：本机 `.tdlib-cache/1.8.68` 这份是 3325 条
+（函数 1065 / 构造器 2257 / 未归类 3）；1.8.66 是 3178，以前还有一份 3214——换文件条数就变，
+别把某个数字当成常量写进断言。）
 `td_api.tl` 是构建的必需输入，所以**先读 [`docs/HANDOFF.md`](docs/HANDOFF.md) 开头的「当前的构建契约」**，
 再看 [`docs/SESSION-SUMMARY.md`](docs/SESSION-SUMMARY.md)（最近一次工作的账：需求 → 证据 → 被推翻的决策）。
 
@@ -198,7 +199,7 @@ TDLib 便捷封装、更新分发管线、`fuyubot` CLI 与内置插件。
     `message_thread_id` / `reply_to_message_id` / 顶层 `disable_notification`），
     `caption` 在内容类型里，`formattedText` 没有 `parse_mode`。
     **规矩**：① 写 TDLib 的 JSON 先拿真定义核对
-    （`Select-String '^sendMessage ' .tdlib-cache/1.8.66/td_api.tl` 最快）；
+    （`Select-String '^sendMessage ' .tdlib-cache/1.8.68/td_api.tl` 最快）；
     ② 硬编码了 TDLib 方法名/参数名的模块，**必须留一条消费 `TdApiSchema::compiled().check_request`
     的测试**（离线可跑，写错名字立刻红）——`fuyubot-simplify` 里
     `every_request_simplify_builds_passes_the_real_schema` 就是模板。
@@ -336,7 +337,7 @@ TDLib 便捷封装、更新分发管线、`fuyubot` CLI 与内置插件。
 $env:FUYUBOT_TDLIB_VENDORED_CACHE = "F:\Rust\FuyuBot\.tdlib-cache"
 
 cargo build --workspace --offline          # 必须 0 退出、0 warning
-cargo test  --workspace --offline          # 所有自检必须绿（180 passed；另有 10 个 #[ignore]）
+cargo test  --workspace --offline          # 所有自检必须绿（180 passed；另有 9 个 #[ignore]）
 cargo tree  --workspace --offline          # 必须无环
 
 # 插件开发 CLI（`fuyubot-sdk`）在 **FuyuBot-SDK 仓库**（不在本仓）：
@@ -363,10 +364,11 @@ target\debug\fuyubot.exe stop   --config <目录>\fuyubot.toml             # 优
 
 # 脚本/TS 示例工程在 SDK 仓库（FuyuBot-SDK/examples/），回放数据在本仓 examples/replay/。
 # 真 TDLib 的端到端自检：真 schema + 真动态库 + 真请求往返 + 登录窗口的旁路
-$env:TDLIB_TDJSON_PATH = ".tdlib-cache\1.8.66\windows-x86_64"
+$env:TDLIB_TDJSON_PATH = ".tdlib-cache\1.8.68\windows-x86_64"
 cargo test -p fuyubot-tdlib --test integration --offline -- --ignored
 # ⚠️ 「兄弟依赖定位」**单独一个测试二进制**，必须单独跑：它有个负向对照
-#    （`Library::new` 必须失败），前提是进程里没加载过 tdjson 的兄弟 DLL——
+#    （样本旁边有兄弟 DLL 时 `Library::new` 必须失败；CI 的 tdjson 是静态链接，
+#    那种样本上会明确打印「跳过」而不是硬造失败），前提是进程里没加载过那些 DLL——
 #    和别的测试同进程跑就会被污染（踩过一次，见 tests/sibling_dependencies.rs 的文件头）。
 cargo test -p fuyubot-tdlib --test sibling_dependencies --offline -- --ignored
 
@@ -491,4 +493,4 @@ cargo build -p fuyubot-cli   --features vendored --offline
 - [ ] `[package.metadata.fuyubot]` 里的值仍与事实一致——**有两份**（`fuyubot-tdlib-sys` 与 `fuyubot-tdlib`
       各一份，守卫测试 `metadata_is_in_sync_between_the_two_crates` 比对）：`releases-repo` 要等于
       **`git remote origin`**（现在是 `CatMoeCircle/Fuyu-Bot`），`tdlib-version` 要等于**CI 跑 build-tdlib 时填的
-      `tdlib_version`**（现在 `1.8.66`——资产放在 tag `TDLib-v<tdlib-version>` 下，填错就是 404）
+      `tdlib_version`**（现在 `1.8.68`——资产放在 tag `TDLib-v<tdlib-version>` 下，填错就是 404）
