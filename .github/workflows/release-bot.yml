@@ -166,6 +166,9 @@ jobs:
   publish:
     name: publish release
     needs: build
+    # 只发 tag：在分支上 `workflow_dispatch`（验证构建用）时 `ref_name` 是 `master`，
+    # 照旧发版会创建 / 覆盖一个叫 master 的 Release。
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
