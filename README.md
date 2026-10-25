@@ -112,8 +112,7 @@ fuyubot-sdk check <产物路径>                      # 静态检查（不加载
 fuyubot plugin install <插件工程目录> --plugin-dir <插件目录>
 ```
 
-各语言的模板、ABI 与调试方法见 [`docs/plugin-guide.md`](docs/plugin-guide.md)、
-[`docs/abi-contract.md`](docs/abi-contract.md)，示例工程在
+各语言的模板、ABI 与调试方法见[文档站的「插件开发」](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/)，示例工程在
 [SDK 仓库的 `examples/`](https://github.com/CatMoeCircle/FuyuBot-SDK/tree/main/examples)。
 
 ## 文档
@@ -122,8 +121,8 @@ fuyubot plugin install <插件工程目录> --plugin-dir <插件目录>
 | --- | --- |
 | [FuyuBot-Docs](https://github.com/CatMoeCircle/FuyuBot-Docs) | **使用文档站**：安装、配置、运行、回放、排错 |
 | [FuyuBot-SDK](https://github.com/CatMoeCircle/FuyuBot-SDK) | 插件 SDK、`fuyubot-sdk` CLI、五种语言示例 |
-| [`docs/architecture.md`](docs/architecture.md) | 内核与更新管线的设计 |
-| [`docs/tdlib-simplify.md`](docs/tdlib-simplify.md) | 发消息 / 编辑 / Markdown 等便捷封装 |
+| [架构与数据流](https://catmoecircle.github.io/FuyuBot-docs/docs/dev/architecture/) | 内核、更新管线、绑定层与数据流 |
+| [调用 TDLib](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/tdlib/) | `td_invoke`、响应通道、`fuyubot-simplify` 全量对照 |
 
 本仓只放运行时；三个仓库的分工与硬约束见 [`AGENTS.md`](AGENTS.md)。
 

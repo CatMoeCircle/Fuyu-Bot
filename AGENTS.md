@@ -436,9 +436,10 @@ cargo build -p fuyubot-cli   --features vendored --offline
   第一件事是落到这里，再动手。
 - [`docs/HANDOFF.md`](docs/HANDOFF.md) —— **入口**：当前状态、构建契约、每个 crate「已实现 / 还是空的」。
   新增能力、改了对外行为，第一件事是同步它；**踩到的坑**写进 [`docs/pitfalls.md`](docs/pitfalls.md)
-  （编号即引用锚），**新缺口**写进 [`docs/gaps.md`](docs/gaps.md)，结构性说明进
-  [`docs/architecture.md`](docs/architecture.md)，被拍板的决定进 [`docs/decisions.md`](docs/decisions.md)，
-  欠账进 [`docs/tech-debt.md`](docs/tech-debt.md)；
+  （编号即引用锚），**新缺口**写进 [`docs/gaps.md`](docs/gaps.md)，被拍板的决定进
+  [`docs/decisions.md`](docs/decisions.md)，欠账进 [`docs/tech-debt.md`](docs/tech-debt.md)；
+  **面向使用者的文档**（架构、ABI 契约、插件写法、TDLib 封装）只在 **FuyuBot-Docs 文档站**
+  （`content/docs/**`）——改这些行为要同步那边，仓库里不放副本。
   同时**删掉已经过时的说法**（过期的“下一步”比没有更坑人）。
 - `AGENTS.md`（本文件）—— 只放**长期成立**的规范与约束。
   本阶段新出现的、后续也必须遵守的约束（依赖方向、加载优先级、禁止进入默认特性图的依赖……）要提炼进「硬约束」；
