@@ -97,9 +97,9 @@ jobs:
           -p fuyubot-cli
           -p fuyubot-plugin-start -p fuyubot-plugin-help -p fuyubot-plugin-manage
 
-      # 三份中间包，各自独立：本体（可执行文件 + tdjson）、内置插件（plugins/）、SDK。
+      # 两份中间包，各自独立：本体（可执行文件 + tdjson）、内置插件（plugins/）。
       # 都先打 .tar.gz（跨平台都能打、也不受 zip 命令有无影响），叠成 zip 是 publish 的事。
-      - name: Package runtime, builtin plugins and sdk (separate tarballs)
+      - name: Package runtime and builtin plugins (separate tarballs)
         shell: bash
         run: |
           set -euo pipefail
@@ -138,8 +138,20 @@ jobs:
           esac
           plugins="fuyubot-plugins-${asset#fuyubot-}"
           mkdir -p "dist/$plugins/plugins"
+          # cdylib 的**文件名**随平台变：Windows 是 `fuyubot_plugin_start.dll`，
+          # Linux / macOS 上 rustc 会给它加 `lib` 前缀（`libfuyubot_plugin_start.so` / `.dylib`）。
+          # 但包里的名字必须是**无前缀**的 `fuyubot_plugin_start.<ext>`：
+          # `scaffold::install_builtins` 按 `{stem}.{DLL_EXTENSION}` 找文件，
+          # 带前缀它认不出来，`init` 的「自动装内置插件」会**静默**跳过。
+          # 所以源文件两种名字都试，目标名固定无前缀。
           for name in fuyubot_plugin_start fuyubot_plugin_help fuyubot_plugin_manage; do
-            cp "target/release/${name}.${lib}" "dist/$plugins/plugins/"
+            src="target/release/${name}.${lib}"
+            [[ -f "$src" ]] || src="target/release/lib${name}.${lib}"
+            [[ -f "$src" ]] || {
+              echo "找不到内置插件产物：${name}.${lib}（带 lib 前缀的也试过了）" >&2
+              exit 1
+            }
+            cp "$src" "dist/$plugins/plugins/${name}.${lib}"
           done
           tar -czf "dist/$plugins.tar.gz" -C "dist/$plugins" plugins
 

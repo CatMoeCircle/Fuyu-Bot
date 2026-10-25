@@ -234,16 +234,35 @@ pub fn init(root: &Path, name: &str, api_id: i64) -> Result<PathBuf, String> {
 /// 内置插件的文件名主干：`fuyubot_plugin_start` → `fuyubot_plugin_start.{dll,so,dylib}`。
 ///
 /// 这三个由 `cargo package-bot`（以及 release 流程）编出来，跟可执行文件放在一起。
+/// ⚠️ 是**打包后**的名字：cargo 在 Linux / macOS 上给 cdylib 加 `lib` 前缀，
+/// 发布包与 `cargo package-bot` 的 `target/release/` 里两种形态都可能出现，
+/// 所以查找走 [`builtin_artifact`]，别在这里拼死文件名。
 pub const BUILTIN_PLUGINS: &[&str] = &[
     "fuyubot_plugin_start",
     "fuyubot_plugin_help",
     "fuyubot_plugin_manage",
 ];
 
+/// 在 `dir` 里找内置插件的产物：无前缀名优先，其次才是 cargo 加的 `lib` 前缀名。
+///
+/// Windows 上 `cargo build -p fuyubot-plugin-start` 出的是 `fuyubot_plugin_start.dll`，
+/// Linux / macOS 上却是 `libfuyubot_plugin_start.{so,dylib}`——同一件事两种名字。
+fn builtin_artifact(dir: &Path, stem: &str) -> Option<PathBuf> {
+    [
+        format!("{stem}.{DLL_EXTENSION}"),
+        format!("lib{stem}.{DLL_EXTENSION}"),
+    ]
+    .into_iter()
+    .map(|file| dir.join(file))
+    .find(|path| path.is_file())
+}
+
 /// 把内置插件装进插件目录：先看**可执行文件旁边**，再看它下面的 `plugins/`
 /// （发布包里是后者，`cargo package-bot` 出来的是前者）。
 ///
 /// **只装缺的**：目标已存在就跳过，不覆盖用户换过的版本。返回这次真的拷过去的文件。
+/// 装进去的名字一律**无前缀**（`fuyubot_plugin_start.so`，不带 `lib`）：与发布包一致，
+/// 也让「已存在就跳过」的判断对得上——否则 Linux 上每次 `init` 都会再拷一份 `lib…so`。
 ///
 /// 这只是「复制一个已经编好的产物」，不碰编译——和 `plugin install` 同一件事（约束 40）。
 pub fn install_builtins(plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -257,18 +276,16 @@ pub fn install_builtins(plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
 
     let mut copied = Vec::new();
     for stem in BUILTIN_PLUGINS {
-        let file = format!("{stem}.{DLL_EXTENSION}");
-        let Some(source) = sources
-            .iter()
-            .map(|dir| dir.join(&file))
-            .find(|path| path.is_file())
-        else {
+        let Some(source) = sources.iter().find_map(|dir| builtin_artifact(dir, stem)) else {
             continue;
         };
-        if plugin_dir.join(&file).exists() {
+        let target = plugin_dir.join(format!("{stem}.{DLL_EXTENSION}"));
+        if target.exists() {
             continue;
         }
-        copied.push(copy(&source, plugin_dir)?);
+        std::fs::copy(&source, &target)
+            .map_err(|e| format!("拷贝 {} → {} 失败: {e}", source.display(), target.display()))?;
+        copied.push(target);
     }
     Ok(copied)
 }
@@ -610,5 +627,33 @@ mod tests {
         let copied = install_from(&dll, &[project.clone()], &plugin_dir).unwrap();
         assert_eq!(copied.len(), 2, "{copied:?}");
         assert!(plugin_dir.join("weather.py").is_file());
+    }
+
+    /// Linux / macOS 上 cargo 给 cdylib 加 `lib` 前缀，Windows 上不加。
+    ///
+    /// 以前 `install_builtins` 只拼无前缀名，于是非 Windows 上 `cargo package-bot` 之后
+    /// `init` 会**静默**装不上内置插件（发布脚本里同样的拼法还把 release 打挂了）。
+    #[test]
+    fn builtin_artifact_accepts_the_cargo_lib_prefix() {
+        let dir = temp("builtin-artifact");
+        let stem = "fuyubot_plugin_start";
+        let plain = dir.join(format!("{stem}.{DLL_EXTENSION}"));
+        let prefixed = dir.join(format!("lib{stem}.{DLL_EXTENSION}"));
+
+        assert_eq!(builtin_artifact(&dir, stem), None, "两个都没有时应该找不到");
+
+        std::fs::write(&prefixed, b"lib").unwrap();
+        assert_eq!(
+            builtin_artifact(&dir, stem).as_deref(),
+            Some(prefixed.as_path()),
+            "带 lib 前缀的产物也要认"
+        );
+
+        // 两个都在时优先无前缀（Windows / 发布包的形态），别被 cargo 的中间产物盖掉。
+        std::fs::write(&plain, b"plain").unwrap();
+        assert_eq!(
+            builtin_artifact(&dir, stem).as_deref(),
+            Some(plain.as_path())
+        );
     }
 }
