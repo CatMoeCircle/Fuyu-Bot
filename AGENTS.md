@@ -488,8 +488,10 @@ cargo build -p fuyubot-cli   --features vendored --offline
 - [ ] 新增的简化点已用 `# ponytail:` 标注
 - [ ] 动了 `fuyubot-tdlib-sys/build.rs`、`build_support.rs` 或 `fuyubot-tdlib` 的 `build.rs` / `src/loader/vendored.rs` 时，
       `--features vendored` 那条测试也跑过
-- [ ] **`README.md`（仓库根）已同步**：它是对外的第一份文档，「现状 / 缺什么」那两节不能落后于
-      `docs/HANDOFF.md`；里面每条命令都必须是真跑过的（见「代码风格」里那条规矩）
+- [ ] **`README.md`（仓库根）已同步**：它是对外的第一份文档，只讲**项目是什么 + 用户怎么用**
+      （下载 / `init` / `run` / 命令表 / 配置 / 插件）。构建契约、crate 表、进度与缺口留在
+      `docs/HANDOFF.md` / `docs/ROADMAP.md` / `docs/gaps.md`，**别再搬回 README**；
+      里面每条命令都必须是真跑过的（见「代码风格」里那条规矩）
 - [ ] `[package.metadata.fuyubot]` 里的值仍与事实一致——**有两份**（`fuyubot-tdlib-sys` 与 `fuyubot-tdlib`
       各一份，守卫测试 `metadata_is_in_sync_between_the_two_crates` 比对）：`releases-repo` 要等于
       **`git remote origin`**（现在是 `CatMoeCircle/Fuyu-Bot`），`tdlib-version` 要等于**CI 跑 build-tdlib 时填的
