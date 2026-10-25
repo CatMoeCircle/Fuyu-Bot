@@ -1,7 +1,7 @@
 # examples：回放用的更新 JSON
 
 这个目录只剩**回放数据**。五种语言的示例插件工程搬到了
-[FuyuBot-SDK 的 `examples/`](https://github.com/xiaoqvan/FuyuBot-SDK/tree/main/examples)
+[FuyuBot-SDK 的 `examples/`](https://github.com/CatMoeCircle/FuyuBot-SDK/tree/main/examples)
 （它们依赖 SDK crate，跟运行时仓库分开）。
 
 | 文件 | 内容 | 打给谁 |
@@ -25,4 +25,4 @@
 ```
 
 插件示例怎么编、怎么装、怎么回放，见
-[FuyuBot-SDK 的 examples/README.md](https://github.com/xiaoqvan/FuyuBot-SDK/blob/main/examples/README.md)。
+[FuyuBot-SDK 的 examples/README.md](https://github.com/CatMoeCircle/FuyuBot-SDK/blob/main/examples/README.md)。

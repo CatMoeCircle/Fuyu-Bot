@@ -6,9 +6,9 @@
 
 | 仓库 | 放什么 |
 | --- | --- |
-| **本仓**（[Fuyu-Bot](https://github.com/xiaoqvan/Fuyu-Bot)） | 运行时本体（`fuyubot` CLI）、内置插件、插件 ABI（`fuyubot-abi`）、TDLib 绑定 |
-| [FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK) | 插件作者 SDK（`fuyubot-plugin-api`、`fuyubot-sdk-script`）与 `fuyubot-sdk` CLI |
-| [FuyuBot-Docs](https://github.com/xiaoqvan/FuyuBot-Docs) | 文档站（Fumadocs） |
+| **本仓**（[Fuyu-Bot](https://github.com/CatMoeCircle/Fuyu-Bot)） | 运行时本体（`fuyubot` CLI）、内置插件、插件 ABI（`fuyubot-abi`）、TDLib 绑定 |
+| [FuyuBot-SDK](https://github.com/CatMoeCircle/FuyuBot-SDK) | 插件作者 SDK（`fuyubot-plugin-api`、`fuyubot-sdk-script`）与 `fuyubot-sdk` CLI |
+| [FuyuBot-Docs](https://github.com/CatMoeCircle/FuyuBot-Docs) | 文档站（Fumadocs） |
 
 - **插件是动态库**（`.dll` / `.so` / `.dylib`）。Rust / C / C++ / Python / JS / TypeScript 都能写，
   一个 cdylib 就是一个插件。
@@ -41,7 +41,7 @@
 
 ## 普通用户：下载即用（不用编译）
 
-到 [Releases](https://github.com/xiaoqvan/Fuyu-Bot/releases) 下对应平台的 zip，解压后 `tdjson` 就在
+到 [Releases](https://github.com/CatMoeCircle/Fuyu-Bot/releases) 下对应平台的 zip，解压后 `tdjson` 就在
 可执行文件旁边、内置插件在 `plugins/`，直接跑：
 
 ```powershell
@@ -59,9 +59,9 @@ cd fuyubot-windows-x86_64
 | Linux（ARM64） | `fuyubot-linux-aarch64.zip` |
 | macOS（Apple Silicon） | `fuyubot-macos-aarch64.zip` |
 
-插件开发 CLI 在 [FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK/releases) 的
+插件开发 CLI 在 [FuyuBot-SDK](https://github.com/CatMoeCircle/FuyuBot-SDK/releases) 的
 `fuyubot-sdk-<系统>-<架构>.zip` 里。完整的使用文档（下载 / 配置 / 运行 / 回放 / 排错）在
-[FuyuBot-Docs](https://github.com/xiaoqvan/FuyuBot-Docs)；本仓的发布包由
+[FuyuBot-Docs](https://github.com/CatMoeCircle/FuyuBot-Docs)；本仓的发布包由
 [`.github/workflows/release-bot.yml`](.github/workflows/release-bot.yml) 产出。
 下面是从源码构建的**开发者**路线。
 
@@ -70,7 +70,7 @@ cd fuyubot-windows-x86_64
 前置：Rust **1.99+**（`edition 2024`）；Windows 上还需要 MSVC 工具链（C/C++ 插件与 Rust 插件都用它链接）。
 
 ```bash
-git clone https://github.com/xiaoqvan/Fuyu-Bot
+git clone https://github.com/CatMoeCircle/Fuyu-Bot
 cd Fuyu-Bot
 cargo build --workspace
 ```
@@ -123,7 +123,7 @@ path = ""          # 留空 = 按加载优先级自动找 tdjson
 ### ② 生成一个插件（或者直接跳到 ③ 用自带的示例）
 
 插件脚手架由 **`fuyubot-sdk`** 生成——它和 SDK crate 在
-[FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK)。默认写 crates.io 依赖
+[FuyuBot-SDK](https://github.com/CatMoeCircle/FuyuBot-SDK)。默认写 crates.io 依赖
 （`fuyubot-plugin-api = "0.1.0"`）；对着 SDK 源码开发时设 `FUYUBOT_SDK_PATH` 指向 SDK 仓库的
 `crates/`，生成器会改写成 `path = …`。
 
@@ -153,7 +153,7 @@ cargo run -q -p fuyubot-cli -- plugin install demo/plugins/mybot --plugin-dir de
 > 传**工程目录**时，工程根目录里的 `.py` / `.js` / `.ts` / `.pyi` 会一起拷过去
 > （脚本插件要求脚本与 cdylib 同目录）；传单个 `.dll` 时看不到脚本在哪，所以脚本插件请传目录。
 > 各语言怎么编见 [`docs/plugin-guide.md`](docs/plugin-guide.md)；五个示例工程在
-> [FuyuBot-SDK 的 `examples/`](https://github.com/xiaoqvan/FuyuBot-SDK/tree/main/examples)。
+> [FuyuBot-SDK 的 `examples/`](https://github.com/CatMoeCircle/FuyuBot-SDK/tree/main/examples)。
 
 ### ④ 离线回放，看插件干活
 
@@ -236,7 +236,7 @@ demo：没有运行中的实例
 
 ## 写一个插件
 
-用 **`fuyubot-sdk`**（在 [FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK)）：
+用 **`fuyubot-sdk`**（在 [FuyuBot-SDK](https://github.com/CatMoeCircle/FuyuBot-SDK)）：
 
 ```bash
 fuyubot-sdk init <名字> --lang <rust|c|cpp|python|js> --dir <项目目录>   # 落在 <项目目录>/plugins/<名字>
@@ -267,7 +267,7 @@ fuyubot-sdk td-method sendMessage                                        # 看�
 fuyubot plugin install <插件工程目录> --plugin-dir <插件目录>
 ```
 
-> 示例工程在 [SDK 仓库的 `examples/`](https://github.com/xiaoqvan/FuyuBot-SDK/tree/main/examples)；
+> 示例工程在 [SDK 仓库的 `examples/`](https://github.com/CatMoeCircle/FuyuBot-SDK/tree/main/examples)；
 > 它们不是本仓库的 workspace 成员，所以产物落在 SDK 仓库自己的 `target/` 下。
 
 TS 靠 **Node 自带的类型剥离**跑（`node x.ts`，需要 Node ≥ 23.6），所以不需要 `tsc`，
@@ -338,7 +338,7 @@ cargo package-bot                     # 本地打包：target\release\fuyubot.ex
                                       # （tdjson.dll + 兄弟 DLL 由 build.rs 放到它同级）
 ```
 
-**SDK 不在这里**：`fuyubot-sdk` 由 [FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK) 仓库
+**SDK 不在这里**：`fuyubot-sdk` 由 [FuyuBot-SDK](https://github.com/CatMoeCircle/FuyuBot-SDK) 仓库
 `cargo build --release -p fuyubot-sdk-cli` 编出来（它不需要 tdjson）。
 本地打包出的是运行时本体（exe + 同级的 TDLib 库），产物目录 `target/release/` 直接拷走就能用——
 **`cargo install` 是唯一例外**（安装目录不受构建脚本管，tdjson 得自己放，见 [gaps.md 缺口 3](docs/gaps.md)）。
@@ -420,8 +420,8 @@ $env:TEMP = "$PWD\target\linktmp"; $env:TMP = $env:TEMP; New-Item -ItemType Dire
 
 ## 仓库结构
 
-本仓只放**运行时**。插件 SDK 在 [FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK)，
-文档站在 [FuyuBot-Docs](https://github.com/xiaoqvan/FuyuBot-Docs)。
+本仓只放**运行时**。插件 SDK 在 [FuyuBot-SDK](https://github.com/CatMoeCircle/FuyuBot-SDK)，
+文档站在 [FuyuBot-Docs](https://github.com/CatMoeCircle/FuyuBot-Docs)。
 
 ```
 crates/
@@ -444,8 +444,8 @@ docs/                  架构、ABI 契约、插件指南、进度台账、交�
 
 | 文件 | 什么时候看 |
 |---|---|
-| [FuyuBot-Docs](https://github.com/xiaoqvan/FuyuBot-Docs) | **给使用者看的文档站**（Fumadocs）：使用文档 + 插件开发文档 |
-| [FuyuBot-SDK](https://github.com/xiaoqvan/FuyuBot-SDK) | SDK crate、`fuyubot-sdk` CLI、五种语言的示例插件 |
+| [FuyuBot-Docs](https://github.com/CatMoeCircle/FuyuBot-Docs) | **给使用者看的文档站**（Fumadocs）：使用文档 + 插件开发文档 |
+| [FuyuBot-SDK](https://github.com/CatMoeCircle/FuyuBot-SDK) | SDK crate、`fuyubot-sdk` CLI、五种语言的示例插件 |
 | [`docs/plugin-guide.md`](docs/plugin-guide.md) | 写插件（各语言模板、构建、调试） |
 | [`docs/abi-contract.md`](docs/abi-contract.md) | 插件 ABI 的正式契约（VTable、字符串归属、版本协商） |
 | [`docs/architecture.md`](docs/architecture.md) | 内核与更新管线的设计（结构 / 数据流 / ABI 契约 / 两种插件形态） |

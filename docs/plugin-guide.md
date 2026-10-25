@@ -62,7 +62,7 @@ fuyubot plugin install target\debug\fuyubot_example_echo.dll
 > （Node ≥ 23.6 默认开；22.6+ 要 `--experimental-strip-types`）。所以 TS 里只能用能剥掉的语法
 > （注解 / `interface` / `type` / `as`），**不能用** `enum` / `namespace` / 构造器参数属性。
 > Node 太老就自己 `tsc` 编成 `.js`——**编译与打包是插件作者自己的工具链**。
-> 完整可跑的例子见 [FuyuBot-SDK 的 `examples/ts-counter`](https://github.com/xiaoqvan/FuyuBot-SDK/tree/main/examples/ts-counter)。
+> 完整可跑的例子见 [FuyuBot-SDK 的 `examples/ts-counter`](https://github.com/CatMoeCircle/FuyuBot-SDK/tree/main/examples/ts-counter)。
 
 ## 1. Rust
 
@@ -106,7 +106,7 @@ define_plugin!(MyPlugin, "demo");
 
 - `define_plugin!` **一个 crate 只能展开一次**（四个符号名是 ABI 定死的）。
 - 回调签名必须 `extern "C-unwind"`：`extern "C"` 边界上逃出去的 panic 直接 abort。
-- 回调没有捕获环境，状态经 `user_data` 传（示例见 [FuyuBot-SDK 的 `examples/rust-echo`](https://github.com/xiaoqvan/FuyuBot-SDK/tree/main/examples/rust-echo)）。
+- 回调没有捕获环境，状态经 `user_data` 传（示例见 [FuyuBot-SDK 的 `examples/rust-echo`](https://github.com/CatMoeCircle/FuyuBot-SDK/tree/main/examples/rust-echo)）。
 
 ## 2. C
 
@@ -245,4 +245,4 @@ fuyubot run --replay examples/replay/weather.json    # python-weather 要联网�
 `--replay-wait <MS>` 是「回放后等插件的静默窗口」，不填时按插件形态自动选：有脚本插件 2000ms，
 纯原生插件 150ms。脚本在另一个进程里、反应要经管道回来，还可能捎带网络请求，窗口太短会把
 最终答复漏掉（上限 60 秒）。两个样例文件的内容与预期结果见
-[FuyuBot-SDK 的 examples/README](https://github.com/xiaoqvan/FuyuBot-SDK/blob/main/examples/README.md)。
+[FuyuBot-SDK 的 examples/README](https://github.com/CatMoeCircle/FuyuBot-SDK/blob/main/examples/README.md)。

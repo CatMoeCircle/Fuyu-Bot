@@ -9,13 +9,13 @@ rust-version.workspace = true
 #
 # ⚠️ 与 crates/fuyubot-tdlib-sys/Cargo.toml 的同名元数据**必须一致**
 #    （schema 与动态库要来自同一版本、同一仓库；守卫测试在 sys 的 build_support 里）。
-# ⚠️ `releases-repo` 必须与 `git remote origin` 一致（现在就是 xiaoqvan/Fuyu-Bot）。
+# ⚠️ `releases-repo` 必须与 `git remote origin` 一致（现在就是 CatMoeCircle/Fuyu-Bot）。
 # ⚠️ `tdlib-version` 必须与 **CI 跑 build-tdlib 时填的 `tdlib_version` 输入**一致：
 #    资产放在 tag `TDLib-v<tdlib-version>` 下（见 build.rs 与
 #    .github/workflows/build-tdlib.yml），填错就是 404。
 [package.metadata.fuyubot]
 tdlib-version = "1.8.66"
-releases-repo = "xiaoqvan/Fuyu-Bot"
+releases-repo = "CatMoeCircle/Fuyu-Bot"
 
 [features]
 default = []

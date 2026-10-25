@@ -292,7 +292,7 @@ TDLib 便捷封装、更新分发管线、`fuyubot` CLI 与内置插件。
     这条只对用户包成立；**TDLib 构建期资产（约束 46）仍是 `.tar.gz`**，两者别混；
     ⑤ Release notes 的下载表**从实际产物生成**（`publish` 里遍历 `dist/*.zip`），不要手抄平台列表——
     加平台时手抄的那份必然漂。
-    **文档必须跟着变**：[FuyuBot-Docs](https://github.com/xiaoqvan/FuyuBot-Docs) 的
+    **文档必须跟着变**：[FuyuBot-Docs](https://github.com/CatMoeCircle/FuyuBot-Docs) 的
     `content/docs/usage/index.mdx` 是「下载解压运行」，源码构建单独在 `usage/build.mdx`；主 README 开头同理。
     ⚠️ GitHub Actions 这条路**在本机验不了**，所以改 workflow 的组包步骤时，把 `Package` + `Merge`
     两段 bash 原样抠出来在本机跑一次，解压产物验证 `--version` / `init` / `run --replay` 全通。
@@ -490,5 +490,5 @@ cargo build -p fuyubot-cli   --features vendored --offline
       `docs/HANDOFF.md`；里面每条命令都必须是真跑过的（见「代码风格」里那条规矩）
 - [ ] `[package.metadata.fuyubot]` 里的值仍与事实一致——**有两份**（`fuyubot-tdlib-sys` 与 `fuyubot-tdlib`
       各一份，守卫测试 `metadata_is_in_sync_between_the_two_crates` 比对）：`releases-repo` 要等于
-      **`git remote origin`**（现在是 `xiaoqvan/Fuyu-Bot`），`tdlib-version` 要等于**CI 跑 build-tdlib 时填的
+      **`git remote origin`**（现在是 `CatMoeCircle/Fuyu-Bot`），`tdlib-version` 要等于**CI 跑 build-tdlib 时填的
       `tdlib_version`**（现在 `1.8.66`——资产放在 tag `TDLib-v<tdlib-version>` 下，填错就是 404）

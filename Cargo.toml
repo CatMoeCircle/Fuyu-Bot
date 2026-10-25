@@ -11,7 +11,7 @@ edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 # `fuyubot-abi` / `fuyubot-tdlib-sys` 会发到 crates.io（SDK 仓库依赖它们）。
-repository = "https://github.com/xiaoqvan/Fuyu-Bot"
+repository = "https://github.com/CatMoeCircle/Fuyu-Bot"
 
 [workspace.dependencies]
 fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.0" }

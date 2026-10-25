@@ -12,12 +12,12 @@ repository.workspace = true
 # 这里与 crates/fuyubot-tdlib/Cargo.toml 的 [package.metadata.fuyubot]
 # （build_support.rs 里有守卫测试比对两边，漂了就红）。
 #
-# ⚠️ `releases-repo` 必须与 `git remote origin` 一致（现在就是 xiaoqvan/Fuyu-Bot）。
+# ⚠️ `releases-repo` 必须与 `git remote origin` 一致（现在就是 CatMoeCircle/Fuyu-Bot）。
 # ⚠️ `tdlib-version` 必须与 **CI 跑 build-tdlib 时填的 `tdlib_version` 输入**一致：
 #    资产放在 tag `TDLib-v<tdlib-version>` 下，填错就是 404。
 [package.metadata.fuyubot]
 tdlib-version = "1.8.66"
-releases-repo = "xiaoqvan/Fuyu-Bot"
+releases-repo = "CatMoeCircle/Fuyu-Bot"
 
 [dependencies]
 # 编译期生成的 td_api 类型带 serde 派生，所以运行时也要 serde（不只是 serde_json）。
