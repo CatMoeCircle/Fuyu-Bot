@@ -132,7 +132,9 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 46. **发布资产契约**：tag `TDLib-v<版本>`、资产名 `TDLib-<os>-<arch>`（cargo 口径）、内容 `.tar.gz`；加平台要同时改 `ASSETS` 与 CI matrix。
 47. **实例状态是 `.fuyubot/` 三个文件**：`lock`（只用于独占）、`status`（启动后发布）、`stop`（优雅停止请求）；不要合并。
 48. **构建期把 tdjson 放到可执行文件同级**（`build.rs` 的 staging），改任一侧要同步 `loader::tests`。
-49. **发行形态是「下载即用」**：`fuyubot-<os>-<arch>.zip`（exe + tdjson + `plugins/`），中间 tar.gz 只留在 Actions artifacts。
+49. **发行形态是「下载即用」**：`fuyubot-<版本>-<OS>-<平台>.zip`（`<OS>` = windows / linux / macos，
+    `<平台>` = x86_64 / aarch64），**解压出来就是本体**（zip 里不再套一层目录），
+    内容是 exe + tdjson + `plugins/`；内置插件**不单独打包**，中间 tar.gz 只留在 Actions artifacts。
 50. **Go 的 c-shared 插件不能卸载**：识别 `Go buildinf` 魔数并故意不卸载；同进程重复加载不可靠。
 51. **三仓发布顺序**：本仓先发 `fuyubot-abi` / `fuyubot-tdlib-sys` → SDK 发 `fuyubot-plugin-api` → `fuyubot-sdk-script`；不要把 patch 写进 SDK 的 `Cargo.toml`。
 

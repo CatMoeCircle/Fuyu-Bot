@@ -1,6 +1,10 @@
-# 发布 fuyubot：按平台编出可执行文件，**本体与内置插件分开打包**，
-# 最后由 publish 把两份叠成用户下载的各平台 zip：
-#   fuyubot-<系统>-<架构>.zip = fuyubot + tdjson + plugins/（内置插件）
+# 发布 fuyubot：按平台编出可执行文件，**内置插件直接编进本体包**，
+# 最后由 publish 把它转成用户下载的各平台 zip：
+#   fuyubot-<版本>-<OS>-<平台>.zip = fuyubot + tdjson + plugins/（内置插件）
+#
+# 资产名里带版本（例：`fuyubot-v0.1.0-windows-x86_64.zip`），所以同一页 Release 里
+# 多个版本可以并存，用户能一眼看出下的是哪个版本。`<OS>` = windows / linux / macos，
+# `<平台>` = x86_64 / aarch64。
 #
 # 本仓库只发**运行时**。插件开发 CLI（`fuyubot-sdk`）在 FuyuBot-SDK 仓库的
 # `release-sdk.yml` 里发；文档站在 FuyuBot-Docs。
@@ -9,13 +13,14 @@
 #   Windows x86_64 / aarch64、Linux x86_64 / aarch64、macOS **只有 aarch64**
 #   （Intel Mac 没有 runner，见 ASSETS 的注释）。
 #
-# 用户视角（`website/content/docs/usage/index.mdx` 就是这么写的）：
-#   下载 `fuyubot-<系统>-<架构>.zip` → 解压 → `./fuyubot init` / `./fuyubot run`。
-# 所以资产名、归档里的布局、以及「tdjson 就在可执行文件旁边」这三件事都是**契约**，
-# 改之前先看 `crates/fuyubot-tdlib/src/loader/vendored.rs` 的 ASSETS 表与
+# 用户视角（`README.md` 与文档站的「使用」就是这么写的）：
+#   下载 `fuyubot-<版本>-<OS>-<平台>.zip` → 解压 → `./fuyubot init` / `./fuyubot run`。
+# 所以这三件事都是**契约**：资产名、zip **解压出来就是本体**（不再套一层目录）、
+# 以及「tdjson 就在可执行文件旁边」。改之前先看
+# `crates/fuyubot-tdlib/src/loader/vendored.rs` 的 ASSETS 表与
 # `crates/fuyubot-tdlib/build.rs` 的 `stage_next_to_binary`。
 #
-# 中间产物（本体 / 内置插件各一份 .tar.gz）只留在 Actions artifacts 里；
+# 中间产物（每平台一份 .tar.gz，内容已经是最终布局）只留在 Actions artifacts 里；
 # zip 只在 publish（Linux）里生成——Windows runner 的 bash 没有 zip 命令，
 # 别为它分叉。
 #
@@ -97,25 +102,64 @@ jobs:
           -p fuyubot-cli
           -p fuyubot-plugin-start -p fuyubot-plugin-help -p fuyubot-plugin-manage
 
-      # 两份中间包，各自独立：本体（可执行文件 + tdjson）、内置插件（plugins/）。
-      # 都先打 .tar.gz（跨平台都能打、也不受 zip 命令有无影响），叠成 zip 是 publish 的事。
-      - name: Package runtime and builtin plugins (separate tarballs)
+      # 每平台**只出一份**中间包，里面的目录就是用户解压后看到的东西：
+      #   fuyubot(.exe) + 该平台的 tdjson + plugins/（内置插件）+ README.txt
+      # 内置插件不再单独打包——它本来就只在本体旁边才有意义，分开只会多一个
+      # 「下了本体却忘了下插件包」的出错面。
+      # 先打 .tar.gz（跨平台都能打、也不受 zip 命令有无影响），转成 zip 是 publish 的事。
+      - name: Package the runtime (executable + tdjson + builtin plugins)
         shell: bash
+        env:
+          GIT_REF: ${{ github.ref }}
+          GIT_REF_NAME: ${{ github.ref_name }}
+          GIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          asset="${{ matrix.asset }}"
+          asset="${{ matrix.asset }}"   # fuyubot-<OS>-<平台>，例 fuyubot-windows-x86_64
           bin="${{ matrix.bin }}"
-          ext=""
-          [[ "$bin" == *.exe ]] && ext=".exe"
+          case "$bin" in *.exe) ext=".exe" ;; *) ext="" ;; esac
 
-          # ① 本体：可执行文件 + 该平台的 tdjson（loader 优先级 2 靠「可执行文件同级」命中）
-          mkdir -p "dist/$asset"
-          cp "target/release/${bin}" "dist/$asset/"
-          cp -a ".tdlib-cache/${TDLIB_VERSION}/${{ matrix.platform_dir }}/." "dist/$asset/"
+          # 版本：tag 推送就直接用 tag 名（v0.1.0）；分支上的手动构建没有版本号，退回短 sha
+          if [[ "$GIT_REF" == refs/tags/* ]]; then
+            version="$GIT_REF_NAME"
+          else
+            version="dev-${GIT_SHA:0:7}"
+          fi
+          pkg="fuyubot-${version}-${asset#fuyubot-}"   # 例：fuyubot-v0.1.0-windows-x86_64
+
+          stage="dist/$pkg"
+          mkdir -p "$stage/plugins"
+
+          cp "target/release/${bin}" "$stage/"
+          # 该平台的 tdjson（loader 优先级 2 靠「可执行文件同级」命中）
+          cp -a ".tdlib-cache/${TDLIB_VERSION}/${{ matrix.platform_dir }}/." "$stage/"
           # TDLib 资产里的说明是给 loader 看的，不该混进面向用户的包
-          rm -f "dist/$asset/README.md" "dist/$asset/VERSION.json" \
-                "dist/$asset/build-info.txt" "dist/$asset/tdjson.lib"
+          rm -f "$stage/README.md" "$stage/VERSION.json" \
+                "$stage/build-info.txt" "$stage/tdjson.lib"
+
+          # 内置插件：直接进本体的 plugins/，不再单独打包
+          case "$(uname -s)" in
+            MINGW*|MSYS*|CYGWIN*) lib="dll" ;;
+            Darwin) lib="dylib" ;;
+            *) lib="so" ;;
+          esac
+          # cdylib 的**文件名**随平台变：Windows 是 `fuyubot_plugin_start.dll`，
+          # Linux / macOS 上 rustc 会给它加 `lib` 前缀（`libfuyubot_plugin_start.so` / `.dylib`）。
+          # 但包里的名字必须是**无前缀**的 `fuyubot_plugin_start.<ext>`：
+          # `scaffold::install_builtins` 按 `{stem}.{DLL_EXTENSION}` 找文件，
+          # 带前缀它认不出来，`init` 的「自动装内置插件」会**静默**跳过。
+          # 所以源文件两种名字都试，目标名固定无前缀。
+          for stem in fuyubot_plugin_start fuyubot_plugin_help fuyubot_plugin_manage; do
+            src="target/release/${stem}.${lib}"
+            [[ -f "$src" ]] || src="target/release/lib${stem}.${lib}"
+            [[ -f "$src" ]] || {
+              echo "找不到内置插件产物：${stem}.${lib}（带 lib 前缀的也试过了）" >&2
+              exit 1
+            }
+            cp "$src" "$stage/plugins/${stem}.${lib}"
+          done
+
           # 用 printf 而不是 heredoc：YAML 块标量会把内容整体缩进，缩进的 `EOF` 不会终止 heredoc
           printf '%s\n' \
             "$("./target/release/${bin}" --version) — 基于 TDLib 的 Telegram bot 框架" \
@@ -127,39 +171,14 @@ jobs:
             "  ./fuyubot${ext} run  --config demo/fuyubot.toml" \
             "" \
             "文档：https://github.com/${GITHUB_REPOSITORY}" \
-            > "dist/$asset/README.txt"
-          tar -czf "dist/$asset.tar.gz" -C dist "$asset"
+            > "$stage/README.txt"
 
-          # ② 内置插件：单独一份包，归档顶层就是 plugins/，publish 直接叠进本体目录
-          case "$(uname -s)" in
-            MINGW*|MSYS*|CYGWIN*) lib="dll" ;;
-            Darwin) lib="dylib" ;;
-            *) lib="so" ;;
-          esac
-          plugins="fuyubot-plugins-${asset#fuyubot-}"
-          mkdir -p "dist/$plugins/plugins"
-          # cdylib 的**文件名**随平台变：Windows 是 `fuyubot_plugin_start.dll`，
-          # Linux / macOS 上 rustc 会给它加 `lib` 前缀（`libfuyubot_plugin_start.so` / `.dylib`）。
-          # 但包里的名字必须是**无前缀**的 `fuyubot_plugin_start.<ext>`：
-          # `scaffold::install_builtins` 按 `{stem}.{DLL_EXTENSION}` 找文件，
-          # 带前缀它认不出来，`init` 的「自动装内置插件」会**静默**跳过。
-          # 所以源文件两种名字都试，目标名固定无前缀。
-          for name in fuyubot_plugin_start fuyubot_plugin_help fuyubot_plugin_manage; do
-            src="target/release/${name}.${lib}"
-            [[ -f "$src" ]] || src="target/release/lib${name}.${lib}"
-            [[ -f "$src" ]] || {
-              echo "找不到内置插件产物：${name}.${lib}（带 lib 前缀的也试过了）" >&2
-              exit 1
-            }
-            cp "$src" "dist/$plugins/plugins/${name}.${lib}"
-          done
-          tar -czf "dist/$plugins.tar.gz" -C "dist/$plugins" plugins
-
-          ls -lh dist
+          tar -czf "dist/$pkg.tar.gz" -C dist "$pkg"
+          ls -lhR dist
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}-tarballs
+          name: ${{ matrix.asset }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
@@ -176,28 +195,20 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # 本体包 + 插件包叠成一个目录，再打 zip：用户下载一个文件、解压就得到
-      #   fuyubot-<os>-<arch>/{fuyubot, tdjson, README.txt, plugins/}
-      # 单独的本体/插件 tar.gz 不挂 Release——它们是构建产物，不是发布形态。
-      - name: Merge into per-platform zips
+      # 中间包 → zip。**从包目录内部**打，所以 zip 里**没有**外层目录：
+      # 用户解压到哪个目录，本体就在哪个目录（`./fuyubot init` 直接能跑）。
+      - name: Turn each bundle into a flat zip
         shell: bash
         run: |
           set -euo pipefail
           out="$PWD/dist"
-          stage="$(mktemp -d)"
-          for runtime in dist/fuyubot-*.tar.gz; do
-            asset="$(basename "$runtime" .tar.gz)"
-            case "$asset" in
-              fuyubot-sdk-*|fuyubot-plugins-*) continue ;;
-            esac
-            plugins="dist/fuyubot-plugins-${asset#fuyubot-}.tar.gz"
-            [[ -f "$plugins" ]] || { echo "缺少配套的插件包：$plugins" >&2; exit 1; }
-            # 本体包顶层是 $asset/，插件包顶层是 plugins/，叠进去就是最终布局
-            tar -xzf "$runtime" -C "$stage"        # → $stage/$asset/
-            tar -xzf "$plugins" -C "$stage/$asset" # → $stage/$asset/plugins/
-            ( cd "$stage" && zip -q -r -X "$out/$asset.zip" "$asset" )
+          for bundle in dist/fuyubot-*.tar.gz; do
+            pkg="$(basename "$bundle" .tar.gz)"
+            stage="$(mktemp -d)"
+            tar -xzf "$bundle" -C "$stage"   # → $stage/$pkg/{fuyubot, tdjson, plugins/, README.txt}
+            ( cd "$stage/$pkg" && zip -q -r -X "$out/$pkg.zip" . )
+            rm -rf "$stage"
           done
-          rm -rf "$stage"
           ls -lh dist/*.zip
 
       - name: Publish
@@ -211,14 +222,13 @@ jobs:
           table="$(
             for zipfile in dist/fuyubot-*.zip; do
               name="$(basename "$zipfile" .zip)"
-              case "$name" in fuyubot-sdk-*) continue ;; esac
-              case "${name#fuyubot-}" in
-                windows-x86_64)  label="Windows 10/11（x64）" ;;
-                windows-aarch64) label="Windows 11（ARM64）" ;;
-                linux-x86_64)    label="Linux（x86_64）" ;;
-                linux-aarch64)   label="Linux（ARM64）" ;;
-                macos-aarch64)   label="macOS（Apple Silicon）" ;;
-                *)               label="${name#fuyubot-}" ;;
+              case "$name" in
+                *-windows-x86_64)  label="Windows 10/11（x64）" ;;
+                *-windows-aarch64) label="Windows 11（ARM64）" ;;
+                *-linux-x86_64)    label="Linux（x86_64）" ;;
+                *-linux-aarch64)   label="Linux（ARM64）" ;;
+                *-macos-aarch64)   label="macOS（Apple Silicon）" ;;
+                *)                 label="$name" ;;
               esac
               printf '| %s | `%s.zip` |\n' "$label" "$name"
             done
@@ -226,7 +236,8 @@ jobs:
           notes=$(printf '%s\n' \
             "## 下载" \
             "" \
-            "每个平台一个 zip：解压后直接跑，TDLib 动态库与可执行文件同级，内置插件（/start、/help、/plugins）在 \`plugins/\` 里。" \
+            "每个平台一个 zip：**解压出来就是本体**（没有额外的一层目录），" \
+            "TDLib 动态库与可执行文件同级，内置插件（/start、/help、/plugins）在 \`plugins/\` 里。" \
             "" \
             "| 系统 | 资产 |" \
             "| --- | --- |" \

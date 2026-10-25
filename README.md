@@ -13,16 +13,19 @@
 
 | 系统 | 资产 |
 | --- | --- |
-| Windows 10/11（x64） | `fuyubot-windows-x86_64.zip` |
-| Windows 11（ARM64） | `fuyubot-windows-aarch64.zip` |
-| Linux（x86_64） | `fuyubot-linux-x86_64.zip` |
-| Linux（ARM64） | `fuyubot-linux-aarch64.zip` |
-| macOS（Apple Silicon） | `fuyubot-macos-aarch64.zip` |
+| Windows 10/11（x64） | `fuyubot-<版本>-windows-x86_64.zip` |
+| Windows 11（ARM64） | `fuyubot-<版本>-windows-aarch64.zip` |
+| Linux（x86_64） | `fuyubot-<版本>-linux-x86_64.zip` |
+| Linux（ARM64） | `fuyubot-<版本>-linux-aarch64.zip` |
+| macOS（Apple Silicon） | `fuyubot-<版本>-macos-aarch64.zip` |
 
-解压后目录长这样——`tdjson` 必须和可执行文件待在一起，别单独删掉：
+`<版本>` 就是 Release 的版本号（如 `v0.1.0`），资产名里带它，方便一眼看出下的是哪个版本。
+
+**解压出来就是本体**，zip 里没有额外的一层目录——建议先建一个空目录再往里解压。
+`tdjson` 必须和可执行文件待在一起，别单独删掉：
 
 ```
-fuyubot-windows-x86_64/
+<你解压到的目录>/
   fuyubot.exe
   tdjson.dll
   plugins/          # 内置插件：/start、/help、/plugins
