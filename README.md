@@ -124,7 +124,7 @@ fuyubot plugin install <插件工程目录> --plugin-dir <插件目录>
 | [架构与数据流](https://catmoecircle.github.io/FuyuBot-docs/docs/dev/architecture/) | 内核、更新管线、绑定层与数据流 |
 | [调用 TDLib](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/tdlib/) | `td_invoke`、响应通道、`fuyubot-simplify` 全量对照 |
 
-本仓只放运行时；三个仓库的分工与硬约束见 [`AGENTS.md`](AGENTS.md)。
+本仓只放运行时；插件 SDK 在 FuyuBot-SDK，文档站在 FuyuBot-Docs。
 
 ## 从源码构建
 
@@ -136,5 +136,4 @@ cargo build --workspace          # 产物在 target/debug/
 cargo build --release -p fuyubot-cli
 ```
 
-改代码前先读 [`AGENTS.md`](AGENTS.md)：依赖方向、加载优先级、凭据不许落盘等硬约束都在那儿，
-提交前还要过它末尾的检查清单。
+改代码前先看[开发文档](https://catmoecircle.github.io/FuyuBot-docs/docs/dev/)：结构、构建与测试、发布与排错。
