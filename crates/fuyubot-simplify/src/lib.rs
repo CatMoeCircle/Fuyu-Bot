@@ -800,6 +800,10 @@ pub struct SendAlbumParams {
     pub caption: Option<Text>,
     pub reply_to_message_id: Option<i64>,
     pub topic_id: Option<i64>,
+    /// 整组**共用**的等待预算（[`Simplify::send_message_album_wait_success`] 用）：
+    /// 先等 `Messages` 响应、再等 N 条 `updateMessageSendSucceeded`，全程只有这一个预算，
+    /// 不是每条各等一次。
+    pub timeout_ms: u64,
 }
 
 impl Default for SendAlbumParams {
@@ -809,6 +813,7 @@ impl Default for SendAlbumParams {
             caption: None,
             reply_to_message_id: None,
             topic_id: None,
+            timeout_ms: 30_000,
         }
     }
 }
@@ -1299,6 +1304,54 @@ pub struct SendConfirmation {
     pub update: Value,
 }
 
+/// 相册发送的结果（`sendMessageAlbum` 返回的是 `Messages`，**一组**消息）。
+///
+/// 时间线和单条消息不一样：TDLib 先回一个 `messages` 数组（里面是**临时消息**，
+/// 还没发出去），随后**每一项各来一条** `updateMessageSendSucceeded`
+/// （`old_message_id` 就是临时消息的 id）。所以「发成功」对相册来说是 N 条确认。
+#[derive(Debug, Clone)]
+pub struct AlbumConfirmation {
+    /// 发起请求时拿到的请求号。
+    pub request_id: RequestId,
+    /// 响应里的那一组**临时消息**（`Messages.messages`，原样保留）。
+    ///
+    /// 响应没等到（超时）或是个 `error` 时为空。
+    pub pending: Vec<Value>,
+    /// 等到 `updateMessageSendSucceeded` 的**最终消息**，与 [`pending`](Self::pending)
+    /// **一一对应、同序**；没等到的位置是 `Value::Null`。
+    pub messages: Vec<Value>,
+    /// 响应是 `error` 时不为 `None`：整组都没发出去，别去看 `messages`。
+    pub error: Option<Value>,
+}
+
+impl AlbumConfirmation {
+    /// 每一项都等到最终消息了（响应拿到了、不是 error、条数对得上、且没有 Null）。
+    pub fn confirmed(&self) -> bool {
+        self.error.is_none()
+            && !self.pending.is_empty()
+            && self.messages.len() == self.pending.len()
+            && self.messages.iter().all(|message| !message.is_null())
+    }
+
+    /// 最终消息 id（拿到几条给几条；没等到的是 `None`）。
+    pub fn message_ids(&self) -> Vec<Option<i64>> {
+        self.messages
+            .iter()
+            .map(|message| message.get("id").and_then(Value::as_i64))
+            .collect()
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "request_id": self.request_id.id,
+            "confirmed": self.confirmed(),
+            "pending": self.pending,
+            "messages": self.messages,
+            "error": self.error,
+        })
+    }
+}
+
 /// TDLib 便捷入口。持有一个 [`HostApi`]（它是 `Copy` 的，随手复制）。
 #[derive(Debug, Clone, Copy)]
 pub struct Simplify {
@@ -1390,6 +1443,57 @@ impl Simplify {
         Ok(self
             .host
             .td_invoke_simplified("sendMessageAlbum", &payload.to_string())?)
+    }
+
+    /// 发相册并**等到**每一项的 `updateMessageSendSucceeded`。
+    ///
+    /// `sendMessageAlbum` 返回的是 `Messages`（`messages` 数组），不是单条 `Message`：
+    /// 先等响应拿到那一组临时消息，再按 `old_message_id` 逐条等最终消息——
+    /// 结果见 [`AlbumConfirmation`]。
+    ///
+    /// ⚠️ **阻塞**当前线程，别在更新回调里用（和 [`send_message_wait_success`](Self::send_message_wait_success)
+    /// 同理）。`timeout_ms` 是**整组共用**的一个预算，不是每条各等一次。
+    pub fn send_message_album_wait_success(
+        &self,
+        chat_id: i64,
+        params: &SendAlbumParams,
+    ) -> Result<AlbumConfirmation> {
+        let request_id = self.send_message_album(chat_id, params)?;
+        let deadline = Instant::now() + Duration::from_millis(params.timeout_ms);
+
+        // 1. 响应：`messages total_count messages:vector<message>`。
+        let response = self.wait_response(request_id, remaining_ms(deadline));
+        let error = response.as_ref().and_then(error_of);
+        let pending = pending_messages(response.as_ref());
+
+        // 2. 每一项各来一条 updateMessageSendSucceeded，`old_message_id` 对得上才算。
+        //    按临时消息的 id 精确匹配，同一会话里别人发的成功更新不会串进来。
+        let mut messages = Vec::with_capacity(pending.len());
+        for pending_message in &pending {
+            let Some(old_message_id) = pending_message.get("id").and_then(Value::as_i64) else {
+                messages.push(Value::Null);
+                continue;
+            };
+            let filter = json!({
+                FILTER_EVENT_TYPE_KEY: "updateMessageSendSucceeded",
+                "message.chat_id": chat_id,
+                "old_message_id": old_message_id,
+            })
+            .to_string();
+            let handle = self.host.wait_for_update(&filter, remaining_ms(deadline));
+            messages.push(
+                payload_of(handle)
+                    .and_then(|update| update.get("message").cloned())
+                    .unwrap_or(Value::Null),
+            );
+        }
+
+        Ok(AlbumConfirmation {
+            request_id,
+            pending,
+            messages,
+            error,
+        })
     }
 
     /// 改一条消息的文本（`editMessageText`）。
@@ -1587,10 +1691,7 @@ impl Simplify {
         let mut completed = false;
 
         while Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let handle = self
-                .host
-                .wait_for_update(&filter, remaining.as_millis() as u64);
+            let handle = self.host.wait_for_update(&filter, remaining_ms(deadline));
             let Some(update) = payload_of(handle) else {
                 break; // 超时或被取消
             };
@@ -1623,6 +1724,36 @@ impl Simplify {
         });
         let _ = self.host.emit("file_progress", &simplified.to_string());
     }
+}
+
+/// 到 `deadline` 还剩多少毫秒（已经超了就是 0）。
+///
+/// 一段等待里要等多次时用它把**同一个**预算分下去：`timeout_ms` 是全程上限，
+/// 不是每一次等待各给一份。
+fn remaining_ms(deadline: Instant) -> u64 {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis() as u64
+}
+
+/// 响应是 `error` 吗（`@type == "error"`，`message` 里是原因）。
+fn error_of(response: &Value) -> Option<Value> {
+    (response.get("@type").and_then(Value::as_str) == Some("error")).then(|| response.clone())
+}
+
+/// 从 `Messages` 响应里取出那一组（临时）消息；不是 `Messages` 就当没有。
+fn pending_messages(response: Option<&Value>) -> Vec<Value> {
+    let Some(response) = response else {
+        return Vec::new();
+    };
+    if response.get("@type").and_then(Value::as_str) != Some("messages") {
+        return Vec::new();
+    }
+    response
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// 把 [`WaitHandle`] 的负载立刻拷成 [`Value`]；没匹配上就是 `None`。
@@ -1983,6 +2114,7 @@ mod tests {
                     caption: Some(Text::plain("一组图")),
                     reply_to_message_id: Some(9),
                     topic_id: Some(3),
+                    timeout_ms: 30_000,
                 },
             )
             .unwrap();
@@ -2058,6 +2190,153 @@ mod tests {
             "不合法就不该发请求：{:?}",
             rt.sent_requests()
         );
+    }
+
+    /// 模拟 TDLib：看到 `sendMessageAlbum` 就先回响应，再逐条推成功更新。
+    fn album_responder(
+        rt: Arc<HostRuntime>,
+        response: Value,
+        updates: Vec<Value>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let id = loop {
+                let sent = rt.sent_requests();
+                if let Some(request) = sent.iter().find(|r| r.method == "sendMessageAlbum") {
+                    break request.id;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            // 让主线程先进 wait（waiter 是先注册订阅、再开始等的）
+            std::thread::sleep(Duration::from_millis(60));
+            let mut response = response;
+            response["request_id"] = json!(id);
+            rt.deliver_response(&response).unwrap();
+            for update in updates {
+                std::thread::sleep(Duration::from_millis(20));
+                rt.publish_update(&update).unwrap();
+            }
+        })
+    }
+
+    /// `sendMessageAlbum` 返回的是 **`Messages`**（一组）：先收 `messages` 数组，
+    /// 再按 `old_message_id` 逐条收 `updateMessageSendSucceeded`。
+    #[test]
+    fn album_wait_success_collects_one_confirmation_per_media() {
+        let rt = runtime();
+        let simplify = simplify(&rt);
+
+        let responder = album_responder(
+            Arc::clone(&rt),
+            json!({
+                "@type": "messages",
+                "total_count": 2,
+                "messages": [
+                    { "@type": "message", "id": 11, "chat_id": 7 },
+                    { "@type": "message", "id": 12, "chat_id": 7 },
+                ],
+            }),
+            vec![
+                json!({
+                    "@type": "updateMessageSendSucceeded",
+                    "old_message_id": 11,
+                    "message": { "@type": "message", "id": 111, "chat_id": 7 },
+                }),
+                json!({
+                    "@type": "updateMessageSendSucceeded",
+                    "old_message_id": 12,
+                    "message": { "@type": "message", "id": 112, "chat_id": 7 },
+                }),
+            ],
+        );
+
+        let result = simplify
+            .send_message_album_wait_success(
+                7,
+                &SendAlbumParams {
+                    medias: vec![Media::photo("/tmp/a.jpg"), Media::photo("/tmp/b.jpg")],
+                    timeout_ms: 2_000,
+                    ..SendAlbumParams::default()
+                },
+            )
+            .unwrap();
+        responder.join().unwrap();
+
+        assert_eq!(result.pending.len(), 2, "响应里的临时消息要原样留着");
+        assert!(result.error.is_none());
+        assert!(result.confirmed(), "两项都该等到最终消息：{result:?}");
+        assert_eq!(result.message_ids(), vec![Some(111), Some(112)]);
+    }
+
+    /// 只回来一半：没等到的那一项是 `Null`，`confirmed()` 为假。
+    #[test]
+    fn album_wait_success_keeps_missing_slots_null() {
+        let rt = runtime();
+        let simplify = simplify(&rt);
+
+        let responder = album_responder(
+            Arc::clone(&rt),
+            json!({
+                "@type": "messages",
+                "total_count": 2,
+                "messages": [
+                    { "@type": "message", "id": 11, "chat_id": 7 },
+                    { "@type": "message", "id": 12, "chat_id": 7 },
+                ],
+            }),
+            vec![json!({
+                "@type": "updateMessageSendSucceeded",
+                "old_message_id": 11,
+                "message": { "@type": "message", "id": 111, "chat_id": 7 },
+            })],
+        );
+
+        let result = simplify
+            .send_message_album_wait_success(
+                7,
+                &SendAlbumParams {
+                    medias: vec![Media::photo("/tmp/a.jpg"), Media::photo("/tmp/b.jpg")],
+                    timeout_ms: 300,
+                    ..SendAlbumParams::default()
+                },
+            )
+            .unwrap();
+        responder.join().unwrap();
+
+        assert_eq!(result.message_ids(), vec![Some(111), None]);
+        assert!(!result.confirmed());
+    }
+
+    /// 响应是 `error`：整组都没发出去，`error` 留着、`pending` 为空。
+    #[test]
+    fn album_wait_success_reports_the_tdlib_error() {
+        let rt = runtime();
+        let simplify = simplify(&rt);
+
+        let responder = album_responder(
+            Arc::clone(&rt),
+            json!({ "@type": "error", "code": 400, "message": "Album is too big" }),
+            Vec::new(),
+        );
+
+        let result = simplify
+            .send_message_album_wait_success(
+                7,
+                &SendAlbumParams {
+                    medias: vec![Media::photo("/tmp/a.jpg"), Media::photo("/tmp/b.jpg")],
+                    timeout_ms: 2_000,
+                    ..SendAlbumParams::default()
+                },
+            )
+            .unwrap();
+        responder.join().unwrap();
+
+        assert_eq!(
+            result.error.as_ref().unwrap()["message"],
+            "Album is too big"
+        );
+        assert!(result.pending.is_empty());
+        assert!(result.messages.is_empty());
+        assert!(!result.confirmed());
     }
 
     #[test]
@@ -2393,6 +2672,7 @@ mod tests {
                     caption: Some(Text::plain("一组")),
                     reply_to_message_id: Some(9),
                     topic_id: Some(3),
+                    timeout_ms: 30_000,
                 },
             )
             .unwrap();

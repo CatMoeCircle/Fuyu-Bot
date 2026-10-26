@@ -4,6 +4,8 @@ TDLib 便捷封装：把「发消息 / 相册 / 富消息 / 编辑消息 / 删�
 
 `formattedText` 那条链路上的带标记文本（Markdown / HTML）**不自己解析**——经同步的 `td_execute` 直接问 TDLib 的 `parseTextEntities`。
 
+发相册（`sendMessageAlbum`）返回的是 **`Messages`**（一组，不是单条）：先回一组临时消息，再**每一项各来一条** `updateMessageSendSucceeded`（`old_message_id` 就是临时消息 id）。`send_message_album_wait_success` 把这两步合成一次，结果在 `AlbumConfirmation { pending, messages, error }`——`pending` 是响应里的临时消息，`messages` 与它一一对应、同序，没等到的位置是 `Null`。
+
 富消息（`messageRichMessage`）是另一套：TDLib 里没有 `sendRichMessage` / `editRichMessage`，也没有本地的 md → 块树转换（md/html 源由**服务端**解析且**仅 bot** 可用）。所以：
 
 - 发送 / 编辑 = `send_rich_message` / `edit_rich_message`（底层就是 `sendMessage` / `editMessageText` + `inputMessageRichMessage`）；
