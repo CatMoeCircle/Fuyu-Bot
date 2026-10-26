@@ -16,4 +16,6 @@ pub use fuyubot_abi as abi;
 
 pub use loader::{DLL_EXTENSION, LoadError, LoadedPlugin, PluginLoader, plugin_files};
 pub use pipeline::{PipelineError, UpdateOutcome, UpdatePipeline};
-pub use runtime::{HostRuntime, RESPONSE_EVENT, SentRequest, UPDATE_EVENT};
+pub use runtime::{
+    DEFAULT_LOG_VERBOSITY, HostRuntime, LogLevel, RESPONSE_EVENT, SentRequest, UPDATE_EVENT,
+};

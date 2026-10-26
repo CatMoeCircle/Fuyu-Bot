@@ -247,6 +247,11 @@ struct Inner {
     tools: BTreeMap<String, ToolDescriptor>,
     permissions: BTreeSet<String>,
     listeners: Vec<Listener>,
+    /// 工具表的版本号：注册 / 注销都 +1。
+    ///
+    /// 给缓存了 [`ToolRegistry::list_tools_json`] 结果的调用方做失效判断——
+    /// 工具表变更不频繁，而列工具是热路径（插件每次都要问一遍）。
+    revision: u64,
 }
 
 /// 工具注册表。`Clone` 共享同一张表。
@@ -278,13 +283,18 @@ impl ToolRegistry {
             inner
                 .tools
                 .insert(descriptor.name.clone(), descriptor.clone());
+            inner.revision += 1;
         }
         self.broadcast(ToolEvent::Registered(descriptor.name.clone()));
 
         let table = Arc::clone(&self.inner);
         let key = descriptor.name.clone();
         let effect = Effect::new(move || {
-            lock(&table).tools.remove(&key);
+            {
+                let mut inner = lock(&table);
+                inner.tools.remove(&key);
+                inner.revision += 1;
+            }
             broadcast_to(&table, ToolEvent::Unregistered(key));
         });
 
@@ -343,6 +353,14 @@ impl ToolRegistry {
             name: name.to_owned(),
             output,
         })
+    }
+
+    /// 工具表的版本号：注册 / 注销都让它 +1。
+    ///
+    /// 缓存 [`list_tools_json`](Self::list_tools_json) 的一方拿它做失效判断：
+    /// 版本号没变，序列化的结果就不会变。
+    pub fn revision(&self) -> u64 {
+        self.lock().revision
     }
 
     /// 全部工具，按名字排序。

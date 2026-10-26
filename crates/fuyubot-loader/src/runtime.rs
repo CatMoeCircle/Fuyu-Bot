@@ -6,14 +6,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use fuyubot_abi::{
-    ABI_VERSION, EventCallbackFn, FILTER_EVENT_TYPE_KEY, HostApiVTable, LogLevel,
-    MiddlewareCallbackFn, MiddlewareHandle, RequestId, ServiceHandle, ServiceVTable,
-    SubscriptionHandle, ToolHandle, WaitHandle,
+    ABI_VERSION, EventCallbackFn, FILTER_EVENT_TYPE_KEY, HostApiVTable, MiddlewareCallbackFn,
+    MiddlewareHandle, RequestId, ServiceHandle, ServiceMethod, ServiceVTable, SubscriptionHandle,
+    ToolHandle, WaitHandle,
 };
 use fuyubot_core::{Context, Effect};
 use fuyubot_event::{EventBus, Filter, SubscriptionHandle as EventSubscription};
@@ -26,6 +26,9 @@ use fuyubot_tdlib::TdClient;
 use fuyubot_tool::{ToolDescriptor, ToolHandle as ToolRegistration, ToolRegistry};
 use serde_json::{Value, json};
 
+/// 插件日志级别。宿主调 [`HostRuntime::set_log_verbosity`] 时用它，
+/// CLI 也从这里取，省得为了一个枚举去依赖 `fuyubot-abi`。
+pub use fuyubot_abi::LogLevel;
 /// 响应通道，与 [`fuyubot_abi::RESPONSE_EVENT`] 同一个名字。
 pub use fuyubot_abi::RESPONSE_EVENT;
 /// 更新的兜底通道，与 [`fuyubot_abi::UPDATE_EVENT`] 同一个名字。
@@ -34,11 +37,23 @@ pub use fuyubot_abi::UPDATE_EVENT;
 /// 插件日志最多留这么多行（环形缓冲，旧的被挤掉）。
 const LOG_CAPACITY: usize = 256;
 
+/// 插件日志的默认门槛：`Info` 及以上才记（`Debug` / `Trace` 默认丢掉）。
+///
+/// 与 `[tdlib] log_verbosity` 一个思路——默认安静，要排查再调大。
+/// 插件那边只要把 `[plugins].log_level` 写成 `"debug"` / `"trace"` 就能开。
+pub const DEFAULT_LOG_VERBOSITY: LogLevel = LogLevel::Info;
+
 /// 已发出请求的留档上限。
 const REQUEST_LOG_CAPACITY: usize = 256;
 
 /// 没接 TDLib 时用的合成请求号起点：躲开 TDLib `@extra` 的低位区间。
 const SYNTHETIC_REQUEST_BASE: u64 = 1 << 48;
+
+/// 请求归属表（请求号 → 发起它的插件）的容量上限。
+///
+/// 等不到响应的请求会让这张表只增不减：离线模式的合成请求号**永远**不会有响应回来，
+/// 真 TDLib 也有不回响应的情形。被挤掉的老请求只是不再定向投递，它的响应仍走全局通道。
+const REQUEST_OWNER_CAPACITY: usize = 1024;
 
 /// 宿主侧跨 ABI 的一次注册。
 ///
@@ -56,7 +71,64 @@ struct Registration {
     id: u64,
     /// 谁注册的：插件 id（0 = 宿主自己）。卸载插件时按它整批回滚。
     owner: u64,
+    /// 属于哪个子作用域（0 = 插件根作用域）。`rollback_scope` 按它细粒度撤销。
+    scope: u64,
     kind: RegistrationKind,
+}
+
+/// 一个子作用域。中间插件为每个脚本建一个，卸载单个脚本只撤销它自己的作用域。
+#[allow(dead_code)] // `parent` 暂未读：留给 enter/leave 配对校验与诊断用（设计文档 5.2）。
+struct ScopeInfo {
+    /// 继承自创建时的 owner：owner 整批回滚时连带把它撤掉。
+    owner: u64,
+    /// 父作用域句柄（0 = 插件根作用域，父就是 owner 本身）。
+    parent: u64,
+    /// 是否还有效（drop 之后即失效，句柄不得再用）。
+    alive: bool,
+}
+
+/// 请求号 → 发起它的插件 owner，按插入顺序淘汰。
+///
+/// 响应回来时 [`take`](Self::take) 出 owner 做定向投递（见 [`HostRuntime::deliver_response`]）。
+/// 容量到 [`REQUEST_OWNER_CAPACITY`] 就挤掉最老的：宁可少一次定向，也不要无界增长。
+///
+/// `order` 只记插入顺序、不跟踪删除，所以成功的响应会在它里面留下幽灵项；
+/// 长到两倍容量时重建一次（重建后淘汰顺序退化为任意，但有界性仍然成立）。
+#[derive(Default)]
+struct RequestOwners {
+    map: HashMap<u64, u64>,
+    order: VecDeque<u64>,
+}
+
+impl RequestOwners {
+    fn insert(&mut self, id: u64, owner: u64) {
+        // 同一个 id 重复登记不该发生；真发生了就只覆盖，不重复排队。
+        if self.map.insert(id, owner).is_none() {
+            self.order.push_back(id);
+        }
+        while self.map.len() > REQUEST_OWNER_CAPACITY {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.map.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        if self.order.len() > REQUEST_OWNER_CAPACITY * 2 {
+            self.order.clear();
+            self.order.extend(self.map.keys().copied());
+        }
+    }
+
+    /// 取走归属：一条请求只配一次响应。
+    fn take(&mut self, id: u64) -> Option<u64> {
+        self.map.remove(&id)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 /// 一个 `wait_for_update` 等待位。
@@ -82,6 +154,10 @@ impl std::fmt::Debug for AbiService {
     }
 }
 
+/// 内置 scope service 的名字。中间插件通过 `get_service("fuyubot.host.scope")` 拿到它，
+/// 用它给每个脚本建子作用域（见设计文档 5.2 / 5.3）。
+static SCOPE_SERVICE_NAME: &CStr = c"fuyubot.host.scope";
+
 /// 宿主运行时。
 ///
 /// 强制定制成 `Arc`：`host_ctx` 必须指向一个地址稳定的实例，而且插件可能
@@ -95,22 +171,32 @@ pub struct HostRuntime {
     td: OnceLock<Arc<TdClient>>,
     /// 装四个机制拿到的守卫，必须留住，否则机制会从 Context 里消失。
     _guards: Vec<Effect>,
-    /// 所有跨 ABI 的注册；插件卸载时按 owner 一次性回滚。
+    /// 所有跨 ABI 的注册；插件卸载时按 owner 一次性回滚，子作用域按 scope 细粒度回滚。
     registrations: Mutex<Vec<Registration>>,
     next_id: AtomicU64,
-    /// 当前正在加载的插件 id（0 = 宿主自己）。
-    current_owner: AtomicU64,
     next_owner: AtomicU64,
+    /// 子作用域表：中间插件为每个脚本建一个，卸载单个脚本只撤销它自己的。
+    scopes: Mutex<HashMap<u64, ScopeInfo>>,
+    next_scope: AtomicU64,
     waiters: Mutex<HashMap<u64, Arc<Waiter>>>,
     next_waiter: AtomicU64,
     /// 插件经 `log` 打进来的日志，环形缓冲、有上限。
     log_lines: Mutex<VecDeque<String>>,
-    /// 请求 id → 发起它的 owner。响应回来时按它决定投递给谁。
-    request_owners: Mutex<HashMap<u64, u64>>,
+    /// 插件日志的门槛：级别数值 **小于等于** 它的才记（`Error = 1 … Trace = 5`）。
+    ///
+    /// 默认 [`DEFAULT_LOG_VERBOSITY`]。没有它的时候 `api_log` 对每条日志都
+    /// `eprintln!`——插件刷 Debug 就是实打实的 stderr 系统调用。
+    log_verbosity: AtomicU32,
+    /// `list_tools` 的序列化缓存：`(工具表版本号, JSON)`。版本号没变就复用。
+    tool_list_cache: Mutex<Option<(u64, Arc<CString>)>>,
+    /// 请求 id → 发起它的 owner。响应回来时按它决定投递给谁（有容量上限）。
+    request_owners: Mutex<RequestOwners>,
     /// 没接 TDLib 时用的合成请求号。
     next_synthetic_request: AtomicU64,
     /// 已经发出的请求留档（诊断 + 测试用）。
     sent_requests: Mutex<VecDeque<SentRequest>>,
+    /// 内置 scope service 的 vtable（`context` 指向本实例）。按值存，地址稳定。
+    scope_vtable: ServiceVTable,
     vtable: HostApiVTable,
 }
 
@@ -122,17 +208,25 @@ pub struct SentRequest {
     pub params: Value,
 }
 
-/// 作用域守卫：把 `current_owner` 换成某个插件，离开作用域自动还原。
-struct OwnerGuard<'a> {
-    runtime: &'a HostRuntime,
-    previous: u64,
+// 当前作用域栈：栈顶是「当前 (owner, scope)」。栈底永远是 `(0, 0)`（宿主根）。
+//
+// 用 **thread-local** 而不是全局量：中间插件要**并行**加载多个脚本，每个加载线程
+// 各自 enter 自己的作用域、互不干扰；全局量会让「pump 线程 enter 期间宿主恰在加载
+// 别的插件」发生串号。硬约束（见设计文档 5.4）：注册必须发生在某个显式作用域内，
+// 离开作用域后不得再使用作用域内取得的句柄。
+thread_local! {
+    static SCOPE_STACK: std::cell::RefCell<Vec<(u64, u64)>> =
+        std::cell::RefCell::new(vec![(0, 0)]);
 }
 
-impl Drop for OwnerGuard<'_> {
+/// 作用域守卫：把一层 (owner, scope) 压进 thread-local 栈，drop 时弹出还原。
+struct ScopeGuard;
+
+impl Drop for ScopeGuard {
     fn drop(&mut self) {
-        self.runtime
-            .current_owner
-            .store(self.previous, Ordering::Relaxed);
+        SCOPE_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
     }
 }
 
@@ -150,7 +244,8 @@ impl HostRuntime {
         let tools = ctx.get::<ToolRegistry>().map_err(|e| e.to_string())?;
         let middleware = ctx.get::<Pipeline>().map_err(|e| e.to_string())?;
 
-        Ok(Arc::new_cyclic(|weak| Self {
+        // 预置内置 scope service（owner = 0 宿主自己，永远不会被回滚）。
+        let rt = Arc::new_cyclic(|weak| Self {
             ctx,
             events,
             services,
@@ -160,14 +255,26 @@ impl HostRuntime {
             _guards: guards,
             registrations: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
-            current_owner: AtomicU64::new(0),
             next_owner: AtomicU64::new(1),
+            scopes: Mutex::new(HashMap::new()),
+            next_scope: AtomicU64::new(1),
             waiters: Mutex::new(HashMap::new()),
             next_waiter: AtomicU64::new(1),
             log_lines: Mutex::new(VecDeque::new()),
-            request_owners: Mutex::new(HashMap::new()),
+            log_verbosity: AtomicU32::new(DEFAULT_LOG_VERBOSITY as u32),
+            tool_list_cache: Mutex::new(None),
+            request_owners: Mutex::new(RequestOwners::default()),
             next_synthetic_request: AtomicU64::new(SYNTHETIC_REQUEST_BASE),
             sent_requests: Mutex::new(VecDeque::new()),
+            // scope service 的 `context` 指向这个 Arc 内部（和 host_ctx 一个道理）。
+            scope_vtable: ServiceVTable {
+                name: SCOPE_SERVICE_NAME.as_ptr(),
+                version: 1,
+                size: core::mem::size_of::<ServiceVTable>() as u32,
+                context: weak.as_ptr() as *mut c_void,
+                methods: SCOPE_METHODS.0.as_ptr(),
+                method_count: SCOPE_METHODS.0.len(),
+            },
             // `host_ctx` 指向这个 `Arc` 内部；地址稳定，插件活着期间一直有效。
             vtable: HostApiVTable {
                 version: ABI_VERSION,
@@ -189,7 +296,23 @@ impl HostRuntime {
                 cancel_wait: Some(api_cancel_wait),
                 log: Some(api_log),
             },
-        }))
+        });
+        rt.provide_scope_service();
+        Ok(rt)
+    }
+
+    /// 把内置 scope service 预置进命名服务容器。
+    ///
+    /// 句柄故意 `forget`：它要活到进程结束，不能跟着谁 drop 就注销。
+    fn provide_scope_service(&self) {
+        let vtable = &self.scope_vtable as *const ServiceVTable;
+        match self.services.provide(
+            SCOPE_SERVICE_NAME.to_str().unwrap_or_default(),
+            AbiService(vtable),
+        ) {
+            Ok(handle) => std::mem::forget(handle),
+            Err(e) => self.warn(&format!("预置 scope service 失败: {e}")),
+        }
     }
 
     /// 交给插件的 VTable 指针。
@@ -241,6 +364,41 @@ impl HostRuntime {
         Ok(total)
     }
 
+    /// 插件日志的门槛：级别数值 **小于等于** 它的才记（`Error = 1 … Trace = 5`）。
+    pub fn log_verbosity(&self) -> u32 {
+        self.log_verbosity.load(Ordering::Relaxed)
+    }
+
+    /// 设门槛。低于门槛的插件日志**既**不进 [`log_lines`](Self::log_lines) **也**不写 stderr。
+    ///
+    /// 只是省掉格式化与系统调用，**不改变**插件侧的行为：插件照样能调 `log`。
+    pub fn set_log_verbosity(&self, level: LogLevel) {
+        self.log_verbosity.store(level as u32, Ordering::Relaxed);
+    }
+
+    /// `list_tools` 的 JSON，按工具表版本号缓存。
+    ///
+    /// 工具表变更不频繁，而列工具是热路径：没缓存时每调一次都要 `BTreeMap` 全表克隆
+    /// → 逐条 `to_json` → 序列化 → 再拷进线程局部缓冲。版本号没变就直接复用上次的
+    /// `CString`（用 `Arc` 存，所以缓存被替换后插件手里那个旧指针**依然有效**）。
+    fn tools_json(&self) -> Arc<CString> {
+        let revision = self.tools.revision();
+        let mut cache = self
+            .tool_list_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match cache.as_ref() {
+            Some((cached_revision, json)) if *cached_revision == revision => Arc::clone(json),
+            _ => {
+                let json = Arc::new(
+                    CString::new(self.tools.list_tools_json().to_string()).unwrap_or_default(),
+                );
+                *cache = Some((revision, Arc::clone(&json)));
+                json
+            }
+        }
+    }
+
     /// 插件经 VTable 打进来的日志（最多 [`LOG_CAPACITY`] 行，最新的在末尾）。
     ///
     /// 宿主自己也可以接日志系统：这里留了一份，省得为了可观测性再引一个 crate。
@@ -276,7 +434,7 @@ impl HostRuntime {
                 .request_owners
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .remove(&id)
+                .take(id)
                 .unwrap_or(0),
             None => 0,
         };
@@ -289,18 +447,20 @@ impl HostRuntime {
         self.events.emit_scoped(owner, RESPONSE_EVENT, &forwarded)
     }
 
-    /// 当前归属：0 = 宿主自己，其它 = 正在跑的那个插件。
+    /// 当前归属：0 = 宿主自己，其它 = 正在跑的那个插件（本线程作用域栈顶）。
     pub fn current_owner(&self) -> u64 {
-        self.current_owner.load(Ordering::Relaxed)
+        SCOPE_STACK.with(|stack| stack.borrow().last().map(|(owner, _)| *owner).unwrap_or(0))
     }
 
-    /// 在作用域内把归属切成 `owner`；插件里再发起请求、再注册订阅都会算在它名下。
-    fn enter_owner(&self, owner: u64) -> OwnerGuard<'_> {
-        let previous = self.current_owner.swap(owner, Ordering::Relaxed);
-        OwnerGuard {
-            runtime: self,
-            previous,
-        }
+    /// 当前子作用域（本线程作用域栈顶；0 = 插件根作用域 / 宿主根）。
+    fn current_scope(&self) -> u64 {
+        SCOPE_STACK.with(|stack| stack.borrow().last().map(|(_, scope)| *scope).unwrap_or(0))
+    }
+
+    /// 在作用域内把归属切成 `(owner, scope)`；插件再发起请求、再注册订阅都会算在它名下。
+    fn enter_scope(&self, owner: u64, scope: u64) -> ScopeGuard {
+        SCOPE_STACK.with(|stack| stack.borrow_mut().push((owner, scope)));
+        ScopeGuard
     }
 
     fn record_request(&self, id: u64, owner: u64, method: String, params: &Value) {
@@ -324,37 +484,70 @@ impl HostRuntime {
 
     fn begin_plugin(&self) -> u64 {
         let id = self.next_owner.fetch_add(1, Ordering::Relaxed);
-        self.current_owner.store(id, Ordering::Relaxed);
+        // 插件加载作用域：scope = 0（插件根作用域），压到本线程栈顶。
+        SCOPE_STACK.with(|stack| stack.borrow_mut().push((id, 0)));
         id
     }
 
     fn end_plugin(&self) {
-        self.current_owner.store(0, Ordering::Relaxed);
+        SCOPE_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
     }
 
-    /// 把某个插件注册的一切都撤掉（注册顺序的倒序由各自的 Drop 保证）。
+    /// 把某个插件注册的一切都撤掉，**后注册的先撤销**。
+    ///
+    /// 子作用域的 owner 继承自父，所以 owner 整批回滚**连带**子作用域（设计文档 5.2）：
+    /// 它们的注册一起撤，条目也从作用域表里摘掉。
     pub(crate) fn rollback_owner(&self, owner: u64) {
-        let removed = {
-            let mut registrations = self.registrations();
-            let mut removed = Vec::new();
-            let mut index = 0;
-            while index < registrations.len() {
-                if registrations[index].owner == owner {
-                    removed.push(registrations.swap_remove(index));
-                } else {
-                    index += 1;
-                }
-            }
-            removed
-        };
+        let removed = self.take_registrations(|r| r.owner == owner);
         // 在锁外回滚：句柄的 Drop 会回头去动事件总线 / 工具表。
-        drop(removed);
+        // 倒序撤销：与「卸载是加载顺序的倒序」一致，后注册的东西先撤。
+        for registration in removed.into_iter().rev() {
+            drop(registration);
+        }
+        // 这个 owner 建的子作用域一并失效并从表里摘掉，否则作用域表只增不减。
+        self.scopes().retain(|_, info| info.owner != owner);
+    }
+
+    /// 摘走满足 `predicate` 的全部注册（**保持注册顺序**），剩下的写回表。
+    ///
+    /// 不用 `swap_remove`：它会搬动元素、打乱顺序，"按注册倒序撤销"就无从谈起。
+    fn take_registrations(&self, predicate: impl Fn(&Registration) -> bool) -> Vec<Registration> {
+        let mut registrations = self.registrations();
+        let (matching, rest): (Vec<Registration>, Vec<Registration>) =
+            registrations.drain(..).partition(|r| predicate(r));
+        registrations.extend(rest);
+        matching
+    }
+
+    /// 撤销某个子作用域累积的全部注册，并把它的句柄标记为失效。
+    ///
+    /// 只影响这个 scope，同 owner 的其他作用域不受影响——这是「单个脚本独立卸载」的落点。
+    pub(crate) fn rollback_scope(&self, scope: u64) {
+        if let Some(info) = self.scopes().get_mut(&scope) {
+            info.alive = false;
+        }
+        let removed = self.take_registrations(|r| r.scope == scope);
+        for registration in removed.into_iter().rev() {
+            drop(registration);
+        }
+        // 摘掉条目：中间插件反复建/撤作用域（脚本热加载）时不该让这张表只增不减。
+        self.scopes().remove(&scope);
     }
 
     fn remember(&self, kind: RegistrationKind) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let owner = self.current_owner.load(Ordering::Relaxed);
-        self.registrations().push(Registration { id, owner, kind });
+        // 记的是「栈顶作用域的 owner + scope」：中间插件 enter 到哪个脚本的作用域，
+        // 那个脚本在宿主侧的注册就落到那个 scope。
+        let (owner, scope) =
+            SCOPE_STACK.with(|stack| stack.borrow().last().copied().unwrap_or((0, 0)));
+        self.registrations().push(Registration {
+            id,
+            owner,
+            scope,
+            kind,
+        });
         id
     }
 
@@ -373,6 +566,68 @@ impl HostRuntime {
 
     fn registrations(&self) -> MutexGuard<'_, Vec<Registration>> {
         self.registrations.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn scopes(&self) -> MutexGuard<'_, HashMap<u64, ScopeInfo>> {
+        self.scopes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // ── 子作用域（供内置 scope service 调用）──────────────────────
+
+    /// 新建一个子作用域：继承当前 owner，父 = 当前 scope。返回句柄。
+    fn scope_create(&self) -> u64 {
+        let handle = self.next_scope.fetch_add(1, Ordering::Relaxed);
+        let (owner, parent) =
+            SCOPE_STACK.with(|stack| stack.borrow().last().copied().unwrap_or((0, 0)));
+        self.scopes().insert(
+            handle,
+            ScopeInfo {
+                owner,
+                parent,
+                alive: true,
+            },
+        );
+        handle
+    }
+
+    /// 进入一个作用域（压到本线程栈顶）。返回 `false` 表示句柄无效或已失效。
+    fn scope_enter(&self, handle: u64) -> bool {
+        let owner = {
+            let scopes = self.scopes();
+            let Some(info) = scopes.get(&handle) else {
+                return false;
+            };
+            if !info.alive {
+                return false;
+            }
+            info.owner
+        };
+        SCOPE_STACK.with(|stack| stack.borrow_mut().push((owner, handle)));
+        true
+    }
+
+    /// 离开当前作用域（弹一层）。栈空时是空操作，不会下探到宿主根之下。
+    fn scope_leave(&self) {
+        SCOPE_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.len() > 1 {
+                stack.pop();
+            }
+        });
+    }
+
+    /// 撤销一个作用域的全部注册并失效句柄。返回 `false` 表示句柄无效。
+    fn scope_drop(&self, handle: u64) -> bool {
+        let valid = self
+            .scopes()
+            .get(&handle)
+            .map(|info| info.alive)
+            .unwrap_or(false);
+        if !valid {
+            return false;
+        }
+        self.rollback_scope(handle);
+        true
     }
 }
 
@@ -417,12 +672,24 @@ unsafe fn cstr<'a>(ptr: *const c_char) -> Option<&'a str> {
 thread_local! {
     /// 宿主返回给插件的字符串：**宿主持有**，下一次宿主调用前有效。
     /// 与插件侧 `plugin_free_string` 的分工：谁分配谁释放，宿主不碰插件的指针。
-    static HOST_STRING: std::cell::RefCell<CString> = std::cell::RefCell::new(CString::default());
+    static HOST_STRING: std::cell::RefCell<Arc<CString>> =
+        std::cell::RefCell::new(Arc::new(CString::default()));
 }
 
 fn host_string(text: &str) -> *const c_char {
     HOST_STRING.with(|slot| {
-        *slot.borrow_mut() = CString::new(text).unwrap_or_default();
+        *slot.borrow_mut() = Arc::new(CString::new(text).unwrap_or_default());
+        slot.borrow().as_ptr()
+    })
+}
+
+/// 把**已经分配好**的字符串放进线程局部缓冲（不拷贝）。
+///
+/// 缓存命中时走这条（见 [`HostRuntime::tools_json`]）：缓冲里存的是 `Arc`，
+/// 所以缓存被替换之后，插件手里那个旧指针**依然有效**——不会悬垂。
+fn host_shared_string(text: Arc<CString>) -> *const c_char {
+    HOST_STRING.with(|slot| {
+        *slot.borrow_mut() = text;
         slot.borrow().as_ptr()
     })
 }
@@ -509,6 +776,8 @@ struct CallbackMiddleware {
     host: usize,
     /// 注册它的插件。
     owner: u64,
+    /// 注册它的子作用域（回调里再注册的东西仍算这个 scope）。
+    scope: u64,
     callback: MiddlewareCallbackFn,
     /// 插件的私有数据，同样存成整数。
     user_data: usize,
@@ -529,7 +798,7 @@ impl Middleware for CallbackMiddleware {
         let Some(rt) = (unsafe { runtime(self.host as *mut c_void) }) else {
             return next.run(ctx);
         };
-        let _scope = rt.enter_owner(self.owner);
+        let _scope = rt.enter_scope(self.owner, self.scope);
 
         // 插件中间件 panic：接住、记日志、当作没挂这一层继续往下走。
         let code = match panic::catch_unwind(AssertUnwindSafe(|| unsafe {
@@ -550,6 +819,91 @@ impl Middleware for CallbackMiddleware {
     }
 }
 
+// ── 内置 scope service 的实现 ───────────────────────────────────────
+//
+// 四个方法以 `ServiceMethodFn` 的形态暴露（`context` = 宿主运行时指针），
+// JSON 协议：`scope_create` 入 `{}` 出 `{"handle":N}`；其余入 `{"handle":N}`，
+// 成功出 `null`，失败出 `{"error":"..."}`。
+
+unsafe extern "C" fn api_scope_create(
+    context: *mut c_void,
+    _input: *const c_char,
+) -> *const c_char {
+    // SAFETY: context 由本运行时在构造 scope_vtable 时写入。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    let handle = rt.scope_create();
+    host_string(&json!({ "handle": handle }).to_string())
+}
+
+unsafe extern "C" fn api_scope_enter(context: *mut c_void, input: *const c_char) -> *const c_char {
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    let Some(handle) = parse_json(input).and_then(|v| v.get("handle").and_then(Value::as_u64))
+    else {
+        return host_string(&json!({ "error": "scope_enter 需要 {\"handle\":N}" }).to_string());
+    };
+    if rt.scope_enter(handle) {
+        core::ptr::null()
+    } else {
+        host_string(&json!({ "error": "无效或已失效的作用域" }).to_string())
+    }
+}
+
+unsafe extern "C" fn api_scope_leave(context: *mut c_void, _input: *const c_char) -> *const c_char {
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    rt.scope_leave();
+    core::ptr::null()
+}
+
+unsafe extern "C" fn api_scope_drop(context: *mut c_void, input: *const c_char) -> *const c_char {
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    let Some(handle) = parse_json(input).and_then(|v| v.get("handle").and_then(Value::as_u64))
+    else {
+        return host_string(&json!({ "error": "scope_drop 需要 {\"handle\":N}" }).to_string());
+    };
+    if rt.scope_drop(handle) {
+        core::ptr::null()
+    } else {
+        host_string(&json!({ "error": "无效或已失效的作用域" }).to_string())
+    }
+}
+
+/// scope service 的方法表。
+///
+/// 包一层 newtype 再 `unsafe impl Sync`：`ServiceMethod` 里的 `name` 是裸指针，
+/// 编译器不认为它 `Sync`；但这里四个 `name` 都指向 `'static` 的字符串字面量，
+/// 安全跨线程共享，`func` 是纯函数指针，同样安全。
+struct ScopeMethods([ServiceMethod; 4]);
+
+// SAFETY: 见 `ScopeMethods` 文档。
+unsafe impl Sync for ScopeMethods {}
+
+static SCOPE_METHODS: ScopeMethods = ScopeMethods([
+    ServiceMethod {
+        name: c"scope_create".as_ptr(),
+        func: Some(api_scope_create),
+    },
+    ServiceMethod {
+        name: c"scope_enter".as_ptr(),
+        func: Some(api_scope_enter),
+    },
+    ServiceMethod {
+        name: c"scope_leave".as_ptr(),
+        func: Some(api_scope_leave),
+    },
+    ServiceMethod {
+        name: c"scope_drop".as_ptr(),
+        func: Some(api_scope_drop),
+    },
+]);
+
 // ── VTable 实现 ────────────────────────────────────────────────────
 
 unsafe extern "C" fn api_log(host: *mut c_void, level: u32, message: *const c_char) {
@@ -559,7 +913,14 @@ unsafe extern "C" fn api_log(host: *mut c_void, level: u32, message: *const c_ch
     };
     let level = LogLevel::from_u32(level);
     // SAFETY: ABI 契约保证 host 来自本运行时。
-    if let Some(rt) = unsafe { runtime(host) } {
+    let Some(rt) = (unsafe { runtime(host) }) else {
+        return;
+    };
+    // 门槛过滤：低于门槛的既不入环形缓冲也不写 stderr（省掉格式化与系统调用）。
+    if level as u32 > rt.log_verbosity() {
+        return;
+    }
+    {
         let mut lines = rt.log_lines.lock().unwrap_or_else(|e| e.into_inner());
         if lines.len() >= LOG_CAPACITY {
             lines.pop_front();
@@ -593,8 +954,9 @@ unsafe extern "C" fn api_on(
     };
 
     let user_data = user_data as usize;
-    // 注册时的归属烧进闭包：插件在自己回调里再注册的东西仍然算它的。
+    // 注册时的归属烧进闭包：插件在自己回调里再注册的东西仍然算它的（同一个子作用域）。
     let owner = rt.current_owner();
+    let scope = rt.current_scope();
     let host = host as usize;
     let handle = rt
         .events
@@ -606,7 +968,7 @@ unsafe extern "C" fn api_on(
             let Some(rt) = (unsafe { runtime(host as *mut c_void) }) else {
                 return Ok(());
             };
-            let _scope = rt.enter_owner(owner);
+            let _scope = rt.enter_scope(owner, scope);
 
             // 插件 panic 在这里被接住：不传播、不 abort，也不打断其余订阅者。
             match panic::catch_unwind(AssertUnwindSafe(|| unsafe {
@@ -720,7 +1082,7 @@ unsafe extern "C" fn api_list_tools(host: *mut c_void) -> *const c_char {
     let Some(rt) = (unsafe { runtime(host) }) else {
         return core::ptr::null();
     };
-    host_string(&rt.tools.list_tools_json().to_string())
+    host_shared_string(rt.tools_json())
 }
 
 unsafe extern "C" fn api_provide_service(
@@ -766,6 +1128,62 @@ unsafe extern "C" fn api_get_service(
     match rt.services.get::<AbiService>(name) {
         Some(service) => service.0,
         None => core::ptr::null(),
+    }
+}
+
+impl HostRuntime {
+    /// 按名字调一个**插件提供的** service 的方法（宿主侧的 Rust 入口）。
+    ///
+    /// 存在的理由：`AbiService` 是私有类型，而宿主里的 Rust 代码想查插件托管的
+    /// 清单时绕不开它——`fuyubot plugin list` 要把两个中间插件管着的脚本摊开打印，
+    /// 就是走这里（约定：名字以 `fuyubot.host.scripts` 开头的 service 都有一个
+    /// `list` 方法，返回 `{"lang":…,"scripts":[…]}`）。
+    ///
+    /// 返回的 JSON 是**当场拷走**的：ABI 要求提供方持有返回字符串、调用方读完即弃，
+    /// 所以这里不等调用方看完就已经复制成 `String`。
+    ///
+    /// 出错（服务不存在 / 没这个方法 / 入参带 NUL）返回 `Err`，不 panic——
+    /// 插件给的 service 表理论上什么都有。
+    pub fn call_service(
+        &self,
+        service: &str,
+        method: &str,
+        input_json: &str,
+    ) -> Result<String, String> {
+        // 查到的 Arc 要一直持有到调用结束：它是对应表项的唯一强引用，
+        // 中间被注销就会让下面的裸指针悬空。
+        let Some(entry) = self.services.get::<AbiService>(service) else {
+            return Err(format!("没有名为 {service} 的 service"));
+        };
+        // SAFETY: 表项活着（上面攥着 Arc），指针来自 provide_service 时校验过的 vtable。
+        let vtable = unsafe { &*entry.0 };
+        let input = CString::new(input_json).map_err(|_| "入参含 NUL".to_owned())?;
+        for index in 0..vtable.method_count {
+            // SAFETY: method_count 由注册方保证，methods 指向同等数量的连续项。
+            let entry = unsafe { &*vtable.methods.add(index) };
+            if entry.name.is_null() {
+                continue;
+            }
+            // SAFETY: 方法名是 NUL 结尾 UTF-8。
+            if unsafe { CStr::from_ptr(entry.name) }.to_string_lossy() != method {
+                continue;
+            }
+            let Some(func) = entry.func else {
+                return Err(format!("service {service} 的方法 {method} 没有实现"));
+            };
+            // SAFETY: 契约要求返回字符串由提供方持有、本线程下一次调用前有效——
+            // 这里立刻拷走，不把裸指针交出去。
+            let raw = unsafe { func(vtable.context, input.as_ptr()) };
+            if raw.is_null() {
+                // 与 scope service 的约定一致：null = 成功但没有输出。
+                return Ok(String::new());
+            }
+            // SAFETY: raw 是提供方的 NUL 结尾字符串。
+            return Ok(unsafe { CStr::from_ptr(raw) }
+                .to_string_lossy()
+                .into_owned());
+        }
+        Err(format!("service {service} 没有方法 {method}"))
     }
 }
 
@@ -840,6 +1258,7 @@ unsafe extern "C" fn api_use_middleware(
         name: format!("plugin:{}", stage.name()),
         host: host as usize,
         owner: rt.current_owner(),
+        scope: rt.current_scope(),
         callback,
         user_data: user_data as usize,
     };
@@ -1100,6 +1519,72 @@ mod tests {
         assert!(vtable.wait_for_update.is_some());
         assert!(vtable.cancel_wait.is_some());
         assert!(vtable.log.is_some());
+    }
+
+    /// 日志门槛：低于门槛的**既**不留档**也**不写 stderr；调高门槛后又能收到。
+    #[test]
+    fn log_verbosity_filters_out_quieter_levels() {
+        let rt = runtime();
+        assert_eq!(rt.log_verbosity(), DEFAULT_LOG_VERBOSITY as u32);
+
+        // SAFETY: vtable 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+
+        // 默认 Info：Debug 被丢掉，Info / Error 留下。
+        api.log(LogLevel::Debug, "debug-should-be-dropped");
+        api.log(LogLevel::Info, "info-should-stay");
+        api.log(LogLevel::Error, "error-should-stay");
+        let lines = rt.log_lines();
+        assert!(!lines.iter().any(|line| line.contains("debug-should")));
+        assert!(lines.iter().any(|line| line.contains("info-should-stay")));
+        assert!(lines.iter().any(|line| line.contains("error-should-stay")));
+
+        // 调成 Trace 之后 Debug 也进来了。
+        rt.set_log_verbosity(LogLevel::Trace);
+        api.log(LogLevel::Debug, "debug-after-raising");
+        assert!(
+            rt.log_lines()
+                .iter()
+                .any(|line| line.contains("debug-after-raising"))
+        );
+
+        // 调成 Error 之后连 Info 都进不来（只影响留档，插件照样能调）。
+        rt.set_log_verbosity(LogLevel::Error);
+        api.log(LogLevel::Info, "info-after-lowering");
+        assert!(
+            !rt.log_lines()
+                .iter()
+                .any(|line| line.contains("info-after-lowering"))
+        );
+    }
+
+    /// `list_tools` 的缓存：工具表没变就复用，注册 / 注销后必须失效。
+    #[test]
+    fn list_tools_json_cache_follows_the_table_revision() {
+        let rt = runtime();
+        let first = rt.tools_json();
+        assert_eq!(first, rt.tools_json(), "没变更时该复用同一个缓冲");
+        // 复用意味着连指针都一样（Arc 里是同一个 CString）。
+        assert!(core::ptr::eq(first.as_ptr(), rt.tools_json().as_ptr()));
+
+        let descriptor = fuyubot_tool::ToolDescriptor::new(
+            "cache.probe",
+            "探测缓存",
+            serde_json::json!({"type": "object"}),
+            None,
+        );
+        let handle = rt.tools.register_tool(descriptor).unwrap();
+        let after_register = rt.tools_json();
+        assert_ne!(after_register, first);
+        assert!(after_register.to_string_lossy().contains("cache.probe"));
+
+        drop(handle);
+        let after_unregister = rt.tools_json();
+        assert!(
+            !after_unregister.to_string_lossy().contains("cache.probe"),
+            "注销后缓存必须失效：{}",
+            after_unregister.to_string_lossy()
+        );
     }
 
     /// 用插件视角的 `HostApi` 走一遍全部能力，证明桥接真的通。
@@ -1449,5 +1934,334 @@ mod tests {
         );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         api.off(subscription);
+    }
+
+    // ── 子作用域 ───────────────────────────────────────────────────
+
+    /// 中间件计数回调，`user_data` 当 `AtomicUsize` 用。
+    unsafe extern "C-unwind" fn count_mw(
+        user_data: *mut c_void,
+        _stage: u32,
+        _payload: *const c_char,
+    ) -> i32 {
+        let counter = unsafe { &*(user_data as *const AtomicUsize) };
+        counter.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    /// 通过 VTable 的 `get_service` 拿内置 scope service。
+    fn scope_service(rt: &HostRuntime) -> *const ServiceVTable {
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+        let svc = api.get_service("fuyubot.host.scope");
+        assert!(!svc.is_null(), "内置 scope service 必须预置");
+        svc
+    }
+
+    /// 按名字调 scope service 的一个方法。`None` = 成功（无输出），
+    /// `Some(text)` = 有输出（scope_create 的 handle，或错误 JSON）。
+    fn call_scope(svc: *const ServiceVTable, name: &str, input: &str) -> Option<String> {
+        // SAFETY: svc 来自 get_service，方法表有效。
+        let vtable = unsafe { &*svc };
+        let input = CString::new(input).unwrap();
+        for i in 0..vtable.method_count {
+            // SAFETY: method_count 由宿主保证。
+            let method = unsafe { &*vtable.methods.add(i) };
+            // SAFETY: 方法名是 NUL 结尾的合法 UTF-8。
+            let mname = unsafe { CStr::from_ptr(method.name) }.to_string_lossy();
+            if mname != name {
+                continue;
+            }
+            let func = method.func.expect("scope 方法都有实现");
+            // SAFETY: context 是宿主运行时指针，input 是临时 C 字符串。
+            let raw = unsafe { func(vtable.context, input.as_ptr()) };
+            if raw.is_null() {
+                return None;
+            }
+            // SAFETY: raw 是宿主线程局部缓冲的 NUL 结尾字符串。
+            return Some(
+                unsafe { CStr::from_ptr(raw) }
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        panic!("scope service 没有方法 {name}");
+    }
+
+    fn scope_create(svc: *const ServiceVTable) -> u64 {
+        let out = call_scope(svc, "scope_create", "{}").expect("create 应返回 handle");
+        serde_json::from_str::<Value>(&out).unwrap()["handle"]
+            .as_u64()
+            .unwrap()
+    }
+
+    fn scope_enter(svc: *const ServiceVTable, handle: u64) {
+        let input = format!(r#"{{"handle":{handle}}}"#);
+        assert!(
+            call_scope(svc, "scope_enter", &input).is_none(),
+            "enter 应成功"
+        );
+    }
+
+    fn scope_leave(svc: *const ServiceVTable) {
+        assert!(call_scope(svc, "scope_leave", "{}").is_none());
+    }
+
+    fn scope_drop(svc: *const ServiceVTable, handle: u64) {
+        let input = format!(r#"{{"handle":{handle}}}"#);
+        assert!(
+            call_scope(svc, "scope_drop", &input).is_none(),
+            "drop 应成功"
+        );
+    }
+
+    /// 验收（设计文档 5.2）：`scope_drop` 后该作用域的订阅/工具/中间件全消失，
+    /// 同 owner 的其他作用域不受影响。
+    #[test]
+    fn scope_drop_removes_its_own_registrations_but_not_others() {
+        let rt = runtime();
+        let _owner = rt.begin_plugin();
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+        let svc = scope_service(&rt);
+
+        let scope_a = scope_create(svc);
+        let scope_b = scope_create(svc);
+
+        // 在 scope_a 里注册：订阅 + 工具 + 中间件。
+        scope_enter(svc, scope_a);
+        let hits_a = AtomicUsize::new(0);
+        let _sub_a = api.on("notice", None, count_event, as_user_data(&hits_a));
+        let _tool_a = api.register_tool(r#"{"name":"a.tool"}"#);
+        let mw_hits = AtomicUsize::new(0);
+        let _mw_a = api.use_middleware(
+            fuyubot_abi::Stage::PreUpdate,
+            count_mw,
+            as_user_data(&mw_hits),
+        );
+        scope_leave(svc);
+
+        // 在 scope_b 里只注册一个工具。
+        scope_enter(svc, scope_b);
+        let _tool_b = api.register_tool(r#"{"name":"b.tool"}"#);
+        scope_leave(svc);
+
+        // 撤销 scope_a。
+        scope_drop(svc, scope_a);
+
+        // scope_a 的订阅收不到事件了。
+        api.emit("notice", r#"{"x":1}"#).unwrap();
+        assert_eq!(
+            hits_a.load(Ordering::SeqCst),
+            0,
+            "scope_a 的订阅应随 drop 撤销"
+        );
+
+        // scope_a 的中间件不跑了。
+        let mut ctx = MiddlewareContext::new(MwStage::PreUpdate, Value::Null);
+        rt.middleware().run(MwStage::PreUpdate, &mut ctx).unwrap();
+        assert_eq!(
+            mw_hits.load(Ordering::SeqCst),
+            0,
+            "scope_a 的中间件应随 drop 撤销"
+        );
+
+        // 工具列表：a.tool 没了，b.tool 还在。
+        let listed = api.list_tools();
+        assert!(!listed.contains("a.tool"), "{listed}");
+        assert!(
+            listed.contains("b.tool"),
+            "scope_b 的工具不受影响：{listed}"
+        );
+
+        // 重复 drop 同一个 scope 应失败（已失效）。
+        let input = format!(r#"{{"handle":{scope_a}}}"#);
+        assert!(
+            call_scope(svc, "scope_drop", &input).is_some(),
+            "已失效的作用域再 drop 应报错"
+        );
+
+        rt.end_plugin();
+    }
+
+    /// 验收（设计文档 5.2）：owner 整批回滚仍连带子作用域。
+    #[test]
+    fn owner_rollback_also_removes_child_scopes() {
+        let rt = runtime();
+        let owner = rt.begin_plugin();
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+        let svc = scope_service(&rt);
+
+        // 建一个子作用域，往里注册一个工具，但不显式 drop。
+        let scope = scope_create(svc);
+        scope_enter(svc, scope);
+        let _tool = api.register_tool(r#"{"name":"child.tool"}"#);
+        scope_leave(svc);
+
+        // 直接回滚 owner（模拟插件被卸载），子作用域的注册应连带消失。
+        rt.rollback_owner(owner);
+
+        let listed = api.list_tools();
+        assert!(
+            !listed.contains("child.tool"),
+            "owner 整批回滚应连带子作用域：{listed}"
+        );
+
+        rt.end_plugin();
+    }
+
+    /// owner 整批回滚时，它的子作用域**条目**也要从表里摘掉（不然只增不减）。
+    #[test]
+    fn owner_rollback_drops_child_scope_entries() {
+        let rt = runtime();
+        let owner = rt.begin_plugin();
+        let svc = scope_service(&rt);
+
+        let _scope = scope_create(svc);
+        assert_eq!(rt.scopes().len(), 1);
+
+        rt.rollback_owner(owner);
+        assert_eq!(
+            rt.scopes().len(),
+            0,
+            "owner 回滚后它的子作用域条目不该留在表里"
+        );
+
+        rt.end_plugin();
+    }
+
+    /// `scope_drop` 之后条目要被摘掉：中间插件反复建/撤作用域（脚本热加载）时不该膨胀。
+    #[test]
+    fn scope_drop_removes_the_entry_too() {
+        let rt = runtime();
+        let _owner = rt.begin_plugin();
+        let svc = scope_service(&rt);
+
+        let a = scope_create(svc);
+        let _b = scope_create(svc);
+        assert_eq!(rt.scopes().len(), 2);
+
+        scope_drop(svc, a);
+        assert_eq!(rt.scopes().len(), 1, "drop 后条目应被摘掉");
+
+        rt.end_plugin();
+    }
+
+    /// 请求归属表必须有界：等不到响应的请求（离线合成号、TDLib 不回的那些）
+    /// 不该让它无限增长。
+    #[test]
+    fn request_owner_table_is_bounded() {
+        let rt = runtime();
+        let total = REQUEST_OWNER_CAPACITY * 3;
+        // 直接登记，绕过 TDLib：这些 id 永远等不到响应，正是会泄漏的那种情形。
+        for index in 0..total {
+            rt.record_request(index as u64, 1, "test.method".to_owned(), &Value::Null);
+        }
+
+        let mut owners = rt.request_owners.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            owners.len() <= REQUEST_OWNER_CAPACITY,
+            "归属表应有界（上限 {REQUEST_OWNER_CAPACITY}），实际 {} 条",
+            owners.len()
+        );
+        assert!(owners.take(0).is_none(), "最老的请求应被挤掉");
+        assert!(
+            owners.take((total - 1) as u64).is_some(),
+            "最新的请求应还在表里"
+        );
+    }
+
+    /// 撤销是注册顺序的倒序：后注册的先撤（与「卸载是加载顺序的倒序」一致）。
+    #[test]
+    fn rollback_undoes_registrations_in_reverse_order() {
+        use fuyubot_tool::ToolEvent;
+
+        let rt = runtime();
+        let owner = rt.begin_plugin();
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        let _listener = rt.tools().on_change({
+            let removed = Arc::clone(&removed);
+            move |event| {
+                if let ToolEvent::Unregistered(name) = event {
+                    removed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(name.clone());
+                }
+                Ok(())
+            }
+        });
+
+        for name in ["t1", "t2", "t3"] {
+            let handle = api.register_tool(&format!(r#"{{"name":"{name}"}}"#));
+            assert!(handle.is_valid(), "{name} 应注册成功");
+        }
+
+        rt.rollback_owner(owner);
+
+        assert_eq!(
+            *removed.lock().unwrap_or_else(|e| e.into_inner()),
+            vec!["t3".to_owned(), "t2".to_owned(), "t1".to_owned()],
+            "撤销顺序应是注册顺序的倒序"
+        );
+
+        rt.end_plugin();
+    }
+
+    /// `call_service`：宿主侧按名字调插件提供的 service。
+    ///
+    /// 这条入口是 `fuyubot plugin list` 展平脚本清单的依赖项——`AbiService` 是私有
+    /// 类型，CLI 只能走这里。
+    #[test]
+    fn call_service_invokes_a_plugin_provided_method() {
+        let rt = runtime();
+
+        unsafe extern "C" fn echo(_context: *mut c_void, input: *const c_char) -> *const c_char {
+            // 把入参回显成 `{"echo":<入参>}`：调用方要能读到返回值。
+            let raw = unsafe { CStr::from_ptr(input) }.to_string_lossy();
+            host_string(&format!(r#"{{"echo":{raw}}}"#))
+        }
+
+        // ServiceMethod 里的 name 是裸指针，编译器不认为它 Sync——包一层
+        // 显式声明（与上面的 SCOPE_METHODS 同一套路）：字面量地址稳定、只读。
+        struct EchoMethods([ServiceMethod; 1]);
+        // SAFETY: name 指向 'static 字面量，func 是纯函数指针。
+        unsafe impl Sync for EchoMethods {}
+        static METHODS: EchoMethods = EchoMethods([ServiceMethod {
+            name: c"echo".as_ptr(),
+            func: Some(echo),
+        }]);
+        let name = CString::new("demo.echo").unwrap();
+        let vtable = ServiceVTable {
+            name: name.as_ptr(),
+            version: 1,
+            size: core::mem::size_of::<ServiceVTable>() as u32,
+            context: core::ptr::null_mut(),
+            methods: METHODS.0.as_ptr(),
+            method_count: METHODS.0.len(),
+        };
+        {
+            // SAFETY: rt 活着；vtable 比注册活得久（本作用域内一直有效）。
+            let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+            let handle = unsafe { api.provide_service("demo.echo", &vtable) };
+            assert!(handle.is_valid());
+
+            // 入参 JSON 原样进、返回值当场拷成 String。
+            let out = rt
+                .call_service("demo.echo", "echo", r#"{"x":1}"#)
+                .expect("echo 必须调得通");
+            assert_eq!(out, r#"{"echo":{"x":1}}"#);
+
+            // 不存在的服务 / 不存在的方法：报错指路，不 panic。
+            let error = rt.call_service("nope", "echo", "{}").unwrap_err();
+            assert!(error.contains("nope"), "{error}");
+            let error = rt.call_service("demo.echo", "nope", "{}").unwrap_err();
+            assert!(error.contains("nope"), "{error}");
+        }
+        // vtable 是局部变量，活到本函数末尾——比所有调用都久。
     }
 }

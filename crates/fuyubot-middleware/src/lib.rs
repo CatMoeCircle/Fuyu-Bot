@@ -110,10 +110,20 @@ pub trait Middleware: Send + Sync {
 /// 一层挂载记录。
 type Layer = (u64, Arc<dyn Middleware>);
 
+/// 一个阶段的层快照（剥掉 id，只留层本身）。见 [`Inner::snapshots`]。
+type Snapshot = Arc<Vec<Arc<dyn Middleware>>>;
+
 #[derive(Default)]
 struct Inner {
     next_id: u64,
     by_stage: HashMap<Stage, Vec<Layer>>,
+    /// 挂载表的版本号：挂载 / 摘除都 +1。
+    revision: u64,
+    /// 每个阶段的层快照 + 生成它的版本号。
+    ///
+    /// 一条更新要跑六个阶段，原来**每个阶段**都要新建 `Vec` 并给每层各克隆一次 `Arc`；
+    /// 挂载表变更不频繁，所以按版本号缓存，跑的时候只克隆一个 `Arc`。
+    snapshots: HashMap<Stage, (u64, Snapshot)>,
 }
 
 /// 中间件管道。`Clone` 共享同一份挂载表。
@@ -141,6 +151,7 @@ impl Pipeline {
             id = inner.next_id;
             inner.next_id += 1;
             inner.by_stage.entry(stage).or_default().push((id, layer));
+            inner.revision += 1;
         }
 
         let pipeline = Arc::clone(&self.inner);
@@ -155,7 +166,10 @@ impl Pipeline {
             };
             if now_empty {
                 inner.by_stage.remove(&stage);
+                // 这个阶段已经空了：连快照一起摘掉，否则它会一直占着旧层。
+                inner.snapshots.remove(&stage);
             }
+            inner.revision += 1;
         });
 
         MiddlewareHandle {
@@ -167,16 +181,10 @@ impl Pipeline {
 
     /// 跑一个阶段：洋葱模型，调用顺序即注册顺序。
     ///
-    /// 层列表先复制出来再执行，所以中间件里再 `use_middleware`/`run` 不会自锁。
+    /// 层列表取的是快照（见 [`Inner::snapshots`]），所以中间件里再
+    /// `use_middleware` / `run` 不会自锁，也不会看到跑一半被改过的表。
     pub fn run(&self, stage: Stage, ctx: &mut MiddlewareContext) -> fuyubot_core::Result<()> {
-        let layers: Vec<Arc<dyn Middleware>> = {
-            let inner = self.read();
-            inner
-                .by_stage
-                .get(&stage)
-                .map(|layers| layers.iter().map(|(_, layer)| Arc::clone(layer)).collect())
-                .unwrap_or_default()
-        };
+        let layers = self.snapshot(stage);
 
         // 传进来的 stage 可能与调用者写的 payload 不符，以参数为准。
         ctx.stage = stage;
@@ -185,6 +193,31 @@ impl Pipeline {
             index: 0,
         }
         .run(ctx)
+    }
+
+    /// 某个阶段的层快照：版本号没变就复用上次那份。
+    fn snapshot(&self, stage: Stage) -> Snapshot {
+        {
+            let inner = self.read();
+            if let Some((revision, snapshot)) = inner.snapshots.get(&stage)
+                && *revision == inner.revision
+            {
+                return Arc::clone(snapshot);
+            }
+        }
+        let mut inner = self.write();
+        let revision = inner.revision;
+        let snapshot: Snapshot = Arc::new(
+            inner
+                .by_stage
+                .get(&stage)
+                .map(|layers| layers.iter().map(|(_, layer)| Arc::clone(layer)).collect())
+                .unwrap_or_default(),
+        );
+        inner
+            .snapshots
+            .insert(stage, (revision, Arc::clone(&snapshot)));
+        snapshot
     }
 
     pub fn len(&self, stage: Stage) -> usize {
@@ -334,6 +367,35 @@ mod tests {
             name,
             log: Arc::clone(log),
         }
+    }
+
+    /// 验收：层快照必须在挂载表变化后失效——挂载与摘除两个方向都要验，
+    /// 否则「缓存了旧快照」会静默漏掉新层 / 继续跑已摘除的层。
+    #[test]
+    fn layer_snapshot_invalidates_on_every_mount_change() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = Pipeline::new();
+
+        // 先缓存一份「空」的快照。
+        let mut ctx = MiddlewareContext::new(Stage::PreUpdate, Value::Null);
+        pipeline.run(Stage::PreUpdate, &mut ctx).unwrap();
+        assert!(log.lock().unwrap().is_empty());
+
+        let handle = pipeline.use_middleware(Stage::PreUpdate, tracer("A", &log));
+        // 新层挂上后，缓存的快照必须重建。
+        pipeline.run(Stage::PreUpdate, &mut ctx).unwrap();
+        // 再跑一次走命中路径，结果必须一样。
+        pipeline.run(Stage::PreUpdate, &mut ctx).unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["A+", "A-", "A+", "A-"]);
+
+        drop(handle);
+        pipeline.run(Stage::PreUpdate, &mut ctx).unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["A+", "A-", "A+", "A-"],
+            "摘除后不该再跑这一层"
+        );
+        assert_eq!(pipeline.len(Stage::PreUpdate), 0);
     }
 
     /// 验收 4：三个中间件 A/B/C，洋葱顺序。C 是洋葱芯，进入/退出各记一次。

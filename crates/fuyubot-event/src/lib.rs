@@ -58,6 +58,7 @@ impl Filter {
 }
 
 /// 一条订阅。
+#[derive(Clone)]
 struct Subscription {
     id: SubscriptionId,
     /// 归属：0 = 全局（宿主与所有插件都收），其它值 = 只有该插件收。
@@ -66,10 +67,23 @@ struct Subscription {
     callback: Callback,
 }
 
+/// 一个 `event_type` 的只读快照。见 [`Inner::snapshots`]。
+type Snapshot = Arc<Vec<Subscription>>;
+
 #[derive(Default)]
 struct Inner {
     next_id: u64,
     by_type: HashMap<String, Vec<Subscription>>,
+    /// 订阅表的版本号：订阅 / 退订都 +1。
+    revision: u64,
+    /// 每个 `event_type` 的快照 + 生成它的版本号。
+    ///
+    /// 订阅表变更不频繁，而 `emit` 是热路径：没有它的时候，每次广播都要新建 `Vec`
+    /// 并给**每条**订阅各克隆一次 `Callback`（N 次原子加减）。有了它，广播只克隆一个 `Arc`，
+    /// 回调直接对着快照里的 `Arc` 调，一次都不用加引用计数。
+    ///
+    /// 快照是**惰性**失效的：只比版本号，不主动删。版本号对不上就按当时的表重建。
+    snapshots: HashMap<String, (u64, Snapshot)>,
 }
 
 /// 事件总线。`Clone` 共享同一张订阅表。
@@ -122,6 +136,7 @@ impl EventBus {
                     filter,
                     callback: Arc::new(callback),
                 });
+            inner.revision += 1;
         }
 
         let bus = Arc::clone(&self.inner);
@@ -137,7 +152,10 @@ impl EventBus {
             };
             if now_empty {
                 inner.by_type.remove(&key);
+                // 这个 type 已经没人订阅：连快照一起摘掉，否则它会一直占着旧回调。
+                inner.snapshots.remove(&key);
             }
+            inner.revision += 1;
         });
 
         SubscriptionHandle {
@@ -179,32 +197,53 @@ impl EventBus {
         event_type: &str,
         payload: &Payload,
     ) -> fuyubot_core::Result<usize> {
-        let callbacks: Vec<Callback> = {
+        // 拿一份快照（命中缓存时只是一次 HashMap 查找 + 一次 Arc 克隆），
+        // 然后在锁**外面**跑回调——回调里再 `on` / `emit` / `off` 都不会自锁。
+        let snapshot = self.snapshot(event_type);
+        let mut called = 0;
+        for subscription in snapshot.iter() {
+            let scoped =
+                scope.is_none_or(|scope| subscription.scope == 0 || subscription.scope == scope);
+            let filtered = subscription
+                .filter
+                .as_ref()
+                .is_none_or(|filter| filter.matches(payload));
+            if !(scoped && filtered) {
+                continue;
+            }
+            // 直接对着快照里的 `Arc` 调：**不克隆**，广播一次只有一次引用计数加减
+            // （拿快照那一下），不再给每条订阅各加一遍。
+            (subscription.callback)(payload).map_err(|e| -> fuyubot_core::BoxError {
+                format!("事件 {event_type} 的回调失败: {e}").into()
+            })?;
+            called += 1;
+        }
+        Ok(called)
+    }
+
+    /// 某个 `event_type` 的订阅快照：版本号没变就复用上次那份。
+    fn snapshot(&self, event_type: &str) -> Snapshot {
+        {
             let inner = self.lock();
+            if let Some((revision, snapshot)) = inner.snapshots.get(event_type)
+                && *revision == inner.revision
+            {
+                return Arc::clone(snapshot);
+            }
+        }
+        let mut inner = self.lock();
+        let revision = inner.revision;
+        let snapshot: Snapshot = Arc::new(
             inner
                 .by_type
                 .get(event_type)
-                .map(|subscriptions| {
-                    subscriptions
-                        .iter()
-                        .filter(|s| scope.is_none_or(|scope| s.scope == 0 || s.scope == scope))
-                        .filter(|s| {
-                            s.filter
-                                .as_ref()
-                                .is_none_or(|filter| filter.matches(payload))
-                        })
-                        .map(|s| Arc::clone(&s.callback))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-
-        for callback in &callbacks {
-            callback(payload).map_err(|e| -> fuyubot_core::BoxError {
-                format!("事件 {event_type} 的回调失败: {e}").into()
-            })?;
-        }
-        Ok(callbacks.len())
+                .map(|subscriptions| subscriptions.to_vec())
+                .unwrap_or_default(),
+        );
+        inner
+            .snapshots
+            .insert(event_type.to_owned(), (revision, Arc::clone(&snapshot)));
+        snapshot
     }
 
     /// 退订。等价于 `drop(handle)`，留着是为了让调用点意图更明确。
@@ -357,6 +396,38 @@ mod tests {
         assert_eq!(called, 1);
         assert_eq!(first.load(Ordering::SeqCst), 1, "退订过的监听不该再被调用");
         assert_eq!(second.load(Ordering::SeqCst), 2);
+    }
+
+    /// 验收：快照缓存必须在订阅表变化后失效——**加**订阅和**退**订阅两个方向都要验，
+    /// 否则「缓存了旧快照」会静默漏掉新监听器 / 继续调用已退订的。
+    #[test]
+    fn snapshot_cache_invalidates_on_every_subscription_change() {
+        let bus = EventBus::new();
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        // 先缓存一份「空」的快照。
+        assert_eq!(bus.emit("notice", &json!({})).unwrap(), 0);
+
+        let handle = bus.on("notice", None, {
+            let hits = Arc::clone(&hits);
+            move |_| {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+
+        // 新增订阅之后，缓存的快照必须重建。
+        assert_eq!(bus.emit("notice", &json!({})).unwrap(), 1);
+        // 再发一次走的是命中路径（版本号没变），结果必须一样。
+        assert_eq!(bus.emit("notice", &json!({})).unwrap(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        bus.off(handle);
+        assert_eq!(bus.emit("notice", &json!({})).unwrap(), 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "退订后不该再被调用");
+
+        // 表空了之后快照也要摘掉：不留旧回调，也不留空条目。
+        assert_eq!(bus.emit("notice", &json!({})).unwrap(), 0);
     }
 
     #[test]
