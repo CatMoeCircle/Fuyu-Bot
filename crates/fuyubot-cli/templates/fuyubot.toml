@@ -20,6 +20,10 @@ data_dir = "data"
 [plugins]
 # 插件目录：`fuyubot run` 从这里加载所有动态库。
 dir = "plugins"
+# 插件日志的最低级别：error / warn / info / debug / trace，默认 **info**。
+# 低于它的日志既不进宿主留档也不写 stderr——插件刷 Debug 是实打实的系统调用。
+# 排查插件时调成 "debug" 或 "trace"。写错级别名会**报错**，不会静默当默认。
+log_level = "info"
 
 [tdlib]
 # 留空 = 按 fuyubot-tdlib 的四级优先级自动找（环境变量 → 自带 → 系统库 → 裸库名）。

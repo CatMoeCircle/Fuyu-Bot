@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use fuyubot_loader::DLL_EXTENSION;
+use fuyubot_loader::{DEFAULT_LOG_VERBOSITY, DLL_EXTENSION, LogLevel};
 
 /// 项目配置文件名。
 pub const CONFIG_FILE: &str = "fuyubot.toml";
@@ -89,6 +89,37 @@ impl Telegram {
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct Plugins {
     pub dir: Option<String>,
+    /// 插件日志的最低级别：`error` / `warn` / `info`（默认）/ `debug` / `trace`。
+    ///
+    /// 它只决定宿主**记不记**：低于门槛的既不留档也不写 stderr。插件照旧能调 `log`。
+    pub log_level: Option<String>,
+}
+
+impl Plugins {
+    /// 插件日志门槛：配置优先，否则 [`DEFAULT_LOG_VERBOSITY`]。
+    ///
+    /// **写错就报错指路**，不静默回退成默认——静默回退会让「日志全没了」的人
+    /// 永远查不到真相是自己把级别名拼错了。
+    pub fn log_level(&self) -> Result<LogLevel, String> {
+        let Some(raw) = self
+            .log_level
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(DEFAULT_LOG_VERBOSITY);
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "error" => Ok(LogLevel::Error),
+            "warn" | "warning" => Ok(LogLevel::Warn),
+            "info" => Ok(LogLevel::Info),
+            "debug" => Ok(LogLevel::Debug),
+            "trace" => Ok(LogLevel::Trace),
+            _ => Err(format!(
+                "[plugins].log_level = \"{raw}\" 认不出来，只能写 error / warn / info / debug / trace"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -191,6 +222,14 @@ pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<Str
             "[plugins]   dir          = {}",
             config.plugin_dir(root).display()
         ),
+        format!(
+            "[plugins]   log_level    = {}",
+            config
+                .plugins
+                .log_level
+                .as_deref()
+                .unwrap_or("info（默认）")
+        ),
         format!("[tdlib]     path         = {tdlib_path}"),
         format!(
             "[tdlib]     log_verbosity= {}",
@@ -292,13 +331,165 @@ pub fn install_builtins(plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
 
 // ── plugin install ─────────────────────────────────────────────────
 
-/// 把一个已编好的插件（文件或插件工程目录）装进插件目录。
+/// 把一个插件装进插件目录。**两种形态，按来源自动分派**：
 ///
-/// 会连**旁边的脚本文件**一起拷：Python / JS / TS 插件的 `.py` / `.js` / `.ts` 必须和 cdylib
-/// 待在同一目录，宿主才找得到（见 `find_script`）。
+/// 1. **脚本插件目录**（v2）：一个目录就是一个插件（`package.json` /
+///    `pyproject.toml` 里带 `fuyubot` / `[tool.fuyubot]` 身份段）→ 整目录复制到
+///    `plugins/scripts/<目录名>/`（设计文档 3.1 / 3.2）。
+/// 2. **原生插件**（旧形态，兼容期继续支持）：一个编好的动态库，连同伴脚本一起
+///    平铺进插件目录。
 pub fn install(source: &Path, plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    if is_script_plugin_dir(source) {
+        return install_script_dir(source, plugin_dir);
+    }
     let artifact = find_artifact(source)?;
     install_from(&artifact, &companion_dirs(source, &artifact), plugin_dir)
+}
+
+/// 复制时**跳过的目录名**：依赖与构建产物。
+///
+/// 到了目标机器该由中间插件跑 `bun install` / `uv sync` 现装现建：拷贝一份
+/// `node_modules` / `.venv` 既慢又容易和新 lock 文件打架，`target` / `.git`
+/// 更是纯粹的死重。
+const SKIP_ON_COPY: &[&str] = &[
+    "node_modules",
+    ".venv",
+    "target",
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    "dist",
+];
+
+/// `source` 是不是一个**脚本插件目录**：带着 manifest，且 manifest 里有 fuyubot 身份段。
+///
+/// 判据刻意与两个中间插件的 `discover` 一致（格式是公开契约），但这里不引 SDK——
+/// CLI 不该依赖插件作者那一侧的 crate。两边各自轻量解析，格式漂移由端到端测试兜。
+pub fn is_script_plugin_dir(source: &Path) -> bool {
+    if !source.is_dir() {
+        return false;
+    }
+    // JS：package.json 的 "fuyubot": { "name": "..." }
+    if let Ok(text) = std::fs::read_to_string(source.join("package.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            let named = json
+                .get("fuyubot")
+                .and_then(|f| f.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .is_some();
+            if named {
+                return true;
+            }
+        }
+    }
+    // Python：pyproject.toml 的 [tool.fuyubot] name = "..."
+    if let Ok(text) = std::fs::read_to_string(source.join("pyproject.toml")) {
+        if let Ok(value) = toml::from_str::<toml::Value>(&text) {
+            let named = value
+                .get("tool")
+                .and_then(|t| t.get("fuyubot"))
+                .and_then(|f| f.get("name"))
+                .and_then(toml::Value::as_str)
+                .is_some();
+            if named {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 把一个脚本插件**目录**装进 `<plugin_dir>/scripts/<目录名>/`。
+///
+/// 目标已存在就报错、不覆盖：覆盖会把作者在机器人那边改过的东西冲掉，
+/// 而「先卸再装」是两个明确的动作。
+pub fn install_script_dir(source: &Path, plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let name = source
+        .file_name()
+        .ok_or_else(|| format!("{} 没有目录名", source.display()))?;
+    let scripts_dir = plugin_dir.join("scripts");
+    let target = scripts_dir.join(name);
+    if target.exists() {
+        return Err(format!(
+            "{} 已经存在了；要覆盖先 `fuyubot plugin uninstall {}`",
+            target.display(),
+            name.to_string_lossy()
+        ));
+    }
+    copy_dir_recursive(source, &target)?;
+    Ok(vec![target])
+}
+
+fn copy_dir_recursive(from: &Path, into: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(into).map_err(|e| format!("建不了 {}: {e}", into.display()))?;
+    let entries = std::fs::read_dir(from).map_err(|e| format!("读不了 {}: {e}", from.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读不了 {}: {e}", from.display()))?;
+        let file_name = entry.file_name();
+        if SKIP_ON_COPY
+            .iter()
+            .any(|skip| *skip == file_name.to_string_lossy())
+        {
+            continue;
+        }
+        let path = entry.path();
+        let target = into.join(&file_name);
+        if path.is_dir() {
+            copy_dir_recursive(&path, &target)?;
+        } else if path.is_file() {
+            std::fs::copy(&path, &target)
+                .map_err(|e| format!("拷贝 {} → {} 失败: {e}", path.display(), target.display()))?;
+        }
+    }
+    Ok(())
+}
+
+// ── plugin uninstall ───────────────────────────────────────────────
+
+/// 卸载。名字先当**脚本目录**找（`plugins/scripts/<名字>`），再当**动态库**找
+/// （带不带 `lib` 前缀都试）——与 [`install`] 的两种形态对称。
+///
+/// 原生插件连同伴文件（`.py` / `.js` / `.ts` / `.pyi`）一起删：单留一个 dll 在
+/// 目录里，下次 `run` 还会试着加载它，然后因为找不到脚本而失败。
+pub fn uninstall(name: &str, plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let script_dir = plugin_dir.join("scripts").join(name);
+    if script_dir.is_dir() {
+        std::fs::remove_dir_all(&script_dir)
+            .map_err(|e| format!("删不了 {}: {e}", script_dir.display()))?;
+        return Ok(vec![script_dir]);
+    }
+
+    for stem in [name.to_owned(), format!("lib{name}")] {
+        let dll = plugin_dir.join(format!("{stem}.{DLL_EXTENSION}"));
+        if !dll.is_file() {
+            continue;
+        }
+        let mut removed = vec![dll.clone()];
+        std::fs::remove_file(&dll).map_err(|e| format!("删不了 {}: {e}", dll.display()))?;
+        // 同伴文件：同目录、同主干、脚本类扩展名。
+        let entries = std::fs::read_dir(plugin_dir)
+            .map_err(|e| format!("读不了 {}: {e}", plugin_dir.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let same_stem = path
+                .file_stem()
+                .is_some_and(|s| s.to_string_lossy() == stem);
+            let is_script = path
+                .extension()
+                .is_some_and(|e| matches!(e.to_str(), Some("py" | "js" | "ts" | "pyi")));
+            if same_stem && is_script && path.is_file() {
+                std::fs::remove_file(&path)
+                    .map_err(|e| format!("删不了 {}: {e}", path.display()))?;
+                removed.push(path);
+            }
+        }
+        return Ok(removed);
+    }
+
+    Err(format!(
+        "插件目录里既没有 scripts/{name}/ 目录，也没有 {name}.{DLL_EXTENSION}：\
+         先 `fuyubot plugin list` 看看现在有什么"
+    ))
 }
 
 /// 把某个具体产物连同它的同伴文件装进插件目录。
@@ -512,6 +703,49 @@ mod tests {
         );
     }
 
+    /// 插件日志门槛：没配就是 `Info`（默认安静），写错级别名要**报错指路**。
+    #[test]
+    fn plugin_log_level_defaults_to_info_and_rejects_unknown_names() {
+        assert_eq!(Plugins::default().log_level().unwrap(), LogLevel::Info);
+
+        for (raw, expected) in [
+            ("error", LogLevel::Error),
+            ("warn", LogLevel::Warn),
+            ("warning", LogLevel::Warn),
+            ("INFO", LogLevel::Info),
+            (" debug ", LogLevel::Debug),
+            ("trace", LogLevel::Trace),
+        ] {
+            assert_eq!(
+                Plugins {
+                    dir: None,
+                    log_level: Some(raw.to_owned()),
+                }
+                .log_level()
+                .unwrap(),
+                expected
+            );
+        }
+
+        let error = Plugins {
+            dir: None,
+            log_level: Some("verbose".to_owned()),
+        }
+        .log_level()
+        .unwrap_err();
+        assert!(error.contains("verbose"), "报错要带上写错的值：{error}");
+        assert!(
+            error.contains("error") && error.contains("trace"),
+            "报错要说清能写哪几个：{error}"
+        );
+
+        // 模板里写出来的那个值必须等于默认值，否则「默认 info」只存在于注释里。
+        assert!(
+            TEMPLATE_CONFIG.contains("log_level = \"info\""),
+            "模板里的 log_level 必须与默认值一致：\n{TEMPLATE_CONFIG}"
+        );
+    }
+
     #[test]
     fn init_never_writes_the_api_hash_into_the_config() {
         // 硬约束 41：api_hash 是凭据，不许落盘。
@@ -655,5 +889,127 @@ mod tests {
             builtin_artifact(&dir, stem).as_deref(),
             Some(plain.as_path())
         );
+    }
+
+    // ── v2：脚本插件目录形态 ──────────────────────────────────────
+
+    /// 造一个脚本插件目录（JS 形态），返回目录路径。
+    fn script_plugin_dir(name: &str) -> PathBuf {
+        let dir = temp(name);
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"weather-bot","type":"module","fuyubot":{"name":"fuyubot.example.weather","entry":"index.ts"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("index.ts"), b"export {}").unwrap();
+        std::fs::write(dir.join("bun.lock"), b"{}").unwrap();
+        dir
+    }
+
+    /// 「是不是脚本插件目录」按 manifest 里的 fuyubot 身份段判，
+    /// 与两个中间插件的 discover 是同一把尺子。
+    #[test]
+    fn script_plugin_detection_follows_the_manifest() {
+        let js = script_plugin_dir("detect-js");
+        assert!(is_script_plugin_dir(&js));
+
+        let py = temp("detect-py");
+        std::fs::write(
+            py.join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[tool.fuyubot]\nname = \"fuyubot.example.x\"\nentry = \"main.py\"\n",
+        )
+        .unwrap();
+        assert!(is_script_plugin_dir(&py));
+
+        // 有 manifest 没身份段：普通 Node / Python 工程，不是插件。
+        let plain = temp("detect-plain");
+        std::fs::write(plain.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        assert!(!is_script_plugin_dir(&plain));
+
+        // 空目录 / 文件：都不是。
+        assert!(!is_script_plugin_dir(&temp("detect-empty")));
+    }
+
+    /// 目录形态 install：整目录进 `plugins/scripts/<名字>/`，
+    /// 依赖与构建产物**不拷**（那边由中间插件现装现建）。
+    #[test]
+    fn install_a_script_plugin_dir_copies_everything_but_deps() {
+        let source = script_plugin_dir("scriptdir-src");
+        // 这些不该出现在安装结果里。
+        std::fs::create_dir_all(source.join("node_modules").join("is-odd")).unwrap();
+        std::fs::write(source.join("node_modules/is-odd/index.js"), b"1").unwrap();
+        std::fs::create_dir_all(source.join(".venv")).unwrap();
+        std::fs::write(source.join(".venv/pyvenv.cfg"), b"").unwrap();
+        std::fs::create_dir_all(source.join("target")).unwrap();
+        std::fs::write(source.join("target/out.dll"), b"").unwrap();
+        std::fs::write(source.join("README.md"), b"hi").unwrap();
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::write(source.join("src/util.ts"), b"export {}").unwrap();
+
+        let plugin_dir = temp("scriptdir-dst");
+        let copied = install(&source, &plugin_dir).unwrap();
+        assert_eq!(copied.len(), 1, "{copied:?}");
+        let target = &copied[0];
+        assert_eq!(target, &plugin_dir.join("scripts").join("scriptdir-src"));
+
+        // 源码与 manifest 都过去了；依赖与构建产物没过去。
+        assert!(target.join("index.ts").is_file());
+        assert!(target.join("package.json").is_file());
+        assert!(target.join("bun.lock").is_file());
+        assert!(target.join("README.md").is_file());
+        assert!(target.join("src/util.ts").is_file(), "子目录要递归拷");
+        assert!(!target.join("node_modules").exists());
+        assert!(!target.join(".venv").exists());
+        assert!(!target.join("target").exists());
+    }
+
+    /// 目标已存在就报错、不覆盖——覆盖会冲掉用户在机器人那边改过的东西。
+    #[test]
+    fn installing_over_an_existing_script_dir_is_refused() {
+        let source = script_plugin_dir("scriptdir-dup-src");
+        let plugin_dir = temp("scriptdir-dup-dst");
+        install(&source, &plugin_dir).unwrap();
+        let error = install(&source, &plugin_dir).unwrap_err();
+        assert!(error.contains("已经存在"), "{error}");
+    }
+
+    /// 卸载脚本插件 = 删整个目录。
+    #[test]
+    fn uninstall_removes_a_script_dir() {
+        let source = script_plugin_dir("uninst-src");
+        let plugin_dir = temp("uninst-dst");
+        install(&source, &plugin_dir).unwrap();
+
+        let removed = uninstall("uninst-src", &plugin_dir).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(!plugin_dir.join("scripts/uninst-src").exists());
+    }
+
+    /// 卸载原生插件 = dll + 同主干的同伴脚本，`lib` 前缀形态也认。
+    #[test]
+    fn uninstall_removes_a_native_plugin_with_its_companions() {
+        let plugin_dir = temp("uninst-native");
+        let stem = "weather";
+        std::fs::write(plugin_dir.join(format!("{stem}.{DLL_EXTENSION}")), b"lib").unwrap();
+        std::fs::write(plugin_dir.join(format!("{stem}.py")), b"print()").unwrap();
+        std::fs::write(plugin_dir.join("other.py"), b"keep").unwrap();
+
+        let removed = uninstall(stem, &plugin_dir).unwrap();
+        assert_eq!(removed.len(), 2, "{removed:?}");
+        assert!(!plugin_dir.join(format!("{stem}.{DLL_EXTENSION}")).exists());
+        assert!(!plugin_dir.join(format!("{stem}.py")).exists());
+        assert!(
+            plugin_dir.join("other.py").is_file(),
+            "别人的同伴文件不能顺手删"
+        );
+    }
+
+    /// 两样都没有时报错指路，不静默成功。
+    #[test]
+    fn uninstall_of_nothing_is_an_error() {
+        let plugin_dir = temp("uninst-nothing");
+        let error = uninstall("ghost", &plugin_dir).unwrap_err();
+        assert!(error.contains("ghost"), "{error}");
+        assert!(error.contains("plugin list"), "{error}");
     }
 }

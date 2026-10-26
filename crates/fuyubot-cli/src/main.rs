@@ -123,10 +123,12 @@ struct PluginArgs {
 
 #[derive(Subcommand, Debug)]
 enum PluginCommand {
-    /// 列出插件目录里能被加载的插件
+    /// 列出插件目录里能被加载的插件（脚本插件展平到每个脚本）
     List(PluginDirArgs),
-    /// 把一个编好的插件（文件或工程目录）装进插件目录
+    /// 把一个插件装进插件目录（目录 = 脚本插件，文件 = 原生插件）
     Install(InstallArgs),
+    /// 卸载一个插件（脚本插件按目录名，原生插件按动态库名）
+    Uninstall(UninstallArgs),
 }
 
 #[derive(Args, Debug)]
@@ -139,8 +141,19 @@ struct PluginDirArgs {
 
 #[derive(Args, Debug)]
 struct InstallArgs {
-    /// 插件动态库，或插件工程目录（目录里会去找 target/ 下的产物）
+    /// 插件动态库，或插件工程目录（目录里会去找 target/ 下的产物）；
+    /// **脚本插件**传目录（带 package.json / pyproject.toml 的那个）
     path: PathBuf,
+    #[arg(long, default_value = scaffold::CONFIG_FILE)]
+    config: PathBuf,
+    #[arg(long)]
+    plugin_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct UninstallArgs {
+    /// 插件名：脚本插件是 `plugins/scripts/` 下的目录名，原生插件是动态库文件名主干
+    name: String,
     #[arg(long, default_value = scaffold::CONFIG_FILE)]
     config: PathBuf,
     #[arg(long)]
@@ -164,6 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Plugin(args) => match args.command {
             PluginCommand::List(args) => plugin_list(args)?,
             PluginCommand::Install(args) => plugin_install(args)?,
+            PluginCommand::Uninstall(args) => plugin_uninstall(args)?,
         },
     }
     Ok(())
@@ -388,6 +402,12 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let loader = PluginLoader::new(kernel.context().clone())?;
     let pipeline = Arc::new(loader.pipeline());
 
+    // 插件日志门槛：`[plugins].log_level`。**必须在插件加载之前**——
+    // 插件 `init` / `start` 里打的日志也受它管。
+    pipeline
+        .runtime()
+        .set_log_verbosity(config.plugins.log_level()?);
+
     // ── 顺序（用户 2026 指定）──────────────────────────────────────
     //
     //   ① 自动 init（上面刚做）
@@ -429,7 +449,8 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ④ 插件全部加载完（**在发 `setTdlibParameters` 之前**）。
-    let mut loaded = load_plugins(&loader, &plugin_dir)?;
+    // `spawn = true`：`run` 要的是真跑起来——装依赖、起进程、watch 一整套。
+    let mut loaded = load_plugins(&loader, &plugin_dir, true)?;
 
     // ⑤⑥ 现在才驱动登录：等「等参数」状态 → 设置 → 等授权状态 →（要登录就登录）→ Ready。
     if let (Some(client), Some(parameters)) = (tdlib_client.as_ref(), parameters.as_ref()) {
@@ -566,6 +587,15 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// `fuyubot plugin list`：列出插件目录里的插件。
+///
+/// 两层输出：**动态库插件**一行一个（dlopen 之后才知道名字，所以真的加载一次），
+/// 外加**脚本插件展平**——两个中间插件把自己托管的清单暴露成
+/// `fuyubot.host.scripts.<lang>` service，这里按前缀枚举后逐个 `list`。
+/// 不展平的话用户只能看到两个 dll，看不到它们究竟管着哪些脚本。
+///
+/// 给插件传 `"spawn": false`：列清单不该替用户跑 `bun install` / `uv sync`，
+/// 更不该把作者的脚本进程拉起来（中间插件据此进入只发现模式）。
 fn plugin_list(args: PluginDirArgs) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
@@ -588,7 +618,14 @@ fn plugin_list(args: PluginDirArgs) -> Result<(), Box<dyn std::error::Error>> {
         // 插件名只有 dlopen 之后才知道，所以这里是「真的加载一次再看」。
         // 用与 `run` 同一个加载函数：带脚本的插件（Python/JS）同样需要拿到
         // 脚本的绝对路径，否则会按当前目录去找、然后加载失败。
-        for plugin in load_plugins(&loader, &plugin_dir)? {
+        // `spawn = false`：只发现不启动（见函数文档）。
+        //
+        // ⚠️ `loaded` 必须**绑到变量上**：`LoadedPlugin` drop 即 `plugin_stop` +
+        // owner 回滚，它一死，中间插件注册的清单 service 跟着注销——后面
+        // `print_managed_scripts` 就什么都查不到。写在 `for` 的临时位置里
+        // 正是踩过这个坑。
+        let loaded = load_plugins(&loader, &plugin_dir, false)?;
+        for plugin in &loaded {
             println!(
                 "{}\tABI {}\t{}",
                 plugin.name,
@@ -596,8 +633,48 @@ fn plugin_list(args: PluginDirArgs) -> Result<(), Box<dyn std::error::Error>> {
                 plugin.path.display()
             );
         }
+
+        print_managed_scripts(&loader);
         Ok::<(), Box<dyn std::error::Error>>(())
     })
+}
+
+/// 把中间插件托管的脚本清单摊开打印。
+///
+/// 约定：名字以 `fuyubot.host.scripts` 开头的 service 都有一个 `list` 方法，
+/// 返回 `{"lang":…,"scripts":[…]}`。按前缀枚举而不是写死两个名字：
+/// 将来多一门语言（`fuyubot.host.scripts.go` 之类）不用改这里。
+fn print_managed_scripts(loader: &PluginLoader) {
+    let runtime = loader.runtime();
+    let mut lines: Vec<String> = Vec::new();
+    for service in runtime.services().names() {
+        if !service.starts_with("fuyubot.host.scripts") {
+            continue;
+        }
+        let lang = service.rsplit('.').next().unwrap_or("?").to_owned();
+        match runtime.call_service(&service, "list", "{}") {
+            Ok(json) => match serde_json::from_str::<serde_json::Value>(&json) {
+                Ok(parsed) => {
+                    for script in parsed["scripts"].as_array().into_iter().flatten() {
+                        let name = script["name"].as_str().unwrap_or("?");
+                        let entry = [script["dir"].as_str(), script["entry"].as_str()]
+                            .into_iter()
+                            .flatten()
+                            .collect::<PathBuf>();
+                        lines.push(format!("  {name}\t{lang}\t{}", entry.display()));
+                    }
+                }
+                Err(e) => eprintln!("{service} 返回的不是合法 JSON: {e}"),
+            },
+            Err(e) => eprintln!("查不了 {service}: {e}"),
+        }
+    }
+    if !lines.is_empty() {
+        println!("脚本插件（{} 个，由中间插件托管）：", lines.len());
+        for line in lines {
+            println!("{line}");
+        }
+    }
 }
 
 fn plugin_install(args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -607,6 +684,22 @@ fn plugin_install(args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     for path in scaffold::install(&args.path, &plugin_dir)? {
         println!("已安装 {}", path.display());
+    }
+    Ok(())
+}
+
+/// `fuyubot plugin uninstall <名字>`：删脚本目录或动态库（连同伴文件）。
+///
+/// **不接正在跑的机器人**：删掉文件之后，宿主侧的目录 watch 会自己发现
+/// 「少了一个目录」并卸载对应脚本（设计文档 S3）。所以这条命令对运行中的
+/// 实例同样安全，不需要先 stop。
+fn plugin_uninstall(args: UninstallArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let root = project_root(&parent_or_dot(&args.config)).unwrap_or_else(|| PathBuf::from("."));
+    let config = scaffold::load_config(&args.config)?;
+    let plugin_dir = args.plugin_dir.unwrap_or_else(|| config.plugin_dir(&root));
+
+    for path in scaffold::uninstall(&args.name, &plugin_dir)? {
+        println!("已卸载 {}", path.display());
     }
     Ok(())
 }
@@ -906,28 +999,59 @@ fn describe_account(me: &serde_json::Value) -> String {
     line
 }
 
+/// 去掉 Windows `canonicalize` 给的 `\\?\` 长路径前缀。
+///
+/// 语义上两种写法等价（fs 调用、拼接都兼容），但带前缀的路径打到终端、
+/// 混进 `plugin list` 输出里就是一串看不懂的 `\\?\F:\…`，纯属噪声。
+fn strip_unc_prefix(path: PathBuf) -> PathBuf {
+    const UNC: &str = r"\\?\";
+    match path.to_string_lossy().strip_prefix(UNC) {
+        Some(rest) => PathBuf::from(rest),
+        None => path,
+    }
+}
+
 /// 逐个加载插件目录里的动态库。
 ///
 /// 带脚本的插件（Python / JS）要把脚本的**绝对路径**当配置传进去——cdylib 自己
 /// 不知道自己在哪个目录，宿主才知道（见 `scaffold::find_script`）。
+///
+/// `spawn` 透传给插件（配置 JSON 的 `"spawn"` 字段）：`false` = 只发现不启动，
+/// `fuyubot plugin list` 用——列清单不该装依赖、起进程。`run` 传 `true`。
 fn load_plugins(
     loader: &PluginLoader,
     plugin_dir: &Path,
+    spawn: bool,
 ) -> Result<Vec<LoadedPlugin>, Box<dyn std::error::Error>> {
     // 插件自己算不出「插件目录」在哪（它跑在宿主进程里），只能由宿主告诉它。
     // 内置的 `/plugins` 命令就靠这个配置；绝对路径，免得随启动目录漂。
-    let absolute = plugin_dir
-        .canonicalize()
-        .unwrap_or_else(|_| plugin_dir.into());
+    // `canonicalize` 在 Windows 上带 `\\?\` 长路径前缀——去掉，配置与输出都干净。
+    let absolute = strip_unc_prefix(
+        plugin_dir
+            .canonicalize()
+            .unwrap_or_else(|_| plugin_dir.into()),
+    );
+    // 脚本插件的家是 `<plugin_dir>/scripts/`（`plugin install` 的落点）：
+    // 传绝对路径给中间插件（它读 `scripts_dir`），别让它按 cwd 猜 `plugins/scripts`
+    // ——`--config` / `--plugin-dir` 指到别处、或不在项目根目录起进程时那样必错。
+    let scripts_dir = absolute.join("scripts");
     let mut loaded = Vec::new();
     for path in plugin_files(plugin_dir)? {
         let config = match scaffold::find_script(&path) {
-            Some(script) => serde_json::json!({ "script": script, "plugins_dir": absolute }),
-            None => serde_json::json!({ "plugins_dir": absolute }),
+            Some(script) => {
+                serde_json::json!({ "script": script, "plugins_dir": absolute, "scripts_dir": scripts_dir, "spawn": spawn })
+            }
+            None => {
+                serde_json::json!({ "plugins_dir": absolute, "scripts_dir": scripts_dir, "spawn": spawn })
+            }
         };
         match loader.load_with_config(&path, &config.to_string()) {
             Ok(plugin) => {
-                println!("已加载插件 {} ({})", plugin.name, path.display());
+                // 只有 `run`（spawn = true）要这行进度；`plugin list` 自己有格式化输出，
+                // 只发现模式下再打一遍「已加载」就是噪声。
+                if spawn {
+                    println!("已加载插件 {} ({})", plugin.name, path.display());
+                }
                 loaded.push(plugin);
             }
             Err(e) => eprintln!("跳过 {}: {e}", path.display()),
