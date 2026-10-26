@@ -42,7 +42,7 @@ TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` �
 
 ```powershell
 cargo build --workspace --offline     # 0 退出、0 warning
-cargo test  --workspace --offline     # 180 passed / 0 failed / 9 ignored
+cargo test  --workspace --offline     # 223 passed / 0 failed / 9 ignored
 cargo tree  --workspace --offline     # 无环
 cargo fmt --all --check               # 0 diff
 
@@ -71,7 +71,7 @@ target\debug\fuyubot.exe run --replay examples\replay\new_message.json --plugin-
 # 文档站（改 content/docs 后）
 cd F:\Rust\FuyuBot-Docs
 $env:NEXT_PUBLIC_BASE_PATH='/FuyuBot-docs'; $env:NEXT_PUBLIC_SITE_URL='https://catmoecircle.github.io/FuyuBot-docs'
-pnpm build        # 再把 out/ 推到 gh-pages（手动，没有 CI 自动部署）
+pnpm build        # push main 自动构建发布到 gh-pages（pages.yml）
 ```
 
 真实账号登录（要真凭据，凭据只走环境变量或交互输入）：
