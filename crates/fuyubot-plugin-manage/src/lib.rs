@@ -8,6 +8,8 @@
 //! 后者 ABI 还问不到（`fuyubot-abi` 没有 `list_plugins` 桥，见 docs/gaps.md）。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use fuyubot_abi::{HostApi, LogLevel, Plugin, define_plugin};
 use fuyubot_simplify::{
@@ -20,6 +22,8 @@ const LIBRARY_EXTENSIONS: [&str; 3] = ["dll", "so", "dylib"];
 struct ManagePlugin {
     host: HostApi,
     subscription: Option<CommandSubscription>,
+    /// 还在跑的异步发送（`stop()` 里 join 掉：卸载之后不能再跑库里的代码）。
+    sending: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl Plugin for ManagePlugin {
@@ -27,6 +31,7 @@ impl Plugin for ManagePlugin {
         Ok(Self {
             host,
             subscription: None,
+            sending: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -38,6 +43,7 @@ impl Plugin for ManagePlugin {
         let prefix = host
             .get_config("fuyubot.manage", "reply_prefix")
             .unwrap_or_else(|| "已安装 ".to_owned());
+        let sending = Arc::clone(&self.sending);
         let subscription = on_command(host, move |command: &Command| {
             if !command.is("plugins") {
                 return;
@@ -47,8 +53,15 @@ impl Plugin for ManagePlugin {
                 reply_to_message_id: Some(command.message_id),
                 ..SendMessageParams::default()
             };
-            if let Err(error) = Simplify::new(host).send_message(command.chat_id, &params) {
-                host.log(LogLevel::Error, &format!("manage 插件回复失败: {error}"));
+            // 命令回调跑在接收循环线程上：用 then，别在回调里等结果。
+            let handle =
+                Simplify::new(host).send_message_then(command.chat_id, &params, move |result| {
+                    if let Err(error) = result {
+                        host.log(LogLevel::Error, &format!("manage 插件回复失败: {error}"));
+                    }
+                });
+            if let Ok(mut sending) = sending.lock() {
+                sending.push(handle);
             }
         });
         let subscription = subscription.ok_or_else(|| "订阅 updateNewMessage 失败".to_owned())?;
@@ -58,6 +71,13 @@ impl Plugin for ManagePlugin {
 
     fn stop(&mut self) {
         self.subscription = None;
+        let mut sending = self
+            .sending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for handle in sending.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 

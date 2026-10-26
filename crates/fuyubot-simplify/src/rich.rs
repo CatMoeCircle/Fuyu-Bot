@@ -22,11 +22,13 @@
 //!   带上 `inputMessageRichMessage`。本模块的 `send_rich_message` / `edit_rich_message`
 //!   只是把这对组合包成人话，方法名不是 TDLib 的方法名。
 
+use std::time::{Duration, Instant};
+
 use serde_json::{Map, Value, json};
 
 use crate::{
-    Media, ReplyButton, RequestId, Result, SendConfirmation, Simplify, SimplifyError, Text,
-    content_json, plain_text, put_common, reply_markup,
+    Media, ReplyButton, Result, Simplify, SimplifyError, Text, content_json, plain_text,
+    put_common, reply_markup,
 };
 
 /// 富消息的源：对应 TDLib 的 `RichMessageSource` 三选一。
@@ -777,45 +779,50 @@ pub fn rich_edit_params(chat_id: i64, message_id: i64, params: &RichMessageParam
 }
 
 impl Simplify {
-    /// 发一条富消息。返回**请求号**；真正的 `Message` 从响应通道回来。
+    /// 发一条富消息并**等到发送结局**：成功返回最终 `Message`，失败 / 超时返回错误。
     ///
     /// TDLib 没有 `sendRichMessage`——这里就是 `sendMessage` + `inputMessageRichMessage`。
-    /// 富消息的错误（超长、块太多、md 写法不被接受）**全部**只能在响应里看到：
+    /// 富消息的错误（超长、块太多、md 写法不被接受）**全部**只能等到结局才知道：
     /// 本地没有解析器可以预判（`from_markdown` 除外，它至少能保证块树是我们自己产的）。
-    pub fn send_rich_message(&self, chat_id: i64, params: &RichMessageParams) -> Result<RequestId> {
+    ///
+    /// ⚠️ **阻塞**当前线程，回调里请用 [`send_rich_message_then`](Self::send_rich_message_then)。
+    pub fn send_rich_message(&self, chat_id: i64, params: &RichMessageParams) -> Result<Value> {
         if params.message.is_empty() {
             return Err(SimplifyError::EmptyRichMessage);
         }
         let payload = rich_send_params(chat_id, params);
-        Ok(self
+        let request_id = self
             .host()
-            .td_invoke_simplified("sendMessage", &payload.to_string())?)
+            .td_invoke_simplified("sendMessage", &payload.to_string())?;
+        let deadline = Instant::now() + Duration::from_millis(params.timeout_ms);
+        let pending = self.await_response(request_id, deadline, params.timeout_ms)?;
+        self.await_outcome(
+            chat_id,
+            pending.get("id").and_then(Value::as_i64),
+            deadline,
+            params.timeout_ms,
+        )
     }
 
-    /// 发富消息并**等到** `updateMessageSendSucceeded`。
+    /// [`send_rich_message`](Self::send_rich_message) 的异步版：不阻塞，结局走闭包。
     ///
-    /// ⚠️ **阻塞**当前线程，别在更新回调里用（和 [`Simplify::send_message_wait_success`] 同理）。
-    pub fn send_rich_message_wait_success(
+    /// 返回那个线程的句柄：`stop()` 里要 join 掉它（卸载之后还跑库里的代码是 UB）。
+    pub fn send_rich_message_then(
         &self,
         chat_id: i64,
         params: &RichMessageParams,
-    ) -> Result<SendConfirmation> {
-        let timeout_ms = params.timeout_ms;
-        let request_id = self.send_rich_message(chat_id, params)?;
-        let filter = crate::UpdateFilter::new("updateMessageSendSucceeded")
-            .chat_id(chat_id)
-            .to_json()
-            .to_string();
-        let handle = self.host().wait_for_update(&filter, timeout_ms);
-        let update = crate::payload_of(handle).unwrap_or(Value::Null);
-        Ok(SendConfirmation {
-            request_id,
-            confirmed: handle.did_match() && !update.is_null(),
-            update,
-        })
+        on_done: impl FnOnce(Result<Value>) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let simplify = *self;
+        let params = params.clone();
+        crate::spawn_then(
+            move || simplify.send_rich_message(chat_id, &params),
+            on_done,
+        )
     }
 
-    /// 把一条消息改成富消息（`editMessageText` + `inputMessageRichMessage`）。
+    /// 把一条消息改成富消息（`editMessageText` + `inputMessageRichMessage`），
+    /// 等到响应返回改完的 `Message`。
     ///
     /// TDLib 没有 `editRichMessage`；`editMessageText` 的 `input_message_content`
     /// 明确接受 `inputMessageText` 或 `inputMessageRichMessage`。
@@ -824,14 +831,35 @@ impl Simplify {
         chat_id: i64,
         message_id: i64,
         params: &RichMessageParams,
-    ) -> Result<RequestId> {
+    ) -> Result<Value> {
         if params.message.is_empty() {
             return Err(SimplifyError::EmptyRichMessage);
         }
         let payload = rich_edit_params(chat_id, message_id, params);
-        Ok(self
+        let request_id = self
             .host()
-            .td_invoke_simplified("editMessageText", &payload.to_string())?)
+            .td_invoke_simplified("editMessageText", &payload.to_string())?;
+        self.await_response(
+            request_id,
+            Instant::now() + Duration::from_millis(params.timeout_ms),
+            params.timeout_ms,
+        )
+    }
+
+    /// [`edit_rich_message`](Self::edit_rich_message) 的异步版：不阻塞，结果走闭包。
+    pub fn edit_rich_message_then(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        params: &RichMessageParams,
+        on_done: impl FnOnce(Result<Value>) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let simplify = *self;
+        let params = params.clone();
+        crate::spawn_then(
+            move || simplify.edit_rich_message(chat_id, message_id, &params),
+            on_done,
+        )
     }
 }
 

@@ -2,6 +2,12 @@
 
 TDLib 便捷封装：把「发消息 / 相册 / 富消息 / 编辑消息 / 删除消息 / 等更新 / 内联键盘 / 批量解析 / 下载进度」包成人话 API——**一个方法一个参数结构体 + 短字段名**（`SendMessageParams { text, media, reply_to_message_id, topic_id, reply_markup, link_preview, timeout_ms }`），调用方不拼 TDLib 的嵌套 JSON，请求经 `td_invoke*` 发出、返回的仍是 TDLib 原始 JSON。
 
+**每个方法都等到结果才返回**，不交回请求号：
+
+- 发送类（`send_message` / `send_message_album` / `send_rich_message`）：等响应拿临时消息 → 等 `updateMessageSendSucceeded`（成功，给最终 `Message`）或 `updateMessageSendFailed`（→ `SimplifyError::SendFailed`）；超时先撤回未发出的消息再 `Timeout`。相册是 **N 条**结局，全成才算成。
+- 其余（`edit_*` / `delete_message` / `answer_callback_query`）：结果是**响应**——`Message` / `ok` 是成功，`@type == "error"` → `SimplifyError::Tdlib`。
+- ⚠️ 这些方法是**阻塞**的，而插件回调就在接收循环线程上——回调里请用 `*_then`（结果走闭包，并返回线程句柄，**`stop()` 里要 join**，否则卸载后线程还在跑库里的代码）。
+
 `formattedText` 那条链路上的带标记文本（Markdown / HTML）**不自己解析**——经同步的 `td_execute` 直接问 TDLib 的 `parseTextEntities`。
 
 发相册（`sendMessageAlbum`）返回的是 **`Messages`**（一组，不是单条）：先回一组临时消息，再**每一项各来一条** `updateMessageSendSucceeded`（`old_message_id` 就是临时消息 id）。`send_message_album_wait_success` 把这两步合成一次，结果在 `AlbumConfirmation { pending, messages, error }`——`pending` 是响应里的临时消息，`messages` 与它一一对应、同序，没等到的位置是 `Null`。

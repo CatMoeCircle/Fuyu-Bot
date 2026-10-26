@@ -5,11 +5,11 @@
 //! `link_preview` / `timeout_ms`），**不暴露 TDLib 的嵌套 JSON**：
 //!
 //! ```ignore
-//! simplify.send_message(chat_id, &SendMessageParams {
+//! let message = simplify.send_message(chat_id, &SendMessageParams {
 //!     text: Some(Text::markdown("*你好*")),
 //!     reply_to_message_id: Some(42),
 //!     ..SendMessageParams::default()
-//! })?;
+//! })?; // 等到发送结局：成功就是最终那条 Message
 //! ```
 //!
 //! 请求本身一律经 [`HostApi::td_invoke`] / [`HostApi::td_invoke_simplified`] 发出，
@@ -33,14 +33,26 @@
 //! `cashtag` / `bankCardNumber` / `tonAddress` / `botCommand` / `icon` / `button` /
 //! `diff` / `anchor`）没有 md 语法，用 [`richtext`] 结构化拼，再塞进块里。
 //!
-//! ## 两条必须知道的时间线
+//! ## 每个方法都等到结果才返回
 //!
-//! - `td_invoke*` 返回的是**请求号**，真正的 JSON 从响应通道回来（事件类型
-//!   [`RESPONSE_EVENT`]，只发给发起请求的那个插件）。
-//!   编辑类方法也一样：改完的 `Message`、以及 `Message is not modified` 这类错误都是响应。
-//! - [`WaitHandle::payload_json`](fuyubot_abi::WaitHandle) 是宿主临时的线程局部缓冲，
-//!   **只在下一次宿主调用之前有效**。要拿数据就立刻读，或者用本文的 `*_json` / `wait_response`
-//!   （它们已经替你拷好了）。
+//! TDLib 是异步的，本 crate 把等待**收进方法里**：调用方拿到的是结果，不是请求号。
+//!
+//! - **发送类**（`send_message` / `send_message_album` / `send_rich_message`）：
+//!   先等响应拿到临时消息，再等那条消息的**结局**——`updateMessageSendSucceeded`
+//!   给最终消息，`updateMessageSendFailed` 变成 [`SimplifyError::SendFailed`]。
+//!   超时则先 `deleteMessages(revoke = true)` 撤回还没发出的消息，再返回
+//!   [`SimplifyError::Timeout`]。
+//! - **其余方法**（`edit_*` / `delete_message` / `answer_callback_query`）：结果就是
+//!   **响应**（事件类型 [`RESPONSE_EVENT`]，只发给发起请求的那个插件）——`Message`
+//!   或 `ok` 是成功，`@type == "error"` 变成 [`SimplifyError::Tdlib`]。
+//! - ⚠️ 它们是**阻塞**的，而插件的更新回调就跑在接收循环那个线程上——在那里等
+//!   就是自己卡自己。回调里用 `*_then`：结果走闭包，不阻塞。
+//!   （`*_then` 返回线程句柄，**插件要在 `stop()` 里 join 掉它**：动态库卸载之后
+//!   线程还在跑库里的代码是未定义行为。）
+//! - 底层出口 `wait_response` / `wait_for_update` 仍然公开：想自己接原始 JSON 就用它们。
+//!   [`WaitHandle::payload_json`](fuyubot_abi::WaitHandle) 是宿主临时的线程局部缓冲，
+//!   **只在下一次宿主调用之前有效**，要拿数据就立刻读（或用 `*_json` / `wait_response`，
+//!   它们已经替你拷好了）。
 //!
 //! ## 类型提示
 //!
@@ -84,9 +96,51 @@ pub enum SimplifyError {
     RichSourceNotBlocks,
     #[error("按钮行不能为空")]
     EmptyButtonRow,
+    /// 发是发出去了，TDLib 说没发成（`updateMessageSendFailed`）。
+    #[error("发送失败（TDLib {code}）：{message}")]
+    SendFailed { code: i32, message: String },
+    /// 方法本身被 TDLib 拒绝了（响应是 `@type == "error"`）。
+    #[error("TDLib 返回错误（{code}）：{message}")]
+    Tdlib { code: i32, message: String },
+    /// 在 `timeout_ms` 里没等到结局。**已经尝试撤回**那条还没发出去的消息。
+    #[error("等了 {0} ms 没等到结果，已尝试撤回未发出的消息")]
+    Timeout(u64),
 }
 
 type Result<T> = std::result::Result<T, SimplifyError>;
+
+/// 等待的默认上限（各参数结构体的 `timeout_ms` 初值）。
+pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+/// 一条 `@type == "error"` 的响应 → 错误（`code` / `message` 都在顶层）。
+fn as_tdlib_error(error: &Value) -> SimplifyError {
+    SimplifyError::Tdlib {
+        code: error.get("code").and_then(Value::as_i64).unwrap_or(0) as i32,
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    }
+}
+
+/// 发送失败的更新（`updateMessageSendFailed`）→ 错误。
+fn send_failed_of(update: &Value) -> Option<SimplifyError> {
+    if update.get("@type").and_then(Value::as_str) != Some("updateMessageSendFailed") {
+        return None;
+    }
+    Some(SimplifyError::SendFailed {
+        code: update
+            .get("error_code")
+            .and_then(Value::as_i64)
+            .unwrap_or(0) as i32,
+        message: update
+            .get("error_message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    })
+}
 
 // ── 文本 ──────────────────────────────────────────────────────────
 
@@ -819,26 +873,62 @@ impl Default for SendAlbumParams {
 }
 
 /// `editMessageText` 的参数（`text` 为 `None` 时只改键盘）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EditTextParams {
     pub text: Option<Text>,
     pub link_preview: Option<bool>,
     pub reply_markup: Vec<Vec<ReplyButton>>,
+    /// 等 TDLib 响应的上限。
+    pub timeout_ms: u64,
+}
+
+impl Default for EditTextParams {
+    fn default() -> Self {
+        Self {
+            text: None,
+            link_preview: None,
+            reply_markup: Vec::new(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        }
+    }
 }
 
 /// `editMessageCaption` 的参数。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EditCaptionParams {
     pub text: Option<Text>,
     pub reply_markup: Vec<Vec<ReplyButton>>,
+    pub timeout_ms: u64,
+}
+
+impl Default for EditCaptionParams {
+    fn default() -> Self {
+        Self {
+            text: None,
+            reply_markup: Vec::new(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        }
+    }
 }
 
 /// `editMessageMedia` 的参数（`text` 是新媒体内容的标题）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EditMediaParams {
     pub text: Option<Text>,
     pub media: Option<Media>,
     pub reply_markup: Vec<Vec<ReplyButton>>,
+    pub timeout_ms: u64,
+}
+
+impl Default for EditMediaParams {
+    fn default() -> Self {
+        Self {
+            text: None,
+            media: None,
+            reply_markup: Vec::new(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        }
+    }
 }
 
 // ── 请求组装 ──────────────────────────────────────────────────────
@@ -1306,65 +1396,6 @@ pub struct FileDownload {
     pub last_update: Value,
 }
 
-/// 发送成功的确认。
-#[derive(Debug, Clone)]
-pub struct SendConfirmation {
-    /// 发起请求时拿到的请求号（对应最初的临时消息）。
-    pub request_id: RequestId,
-    /// 等到 `updateMessageSendSucceeded` 了没有。
-    pub confirmed: bool,
-    /// 那条更新的原始 JSON（里面 `message` 就是最终消息）。
-    pub update: Value,
-}
-
-/// 相册发送的结果（`sendMessageAlbum` 返回的是 `Messages`，**一组**消息）。
-///
-/// 时间线和单条消息不一样：TDLib 先回一个 `messages` 数组（里面是**临时消息**，
-/// 还没发出去），随后**每一项各来一条** `updateMessageSendSucceeded`
-/// （`old_message_id` 就是临时消息的 id）。所以「发成功」对相册来说是 N 条确认。
-#[derive(Debug, Clone)]
-pub struct AlbumConfirmation {
-    /// 发起请求时拿到的请求号。
-    pub request_id: RequestId,
-    /// 响应里的那一组**临时消息**（`Messages.messages`，原样保留）。
-    ///
-    /// 响应没等到（超时）或是个 `error` 时为空。
-    pub pending: Vec<Value>,
-    /// 等到 `updateMessageSendSucceeded` 的**最终消息**，与 [`pending`](Self::pending)
-    /// **一一对应、同序**；没等到的位置是 `Value::Null`。
-    pub messages: Vec<Value>,
-    /// 响应是 `error` 时不为 `None`：整组都没发出去，别去看 `messages`。
-    pub error: Option<Value>,
-}
-
-impl AlbumConfirmation {
-    /// 每一项都等到最终消息了（响应拿到了、不是 error、条数对得上、且没有 Null）。
-    pub fn confirmed(&self) -> bool {
-        self.error.is_none()
-            && !self.pending.is_empty()
-            && self.messages.len() == self.pending.len()
-            && self.messages.iter().all(|message| !message.is_null())
-    }
-
-    /// 最终消息 id（拿到几条给几条；没等到的是 `None`）。
-    pub fn message_ids(&self) -> Vec<Option<i64>> {
-        self.messages
-            .iter()
-            .map(|message| message.get("id").and_then(Value::as_i64))
-            .collect()
-    }
-
-    pub fn to_json(&self) -> Value {
-        json!({
-            "request_id": self.request_id.id,
-            "confirmed": self.confirmed(),
-            "pending": self.pending,
-            "messages": self.messages,
-            "error": self.error,
-        })
-    }
-}
-
 /// TDLib 便捷入口。持有一个 [`HostApi`]（它是 `Copy` 的，随手复制）。
 #[derive(Debug, Clone, Copy)]
 pub struct Simplify {
@@ -1413,42 +1444,82 @@ impl Simplify {
         formatted_from(text, response.as_ref())
     }
 
-    /// 发消息。返回**请求号**；TDLib 的临时消息 JSON 会从响应通道回来。
+    /// 发消息并**等到发送结局**：成功返回最终的 `Message`，失败 / 超时返回错误。
     ///
-    /// 不阻塞，所以在更新回调里也能放心用（想要最终消息就用
-    /// [`send_message_wait_success`](Self::send_message_wait_success)）。
-    pub fn send_message(&self, chat_id: i64, params: &SendMessageParams) -> Result<RequestId> {
+    /// 时间线（TDLib 是异步的，这里把两步合成一次）：
+    ///
+    /// 1. `sendMessage` 的**响应**先回来，里面是还**没发出去**的临时消息；
+    /// 2. 随后那条临时消息各来一条结局更新——`updateMessageSendSucceeded`
+    ///    （`message` 是最终消息）或 `updateMessageSendFailed`（`error_code` /
+    ///    `error_message`）。按临时消息的 `old_message_id` 精确对号，
+    ///    同一会话里别人发的结局不会串进来。
+    ///
+    /// ⚠️ **阻塞**当前线程：在更新回调里调它就是自己卡自己（回调跑在接收循环
+    /// 那个线程上，更新送不回来），等到的一定是超时——回调里请用
+    /// [`send_message_then`](Self::send_message_then)。
+    ///
+    /// 超时会先 `deleteMessages(revoke = true)` 把那条还没发出去的消息撤回，再返回
+    /// [`SimplifyError::Timeout`]。
+    pub fn send_message(&self, chat_id: i64, params: &SendMessageParams) -> Result<Value> {
+        let request_id = self.invoke_send_message(chat_id, params)?;
+        let deadline = Instant::now() + Duration::from_millis(params.timeout_ms);
+
+        // 1. 响应 = 临时消息（sendMessage = Message）
+        let pending = self.await_response(request_id, deadline, params.timeout_ms)?;
+        let old_message_id = pending.get("id").and_then(Value::as_i64);
+
+        // 2. 这条临时消息的结局：成功 / 失败
+        self.await_outcome(chat_id, old_message_id, deadline, params.timeout_ms)
+    }
+
+    /// 发一组相册（2–10 项，仅音频/文档/图片/视频可混）并**等到每一项的结局**。
+    ///
+    /// `sendMessageAlbum` 返回 `Messages`（一组临时消息），不是单条 `Message`：
+    /// 先收响应拿那一组 id，再逐项等结局——**全部成功**才返回（`Vec<Value>`，
+    /// 与 `medias` 同序的最终消息）。任一项 `updateMessageSendFailed` 就返回
+    /// [`SimplifyError::SendFailed`]；超时则撤回还没发出去的那些，返回
+    /// [`SimplifyError::Timeout`]。
+    ///
+    /// ⚠️ **阻塞**当前线程，回调里请用 [`send_message_album_then`](Self::send_message_album_then)。
+    /// `timeout_ms` 是**整组共用**的一个预算，不是每项各等一次。
+    pub fn send_message_album(&self, chat_id: i64, params: &SendAlbumParams) -> Result<Vec<Value>> {
+        let request_id = self.invoke_send_album(chat_id, params)?;
+        let deadline = Instant::now() + Duration::from_millis(params.timeout_ms);
+
+        let response = self.await_response(request_id, deadline, params.timeout_ms)?;
+        let ids: Vec<Option<i64>> = pending_messages(&response)
+            .iter()
+            .map(|message| message.get("id").and_then(Value::as_i64))
+            .collect();
+
+        let mut messages = Vec::with_capacity(ids.len());
+        for (index, old_message_id) in ids.iter().enumerate() {
+            let Some(old_message_id) = *old_message_id else {
+                self.cancel_sending(chat_id, ids[index..].iter().flatten());
+                return Err(SimplifyError::Timeout(params.timeout_ms));
+            };
+            messages.push(self.await_outcome(
+                chat_id,
+                Some(old_message_id),
+                deadline,
+                params.timeout_ms,
+            )?);
+        }
+        Ok(messages)
+    }
+
+    // ── 发送的内部三步：发 → 等响应 → 等结局 ──────────────────────
+
+    /// 只发请求，不等结果（`sendMessage`）。
+    fn invoke_send_message(&self, chat_id: i64, params: &SendMessageParams) -> Result<RequestId> {
         let payload = send_params(chat_id, params, &|text: &Text| self.formatted(text));
         Ok(self
             .host
             .td_invoke_simplified("sendMessage", &payload.to_string())?)
     }
 
-    /// 发消息并**等到** `updateMessageSendSucceeded`（拿到最终消息）。
-    ///
-    /// ⚠️ **阻塞**当前线程，别在更新回调里用：投递线程被自己卡住，等到的是超时。
-    pub fn send_message_wait_success(
-        &self,
-        chat_id: i64,
-        params: &SendMessageParams,
-    ) -> Result<SendConfirmation> {
-        let timeout_ms = params.timeout_ms;
-        let request_id = self.send_message(chat_id, params)?;
-        let filter = UpdateFilter::new("updateMessageSendSucceeded")
-            .chat_id(chat_id)
-            .to_json()
-            .to_string();
-        let handle = self.host.wait_for_update(&filter, timeout_ms);
-        let update = payload_of(handle).unwrap_or(Value::Null);
-        Ok(SendConfirmation {
-            request_id,
-            confirmed: handle.did_match() && !update.is_null(),
-            update,
-        })
-    }
-
-    /// 发一组相册（2–10 项，仅音频/文档/图片/视频可混）。
-    pub fn send_message_album(&self, chat_id: i64, params: &SendAlbumParams) -> Result<RequestId> {
+    /// 只发请求，不等结果（`sendMessageAlbum`）——顺带先验项数。
+    fn invoke_send_album(&self, chat_id: i64, params: &SendAlbumParams) -> Result<RequestId> {
         if !(2..=10).contains(&params.medias.len()) {
             return Err(SimplifyError::AlbumSize(params.medias.len()));
         }
@@ -1458,92 +1529,126 @@ impl Simplify {
             .td_invoke_simplified("sendMessageAlbum", &payload.to_string())?)
     }
 
-    /// 发相册并**等到**每一项的 `updateMessageSendSucceeded`。
-    ///
-    /// `sendMessageAlbum` 返回的是 `Messages`（`messages` 数组），不是单条 `Message`：
-    /// 先等响应拿到那一组临时消息，再按 `old_message_id` 逐条等最终消息——
-    /// 结果见 [`AlbumConfirmation`]。
-    ///
-    /// ⚠️ **阻塞**当前线程，别在更新回调里用（和 [`send_message_wait_success`](Self::send_message_wait_success)
-    /// 同理）。`timeout_ms` 是**整组共用**的一个预算，不是每条各等一次。
-    pub fn send_message_album_wait_success(
+    /// 等某个请求的响应：拿到就返回，`error` 变 [`SimplifyError::Tdlib`]，
+    /// 超时变 [`SimplifyError::Timeout`]。
+    fn await_response(
         &self,
-        chat_id: i64,
-        params: &SendAlbumParams,
-    ) -> Result<AlbumConfirmation> {
-        let request_id = self.send_message_album(chat_id, params)?;
-        let deadline = Instant::now() + Duration::from_millis(params.timeout_ms);
-
-        // 1. 响应：`messages total_count messages:vector<message>`。
-        let response = self.wait_response(request_id, remaining_ms(deadline));
-        let error = response.as_ref().and_then(error_of);
-        let pending = pending_messages(response.as_ref());
-
-        // 2. 每一项各来一条 updateMessageSendSucceeded，`old_message_id` 对得上才算。
-        //    按临时消息的 id 精确匹配，同一会话里别人发的成功更新不会串进来。
-        let mut messages = Vec::with_capacity(pending.len());
-        for pending_message in &pending {
-            let Some(old_message_id) = pending_message.get("id").and_then(Value::as_i64) else {
-                messages.push(Value::Null);
-                continue;
-            };
-            let filter = json!({
-                FILTER_EVENT_TYPE_KEY: "updateMessageSendSucceeded",
-                "message.chat_id": chat_id,
-                "old_message_id": old_message_id,
-            })
-            .to_string();
-            let handle = self.host.wait_for_update(&filter, remaining_ms(deadline));
-            messages.push(
-                payload_of(handle)
-                    .and_then(|update| update.get("message").cloned())
-                    .unwrap_or(Value::Null),
-            );
+        request_id: RequestId,
+        deadline: Instant,
+        timeout_ms: u64,
+    ) -> Result<Value> {
+        let Some(response) = self.wait_response(request_id, remaining_ms(deadline)) else {
+            return Err(SimplifyError::Timeout(timeout_ms));
+        };
+        match error_of(&response) {
+            Some(error) => Err(as_tdlib_error(error)),
+            None => Ok(response),
         }
-
-        Ok(AlbumConfirmation {
-            request_id,
-            pending,
-            messages,
-            error,
-        })
     }
 
-    /// 改一条消息的文本（`editMessageText`）。
+    /// 等一条临时消息的**结局**：成功给最终 `Message`，失败给错误，超时先撤回再给错误。
     ///
-    /// 返回**请求号**：编辑后的 `Message`、以及 `Message is not modified` 这类错误
-    /// 都从响应通道回来（错误是 `@type == "error"` 的一条响应），要拿就
-    /// [`wait_response`](Self::wait_response)。**不在这里重试**——限流该等多久是调用方的事。
+    /// 走**兜底的 `"update"` 通道** + `old_message_id` 精确匹配：成功和失败两条更新
+    /// 都在这一条通道上，所以一次等待就能拿到「到底成了没」。
+    fn await_outcome(
+        &self,
+        chat_id: i64,
+        old_message_id: Option<i64>,
+        deadline: Instant,
+        timeout_ms: u64,
+    ) -> Result<Value> {
+        let Some(old_message_id) = old_message_id else {
+            return Err(SimplifyError::Timeout(timeout_ms));
+        };
+        let filter = json!({
+            FILTER_EVENT_TYPE_KEY: UPDATE_EVENT,
+            "old_message_id": old_message_id,
+        })
+        .to_string();
+        let Some(update) = payload_of(self.host.wait_for_update(&filter, remaining_ms(deadline)))
+        else {
+            // 没等到结局：消息多半还卡在发送中，撤回它
+            self.cancel_sending(chat_id, std::iter::once(&old_message_id));
+            return Err(SimplifyError::Timeout(timeout_ms));
+        };
+        match send_failed_of(&update) {
+            Some(error) => Err(error),
+            None => Ok(update.get("message").cloned().unwrap_or(Value::Null)),
+        }
+    }
+
+    /// 撤回还没发出去的（临时）消息：`deleteMessages(revoke = true)`。
+    ///
+    /// 这是超时之后能做的唯一补救——发出去的撤不回，没发出去的会被取消。
+    /// 只打日志，不把删除的成败当成结果返回。
+    fn cancel_sending<'a>(&self, chat_id: i64, message_ids: impl IntoIterator<Item = &'a i64>) {
+        let ids: Vec<i64> = message_ids.into_iter().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let params = json!({ "chat_id": chat_id, "message_ids": ids, "revoke": true });
+        match self
+            .host
+            .td_invoke_simplified("deleteMessages", &params.to_string())
+        {
+            Ok(_) => self.host.log(
+                fuyubot_abi::LogLevel::Warn,
+                &format!("发送超时，已撤回未发出的消息 {ids:?}"),
+            ),
+            Err(error) => self.host.log(
+                fuyubot_abi::LogLevel::Error,
+                &format!("发送超时，撤回 {ids:?} 也失败了：{error}"),
+            ),
+        }
+    }
+
+    /// 改一条消息的文本（`editMessageText`），**等到响应**并返回改完的 `Message`。
+    ///
+    /// 编辑没有「发送成功 / 失败」那一对更新，它的结果就是**响应**：
+    /// 成功是 `Message`，`Message is not modified` 这类是 `@type == "error"`
+    /// （变成 [`SimplifyError::Tdlib`]）。**不在这里重试**——限流该等多久是调用方的事。
+    ///
+    /// ⚠️ **阻塞**当前线程，回调里请用 [`edit_message_text_then`](Self::edit_message_text_then)。
     pub fn edit_message_text(
         &self,
         chat_id: i64,
         message_id: i64,
         params: &EditTextParams,
-    ) -> Result<RequestId> {
+    ) -> Result<Value> {
         let payload = edit_text_params(chat_id, message_id, params, &|text: &Text| {
             self.formatted(text)
         });
-        Ok(self
+        let request_id = self
             .host
-            .td_invoke_simplified("editMessageText", &payload.to_string())?)
+            .td_invoke_simplified("editMessageText", &payload.to_string())?;
+        self.await_response(
+            request_id,
+            Instant::now() + Duration::from_millis(params.timeout_ms),
+            params.timeout_ms,
+        )
     }
 
-    /// 改一条媒体消息的标题（`editMessageCaption`）。
+    /// 改一条媒体消息的标题（`editMessageCaption`），等到响应返回改完的 `Message`。
     pub fn edit_message_caption(
         &self,
         chat_id: i64,
         message_id: i64,
         params: &EditCaptionParams,
-    ) -> Result<RequestId> {
+    ) -> Result<Value> {
         let payload = edit_caption_params(chat_id, message_id, params, &|text: &Text| {
             self.formatted(text)
         });
-        Ok(self
+        let request_id = self
             .host
-            .td_invoke_simplified("editMessageCaption", &payload.to_string())?)
+            .td_invoke_simplified("editMessageCaption", &payload.to_string())?;
+        self.await_response(
+            request_id,
+            Instant::now() + Duration::from_millis(params.timeout_ms),
+            params.timeout_ms,
+        )
     }
 
-    /// 换掉一条消息的内容（`editMessageMedia`）。
+    /// 换掉一条消息的内容（`editMessageMedia`），等到响应返回改完的 `Message`。
     ///
     /// 和发消息同一套 [`Media`]：内容形状只有一份实现。
     pub fn edit_message_media(
@@ -1551,56 +1656,80 @@ impl Simplify {
         chat_id: i64,
         message_id: i64,
         params: &EditMediaParams,
-    ) -> Result<RequestId> {
+    ) -> Result<Value> {
         let payload = edit_media_params(chat_id, message_id, params, &|text: &Text| {
             self.formatted(text)
         });
-        Ok(self
+        let request_id = self
             .host
-            .td_invoke_simplified("editMessageMedia", &payload.to_string())?)
+            .td_invoke_simplified("editMessageMedia", &payload.to_string())?;
+        self.await_response(
+            request_id,
+            Instant::now() + Duration::from_millis(params.timeout_ms),
+            params.timeout_ms,
+        )
     }
 
     /// 只改一条消息的键盘（`editMessageReplyMarkup`）——**相册要挂键盘就只能用这条**：
     /// `sendMessageAlbum` 的真签名里没有 `reply_markup`，发的时候带不上。
     ///
-    /// 返回**请求号**：改完的 `Message` 从响应通道回来（要拿就 [`wait_response`](Self::wait_response)）。
-    /// 空键盘 = **移除键盘**（`replyMarkupRemoveKeyboard`），不是「什么都不改」。
+    /// 等到响应返回改完的 `Message`。空键盘 = **移除键盘**
+    /// （`replyMarkupRemoveKeyboard`），不是「什么都不改」。
     pub fn edit_message_reply_markup(
         &self,
         chat_id: i64,
         message_id: i64,
         reply_markup: &[Vec<ReplyButton>],
-    ) -> Result<RequestId> {
+        timeout_ms: u64,
+    ) -> Result<Value> {
         let payload = edit_markup_params(chat_id, message_id, reply_markup);
-        Ok(self
+        let request_id = self
             .host
-            .td_invoke_simplified("editMessageReplyMarkup", &payload.to_string())?)
+            .td_invoke_simplified("editMessageReplyMarkup", &payload.to_string())?;
+        self.await_response(
+            request_id,
+            Instant::now() + Duration::from_millis(timeout_ms),
+            timeout_ms,
+        )
     }
 
     /// 删消息（`deleteMessages`），`revoke = true` 表示对所有人撤回。
+    ///
+    /// 等到响应：成功是 `Ok`（TDLib 的 `ok`，没有内容），失败是
+    /// [`SimplifyError::Tdlib`]（权限不够、消息太老之类都会在这里冒出来）。
     pub fn delete_message(
         &self,
         chat_id: i64,
         message_ids: impl IntoIterator<Item = i64>,
         revoke: bool,
-    ) -> Result<RequestId> {
+        timeout_ms: u64,
+    ) -> Result<()> {
         let params = json!({
             "chat_id": chat_id,
             "message_ids": message_ids.into_iter().collect::<Vec<_>>(),
             "revoke": revoke,
         });
-        Ok(self
+        let request_id = self
             .host
-            .td_invoke_simplified("deleteMessages", &params.to_string())?)
+            .td_invoke_simplified("deleteMessages", &params.to_string())?;
+        self.await_response(
+            request_id,
+            Instant::now() + Duration::from_millis(timeout_ms),
+            timeout_ms,
+        )
+        .map(|_| ())
     }
 
     /// 回一条 callback query（点了内联按钮之后必须回，否则客户端一直转圈）。
+    ///
+    /// 等到响应：成功是 `Ok`，失败是 [`SimplifyError::Tdlib`]。
     pub fn answer_callback_query(
         &self,
         callback_query_id: i64,
         text: Option<&str>,
         show_alert: bool,
-    ) -> Result<RequestId> {
+        timeout_ms: u64,
+    ) -> Result<()> {
         let params = json!({
             "callback_query_id": callback_query_id,
             "text": text.unwrap_or_default(),
@@ -1608,9 +1737,155 @@ impl Simplify {
             "url": "",
             "cache_time": 0,
         });
-        Ok(self
+        let request_id = self
             .host
-            .td_invoke_simplified("answerCallbackQuery", &params.to_string())?)
+            .td_invoke_simplified("answerCallbackQuery", &params.to_string())?;
+        self.await_response(
+            request_id,
+            Instant::now() + Duration::from_millis(timeout_ms),
+            timeout_ms,
+        )
+        .map(|_| ())
+    }
+
+    // ── 异步版：不阻塞当前线程，结果走闭包 ────────────────────────
+    //
+    // 等待版要阻塞，而插件的更新回调**就跑在接收循环那个线程上**——在那里等
+    // 就是自己卡自己，等到的一定是超时。回调里一律用 `*_then`：它们把等待挪到
+    // 另一个线程上，结果由闭包接住。代价是每次调用起一个线程（有 `timeout_ms`
+    // 兜着，不会一直挂着）。
+
+    /// [`send_message`](Self::send_message) 的异步版：发完立刻返回，
+    /// 结局（`Ok(最终消息)` / `Err(…)`）从另一个线程交给 `on_done`。
+    pub fn send_message_then(
+        &self,
+        chat_id: i64,
+        params: &SendMessageParams,
+        on_done: impl FnOnce(Result<Value>) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let simplify = *self;
+        let params = params.clone();
+        spawn_then(move || simplify.send_message(chat_id, &params), on_done)
+    }
+
+    /// [`send_message_album`](Self::send_message_album) 的异步版。
+    pub fn send_message_album_then(
+        &self,
+        chat_id: i64,
+        params: &SendAlbumParams,
+        on_done: impl FnOnce(Result<Vec<Value>>) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let simplify = *self;
+        let params = params.clone();
+        spawn_then(
+            move || simplify.send_message_album(chat_id, &params),
+            on_done,
+        )
+    }
+
+    /// [`edit_message_text`](Self::edit_message_text) 的异步版。
+    pub fn edit_message_text_then(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        params: &EditTextParams,
+        on_done: impl FnOnce(Result<Value>) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let simplify = *self;
+        let params = params.clone();
+        spawn_then(
+            move || simplify.edit_message_text(chat_id, message_id, &params),
+            on_done,
+        )
+    }
+
+    /// [`edit_message_caption`](Self::edit_message_caption) 的异步版。
+    pub fn edit_message_caption_then(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        params: &EditCaptionParams,
+        on_done: impl FnOnce(Result<Value>) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let simplify = *self;
+        let params = params.clone();
+        spawn_then(
+            move || simplify.edit_message_caption(chat_id, message_id, &params),
+            on_done,
+        )
+    }
+
+    /// [`edit_message_media`](Self::edit_message_media) 的异步版。
+    pub fn edit_message_media_then(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        params: &EditMediaParams,
+        on_done: impl FnOnce(Result<Value>) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let simplify = *self;
+        let params = params.clone();
+        spawn_then(
+            move || simplify.edit_message_media(chat_id, message_id, &params),
+            on_done,
+        )
+    }
+
+    /// [`edit_message_reply_markup`](Self::edit_message_reply_markup) 的异步版。
+    pub fn edit_message_reply_markup_then(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        reply_markup: Vec<Vec<ReplyButton>>,
+        timeout_ms: u64,
+        on_done: impl FnOnce(Result<Value>) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let simplify = *self;
+        spawn_then(
+            move || {
+                simplify.edit_message_reply_markup(chat_id, message_id, &reply_markup, timeout_ms)
+            },
+            on_done,
+        )
+    }
+
+    /// [`delete_message`](Self::delete_message) 的异步版。
+    pub fn delete_message_then(
+        &self,
+        chat_id: i64,
+        message_ids: Vec<i64>,
+        revoke: bool,
+        timeout_ms: u64,
+        on_done: impl FnOnce(Result<()>) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let simplify = *self;
+        spawn_then(
+            move || simplify.delete_message(chat_id, message_ids, revoke, timeout_ms),
+            on_done,
+        )
+    }
+
+    /// [`answer_callback_query`](Self::answer_callback_query) 的异步版。
+    pub fn answer_callback_query_then(
+        &self,
+        callback_query_id: i64,
+        text: Option<String>,
+        show_alert: bool,
+        timeout_ms: u64,
+        on_done: impl FnOnce(Result<()>) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let simplify = *self;
+        spawn_then(
+            move || {
+                simplify.answer_callback_query(
+                    callback_query_id,
+                    text.as_deref(),
+                    show_alert,
+                    timeout_ms,
+                )
+            },
+            on_done,
+        )
     }
 
     // ── 等更新 / 等响应 ────────────────────────────────────────────
@@ -1756,6 +2031,23 @@ impl Simplify {
     }
 }
 
+/// 把一次等待挪到**另一个线程**上，结果交给 `on_done`。
+///
+/// 这是 `*_then` 那一套的底：等待版要阻塞，而插件回调跑在接收循环线程上，
+/// 在那里等就是自己卡自己。挪走之后回调线程立刻返回，结局由闭包接住。
+/// 返回的句柄**要收好**：插件是动态库，卸载之后这个线程还在跑库里的代码就是
+/// 未定义行为——`stop()` 里 join 掉它们（内置插件就是这么写的）。
+fn spawn_then<T>(
+    work: impl FnOnce() -> T + Send + 'static,
+    on_done: impl FnOnce(T) + Send + 'static,
+) -> std::thread::JoinHandle<()>
+where
+    T: Send + 'static,
+{
+    // 起不了线程是 OS 资源耗尽那一档，让它 panic 好过悄悄丢掉结果。
+    std::thread::spawn(move || on_done(work()))
+}
+
 /// 到 `deadline` 还剩多少毫秒（已经超了就是 0）。
 ///
 /// 一段等待里要等多次时用它把**同一个**预算分下去：`timeout_ms` 是全程上限，
@@ -1767,15 +2059,12 @@ fn remaining_ms(deadline: Instant) -> u64 {
 }
 
 /// 响应是 `error` 吗（`@type == "error"`，`message` 里是原因）。
-fn error_of(response: &Value) -> Option<Value> {
-    (response.get("@type").and_then(Value::as_str) == Some("error")).then(|| response.clone())
+fn error_of(response: &Value) -> Option<&Value> {
+    (response.get("@type").and_then(Value::as_str) == Some("error")).then_some(response)
 }
 
 /// 从 `Messages` 响应里取出那一组（临时）消息；不是 `Messages` 就当没有。
-fn pending_messages(response: Option<&Value>) -> Vec<Value> {
-    let Some(response) = response else {
-        return Vec::new();
-    };
+fn pending_messages(response: &Value) -> Vec<Value> {
     if response.get("@type").and_then(Value::as_str) != Some("messages") {
         return Vec::new();
     }
@@ -1816,74 +2105,106 @@ mod tests {
         Simplify::new(host)
     }
 
+    /// 把等待上限压成 0：这些测试只验**请求怎么拼**，不等结果。
+    ///
+    /// 超时上限为 0 时 `wait_for_update` 立刻返回「没等到」，所以既不用真的等，
+    /// 也不会走到「超时撤回」那一步（没拿到临时消息 id）——`sent_requests` 里
+    /// 就只有被测的那一条请求。
+    macro_rules! quick {
+        ($params:expr) => {{
+            let mut params = $params;
+            params.timeout_ms = 0;
+            params
+        }};
+    }
+
+    /// 发一条**注定超时**的请求（离线环境没有 TDLib 回响应），只为让它留档。
+    macro_rules! fire {
+        ($simplify:expr, $method:ident $(, $arg:expr)*) => {
+            let _ = $simplify.$method($($arg,)*);
+        };
+    }
+
     /// 七种内容**全是 `sendMessage`**，每种一个 `InputMessageContent` 形状。
     #[test]
     fn every_media_kind_becomes_one_send_message() {
         let rt = runtime();
         let simplify = simplify(&rt);
 
-        simplify
-            .send_message(7, &SendMessageParams::text("hi"))
-            .unwrap();
-        simplify
-            .send_message(7, &SendMessageParams::media(Media::photo("/tmp/a.jpg")))
-            .unwrap();
-        simplify
-            .send_message(
-                7,
-                &SendMessageParams::media(Media::Video {
-                    file: InputFile::remote("video-id"),
-                    caption: None,
-                    duration: 3,
-                    width: 640,
-                    height: 480,
-                    supports_streaming: true,
-                    has_spoiler: false,
-                }),
-            )
-            .unwrap();
-        simplify
-            .send_message(
-                7,
-                &SendMessageParams::media(Media::Audio {
-                    file: "/tmp/a.mp3".into(),
-                    caption: None,
-                    duration: 12,
-                    title: "标题".to_owned(),
-                    performer: "作者".to_owned(),
-                }),
-            )
-            .unwrap();
-        simplify
-            .send_message(7, &SendMessageParams::media(Media::document("/tmp/a.pdf")))
-            .unwrap();
-        simplify
-            .send_message(
-                7,
-                &SendMessageParams::media(Media::Animation {
-                    file: "/tmp/a.gif".into(),
-                    caption: None,
-                    duration: 1,
-                    width: 10,
-                    height: 10,
-                    has_spoiler: false,
-                }),
-            )
-            .unwrap();
-        simplify
-            .send_message(
-                7,
-                &SendMessageParams::media(Media::Sticker {
-                    file: "/tmp/a.webp".into(),
-                    emoji: "😀".to_owned(),
-                    width: 512,
-                    height: 512,
-                }),
-            )
-            .unwrap();
-        simplify
-            .send_message(7, &SendMessageParams::media(Media::location(1.5, 2.5)))
-            .unwrap();
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::text("hi"))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::photo("/tmp/a.jpg")))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::Video {
+                file: InputFile::remote("video-id"),
+                caption: None,
+                duration: 3,
+                width: 640,
+                height: 480,
+                supports_streaming: true,
+                has_spoiler: false,
+            }))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::Audio {
+                file: "/tmp/a.mp3".into(),
+                caption: None,
+                duration: 12,
+                title: "标题".to_owned(),
+                performer: "作者".to_owned(),
+            }))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::document("/tmp/a.pdf")))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::Animation {
+                file: "/tmp/a.gif".into(),
+                caption: None,
+                duration: 1,
+                width: 10,
+                height: 10,
+                has_spoiler: false,
+            }))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::Sticker {
+                file: "/tmp/a.webp".into(),
+                emoji: "😀".to_owned(),
+                width: 512,
+                height: 512,
+            }))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::location(1.5, 2.5)))
+        );
 
         let sent = rt.sent_requests();
         let methods: Vec<&str> = sent.iter().map(|request| request.method.as_str()).collect();
@@ -1952,25 +2273,25 @@ mod tests {
         let rt = runtime();
         let simplify = simplify(&rt);
 
-        simplify
-            .send_message(
-                7,
-                &SendMessageParams {
-                    text: Some(Text::plain("hi")),
-                    media: None,
-                    reply_to_message_id: Some(9),
-                    topic_id: Some(3),
-                    reply_markup: vec![vec![
-                        ReplyButton::callback("ok", "x")
-                            .emoji(4242)
-                            .style(ButtonStyle::Primary),
-                        ReplyButton::url("打开", "https://example.com"),
-                    ]],
-                    link_preview: Some(false),
-                    timeout_ms: 30_000,
-                },
-            )
-            .unwrap();
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &SendMessageParams {
+                text: Some(Text::plain("hi")),
+                media: None,
+                reply_to_message_id: Some(9),
+                topic_id: Some(3),
+                reply_markup: vec![vec![
+                    ReplyButton::callback("ok", "x")
+                        .emoji(4242)
+                        .style(ButtonStyle::Primary),
+                    ReplyButton::url("打开", "https://example.com"),
+                ]],
+                link_preview: Some(false),
+                timeout_ms: 0,
+            }
+        );
 
         let params = rt.sent_requests()[0].params.clone();
         // 真 `sendMessage` 是 `chat_id topic_id reply_to options reply_markup input_message_content`
@@ -2080,9 +2401,12 @@ mod tests {
         // 真的走一遍 Simplify：离线（没接 TDLib）时不 panic、按纯文本发出去
         let rt = runtime();
         let simplify = simplify(&rt);
-        simplify
-            .send_message(7, &SendMessageParams::text(Text::markdown("**hi**")))
-            .unwrap();
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::text(Text::markdown("**hi**")))
+        );
         let sent = rt.sent_requests();
         assert_eq!(
             sent[0].params["input_message_content"]["text"]["text"],
@@ -2104,51 +2428,54 @@ mod tests {
         let simplify = simplify(&rt);
         let markup = vec![vec![ReplyButton::callback("ok", "x")]];
 
-        simplify
-            .edit_message_text(
-                7,
-                9,
-                &EditTextParams {
-                    text: Some(Text::markdown("*hi*")),
-                    link_preview: Some(false),
-                    reply_markup: markup.clone(),
-                },
-            )
-            .unwrap();
-        simplify
-            .edit_message_caption(
-                7,
-                9,
-                &EditCaptionParams {
-                    text: Some(Text::plain("新标题")),
-                    reply_markup: Vec::new(),
-                },
-            )
-            .unwrap();
-        simplify
-            .edit_message_media(
-                7,
-                9,
-                &EditMediaParams {
-                    text: None,
-                    media: Some(Media::photo("/tmp/a.jpg")),
-                    reply_markup: markup,
-                },
-            )
-            .unwrap();
-        simplify
-            .send_message_album(
-                7,
-                &SendAlbumParams {
-                    medias: vec![Media::photo("/tmp/a.jpg"), Media::photo("/tmp/b.jpg")],
-                    caption: Some(Text::plain("一组图")),
-                    reply_to_message_id: Some(9),
-                    topic_id: Some(3),
-                    timeout_ms: 30_000,
-                },
-            )
-            .unwrap();
-        simplify.delete_message(7, [9, 10], true).unwrap();
+        fire!(
+            simplify,
+            edit_message_text,
+            7,
+            9,
+            &EditTextParams {
+                text: Some(Text::markdown("*hi*")),
+                link_preview: Some(false),
+                reply_markup: markup.clone(),
+                timeout_ms: 0,
+            }
+        );
+        fire!(
+            simplify,
+            edit_message_caption,
+            7,
+            9,
+            &EditCaptionParams {
+                text: Some(Text::plain("新标题")),
+                reply_markup: Vec::new(),
+                timeout_ms: 0,
+            }
+        );
+        fire!(
+            simplify,
+            edit_message_media,
+            7,
+            9,
+            &EditMediaParams {
+                text: None,
+                media: Some(Media::photo("/tmp/a.jpg")),
+                reply_markup: markup,
+                timeout_ms: 0,
+            }
+        );
+        fire!(
+            simplify,
+            send_message_album,
+            7,
+            &SendAlbumParams {
+                medias: vec![Media::photo("/tmp/a.jpg"), Media::photo("/tmp/b.jpg")],
+                caption: Some(Text::plain("一组图")),
+                reply_to_message_id: Some(9),
+                topic_id: Some(3),
+                timeout_ms: 0,
+            }
+        );
+        fire!(simplify, delete_message, 7, [9, 10], true, 0);
 
         let sent = rt.sent_requests();
         let methods: Vec<&str> = sent.iter().map(|request| request.method.as_str()).collect();
@@ -2230,10 +2557,15 @@ mod tests {
         let rt = runtime();
         let simplify = simplify(&rt);
 
-        simplify
-            .edit_message_reply_markup(7, 9, &[vec![ReplyButton::callback("ok", "x")]])
-            .unwrap();
-        simplify.edit_message_reply_markup(7, 9, &[]).unwrap();
+        fire!(
+            simplify,
+            edit_message_reply_markup,
+            7,
+            9,
+            &[vec![ReplyButton::callback("ok", "x")]],
+            0
+        );
+        fire!(simplify, edit_message_reply_markup, 7, 9, &[], 0);
 
         let sent = rt.sent_requests();
         assert_eq!(sent[0].method, "editMessageReplyMarkup");
@@ -2251,16 +2583,20 @@ mod tests {
         );
     }
 
-    /// 模拟 TDLib：看到 `sendMessageAlbum` 就先回响应，再逐条推成功更新。
-    fn album_responder(
+    /// 模拟 TDLib：看到某个方法的请求就回一条响应，再逐条推更新。
+    ///
+    /// 顺序是 TDLib 真实的时间线：**先响应**（里面是还没发出去的临时消息），
+    /// **再一条条结局更新**。
+    fn tdlib_responder(
         rt: Arc<HostRuntime>,
+        method: &'static str,
         response: Value,
         updates: Vec<Value>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let id = loop {
                 let sent = rt.sent_requests();
-                if let Some(request) = sent.iter().find(|r| r.method == "sendMessageAlbum") {
+                if let Some(request) = sent.iter().find(|r| r.method == method) {
                     break request.id;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -2277,15 +2613,131 @@ mod tests {
         })
     }
 
-    /// `sendMessageAlbum` 返回的是 **`Messages`**（一组）：先收 `messages` 数组，
-    /// 再按 `old_message_id` 逐条收 `updateMessageSendSucceeded`。
+    /// 一条「发送成功」的更新：`old_message_id` 是临时消息 id，`message` 是最终消息。
+    fn send_succeeded(old_message_id: i64, message_id: i64) -> Value {
+        json!({
+            "@type": "updateMessageSendSucceeded",
+            "old_message_id": old_message_id,
+            "message": { "@type": "message", "id": message_id, "chat_id": 7 },
+        })
+    }
+
+    /// 一条「发送失败」的更新。
+    fn send_failed(old_message_id: i64, code: i32, message: &str) -> Value {
+        json!({
+            "@type": "updateMessageSendFailed",
+            "old_message_id": old_message_id,
+            "error_code": code,
+            "error_message": message,
+            "message": { "@type": "message", "id": old_message_id, "chat_id": 7 },
+        })
+    }
+
+    /// `send_message` 等到结局：响应 → 成功更新 → 返回最终 `Message`。
     #[test]
-    fn album_wait_success_collects_one_confirmation_per_media() {
+    fn send_message_returns_the_final_message() {
         let rt = runtime();
         let simplify = simplify(&rt);
 
-        let responder = album_responder(
+        let responder = tdlib_responder(
             Arc::clone(&rt),
+            "sendMessage",
+            json!({ "@type": "message", "id": 11, "chat_id": 7 }),
+            vec![send_succeeded(11, 111)],
+        );
+
+        let message = simplify
+            .send_message(
+                7,
+                &SendMessageParams {
+                    timeout_ms: 2_000,
+                    ..SendMessageParams::text("hi")
+                },
+            )
+            .unwrap();
+        responder.join().unwrap();
+
+        assert_eq!(message["id"], 111, "要的是最终消息，不是临时那条");
+        assert_eq!(message["chat_id"], 7);
+    }
+
+    /// 发送失败：`updateMessageSendFailed` 变成 [`SimplifyError::SendFailed`]。
+    #[test]
+    fn send_message_reports_send_failed() {
+        let rt = runtime();
+        let simplify = simplify(&rt);
+
+        let responder = tdlib_responder(
+            Arc::clone(&rt),
+            "sendMessage",
+            json!({ "@type": "message", "id": 11, "chat_id": 7 }),
+            vec![send_failed(11, 429, "Too Many Requests")],
+        );
+
+        let error = simplify
+            .send_message(
+                7,
+                &SendMessageParams {
+                    timeout_ms: 2_000,
+                    ..SendMessageParams::text("hi")
+                },
+            )
+            .unwrap_err();
+        responder.join().unwrap();
+
+        assert!(
+            matches!(error, SimplifyError::SendFailed { code: 429, ref message } if message == "Too Many Requests"),
+            "失败要连错误码一起带回来：{error:?}"
+        );
+    }
+
+    /// 等到超时：先撤回那条还没发出去的消息，再返回 [`SimplifyError::Timeout`]。
+    #[test]
+    fn send_message_cancels_the_pending_message_on_timeout() {
+        let rt = runtime();
+        let simplify = simplify(&rt);
+
+        // 只回响应（临时消息），不发任何结局更新
+        let responder = tdlib_responder(
+            Arc::clone(&rt),
+            "sendMessage",
+            json!({ "@type": "message", "id": 11, "chat_id": 7 }),
+            Vec::new(),
+        );
+
+        let error = simplify
+            .send_message(
+                7,
+                &SendMessageParams {
+                    timeout_ms: 200,
+                    ..SendMessageParams::text("hi")
+                },
+            )
+            .unwrap_err();
+        responder.join().unwrap();
+
+        assert!(matches!(error, SimplifyError::Timeout(200)), "{error:?}");
+
+        // 超时补救：把那条临时消息撤回来（revoke = true）
+        let cancellation = rt
+            .sent_requests()
+            .into_iter()
+            .find(|request| request.method == "deleteMessages")
+            .expect("超时该撤回那条没发出去的消息");
+        assert_eq!(cancellation.params["message_ids"], json!([11]));
+        assert_eq!(cancellation.params["revoke"], true);
+    }
+
+    /// 相册返回的是 **`Messages`**（一组）：先收 `messages` 数组，
+    /// 再按 `old_message_id` 逐条收结局；全部成功才返回。
+    #[test]
+    fn album_waits_for_every_item() {
+        let rt = runtime();
+        let simplify = simplify(&rt);
+
+        let responder = tdlib_responder(
+            Arc::clone(&rt),
+            "sendMessageAlbum",
             json!({
                 "@type": "messages",
                 "total_count": 2,
@@ -2294,22 +2746,11 @@ mod tests {
                     { "@type": "message", "id": 12, "chat_id": 7 },
                 ],
             }),
-            vec![
-                json!({
-                    "@type": "updateMessageSendSucceeded",
-                    "old_message_id": 11,
-                    "message": { "@type": "message", "id": 111, "chat_id": 7 },
-                }),
-                json!({
-                    "@type": "updateMessageSendSucceeded",
-                    "old_message_id": 12,
-                    "message": { "@type": "message", "id": 112, "chat_id": 7 },
-                }),
-            ],
+            vec![send_succeeded(11, 111), send_succeeded(12, 112)],
         );
 
-        let result = simplify
-            .send_message_album_wait_success(
+        let messages = simplify
+            .send_message_album(
                 7,
                 &SendAlbumParams {
                     medias: vec![Media::photo("/tmp/a.jpg"), Media::photo("/tmp/b.jpg")],
@@ -2320,20 +2761,22 @@ mod tests {
             .unwrap();
         responder.join().unwrap();
 
-        assert_eq!(result.pending.len(), 2, "响应里的临时消息要原样留着");
-        assert!(result.error.is_none());
-        assert!(result.confirmed(), "两项都该等到最终消息：{result:?}");
-        assert_eq!(result.message_ids(), vec![Some(111), Some(112)]);
+        let ids: Vec<i64> = messages
+            .iter()
+            .map(|message| message["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![111, 112], "与 medias 同序的最终消息");
     }
 
-    /// 只回来一半：没等到的那一项是 `Null`，`confirmed()` 为假。
+    /// 相册里**任一项**失败就是失败。
     #[test]
-    fn album_wait_success_keeps_missing_slots_null() {
+    fn album_reports_the_first_failure() {
         let rt = runtime();
         let simplify = simplify(&rt);
 
-        let responder = album_responder(
+        let responder = tdlib_responder(
             Arc::clone(&rt),
+            "sendMessageAlbum",
             json!({
                 "@type": "messages",
                 "total_count": 2,
@@ -2342,43 +2785,42 @@ mod tests {
                     { "@type": "message", "id": 12, "chat_id": 7 },
                 ],
             }),
-            vec![json!({
-                "@type": "updateMessageSendSucceeded",
-                "old_message_id": 11,
-                "message": { "@type": "message", "id": 111, "chat_id": 7 },
-            })],
+            vec![send_succeeded(11, 111), send_failed(12, 400, "Bad file")],
         );
 
-        let result = simplify
-            .send_message_album_wait_success(
+        let error = simplify
+            .send_message_album(
                 7,
                 &SendAlbumParams {
                     medias: vec![Media::photo("/tmp/a.jpg"), Media::photo("/tmp/b.jpg")],
-                    timeout_ms: 300,
+                    timeout_ms: 2_000,
                     ..SendAlbumParams::default()
                 },
             )
-            .unwrap();
+            .unwrap_err();
         responder.join().unwrap();
 
-        assert_eq!(result.message_ids(), vec![Some(111), None]);
-        assert!(!result.confirmed());
+        assert!(
+            matches!(error, SimplifyError::SendFailed { code: 400, ref message } if message == "Bad file"),
+            "{error:?}"
+        );
     }
 
-    /// 响应是 `error`：整组都没发出去，`error` 留着、`pending` 为空。
+    /// 方法被 TDLib 拒了（响应是 `error`）：根本没进发送阶段。
     #[test]
-    fn album_wait_success_reports_the_tdlib_error() {
+    fn album_reports_the_tdlib_error() {
         let rt = runtime();
         let simplify = simplify(&rt);
 
-        let responder = album_responder(
+        let responder = tdlib_responder(
             Arc::clone(&rt),
+            "sendMessageAlbum",
             json!({ "@type": "error", "code": 400, "message": "Album is too big" }),
             Vec::new(),
         );
 
-        let result = simplify
-            .send_message_album_wait_success(
+        let error = simplify
+            .send_message_album(
                 7,
                 &SendAlbumParams {
                     medias: vec![Media::photo("/tmp/a.jpg"), Media::photo("/tmp/b.jpg")],
@@ -2386,16 +2828,154 @@ mod tests {
                     ..SendAlbumParams::default()
                 },
             )
-            .unwrap();
+            .unwrap_err();
         responder.join().unwrap();
 
-        assert_eq!(
-            result.error.as_ref().unwrap()["message"],
-            "Album is too big"
+        assert!(
+            matches!(error, SimplifyError::Tdlib { code: 400, ref message } if message == "Album is too big"),
+            "{error:?}"
         );
-        assert!(result.pending.is_empty());
-        assert!(result.messages.is_empty());
-        assert!(!result.confirmed());
+        assert!(
+            !rt.sent_requests()
+                .iter()
+                .any(|request| request.method == "deleteMessages"),
+            "没发出去就不该有撤回"
+        );
+    }
+
+    /// 编辑没有「发送成功 / 失败」那一对更新：结果就是**响应**。
+    #[test]
+    fn edit_waits_for_the_response() {
+        let rt = runtime();
+        let simplify = simplify(&rt);
+
+        // 成功：拿到改完的 Message
+        let responder = tdlib_responder(
+            Arc::clone(&rt),
+            "editMessageText",
+            json!({ "@type": "message", "id": 9, "chat_id": 7 }),
+            Vec::new(),
+        );
+        let message = simplify
+            .edit_message_text(
+                7,
+                9,
+                &EditTextParams {
+                    text: Some(Text::plain("改过")),
+                    timeout_ms: 2_000,
+                    ..EditTextParams::default()
+                },
+            )
+            .unwrap();
+        responder.join().unwrap();
+        assert_eq!(message["id"], 9);
+    }
+
+    /// 编辑被 TDLib 拒了：`Message is not modified` 这类失败是**响应里的 error**。
+    #[test]
+    fn edit_reports_the_tdlib_error() {
+        let rt = runtime();
+        let simplify = simplify(&rt);
+
+        let responder = tdlib_responder(
+            Arc::clone(&rt),
+            "editMessageMedia",
+            json!({ "@type": "error", "code": 400, "message": "Message is not modified" }),
+            Vec::new(),
+        );
+        let error = simplify
+            .edit_message_media(
+                7,
+                9,
+                &EditMediaParams {
+                    media: Some(Media::photo("/tmp/a.jpg")),
+                    timeout_ms: 2_000,
+                    ..EditMediaParams::default()
+                },
+            )
+            .unwrap_err();
+        responder.join().unwrap();
+        assert!(
+            matches!(error, SimplifyError::Tdlib { code: 400, ref message } if message == "Message is not modified"),
+            "{error:?}"
+        );
+    }
+
+    /// 删除：等到响应，成功就是 `Ok(())`（TDLib 的 `ok` 没有内容）。
+    #[test]
+    fn delete_waits_for_the_response() {
+        let rt = runtime();
+        let simplify = simplify(&rt);
+
+        let responder = tdlib_responder(
+            Arc::clone(&rt),
+            "deleteMessages",
+            json!({ "@type": "ok" }),
+            Vec::new(),
+        );
+        simplify.delete_message(7, [9, 10], true, 2_000).unwrap();
+        responder.join().unwrap();
+    }
+
+    /// 回 callback query 失败（query 太老 / 已过期）：不再是静默的。
+    #[test]
+    fn answer_callback_query_reports_the_tdlib_error() {
+        let rt = runtime();
+        let simplify = simplify(&rt);
+
+        let responder = tdlib_responder(
+            Arc::clone(&rt),
+            "answerCallbackQuery",
+            json!({ "@type": "error", "code": 400, "message": "Query is too old" }),
+            Vec::new(),
+        );
+        let error = simplify
+            .answer_callback_query(555, Some("好的"), true, 2_000)
+            .unwrap_err();
+        responder.join().unwrap();
+        assert!(
+            matches!(error, SimplifyError::Tdlib { code: 400, .. }),
+            "{error:?}"
+        );
+    }
+
+    /// `*_then` 不阻塞：调用立刻返回，结局从另一个线程交给闭包。
+    #[test]
+    fn then_variants_hand_the_result_to_the_callback() {
+        let rt = runtime();
+        let simplify = simplify(&rt);
+
+        let responder = tdlib_responder(
+            Arc::clone(&rt),
+            "sendMessage",
+            json!({ "@type": "message", "id": 11, "chat_id": 7 }),
+            vec![send_succeeded(11, 111)],
+        );
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        simplify.send_message_then(
+            7,
+            &SendMessageParams {
+                timeout_ms: 2_000,
+                ..SendMessageParams::text("hi")
+            },
+            move |result| {
+                let _ = sender.send(result.map(|message| message["id"].as_i64().unwrap()));
+            },
+        );
+        // 关键：调用线程没有等在这里
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "then 不该阻塞调用线程：{:?}",
+            started.elapsed()
+        );
+
+        let got = receiver
+            .recv_timeout(Duration::from_millis(2_000))
+            .expect("结局该从另一个线程送回来");
+        responder.join().unwrap();
+        assert_eq!(got.unwrap(), 111);
     }
 
     #[test]
@@ -2454,20 +3034,20 @@ mod tests {
         let rt = runtime();
         let simplify = simplify(&rt);
 
-        let request = simplify
-            .send_message(
-                7,
-                &SendMessageParams {
-                    text: Some(Text::plain("选一个")),
-                    reply_markup: vec![vec![
-                        ReplyButton::callback("A", "a"),
-                        ReplyButton::callback("B", "b"),
-                    ]],
-                    ..SendMessageParams::default()
-                },
-            )
-            .unwrap();
-        assert!(request.is_valid());
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &SendMessageParams {
+                text: Some(Text::plain("选一个")),
+                reply_markup: vec![vec![
+                    ReplyButton::callback("A", "a"),
+                    ReplyButton::callback("B", "b"),
+                ]],
+                timeout_ms: 0,
+                ..SendMessageParams::default()
+            }
+        );
 
         // 模拟一条 callback query 更新：chat_id 在顶层，所以要 flat
         let payload = json!({
@@ -2492,11 +3072,8 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 1, "插件该收到回调查询");
         drop(listener);
 
-        // 收到回调查询后回一条
-        let answered = simplify
-            .answer_callback_query(555, Some("好的"), true)
-            .unwrap();
-        assert!(answered.is_valid());
+        // 收到回调查询后回一条（离线环境拿不到响应，超时也算把请求发出去了）
+        fire!(simplify, answer_callback_query, 555, Some("好的"), true, 0);
 
         let sent = rt.sent_requests();
         let answer = sent.last().unwrap();
@@ -2640,174 +3217,193 @@ mod tests {
         ]];
 
         // 尽可能多地把 Simplify 的请求拼法都走一遍（拿不到响应没关系，请求已经留档了）。
-        simplify
-            .send_message(7, &SendMessageParams::text("hi"))
-            .unwrap();
-        simplify
-            .send_message(
-                7,
-                &SendMessageParams {
-                    text: Some(Text::markdown_v2("*hi*")),
-                    media: None,
-                    reply_to_message_id: Some(9),
-                    topic_id: Some(3),
-                    reply_markup: markup.clone(),
-                    link_preview: Some(false),
-                    timeout_ms: 30_000,
-                },
-            )
-            .unwrap();
-        simplify
-            .send_message(
-                7,
-                &SendMessageParams {
-                    text: Some(Text::plain("标题")),
-                    media: Some(Media::photo("/tmp/a.jpg")),
-                    ..SendMessageParams::default()
-                },
-            )
-            .unwrap();
-        simplify
-            .send_message(7, &SendMessageParams::media(Media::document("/tmp/a.pdf")))
-            .unwrap();
-        simplify
-            .send_message(
-                7,
-                &SendMessageParams::media(Media::Video {
-                    file: "/tmp/a.mp4".into(),
-                    caption: Some(Text::plain("视频")),
-                    duration: 3,
-                    width: 640,
-                    height: 480,
-                    supports_streaming: true,
-                    has_spoiler: true,
-                }),
-            )
-            .unwrap();
-        simplify
-            .send_message(
-                7,
-                &SendMessageParams::media(Media::Audio {
-                    file: "/tmp/a.mp3".into(),
-                    caption: None,
-                    duration: 12,
-                    title: "标题".to_owned(),
-                    performer: "作者".to_owned(),
-                }),
-            )
-            .unwrap();
-        simplify
-            .send_message(
-                7,
-                &SendMessageParams::media(Media::Animation {
-                    file: "/tmp/a.gif".into(),
-                    caption: None,
-                    duration: 1,
-                    width: 10,
-                    height: 10,
-                    has_spoiler: false,
-                }),
-            )
-            .unwrap();
-        simplify
-            .send_message(
-                7,
-                &SendMessageParams::media(Media::Sticker {
-                    file: "/tmp/a.webp".into(),
-                    emoji: "😀".to_owned(),
-                    width: 512,
-                    height: 512,
-                }),
-            )
-            .unwrap();
-        simplify
-            .send_message(7, &SendMessageParams::media(Media::location(1.5, 2.5)))
-            .unwrap();
-        simplify
-            .send_message_album(
-                7,
-                &SendAlbumParams {
-                    medias: vec![Media::photo("/tmp/a.jpg"), Media::photo("/tmp/b.jpg")],
-                    caption: Some(Text::plain("一组")),
-                    reply_to_message_id: Some(9),
-                    topic_id: Some(3),
-                    timeout_ms: 30_000,
-                },
-            )
-            .unwrap();
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::text("hi"))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &SendMessageParams {
+                text: Some(Text::markdown_v2("*hi*")),
+                media: None,
+                reply_to_message_id: Some(9),
+                topic_id: Some(3),
+                reply_markup: markup.clone(),
+                link_preview: Some(false),
+                timeout_ms: 0,
+            }
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &SendMessageParams {
+                text: Some(Text::plain("标题")),
+                media: Some(Media::photo("/tmp/a.jpg")),
+                timeout_ms: 0,
+                ..SendMessageParams::default()
+            }
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::document("/tmp/a.pdf")))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::Video {
+                file: "/tmp/a.mp4".into(),
+                caption: Some(Text::plain("视频")),
+                duration: 3,
+                width: 640,
+                height: 480,
+                supports_streaming: true,
+                has_spoiler: true,
+            }))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::Audio {
+                file: "/tmp/a.mp3".into(),
+                caption: None,
+                duration: 12,
+                title: "标题".to_owned(),
+                performer: "作者".to_owned(),
+            }))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::Animation {
+                file: "/tmp/a.gif".into(),
+                caption: None,
+                duration: 1,
+                width: 10,
+                height: 10,
+                has_spoiler: false,
+            }))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::Sticker {
+                file: "/tmp/a.webp".into(),
+                emoji: "😀".to_owned(),
+                width: 512,
+                height: 512,
+            }))
+        );
+        fire!(
+            simplify,
+            send_message,
+            7,
+            &quick!(SendMessageParams::media(Media::location(1.5, 2.5)))
+        );
+        simplify.send_message_album(
+            7,
+            &SendAlbumParams {
+                medias: vec![Media::photo("/tmp/a.jpg"), Media::photo("/tmp/b.jpg")],
+                caption: Some(Text::plain("一组")),
+                reply_to_message_id: Some(9),
+                topic_id: Some(3),
+                timeout_ms: 0,
+            },
+        );
         // 富消息：本地 md → blocks、服务端 md 源、以及编辑
-        simplify
-            .send_rich_message(
-                7,
-                &RichMessageParams {
-                    reply_to_message_id: Some(9),
-                    topic_id: Some(3),
-                    reply_markup: markup.clone(),
-                    clear_draft: true,
-                    ..RichMessageParams::markdown(
-                        "# 标题\n\n**粗** 与 [链接](https://example.com)\n\n- 一\n- 二\n\n```rust\nfn main() {}\n```",
-                    )
-                },
-            )
-            .unwrap();
-        simplify
-            .send_rich_message(
-                7,
-                &RichMessageParams::new(
-                    RichMessage::server_markdown("*hi*")
-                        .with_media(vec![RichMedia::new("cover", Media::photo("/tmp/a.jpg"))]),
-                ),
-            )
-            .unwrap();
-        simplify
-            .edit_rich_message(7, 9, &RichMessageParams::markdown("改过"))
-            .unwrap();
+        fire!(
+            simplify,
+            send_rich_message,
+            7,
+            &RichMessageParams {
+                reply_to_message_id: Some(9),
+                topic_id: Some(3),
+                reply_markup: markup.clone(),
+                clear_draft: true,
+                timeout_ms: 0,
+                ..RichMessageParams::markdown(
+                    "# 标题\n\n**粗** 与 [链接](https://example.com)\n\n- 一\n- 二\n\n```rust\nfn main() {}\n```",
+                )
+            }
+        );
+        fire!(
+            simplify,
+            send_rich_message,
+            7,
+            &quick!(RichMessageParams::new(
+                RichMessage::server_markdown("*hi*")
+                    .with_media(vec![RichMedia::new("cover", Media::photo("/tmp/a.jpg"))]),
+            ))
+        );
+        fire!(
+            simplify,
+            edit_rich_message,
+            7,
+            9,
+            &quick!(RichMessageParams::markdown("改过"))
+        );
         // 空富消息在本地就被挡住，不会白跑一次往返
         assert!(matches!(
             simplify.send_rich_message(7, &RichMessageParams::default()),
             Err(SimplifyError::EmptyRichMessage)
         ));
-        simplify
-            .edit_message_text(
-                7,
-                9,
-                &EditTextParams {
-                    text: Some(Text::markdown_v2("*hi*")),
-                    link_preview: Some(false),
-                    reply_markup: markup.clone(),
-                },
-            )
-            .unwrap();
-        simplify
-            .edit_message_caption(
-                7,
-                9,
-                &EditCaptionParams {
-                    text: Some(Text::plain("标题")),
-                    reply_markup: Vec::new(),
-                },
-            )
-            .unwrap();
-        simplify
-            .edit_message_media(
-                7,
-                9,
-                &EditMediaParams {
-                    text: Some(Text::plain("新标题")),
-                    media: Some(Media::document("/tmp/a.pdf")),
-                    reply_markup: markup,
-                },
-            )
-            .unwrap();
-        simplify
-            .edit_message_reply_markup(7, 9, &[vec![ReplyButton::callback("ok", "x")]])
-            .unwrap();
+        fire!(
+            simplify,
+            edit_message_text,
+            7,
+            9,
+            &EditTextParams {
+                text: Some(Text::markdown_v2("*hi*")),
+                link_preview: Some(false),
+                reply_markup: markup.clone(),
+                timeout_ms: 0,
+            }
+        );
+        fire!(
+            simplify,
+            edit_message_caption,
+            7,
+            9,
+            &EditCaptionParams {
+                text: Some(Text::plain("标题")),
+                reply_markup: Vec::new(),
+                timeout_ms: 0,
+            }
+        );
+        fire!(
+            simplify,
+            edit_message_media,
+            7,
+            9,
+            &EditMediaParams {
+                text: Some(Text::plain("新标题")),
+                media: Some(Media::document("/tmp/a.pdf")),
+                reply_markup: markup,
+                timeout_ms: 0,
+            }
+        );
+        fire!(
+            simplify,
+            edit_message_reply_markup,
+            7,
+            9,
+            &[vec![ReplyButton::callback("ok", "x")]],
+            0
+        );
         // 空键盘 = 移除键盘：reply_markup 是必需字段，不能省
-        simplify.edit_message_reply_markup(7, 9, &[]).unwrap();
-        simplify.delete_message(7, [9, 10], true).unwrap();
-        simplify
-            .answer_callback_query(555, Some("好的"), true)
-            .unwrap();
+        fire!(simplify, edit_message_reply_markup, 7, 9, &[], 0);
+        fire!(simplify, delete_message, 7, [9, 10], true, 0);
+        fire!(simplify, answer_callback_query, 555, Some("好的"), true, 0);
         // 不等响应：超时也照样说明请求发出去了
         let _ = simplify.download_file(99, 1, 10);
 
