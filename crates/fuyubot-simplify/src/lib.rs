@@ -605,6 +605,298 @@ impl Media {
         }
     }
 
+    /// 剧透：发过去先被遮住，点一下才看得见。
+    ///
+    /// 只对图 / 视频 / 动图有效（真 `td_api.tl` 里只有这三个 `inputMessage*` 有
+    /// `has_spoiler`），其余变体原样返回。
+    pub fn spoiler(self, has_spoiler: bool) -> Self {
+        match self {
+            Self::Photo {
+                file,
+                caption,
+                thumbnail,
+                width,
+                height,
+                ..
+            } => Self::Photo {
+                file,
+                caption,
+                thumbnail,
+                width,
+                height,
+                has_spoiler,
+            },
+            Self::Video {
+                file,
+                caption,
+                thumbnail,
+                cover,
+                start_timestamp,
+                duration,
+                width,
+                height,
+                supports_streaming,
+                ..
+            } => Self::Video {
+                file,
+                caption,
+                thumbnail,
+                cover,
+                start_timestamp,
+                duration,
+                width,
+                height,
+                supports_streaming,
+                has_spoiler,
+            },
+            Self::Animation {
+                file,
+                caption,
+                thumbnail,
+                duration,
+                width,
+                height,
+                ..
+            } => Self::Animation {
+                file,
+                caption,
+                thumbnail,
+                duration,
+                width,
+                height,
+                has_spoiler,
+            },
+            other => other,
+        }
+    }
+
+    /// 宽高（图 / 视频 / 动图 / 贴纸）。填 `0` 让 TDLib 自己读真实值。
+    pub fn size(self, width: i32, height: i32) -> Self {
+        match self {
+            Self::Photo {
+                file,
+                caption,
+                thumbnail,
+                has_spoiler,
+                ..
+            } => Self::Photo {
+                file,
+                caption,
+                thumbnail,
+                width,
+                height,
+                has_spoiler,
+            },
+            Self::Video {
+                file,
+                caption,
+                thumbnail,
+                cover,
+                start_timestamp,
+                duration,
+                supports_streaming,
+                has_spoiler,
+                ..
+            } => Self::Video {
+                file,
+                caption,
+                thumbnail,
+                cover,
+                start_timestamp,
+                duration,
+                width,
+                height,
+                supports_streaming,
+                has_spoiler,
+            },
+            Self::Animation {
+                file,
+                caption,
+                thumbnail,
+                duration,
+                has_spoiler,
+                ..
+            } => Self::Animation {
+                file,
+                caption,
+                thumbnail,
+                duration,
+                width,
+                height,
+                has_spoiler,
+            },
+            Self::Sticker {
+                file,
+                emoji,
+                thumbnail,
+                ..
+            } => Self::Sticker {
+                file,
+                emoji,
+                thumbnail,
+                width,
+                height,
+            },
+            other => other,
+        }
+    }
+
+    /// 时长（秒）。图 / 文档 / 贴纸 / 位置没有时长，原样返回。
+    pub fn duration(self, duration: i32) -> Self {
+        match self {
+            Self::Video {
+                file,
+                caption,
+                thumbnail,
+                cover,
+                start_timestamp,
+                width,
+                height,
+                supports_streaming,
+                has_spoiler,
+                ..
+            } => Self::Video {
+                file,
+                caption,
+                thumbnail,
+                cover,
+                start_timestamp,
+                duration,
+                width,
+                height,
+                supports_streaming,
+                has_spoiler,
+            },
+            Self::Audio {
+                file,
+                caption,
+                album_cover_thumbnail,
+                title,
+                performer,
+                ..
+            } => Self::Audio {
+                file,
+                caption,
+                album_cover_thumbnail,
+                duration,
+                title,
+                performer,
+            },
+            Self::Animation {
+                file,
+                caption,
+                thumbnail,
+                width,
+                height,
+                has_spoiler,
+                ..
+            } => Self::Animation {
+                file,
+                caption,
+                thumbnail,
+                duration,
+                width,
+                height,
+                has_spoiler,
+            },
+            other => other,
+        }
+    }
+
+    /// 视频按流式发（不传完就能播）。只对 [`Media::Video`] 有效。
+    pub fn streaming(self, supports_streaming: bool) -> Self {
+        match self {
+            Self::Video {
+                file,
+                caption,
+                thumbnail,
+                cover,
+                start_timestamp,
+                duration,
+                width,
+                height,
+                has_spoiler,
+                ..
+            } => Self::Video {
+                file,
+                caption,
+                thumbnail,
+                cover,
+                start_timestamp,
+                duration,
+                width,
+                height,
+                supports_streaming,
+                has_spoiler,
+            },
+            other => other,
+        }
+    }
+
+    /// 音频的曲名。只对 [`Media::Audio`] 有效。
+    pub fn title(self, title: impl Into<String>) -> Self {
+        match self {
+            Self::Audio {
+                file,
+                caption,
+                album_cover_thumbnail,
+                duration,
+                performer,
+                ..
+            } => Self::Audio {
+                file,
+                caption,
+                album_cover_thumbnail,
+                duration,
+                title: title.into(),
+                performer,
+            },
+            other => other,
+        }
+    }
+
+    /// 音频的演唱者。只对 [`Media::Audio`] 有效。
+    pub fn performer(self, performer: impl Into<String>) -> Self {
+        match self {
+            Self::Audio {
+                file,
+                caption,
+                album_cover_thumbnail,
+                duration,
+                title,
+                ..
+            } => Self::Audio {
+                file,
+                caption,
+                album_cover_thumbnail,
+                duration,
+                title,
+                performer: performer.into(),
+            },
+            other => other,
+        }
+    }
+
+    /// 贴纸关联的 emoji。只对 [`Media::Sticker`] 有效。
+    pub fn emoji(self, emoji: impl Into<String>) -> Self {
+        match self {
+            Self::Sticker {
+                file,
+                thumbnail,
+                width,
+                height,
+                ..
+            } => Self::Sticker {
+                file,
+                emoji: emoji.into(),
+                thumbnail,
+                width,
+                height,
+            },
+            other => other,
+        }
+    }
+
     /// 给带标题的媒体挂一段文本（贴纸/位置没有标题，原样返回）。
     pub fn caption(self, text: impl Into<Text>) -> Self {
         let caption = Some(text.into());
@@ -2745,6 +3037,96 @@ mod tests {
         );
     }
 
+    /// 链式设置器：`spoiler` / `size` / `duration` / `streaming` / `title` /
+    /// `performer` / `emoji`。只对**真签名里有那个参数**的变体生效，其余原样返回。
+    #[test]
+    fn media_setters_touch_only_the_variants_that_have_the_field() {
+        // 剧透：图 / 视频 / 动图有 has_spoiler
+        let content = content_json(&Media::photo("/tmp/a.jpg").spoiler(true), &plain_text);
+        assert_eq!(content["@type"], "inputMessagePhoto");
+        assert_eq!(content["has_spoiler"], true);
+        let content = content_json(&Media::video("/tmp/a.mp4").spoiler(true), &plain_text);
+        assert_eq!(content["has_spoiler"], true);
+        let content = content_json(
+            &Media::Animation {
+                file: "/tmp/a.gif".into(),
+                caption: None,
+                thumbnail: None,
+                duration: 1,
+                width: 10,
+                height: 10,
+                has_spoiler: false,
+            }
+            .spoiler(true),
+            &plain_text,
+        );
+        assert_eq!(content["has_spoiler"], true);
+        // 文档没有 has_spoiler：设了也不该冒出这个键
+        let content = content_json(&Media::document("/tmp/a.pdf").spoiler(true), &plain_text);
+        assert!(content.get("has_spoiler").is_none(), "{content}");
+
+        // 尺寸 / 时长 / 流式（视频那三个都在 `inputVideo` 上）
+        let content = content_json(
+            &Media::video("/tmp/a.mp4")
+                .size(640, 480)
+                .duration(3)
+                .streaming(true),
+            &plain_text,
+        );
+        assert_eq!(content["video"]["width"], 640);
+        assert_eq!(content["video"]["height"], 480);
+        assert_eq!(content["video"]["duration"], 3);
+        assert_eq!(content["video"]["supports_streaming"], true);
+
+        // 音频：title / performer / duration
+        let content = content_json(
+            &Media::Audio {
+                file: "/tmp/a.mp3".into(),
+                caption: None,
+                album_cover_thumbnail: None,
+                duration: 0,
+                title: String::new(),
+                performer: String::new(),
+            }
+            .duration(12)
+            .title("标题")
+            .performer("作者"),
+            &plain_text,
+        );
+        assert_eq!(content["audio"]["duration"], 12);
+        assert_eq!(content["audio"]["title"], "标题");
+        assert_eq!(content["audio"]["performer"], "作者");
+
+        // 贴纸：emoji + 尺寸
+        let content = content_json(
+            &Media::Sticker {
+                file: "/tmp/a.webp".into(),
+                emoji: "🙂".to_owned(),
+                thumbnail: None,
+                width: 0,
+                height: 0,
+            }
+            .emoji("😀")
+            .size(512, 512),
+            &plain_text,
+        );
+        assert_eq!(content["emoji"], "😀");
+        assert_eq!(content["sticker"]["width"], 512);
+        assert_eq!(content["sticker"]["height"], 512);
+
+        // 设置器之间不互相抹掉：caption + thumbnail + spoiler 一起给
+        let content = content_json(
+            &Media::photo("/tmp/a.jpg")
+                .spoiler(true)
+                .thumbnail("/tmp/thumb.jpg")
+                .caption("标题"),
+            &plain_text,
+        );
+        assert_eq!(content["has_spoiler"], true);
+        assert_eq!(content["photo"]["thumbnail"]["@type"], "inputThumbnail");
+        assert_eq!(content["caption"]["text"], "标题");
+    }
+
     /// Markdown / HTML 的转换**只有一条路**：交给 TDLib 的 `parseTextEntities`。
     ///
     /// 这里钉住三件事：模式到 `TextParseMode` 的映射（真 `td_api.tl` 的构造器名 + 版本号）、
@@ -3667,6 +4049,10 @@ mod tests {
                     // 缩略图 + 封面帧（从第 3 秒开始播）
                     .thumbnail(Thumbnail::new("/tmp/thumb.jpg").size(320, 240))
                     .cover("/tmp/cover.jpg", 3)
+                    .size(640, 480)
+                    .duration(3)
+                    .streaming(true)
+                    .spoiler(true)
             ))
         );
         fire!(
