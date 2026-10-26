@@ -310,14 +310,74 @@ impl From<String> for InputFile {
     }
 }
 
+/// 一张缩略图 / 封面（`inputThumbnail`）。
+///
+/// 真 `td_api.tl`：`inputThumbnail thumbnail:InputFile width:int32 height:int32 = InputThumbnail`。
+/// 宽高填 `0` 让 TDLib 自己判断。没设置（[`None`]）时**整个字段不发**——
+/// 真库文档写的是「pass null to skip thumbnail uploading」，省略同样是「没传」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thumbnail {
+    pub file: InputFile,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Thumbnail {
+    /// 一张缩略图；尺寸交给 TDLib 自己判断。
+    pub fn new(file: impl Into<InputFile>) -> Self {
+        Self {
+            file: file.into(),
+            width: 0,
+            height: 0,
+        }
+    }
+
+    pub fn size(self, width: i32, height: i32) -> Self {
+        Self {
+            width,
+            height,
+            ..self
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "@type": "inputThumbnail",
+            "thumbnail": self.file.to_json(),
+            "width": self.width,
+            "height": self.height,
+        })
+    }
+}
+
+impl From<&str> for Thumbnail {
+    fn from(path: &str) -> Self {
+        Self::new(path)
+    }
+}
+
+impl From<String> for Thumbnail {
+    fn from(path: String) -> Self {
+        Self::new(path)
+    }
+}
+
+impl From<InputFile> for Thumbnail {
+    fn from(file: InputFile) -> Self {
+        Self::new(file)
+    }
+}
+
 /// 媒体内容（对应 TDLib 的各个 `inputMessage*` 构造器）。
 ///
 /// 尺寸/时长这些填 `0` 也没关系（TDLib 会自己读真实值），要精确控制再填。
+/// `thumbnail` 同理：不给就不发这个字段（TDLib 自己抽，或者干脆没有）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Media {
     Photo {
         file: InputFile,
         caption: Option<Text>,
+        thumbnail: Option<Thumbnail>,
         width: i32,
         height: i32,
         has_spoiler: bool,
@@ -325,6 +385,11 @@ pub enum Media {
     Video {
         file: InputFile,
         caption: Option<Text>,
+        thumbnail: Option<Thumbnail>,
+        /// 视频封面（那一帧的画面文件）。⚠️ 秘密聊天和阅后即焚消息不支持。
+        cover: Option<InputFile>,
+        /// 从视频的第几秒开始播。
+        start_timestamp: Option<i32>,
         duration: i32,
         width: i32,
         height: i32,
@@ -334,6 +399,8 @@ pub enum Media {
     Audio {
         file: InputFile,
         caption: Option<Text>,
+        /// 专辑封面（真 `inputAudio` 里叫 `album_cover_thumbnail`）。
+        album_cover_thumbnail: Option<Thumbnail>,
         duration: i32,
         title: String,
         performer: String,
@@ -341,10 +408,12 @@ pub enum Media {
     Document {
         file: InputFile,
         caption: Option<Text>,
+        thumbnail: Option<Thumbnail>,
     },
     Animation {
         file: InputFile,
         caption: Option<Text>,
+        thumbnail: Option<Thumbnail>,
         duration: i32,
         width: i32,
         height: i32,
@@ -353,6 +422,7 @@ pub enum Media {
     Sticker {
         file: InputFile,
         emoji: String,
+        thumbnail: Option<Thumbnail>,
         width: i32,
         height: i32,
     },
@@ -368,8 +438,25 @@ impl Media {
         Self::Photo {
             file: file.into(),
             caption: None,
+            thumbnail: None,
             width: 0,
             height: 0,
+            has_spoiler: false,
+        }
+    }
+
+    /// 一段视频（尺寸/时长交给 TDLib 自己判断）。
+    pub fn video(file: impl Into<InputFile>) -> Self {
+        Self::Video {
+            file: file.into(),
+            caption: None,
+            thumbnail: None,
+            cover: None,
+            start_timestamp: None,
+            duration: 0,
+            width: 0,
+            height: 0,
+            supports_streaming: false,
             has_spoiler: false,
         }
     }
@@ -379,6 +466,7 @@ impl Media {
         Self::Document {
             file: file.into(),
             caption: None,
+            thumbnail: None,
         }
     }
 
@@ -389,12 +477,13 @@ impl Media {
         }
     }
 
-    /// 给带标题的媒体挂一段文本（贴纸/位置没有标题，原样返回）。
-    pub fn caption(self, text: impl Into<Text>) -> Self {
-        let caption = Some(text.into());
+    /// 挂一张缩略图 / 封面（位置没有缩略图，原样返回）。
+    pub fn thumbnail(self, thumbnail: impl Into<Thumbnail>) -> Self {
+        let thumbnail = Some(thumbnail.into());
         match self {
             Self::Photo {
                 file,
+                caption,
                 width,
                 height,
                 has_spoiler,
@@ -402,12 +491,16 @@ impl Media {
             } => Self::Photo {
                 file,
                 caption,
+                thumbnail,
                 width,
                 height,
                 has_spoiler,
             },
             Self::Video {
                 file,
+                caption,
+                cover,
+                start_timestamp,
                 duration,
                 width,
                 height,
@@ -417,6 +510,9 @@ impl Media {
             } => Self::Video {
                 file,
                 caption,
+                thumbnail,
+                cover,
+                start_timestamp,
                 duration,
                 width,
                 height,
@@ -425,6 +521,7 @@ impl Media {
             },
             Self::Audio {
                 file,
+                caption,
                 duration,
                 title,
                 performer,
@@ -432,13 +529,19 @@ impl Media {
             } => Self::Audio {
                 file,
                 caption,
+                album_cover_thumbnail: thumbnail,
                 duration,
                 title,
                 performer,
             },
-            Self::Document { file, .. } => Self::Document { file, caption },
+            Self::Document { file, caption, .. } => Self::Document {
+                file,
+                caption,
+                thumbnail,
+            },
             Self::Animation {
                 file,
+                caption,
                 duration,
                 width,
                 height,
@@ -447,6 +550,137 @@ impl Media {
             } => Self::Animation {
                 file,
                 caption,
+                thumbnail,
+                duration,
+                width,
+                height,
+                has_spoiler,
+            },
+            Self::Sticker {
+                file,
+                emoji,
+                width,
+                height,
+                ..
+            } => Self::Sticker {
+                file,
+                emoji,
+                thumbnail,
+                width,
+                height,
+            },
+            other => other,
+        }
+    }
+
+    /// 给视频挑一帧做封面，并指定从第几秒开始播（`cover` / `start_timestamp`）。
+    ///
+    /// 只对 [`Media::Video`] 有效，别的变体原样返回。
+    /// ⚠️ 真库：秘密聊天和阅后即焚消息不支持 `cover`。
+    pub fn cover(self, cover: impl Into<InputFile>, start_timestamp: i32) -> Self {
+        match self {
+            Self::Video {
+                file,
+                caption,
+                thumbnail,
+                duration,
+                width,
+                height,
+                supports_streaming,
+                has_spoiler,
+                ..
+            } => Self::Video {
+                file,
+                caption,
+                thumbnail,
+                cover: Some(cover.into()),
+                start_timestamp: Some(start_timestamp),
+                duration,
+                width,
+                height,
+                supports_streaming,
+                has_spoiler,
+            },
+            other => other,
+        }
+    }
+
+    /// 给带标题的媒体挂一段文本（贴纸/位置没有标题，原样返回）。
+    pub fn caption(self, text: impl Into<Text>) -> Self {
+        let caption = Some(text.into());
+        match self {
+            Self::Photo {
+                file,
+                thumbnail,
+                width,
+                height,
+                has_spoiler,
+                ..
+            } => Self::Photo {
+                file,
+                caption,
+                thumbnail,
+                width,
+                height,
+                has_spoiler,
+            },
+            Self::Video {
+                file,
+                thumbnail,
+                cover,
+                start_timestamp,
+                duration,
+                width,
+                height,
+                supports_streaming,
+                has_spoiler,
+                ..
+            } => Self::Video {
+                file,
+                caption,
+                thumbnail,
+                cover,
+                start_timestamp,
+                duration,
+                width,
+                height,
+                supports_streaming,
+                has_spoiler,
+            },
+            Self::Audio {
+                file,
+                album_cover_thumbnail,
+                duration,
+                title,
+                performer,
+                ..
+            } => Self::Audio {
+                file,
+                caption,
+                album_cover_thumbnail,
+                duration,
+                title,
+                performer,
+            },
+            Self::Document {
+                file, thumbnail, ..
+            } => Self::Document {
+                file,
+                caption,
+                thumbnail,
+            },
+            Self::Animation {
+                file,
+                thumbnail,
+                duration,
+                width,
+                height,
+                has_spoiler,
+                ..
+            } => Self::Animation {
+                file,
+                caption,
+                thumbnail,
                 duration,
                 width,
                 height,
@@ -485,6 +719,7 @@ pub fn content_json(media: &Media, render: &dyn Fn(&Text) -> Value) -> Value {
     match media {
         Media::Photo {
             file,
+            thumbnail,
             width,
             height,
             has_spoiler,
@@ -492,15 +727,17 @@ pub fn content_json(media: &Media, render: &dyn Fn(&Text) -> Value) -> Value {
         } => {
             let mut object = Map::new();
             object.insert("@type".to_owned(), json!("inputMessagePhoto"));
-            object.insert(
-                "photo".to_owned(),
-                json!({
-                    "@type": "inputPhoto",
-                    "photo": file.to_json(),
-                    "width": width,
-                    "height": height,
-                }),
+            let mut inner = Map::new();
+            inner.insert("@type".to_owned(), json!("inputPhoto"));
+            inner.insert("photo".to_owned(), file.to_json());
+            put_some(
+                &mut inner,
+                "thumbnail",
+                thumbnail.as_ref().map(Thumbnail::to_json),
             );
+            inner.insert("width".to_owned(), json!(width));
+            inner.insert("height".to_owned(), json!(height));
+            object.insert("photo".to_owned(), Value::Object(inner));
             if let Some(caption) = caption(media) {
                 object.insert("caption".to_owned(), caption);
             }
@@ -509,6 +746,9 @@ pub fn content_json(media: &Media, render: &dyn Fn(&Text) -> Value) -> Value {
         }
         Media::Video {
             file,
+            thumbnail,
+            cover,
+            start_timestamp,
             duration,
             width,
             height,
@@ -518,17 +758,25 @@ pub fn content_json(media: &Media, render: &dyn Fn(&Text) -> Value) -> Value {
         } => {
             let mut object = Map::new();
             object.insert("@type".to_owned(), json!("inputMessageVideo"));
-            object.insert(
-                "video".to_owned(),
-                json!({
-                    "@type": "inputVideo",
-                    "video": file.to_json(),
-                    "duration": duration,
-                    "width": width,
-                    "height": height,
-                    "supports_streaming": supports_streaming,
-                }),
+            let mut inner = Map::new();
+            inner.insert("@type".to_owned(), json!("inputVideo"));
+            inner.insert("video".to_owned(), file.to_json());
+            put_some(
+                &mut inner,
+                "thumbnail",
+                thumbnail.as_ref().map(Thumbnail::to_json),
             );
+            put_some(&mut inner, "cover", cover.as_ref().map(InputFile::to_json));
+            put_some(
+                &mut inner,
+                "start_timestamp",
+                start_timestamp.map(|seconds| json!(seconds)),
+            );
+            inner.insert("duration".to_owned(), json!(duration));
+            inner.insert("width".to_owned(), json!(width));
+            inner.insert("height".to_owned(), json!(height));
+            inner.insert("supports_streaming".to_owned(), json!(supports_streaming));
+            object.insert("video".to_owned(), Value::Object(inner));
             if let Some(caption) = caption(media) {
                 object.insert("caption".to_owned(), caption);
             }
@@ -537,6 +785,7 @@ pub fn content_json(media: &Media, render: &dyn Fn(&Text) -> Value) -> Value {
         }
         Media::Audio {
             file,
+            album_cover_thumbnail,
             duration,
             title,
             performer,
@@ -544,28 +793,37 @@ pub fn content_json(media: &Media, render: &dyn Fn(&Text) -> Value) -> Value {
         } => {
             let mut object = Map::new();
             object.insert("@type".to_owned(), json!("inputMessageAudio"));
-            object.insert(
-                "audio".to_owned(),
-                json!({
-                    "@type": "inputAudio",
-                    "audio": file.to_json(),
-                    "duration": duration,
-                    "title": title,
-                    "performer": performer,
-                }),
+            let mut inner = Map::new();
+            inner.insert("@type".to_owned(), json!("inputAudio"));
+            inner.insert("audio".to_owned(), file.to_json());
+            put_some(
+                &mut inner,
+                "album_cover_thumbnail",
+                album_cover_thumbnail.as_ref().map(Thumbnail::to_json),
             );
+            inner.insert("duration".to_owned(), json!(duration));
+            inner.insert("title".to_owned(), json!(title));
+            inner.insert("performer".to_owned(), json!(performer));
+            object.insert("audio".to_owned(), Value::Object(inner));
             if let Some(caption) = caption(media) {
                 object.insert("caption".to_owned(), caption);
             }
             Value::Object(object)
         }
-        Media::Document { file, .. } => {
+        Media::Document {
+            file, thumbnail, ..
+        } => {
             let mut object = Map::new();
             object.insert("@type".to_owned(), json!("inputMessageDocument"));
-            object.insert(
-                "document".to_owned(),
-                json!({ "@type": "inputDocument", "document": file.to_json() }),
+            let mut inner = Map::new();
+            inner.insert("@type".to_owned(), json!("inputDocument"));
+            inner.insert("document".to_owned(), file.to_json());
+            put_some(
+                &mut inner,
+                "thumbnail",
+                thumbnail.as_ref().map(Thumbnail::to_json),
             );
+            object.insert("document".to_owned(), Value::Object(inner));
             if let Some(caption) = caption(media) {
                 object.insert("caption".to_owned(), caption);
             }
@@ -573,6 +831,7 @@ pub fn content_json(media: &Media, render: &dyn Fn(&Text) -> Value) -> Value {
         }
         Media::Animation {
             file,
+            thumbnail,
             duration,
             width,
             height,
@@ -581,16 +840,18 @@ pub fn content_json(media: &Media, render: &dyn Fn(&Text) -> Value) -> Value {
         } => {
             let mut object = Map::new();
             object.insert("@type".to_owned(), json!("inputMessageAnimation"));
-            object.insert(
-                "animation".to_owned(),
-                json!({
-                    "@type": "inputAnimation",
-                    "animation": file.to_json(),
-                    "duration": duration,
-                    "width": width,
-                    "height": height,
-                }),
+            let mut inner = Map::new();
+            inner.insert("@type".to_owned(), json!("inputAnimation"));
+            inner.insert("animation".to_owned(), file.to_json());
+            put_some(
+                &mut inner,
+                "thumbnail",
+                thumbnail.as_ref().map(Thumbnail::to_json),
             );
+            inner.insert("duration".to_owned(), json!(duration));
+            inner.insert("width".to_owned(), json!(width));
+            inner.insert("height".to_owned(), json!(height));
+            object.insert("animation".to_owned(), Value::Object(inner));
             if let Some(caption) = caption(media) {
                 object.insert("caption".to_owned(), caption);
             }
@@ -600,18 +861,26 @@ pub fn content_json(media: &Media, render: &dyn Fn(&Text) -> Value) -> Value {
         Media::Sticker {
             file,
             emoji,
+            thumbnail,
             width,
             height,
-        } => json!({
-            "@type": "inputMessageSticker",
-            "sticker": {
-                "@type": "inputSticker",
-                "sticker": file.to_json(),
-                "width": width,
-                "height": height,
-            },
-            "emoji": emoji,
-        }),
+        } => {
+            let mut inner = Map::new();
+            inner.insert("@type".to_owned(), json!("inputSticker"));
+            inner.insert("sticker".to_owned(), file.to_json());
+            put_some(
+                &mut inner,
+                "thumbnail",
+                thumbnail.as_ref().map(Thumbnail::to_json),
+            );
+            inner.insert("width".to_owned(), json!(width));
+            inner.insert("height".to_owned(), json!(height));
+            json!({
+                "@type": "inputMessageSticker",
+                "sticker": Value::Object(inner),
+                "emoji": emoji,
+            })
+        }
         Media::Location {
             latitude,
             longitude,
@@ -623,6 +892,16 @@ pub fn content_json(media: &Media, render: &dyn Fn(&Text) -> Value) -> Value {
                 "longitude": longitude,
             },
         }),
+    }
+}
+
+/// 只在 `Some` 时把键写进去。
+///
+/// 缩略图 / 封面这些「可空对象字段」没设置就**整个键不发**（不是发 `null`）：
+/// 保持和改之前一致的行为，真库那边「没收到」就是跳过。
+fn put_some(object: &mut Map<String, Value>, key: &str, value: Option<Value>) {
+    if let Some(value) = value {
+        object.insert(key.to_owned(), value);
     }
 }
 
@@ -2150,6 +2429,9 @@ mod tests {
             &quick!(SendMessageParams::media(Media::Video {
                 file: InputFile::remote("video-id"),
                 caption: None,
+                thumbnail: None,
+                cover: None,
+                start_timestamp: None,
                 duration: 3,
                 width: 640,
                 height: 480,
@@ -2164,6 +2446,7 @@ mod tests {
             &quick!(SendMessageParams::media(Media::Audio {
                 file: "/tmp/a.mp3".into(),
                 caption: None,
+                album_cover_thumbnail: None,
                 duration: 12,
                 title: "标题".to_owned(),
                 performer: "作者".to_owned(),
@@ -2182,6 +2465,7 @@ mod tests {
             &quick!(SendMessageParams::media(Media::Animation {
                 file: "/tmp/a.gif".into(),
                 caption: None,
+                thumbnail: None,
                 duration: 1,
                 width: 10,
                 height: 10,
@@ -2195,6 +2479,7 @@ mod tests {
             &quick!(SendMessageParams::media(Media::Sticker {
                 file: "/tmp/a.webp".into(),
                 emoji: "😀".to_owned(),
+                thumbnail: None,
                 width: 512,
                 height: 512,
             }))
@@ -2340,6 +2625,124 @@ mod tests {
         // 没给 params.text 时用媒体自带的
         let content = content_json(&media, &plain_text);
         assert_eq!(content["caption"]["text"], "<自带标题>");
+    }
+
+    /// 缩略图 / 封面：`inputThumbnail` 挂在各 `inputX` 上，**没设置就整个键不发**。
+    ///
+    /// 真 `td_api.tl`：`inputVideo video:InputFile thumbnail:inputThumbnail cover:InputFile
+    /// start_timestamp:int32 …`；`inputAudio` 那个叫 `album_cover_thumbnail`。
+    #[test]
+    fn media_thumbnail_and_cover_are_omitted_when_unset() {
+        // 没设置：既没有 thumbnail，也没有 cover / start_timestamp（保持改之前的行为）
+        let content = content_json(&Media::video("/tmp/a.mp4"), &plain_text);
+        let video = &content["video"];
+        assert_eq!(video["@type"], "inputVideo");
+        assert!(video.get("thumbnail").is_none(), "{video}");
+        assert!(video.get("cover").is_none(), "{video}");
+        assert!(video.get("start_timestamp").is_none(), "{video}");
+
+        // 设了就发：`inputThumbnail` 也是「文件 + 宽高」两层
+        let content = content_json(
+            &Media::video("/tmp/a.mp4")
+                .thumbnail(Thumbnail::new("/tmp/thumb.jpg").size(320, 240))
+                .cover("/tmp/cover.jpg", 3),
+            &plain_text,
+        );
+        let video = &content["video"];
+        assert_eq!(video["thumbnail"]["@type"], "inputThumbnail");
+        assert_eq!(video["thumbnail"]["thumbnail"]["@type"], "inputFileLocal");
+        assert_eq!(video["thumbnail"]["thumbnail"]["path"], "/tmp/thumb.jpg");
+        assert_eq!(video["thumbnail"]["width"], 320);
+        assert_eq!(video["thumbnail"]["height"], 240);
+        assert_eq!(video["cover"]["@type"], "inputFileLocal");
+        assert_eq!(video["cover"]["path"], "/tmp/cover.jpg");
+        assert_eq!(video["start_timestamp"], 3);
+
+        // 音频的封面在真签名里叫 album_cover_thumbnail，不是 thumbnail
+        let content = content_json(
+            &Media::Audio {
+                file: "/tmp/a.mp3".into(),
+                caption: None,
+                album_cover_thumbnail: Some(Thumbnail::new("/tmp/cover.jpg")),
+                duration: 12,
+                title: "标题".to_owned(),
+                performer: "作者".to_owned(),
+            },
+            &plain_text,
+        );
+        assert_eq!(
+            content["audio"]["album_cover_thumbnail"]["@type"],
+            "inputThumbnail"
+        );
+        assert!(content["audio"].get("thumbnail").is_none());
+
+        // 图 / 文档 / 动画 / 贴纸四个都能挂缩略图
+        let content = content_json(
+            &Media::photo("/tmp/a.jpg").thumbnail("/tmp/thumb.jpg"),
+            &plain_text,
+        );
+        assert_eq!(content["photo"]["thumbnail"]["@type"], "inputThumbnail");
+        let content = content_json(
+            &Media::document("/tmp/a.pdf").thumbnail("/tmp/thumb.png"),
+            &plain_text,
+        );
+        assert_eq!(content["document"]["thumbnail"]["@type"], "inputThumbnail");
+        let content = content_json(
+            &Media::Animation {
+                file: "/tmp/a.gif".into(),
+                caption: None,
+                thumbnail: None,
+                duration: 1,
+                width: 10,
+                height: 10,
+                has_spoiler: false,
+            }
+            .thumbnail("/tmp/thumb.jpg"),
+            &plain_text,
+        );
+        assert_eq!(content["animation"]["thumbnail"]["@type"], "inputThumbnail");
+        let content = content_json(
+            &Media::Sticker {
+                file: "/tmp/a.webp".into(),
+                emoji: "😀".to_owned(),
+                thumbnail: Some(Thumbnail::new("/tmp/thumb.webp")),
+                width: 512,
+                height: 512,
+            },
+            &plain_text,
+        );
+        assert_eq!(content["sticker"]["thumbnail"]["@type"], "inputThumbnail");
+
+        // 位置没有缩略图：挂上去原样返回
+        let location = Media::location(1.5, 2.5).thumbnail("/tmp/thumb.jpg");
+        assert!(matches!(location, Media::Location { .. }));
+
+        // 字段名拿真 schema 钉住（`check_request` 只查顶层参数，不看嵌套对象）
+        let schema = fuyubot_tdlib_sys::TdApiSchema::compiled();
+        for (constructor, field) in [
+            ("inputPhoto", "thumbnail"),
+            ("inputVideo", "thumbnail"),
+            ("inputVideo", "cover"),
+            ("inputVideo", "start_timestamp"),
+            ("inputAudio", "album_cover_thumbnail"),
+            ("inputDocument", "thumbnail"),
+            ("inputAnimation", "thumbnail"),
+            ("inputSticker", "thumbnail"),
+        ] {
+            let entry = schema
+                .get(constructor)
+                .unwrap_or_else(|| panic!("真 td_api.tl 里没有 {constructor}"));
+            assert!(
+                entry.has_param(field),
+                "{constructor} 里没有 {field}（真 schema 的参数：{:?}）",
+                entry.params
+            );
+        }
+        let thumbnail = schema.get("inputThumbnail").expect("inputThumbnail");
+        assert_eq!(
+            thumbnail.params[0].ty, "InputFile",
+            "inputThumbnail 的第一个参数是文件"
+        );
     }
 
     /// Markdown / HTML 的转换**只有一条路**：交给 TDLib 的 `parseTextEntities`。
@@ -3258,15 +3661,13 @@ mod tests {
             simplify,
             send_message,
             7,
-            &quick!(SendMessageParams::media(Media::Video {
-                file: "/tmp/a.mp4".into(),
-                caption: Some(Text::plain("视频")),
-                duration: 3,
-                width: 640,
-                height: 480,
-                supports_streaming: true,
-                has_spoiler: true,
-            }))
+            &quick!(SendMessageParams::media(
+                Media::video("/tmp/a.mp4")
+                    .caption(Text::plain("视频"))
+                    // 缩略图 + 封面帧（从第 3 秒开始播）
+                    .thumbnail(Thumbnail::new("/tmp/thumb.jpg").size(320, 240))
+                    .cover("/tmp/cover.jpg", 3)
+            ))
         );
         fire!(
             simplify,
@@ -3275,6 +3676,7 @@ mod tests {
             &quick!(SendMessageParams::media(Media::Audio {
                 file: "/tmp/a.mp3".into(),
                 caption: None,
+                album_cover_thumbnail: Some(Thumbnail::new("/tmp/cover.jpg").size(90, 90)),
                 duration: 12,
                 title: "标题".to_owned(),
                 performer: "作者".to_owned(),
@@ -3284,14 +3686,18 @@ mod tests {
             simplify,
             send_message,
             7,
-            &quick!(SendMessageParams::media(Media::Animation {
-                file: "/tmp/a.gif".into(),
-                caption: None,
-                duration: 1,
-                width: 10,
-                height: 10,
-                has_spoiler: false,
-            }))
+            &quick!(SendMessageParams::media(
+                Media::Animation {
+                    file: "/tmp/a.gif".into(),
+                    caption: None,
+                    thumbnail: None,
+                    duration: 1,
+                    width: 10,
+                    height: 10,
+                    has_spoiler: false,
+                }
+                .thumbnail("/tmp/thumb.jpg")
+            ))
         );
         fire!(
             simplify,
@@ -3300,6 +3706,7 @@ mod tests {
             &quick!(SendMessageParams::media(Media::Sticker {
                 file: "/tmp/a.webp".into(),
                 emoji: "😀".to_owned(),
+                thumbnail: Some(Thumbnail::new("/tmp/thumb.webp").size(512, 512)),
                 width: 512,
                 height: 512,
             }))
