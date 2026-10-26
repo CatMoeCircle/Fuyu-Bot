@@ -6,6 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{self, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -154,9 +155,25 @@ impl std::fmt::Debug for AbiService {
     }
 }
 
+/// 全局配置的运行时状态：一份 JSON（完整配置树）+ 落盘位置。
+///
+/// CLI 在 `load_config` 之后、插件加载之前用 [`HostRuntime::install_config`] 装进来。
+/// 插件经 `get_config` / `set_config` 读写它；`set_config` 还会把它回写到配置文件。
+#[derive(Default)]
+struct ConfigState {
+    /// 配置文件的路径（`set_config` 回写用）。`None` = 没装配置（或没有落盘文件）。
+    path: Option<PathBuf>,
+    /// 完整配置树的 JSON（顶层含 `bot` / `telegram` / `plugins` / `tdlib` / `plugin` 等）。
+    root: Value,
+}
+
 /// 内置 scope service 的名字。中间插件通过 `get_service("fuyubot.host.scope")` 拿到它，
 /// 用它给每个脚本建子作用域（见设计文档 5.2 / 5.3）。
 static SCOPE_SERVICE_NAME: &CStr = c"fuyubot.host.scope";
+
+/// 全局配置里，插件各自的段所在的顶层键名：`[plugin.<插件名>]` 解析成
+/// `{"plugin": {"<插件名>": {…}}}`。读顶层、写自己段都从这颗子树出发。
+const CONFIG_PLUGIN_KEY: &str = "plugin";
 
 /// 宿主运行时。
 ///
@@ -198,6 +215,10 @@ pub struct HostRuntime {
     /// 内置 scope service 的 vtable（`context` 指向本实例）。按值存，地址稳定。
     scope_vtable: ServiceVTable,
     vtable: HostApiVTable,
+    /// 全局配置（路径 + JSON 树）。`get_config` / `set_config` 读写它。
+    config: Mutex<ConfigState>,
+    /// 插件 owner id → 插件名（`set_config` 按它判定「这是谁的段」）。
+    owner_names: Mutex<HashMap<u64, String>>,
 }
 
 /// 一条已经发出的请求。
@@ -275,6 +296,8 @@ impl HostRuntime {
                 methods: SCOPE_METHODS.0.as_ptr(),
                 method_count: SCOPE_METHODS.0.len(),
             },
+            config: Mutex::new(ConfigState::default()),
+            owner_names: Mutex::new(HashMap::new()),
             // `host_ctx` 指向这个 `Arc` 内部；地址稳定，插件活着期间一直有效。
             vtable: HostApiVTable {
                 version: ABI_VERSION,
@@ -295,6 +318,8 @@ impl HostRuntime {
                 wait_for_update: Some(api_wait_for_update),
                 cancel_wait: Some(api_cancel_wait),
                 log: Some(api_log),
+                get_config: Some(api_get_config),
+                set_config: Some(api_set_config),
             },
         });
         rt.provide_scope_service();
@@ -313,6 +338,108 @@ impl HostRuntime {
             Ok(handle) => std::mem::forget(handle),
             Err(e) => self.warn(&format!("预置 scope service 失败: {e}")),
         }
+    }
+
+    /// 装进全局配置：`path` 是配置文件的落盘位置（`set_config` 回写用，可为 `None`），
+    /// `root` 是完整配置树的 JSON。必须在插件加载之前调（插件 `start` 里就可能读）。
+    pub fn install_config(&self, path: Option<PathBuf>, root: Value) {
+        let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
+        config.path = path;
+        config.root = root;
+    }
+
+    /// 登记「插件 owner id → 插件名」。loader 在 `plugin_init` 之后、`plugin_start` 之前调，
+    /// 这样插件在 `start` 里（以及之后的回调里）调 `set_config` 时，宿主能据此判定它是谁。
+    pub(crate) fn register_owner_name(&self, owner: u64, name: &str) {
+        self.owner_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(owner, name.to_owned());
+    }
+
+    /// 卸载插件时摘掉它的 owner 映射（owner id 会复用吗？不会——`next_owner` 只增不减，
+    /// 但摘掉仍能省内存，也避免误判）。loader 在 `LoadedPlugin::drop` 回滚时顺带调。
+    pub(crate) fn unregister_owner_name(&self, owner: u64) {
+        self.owner_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&owner);
+    }
+
+    /// 读配置：`section` 为空 = 读顶层；否则把 `section` 当**点路径**在 `plugin` 表里下钻
+    /// （插件名是点分的，如 `fuyubot.manage` → `plugin.fuyubot.manage`）。
+    /// `key` 为空 = 整段/整个顶层。命中返回 `Some(JSON)`，否则 `None`。
+    fn read_config(&self, section: &str, key: &str) -> Option<Value> {
+        let config = self.config.lock().unwrap_or_else(|e| e.into_inner());
+        let node = if section.is_empty() {
+            &config.root
+        } else {
+            let plugin = config.root.get(CONFIG_PLUGIN_KEY)?;
+            lookup_path(plugin, section)?
+        };
+        if key.is_empty() {
+            return Some(node.clone());
+        }
+        lookup_path(node, key).cloned()
+    }
+
+    /// 写配置：只能写「当前调用者」自己名下的段。返回错误消息（`Ok(())` = 成功并已落盘）。
+    ///
+    /// 越权判定靠 [`HostRuntime::current_owner`] + `owner_names` 映射：插件无法伪造
+    /// `section`（这里根本没有 section 参数——它只写自己的段）。
+    fn write_config(&self, key: &str, value_json: &str) -> Result<(), String> {
+        // 调用者是哪个插件？没登记名字（宿主自己、或还没走完 init）就不能写。
+        let owner = self.current_owner();
+        let name = self
+            .owner_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&owner)
+            .cloned()
+            .ok_or_else(|| "当前调用者没有登记的插件名，不能写配置".to_owned())?;
+
+        let value: Value =
+            serde_json::from_str(value_json).map_err(|e| format!("值不是合法 JSON: {e}"))?;
+
+        // 锁住配置，先改内存，落盘成功才算数（落盘失败要还原，不能留半截状态）。
+        let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
+        // 落盘路径先拷出来，避免下面持有 `config` 可变借用的同时再读它。
+        let path = config.path.clone();
+        // 保证 `plugin.<name路径>` 这颗子树存在。
+        let (old, persist_snapshot) = {
+            let root = config
+                .root
+                .as_object_mut()
+                .ok_or_else(|| "配置根不是 JSON 对象".to_owned())?;
+            let plugin = root
+                .entry(CONFIG_PLUGIN_KEY.to_owned())
+                .or_insert_with(|| json!({}));
+            // 插件名是点分的：在 plugin 表里按路径下钻到自己的叶子表。
+            let own = ensure_leaf(plugin, &name)?;
+
+            let old = own.clone();
+            if key.is_empty() {
+                *own = value;
+            } else {
+                set_path(own, key, value)?;
+            }
+            // 落盘用的树在借用结束前 clone 出来（落盘失败还要靠 `old` 还原）。
+            (old, config.root.clone())
+        };
+
+        // 落盘：有文件路径才回写；没有（纯内存，比如测试）也算成功。
+        if let Some(path) = path.as_ref() {
+            if let Err(e) = persist_toml(path, &persist_snapshot) {
+                // 落盘失败：还原内存，报错。
+                if let Some(plugin) = config.root.get_mut(CONFIG_PLUGIN_KEY) {
+                    if let Ok(own) = ensure_leaf(plugin, &name) {
+                        *own = old;
+                    }
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// 交给插件的 VTable 指针。
@@ -701,6 +828,71 @@ fn parse_json(raw: *const c_char) -> Option<Value> {
         return Some(Value::Null);
     }
     serde_json::from_str(text).ok()
+}
+
+/// 按点路径在 JSON 对象里查一个值（只下钻对象，路径里有数组/非对象就返回 `None`）。
+fn lookup_path<'a>(node: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = node;
+    for part in path.split('.') {
+        if part.is_empty() {
+            continue;
+        }
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+
+/// 按点路径在 JSON 对象里写一个值（自动创建沿途对象）。`path` 为空由调用方处理。
+fn set_path(node: &mut Value, path: &str, value: Value) -> Result<(), String> {
+    let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return Err("写配置的 key 是空的".to_owned());
+    }
+    let mut current = node;
+    for (index, part) in parts.iter().enumerate() {
+        let is_last = index == parts.len() - 1;
+        if is_last {
+            current[part] = value;
+            return Ok(());
+        }
+        // 中间层必须是对象（或不存在，那就建一个）。
+        current = current
+            .as_object_mut()
+            .ok_or_else(|| format!("路径里的 {part} 不是对象，无法继续下钻"))?
+            .entry((*part).to_owned())
+            .or_insert_with(|| json!({}));
+    }
+    Ok(())
+}
+
+/// 按点路径下钻到一个**叶子对象**（沿途对象不存在就创建，已存在但非对象则报错）。
+/// 用于把插件名（如 `fuyubot.manage`）在 `plugin` 表里定位到它自己的那段。
+fn ensure_leaf<'a>(node: &'a mut Value, path: &str) -> Result<&'a mut Value, String> {
+    let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return Err("插件名是空的".to_owned());
+    }
+    let mut current = node;
+    for part in parts {
+        current = current
+            .as_object_mut()
+            .ok_or_else(|| format!("路径里的 {part} 不是对象，无法下钻"))?
+            .entry(part.to_owned())
+            .or_insert_with(|| json!({}));
+    }
+    Ok(current)
+}
+
+/// 把配置 JSON 树序列化回 TOML 并写盘。
+///
+/// ⚠️ 这是**全量重写**：用户在原文件里手写的注释、空白会被 `toml` 序列化丢掉。
+/// 插件写配置属于「程序化修改」，重写是简单且可预期的一步；要保注释得上保留格式的
+/// 编辑器（超出本框架范围）。序列化失败的典型原因是某段塞进了 TOML 表达不了的 JSON
+/// （比如数组里混类型）——那种情况如实报错，不静默吞掉。
+fn persist_toml(path: &Path, root: &Value) -> Result<(), String> {
+    let value = toml::Value::try_from(root.clone()).map_err(|e| format!("配置转不了 TOML: {e}"))?;
+    let text = toml::to_string_pretty(&value).map_err(|e| format!("序列化 TOML 失败: {e}"))?;
+    std::fs::write(path, text).map_err(|e| format!("写不了 {}: {e}", path.display()))
 }
 
 /// 从响应里取请求号。
@@ -1366,6 +1558,45 @@ unsafe extern "C" fn api_cancel_wait(host: *mut c_void, handle: WaitHandle) {
     }
 }
 
+unsafe extern "C" fn api_get_config(
+    host: *mut c_void,
+    section: *const c_char,
+    key: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 host 来自本运行时。
+    let Some(rt) = (unsafe { runtime(host) }) else {
+        return core::ptr::null();
+    };
+    // SAFETY: 同上；NULL 当空串（读顶层）。
+    let section = unsafe { cstr(section) }.unwrap_or("");
+    let key = unsafe { cstr(key) }.unwrap_or("");
+    match rt.read_config(section, key) {
+        Some(value) => host_string(&value.to_string()),
+        None => core::ptr::null(),
+    }
+}
+
+unsafe extern "C" fn api_set_config(
+    host: *mut c_void,
+    key: *const c_char,
+    value_json: *const c_char,
+) -> i32 {
+    // SAFETY: ABI 契约保证 host 来自本运行时。
+    let Some(rt) = (unsafe { runtime(host) }) else {
+        return -1;
+    };
+    // SAFETY: 同上；key 空串 = 覆盖整段。
+    let key = unsafe { cstr(key) }.unwrap_or("");
+    let value = unsafe { cstr(value_json) }.unwrap_or("null");
+    match rt.write_config(key, value) {
+        Ok(()) => 0,
+        Err(e) => {
+            rt.warn(&format!("写配置被拒: {e}"));
+            -1
+        }
+    }
+}
+
 impl HostRuntime {
     fn td_send(&self, request: Value) -> RequestId {
         let method = request
@@ -1519,6 +1750,82 @@ mod tests {
         assert!(vtable.wait_for_update.is_some());
         assert!(vtable.cancel_wait.is_some());
         assert!(vtable.log.is_some());
+        assert!(vtable.get_config.is_some());
+        assert!(vtable.set_config.is_some());
+    }
+
+    /// 配置读写桥：读顶层 / 读插件段 / 写自己段（含点路径）/ 越权写别人段被拒 / 落盘回写。
+    #[test]
+    fn config_is_readable_and_writable_only_own_section() {
+        let rt = runtime();
+        // 装一份配置：顶层 + 两个插件段，落盘到一个临时文件。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp/fuyubot-loader");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config-write.toml");
+        rt.install_config(
+            Some(path.clone()),
+            serde_json::json!({
+                "bot": { "name": "demo" },
+                "plugin": {
+                    "a": { "bot": { "city": "上海", "nested": { "k": 1 } } },
+                    "other": { "bot": { "secret": "x" } }
+                }
+            }),
+        );
+
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+
+        // 读顶层。
+        let top = api.get_config("", "bot.name").unwrap();
+        assert_eq!(top, "\"demo\"");
+
+        // 读别人的段 + 点路径。
+        let city = api.get_config("a.bot", "city").unwrap();
+        assert_eq!(city, "\"上海\"");
+        let nested = api.get_config("a.bot", "nested.k").unwrap();
+        assert_eq!(nested, "1");
+        // 读整段。
+        let whole = api.get_config("other.bot", "").unwrap();
+        assert!(whole.contains("secret"), "{whole}");
+        // 不存在的段 / 键返回 None。
+        assert!(api.get_config("ghost", "").is_none());
+        assert!(api.get_config("a.bot", "nope").is_none());
+
+        // 写自己段：先登记 owner → 名字（模拟 loader 在 init 后做的事）。
+        {
+            let scope = rt.plugin_scope();
+            rt.register_owner_name(scope.owner(), "a.bot");
+
+            // 写自己的段（新键）。
+            assert_eq!(api.set_config("greeting", "\"hi\"").unwrap(), ());
+            assert_eq!(api.get_config("a.bot", "greeting").unwrap(), "\"hi\"");
+
+            // 点路径写：nested.k = 2。
+            assert_eq!(api.set_config("nested.k", "2").unwrap(), ());
+            assert_eq!(api.get_config("a.bot", "nested.k").unwrap(), "2");
+
+            // 覆盖整段。
+            assert_eq!(api.set_config("", "{\"x\":1}").unwrap(), ());
+            let whole = api.get_config("a.bot", "").unwrap();
+            assert!(whole.contains("\"x\":1"), "{whole}");
+
+            // 落盘：文件里要有刚写进去的 a.bot 段（TOML 里就是 [plugin.a.bot]）。
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert!(on_disk.contains("[plugin.a.bot]"), "{on_disk}");
+
+            // 越权写别人的段：owner 是 a.bot，改不了 other.bot。
+            // set_config 没有 section 参数，只能写自己——所以「越权」体现为「写不到别人段」：
+            // 从 a.bot 的身份写，只会落进 a.bot 段，碰不到 other.bot。
+            api.set_config("secret", "\"hacked\"").unwrap();
+            assert_eq!(api.get_config("other.bot", "secret").unwrap(), "\"x\"");
+
+            scope.commit();
+        }
+
+        // 回到宿主根作用域（owner 0），没有名字 → 写失败。
+        assert!(api.set_config("k", "1").is_err());
     }
 
     /// 日志门槛：低于门槛的**既**不留档**也**不写 stderr；调高门槛后又能收到。

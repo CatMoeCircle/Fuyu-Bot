@@ -17,7 +17,10 @@ use core::ffi::{c_char, c_void};
 use std::ffi::{CStr, CString};
 
 /// ABI 版本。字段只增不改，新增一律追加在尾部。
-pub const ABI_VERSION: u32 = 2;
+///
+/// v3：新增 [`HostApiVTable::get_config`] 与 [`HostApiVTable::set_config`]——
+/// 插件读全局配置（自己的段 + 别人的段），只能写自己的段。
+pub const ABI_VERSION: u32 = 3;
 
 /// cbindgen 生成的头文件**原文**。
 ///
@@ -352,9 +355,30 @@ pub struct HostApiVTable {
     >,
     pub cancel_wait: Option<unsafe extern "C" fn(host: *mut c_void, handle: WaitHandle)>,
     pub log: Option<unsafe extern "C" fn(host: *mut c_void, level: u32, message: *const c_char)>,
+    /// 读全局配置。`section` 是配置段名（如 `"fuyubot.manage"`），`key` 是可选的点路径
+    /// （`"a.b"`），空串返回整段。`section` 为空串表示读顶层（`[bot]` / `[telegram]` 等）。
+    ///
+    /// 返回宿主线程局部缓冲里的 JSON 字符串（读完即弃），找不到段 / 键时返回 NULL。
+    pub get_config: Option<
+        unsafe extern "C" fn(
+            host: *mut c_void,
+            section: *const c_char,
+            key: *const c_char,
+        ) -> *const c_char,
+    >,
+    /// 写配置：**只能写「当前调用者」自己名下的段**（由宿主按调用者身份判定，插件无法伪造）。
+    /// `key` 是点路径（空串 = 覆盖整段），`value_json` 是要写进去的 JSON 值。
+    /// 返回 0 = 成功（已写内存并持久化回配置文件）；非 0 = 失败（越权 / 解析失败 / 写盘失败）。
+    pub set_config: Option<
+        unsafe extern "C" fn(
+            host: *mut c_void,
+            key: *const c_char,
+            value_json: *const c_char,
+        ) -> i32,
+    >,
 }
 
-/// VTable 就是「两个 u32 + 16 个指针」；布局一改，这里立刻编译不过。
+/// VTable 就是「两个 u32 + 18 个指针」；布局一改，这里立刻编译不过。
 const _: () = {
     use core::mem::{offset_of, size_of};
 
@@ -362,7 +386,7 @@ const _: () = {
     assert!(offset_of!(HostApiVTable, size) == 4);
     assert!(offset_of!(HostApiVTable, host_ctx) == 8);
     assert!(size_of::<Option<unsafe extern "C" fn()>>() == size_of::<*const c_void>());
-    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 16 * size_of::<*const c_void>());
+    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 18 * size_of::<*const c_void>());
 
     // 句柄要能按值跨 ABI：必须恰好一个 u64。
     assert!(size_of::<SubscriptionHandle>() == size_of::<u64>());
@@ -432,6 +456,8 @@ pub struct HostApi {
     wait_for_update: unsafe extern "C" fn(*mut c_void, *const c_char, u64) -> WaitHandle,
     cancel_wait: unsafe extern "C" fn(*mut c_void, WaitHandle),
     log: unsafe extern "C" fn(*mut c_void, u32, *const c_char),
+    get_config: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> *const c_char,
+    set_config: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> i32,
 }
 
 impl std::fmt::Debug for HostApi {
@@ -500,6 +526,8 @@ impl HostApi {
             wait_for_update: required!(wait_for_update),
             cancel_wait: required!(cancel_wait),
             log: required!(log),
+            get_config: required!(get_config),
+            set_config: required!(set_config),
         })
     }
 
@@ -667,6 +695,44 @@ impl HostApi {
     pub fn cancel_wait(&self, handle: WaitHandle) {
         // SAFETY: 句柄由宿主发放。
         unsafe { (self.cancel_wait)(self.host_ctx, handle) };
+    }
+
+    /// 读全局配置的一个段 / 键。`section` 空串 = 读顶层；`key` 空串 = 整段。
+    ///
+    /// 返回宿主线程局部缓冲里的 JSON，读完即弃；段 / 键不存在或宿主没装配置时是 `None`。
+    pub fn get_config(&self, section: &str, key: &str) -> Option<String> {
+        let Ok(section) = CString::new(section) else {
+            return None;
+        };
+        let Ok(key) = CString::new(key) else {
+            return None;
+        };
+        // SAFETY: 构造时已校验非空；host_ctx 由宿主保证有效。
+        let raw = unsafe { (self.get_config)(self.host_ctx, section.as_ptr(), key.as_ptr()) };
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: 宿主保证指针在下次宿主调用前有效，这里立刻拷走。
+        Some(
+            unsafe { CStr::from_ptr(raw) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    /// 写配置：只能写**自己**段下的 `key`（点路径，空串 = 覆盖整段）。
+    ///
+    /// 返回 `Ok(())` 表示已写内存并持久化；`Err` 表示越权 / 解析失败 / 写盘失败。
+    pub fn set_config(&self, key: &str, value_json: &str) -> Result<(), AbiError> {
+        let key = CString::new(key).map_err(|_| AbiError::BadString)?;
+        let value = CString::new(value_json).map_err(|_| AbiError::BadString)?;
+        // SAFETY: 构造时已校验非空；host_ctx 由宿主保证有效。
+        let code = unsafe { (self.set_config)(self.host_ctx, key.as_ptr(), value.as_ptr()) };
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(AbiError::HostCall(code))
+        }
     }
 }
 
@@ -918,6 +984,20 @@ mod tests {
         WaitHandle::INVALID
     }
     unsafe extern "C" fn noop_cancel(_: *mut c_void, _: WaitHandle) {}
+    unsafe extern "C" fn noop_get_config(
+        _: *mut c_void,
+        _: *const c_char,
+        _: *const c_char,
+    ) -> *const c_char {
+        core::ptr::null()
+    }
+    unsafe extern "C" fn noop_set_config(
+        _: *mut c_void,
+        _: *const c_char,
+        _: *const c_char,
+    ) -> i32 {
+        -1
+    }
 
     fn test_vtable() -> HostApiVTable {
         HostApiVTable {
@@ -939,6 +1019,8 @@ mod tests {
             wait_for_update: Some(noop_wait),
             cancel_wait: Some(noop_cancel),
             log: Some(test_log),
+            get_config: Some(noop_get_config),
+            set_config: Some(noop_set_config),
         }
     }
 

@@ -15,9 +15,14 @@ pub const CONFIG_FILE: &str = "fuyubot.toml";
 
 const TEMPLATE_CONFIG: &str = include_str!("../templates/fuyubot.toml");
 
+/// `Config.plugin` 的默认值：一张空表（没有 `[plugin.*]` 段时）。
+fn empty_table() -> toml::Value {
+    toml::Value::Table(toml::Table::new())
+}
+
 // ── 项目配置 ───────────────────────────────────────────────────────
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {
     #[serde(default)]
     pub bot: Bot,
@@ -27,9 +32,27 @@ pub struct Config {
     pub plugins: Plugins,
     #[serde(default)]
     pub tdlib: Tdlib,
+    /// 每个插件自己的配置段：`[plugin.<插件名>]`。插件名是点分的（如 `fuyubot.manage`），
+    /// 在 TOML 里自然写成嵌套表 `[plugin.fuyubot.manage]`——所以这里存整棵 `plugin` 表
+    /// （`toml::Value`），宿主把插件名当**点路径**在它里面下钻。
+    /// 插件经 ABI 的 `get_config` 读自己/别人的段、经 `set_config` 写自己的段。
+    #[serde(default = "empty_table")]
+    pub plugin: toml::Value,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bot: Bot::default(),
+            telegram: Telegram::default(),
+            plugins: Plugins::default(),
+            tdlib: Tdlib::default(),
+            plugin: empty_table(),
+        }
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct Bot {
     pub name: Option<String>,
     /// TDLib api_id 的**旧位置**（[`Telegram::api_id`] 优先）。新配置写进 `[telegram]`。
@@ -42,7 +65,7 @@ pub struct Bot {
 /// `[telegram]`：TDLib 参数与**账号类型**。
 ///
 /// ⚠️ 凭据（`api_hash` / token / 手机号）**不在这里**（硬约束 41）——只落**类型**。
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct Telegram {
     /// `"bot"`（默认）或 `"user"`——决定登录走哪条路（Bot Token / 手机号 / 扫码）。
     pub account_type: Option<String>,
@@ -86,7 +109,7 @@ impl Telegram {
     }
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct Plugins {
     pub dir: Option<String>,
     /// 插件日志的最低级别：`error` / `warn` / `info`（默认）/ `debug` / `trace`。
@@ -122,7 +145,7 @@ impl Plugins {
     }
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct Tdlib {
     pub path: Option<String>,
     /// TDLib 的日志详细度。**配置里没写就用 1**（框架的默认值，见
@@ -143,6 +166,16 @@ impl Config {
     /// 插件目录（配置里没写就用 `plugins`）。
     pub fn plugin_dir(&self, root: &Path) -> PathBuf {
         root.join(self.plugins.dir.as_deref().unwrap_or("plugins"))
+    }
+
+    /// 把整个配置树序列化成 JSON（含 `[plugin.*]` 段），给宿主运行时 `install_config` 用。
+    ///
+    /// 插件经 ABI 的 `get_config` / `set_config` 读写的那棵树就是它。`toml::Value` 序列化成
+    /// JSON 时可能失败（TOML 里的日期时间 / 内联表边缘情况），失败就返回 `Err` 由调用方报。
+    pub fn to_json(&self) -> Result<serde_json::Value, String> {
+        let toml_value =
+            toml::Value::try_from(self).map_err(|e| format!("配置序列化成 TOML 失败: {e}"))?;
+        serde_json::to_value(toml_value).map_err(|e| format!("TOML 转 JSON 失败: {e}"))
     }
 }
 
@@ -202,7 +235,7 @@ pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<Str
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("自动（TDLIB_TDJSON_PATH → 自带 → exe 同级 → 系统库 → 裸库名）");
-    vec![
+    let mut lines = vec![
         format!("配置文件  {}{missing}", config_path.display()),
         format!("项目根    {}", root.display()),
         format!(
@@ -237,7 +270,43 @@ pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<Str
         ),
         "凭据        api_hash / token / 手机号不读配置（TG_API_HASH 等环境变量或交互输入）"
             .to_owned(),
-    ]
+    ];
+    // 插件各自的配置段：把 `plugin` 表按「点路径」展平成 `[plugin.fuyubot.manage]` 这样一行一个。
+    // 插件名是点分的，`[plugin.fuyubot.manage]` 解析成嵌套表 `{ fuyubot: { manage: … } }`；
+    // 这里递归下钻，每个「叶子表」（内容是一组键值、不再含子表的那层）打印成一行。
+    let mut plugin_lines = Vec::new();
+    flatten_plugin_sections(&config.plugin, "plugin", &mut plugin_lines);
+    if plugin_lines.is_empty() {
+        lines.push("插件配置    无（没有 [plugin.*] 段）".to_owned());
+    } else {
+        lines.extend(plugin_lines);
+    }
+    lines
+}
+
+/// 递归展平 `plugin` 表：一个「叶子表」= 一段插件的配置，一行 `[plugin.<路径>] = {…}`。
+fn flatten_plugin_sections(value: &toml::Value, prefix: &str, out: &mut Vec<String>) {
+    let Some(table) = value.as_table() else {
+        out.push(format!("[{prefix}] = {value}"));
+        return;
+    };
+    // 有叶子键（非表）的就是一个「插件段」，把它的键值序列化成 JSON 摘要。
+    let leaves: Vec<(&String, &toml::Value)> =
+        table.iter().filter(|(_, v)| !v.is_table()).collect();
+    if !leaves.is_empty() {
+        let summary = leaves
+            .iter()
+            .map(|(k, v)| format!("{k} = {v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(format!("[{prefix}] = {{ {summary} }}"));
+    }
+    // 子表继续下钻（可能代表更深一层的插件名，或插件段里的嵌套表）。
+    for (key, child) in table {
+        if child.is_table() {
+            flatten_plugin_sections(child, &format!("{prefix}.{key}"), out);
+        }
+    }
 }
 
 // ── init ───────────────────────────────────────────────────────────
@@ -647,6 +716,43 @@ mod tests {
         assert!(root.join("plugins").is_dir());
         // 第二次要被挡住，不能把用户改过的配置冲掉。
         assert!(init(&root, "mybot", 1).is_err());
+    }
+
+    /// `[plugin.<插件名>]` 段能解析回来，并能序列化成给宿主运行时的 JSON（点分插件名走嵌套路径）。
+    #[test]
+    fn plugin_sections_parse_and_round_trip_to_json() {
+        let root = temp("plugin-config");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(
+            &path,
+            "[bot]\nname = \"x\"\n\n[plugin.fuyubot.manage]\nreply_prefix = \"已安装插件：\"\n\n[plugin.my.weather]\ncity = \"上海\"\n",
+        )
+        .unwrap();
+        let config = load_config(&path).unwrap();
+
+        // `plugin` 是一棵嵌套表：`fuyubot` → `manage` → `{ reply_prefix }`。
+        let plugin = config.plugin.as_table().unwrap();
+        assert!(plugin.contains_key("fuyubot"), "{plugin:?}");
+        assert!(plugin.contains_key("my"), "{plugin:?}");
+
+        // 序列化成 JSON 后，宿主的 `get_config("fuyubot.manage", "reply_prefix")` 能下钻到。
+        let json = config.to_json().unwrap();
+        let prefix = json
+            .pointer("/plugin/fuyubot/manage/reply_prefix")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert_eq!(prefix, "已安装插件：");
+        assert_eq!(
+            json.pointer("/plugin/my/weather/city")
+                .and_then(serde_json::Value::as_str)
+                .unwrap(),
+            "上海"
+        );
+
+        // 配置展示里要把段摊开成 `[plugin.fuyubot.manage]` 这样的可读行。
+        let lines = config_lines(&path, &root, &config).join("\n");
+        assert!(lines.contains("[plugin.fuyubot.manage]"), "{lines}");
+        assert!(lines.contains("[plugin.my.weather]"), "{lines}");
     }
 
     /// 账号类型写错必须**报错指路**，不能静默当 bot——否则用户会拿着错的登录方式

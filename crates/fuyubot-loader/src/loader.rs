@@ -105,6 +105,8 @@ impl Drop for LoadedPlugin {
         }
         // 插件停掉之后，把它注册的订阅/工具/服务/中间件一次性撤掉。
         self._runtime.rollback_owner(self.owner);
+        // owner → 名字的映射也一并摘掉（插件卸载后不能再以它之名写配置）。
+        self._runtime.unregister_owner_name(self.owner);
         // 动态库这时才真正卸载；Go 的 c-shared 除外——卸载它会让进程崩（见类型文档）。
         if self.go_runtime {
             if let Some(lib) = self._lib.take() {
@@ -223,6 +225,12 @@ impl PluginLoader {
             });
         }
 
+        // 现在就能定下插件名（`handle.name` 在 init 时就有），并在 start 之前登记
+        // owner → 名字的映射：插件在 `start` 里（以及之后的回调里）调 `set_config`
+        // 时，宿主靠它判定「这是谁的段」。名字在 start 失败时也要能算（见下面）。
+        let name = plugin_name(&handle, path);
+        self.runtime.register_owner_name(owner, &name);
+
         if let Some(start) = start {
             // SAFETY: handle 来自本插件的 init；config 在调用期间存活。
             let code = unsafe { start(handle, config.as_ptr()) };
@@ -232,6 +240,8 @@ impl PluginLoader {
                     // SAFETY: 同一个 handle。
                     unsafe { stop(handle) };
                 }
+                // start 失败：这次的 owner 映射也要摘掉（加载没成功，不该留名字）。
+                self.runtime.unregister_owner_name(owner);
                 return Err(LoadError::StartFailed {
                     path: path.to_owned(),
                     code,
@@ -239,7 +249,6 @@ impl PluginLoader {
             }
         }
 
-        let name = plugin_name(&handle, path);
         scope.commit();
 
         Ok(LoadedPlugin {

@@ -402,6 +402,13 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let loader = PluginLoader::new(kernel.context().clone())?;
     let pipeline = Arc::new(loader.pipeline());
 
+    // 把全局配置装进宿主运行时：插件经 ABI 的 `get_config` / `set_config` 读写它。
+    // 必须在插件加载之前——插件 `start` 里就可能读自己的段。
+    let config_json = config.to_json()?;
+    loader
+        .runtime()
+        .install_config(Some(config_path.clone()), config_json);
+
     // 插件日志门槛：`[plugins].log_level`。**必须在插件加载之前**——
     // 插件 `init` / `start` 里打的日志也受它管。
     pipeline

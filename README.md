@@ -95,6 +95,26 @@ log_verbosity = 1      # 默认只留警告与错误；排查问题再调大
 **凭据规则**：`api_hash`、bot token、手机号、验证码**只**来自环境变量
 （`TG_API_ID` / `TG_API_HASH` / `TG_BOT_TOKEN`）或交互式输入，配置文件里写了也会被忽略。
 
+### 插件自己的配置段
+
+每个插件可以在 `[plugin.<插件名>]` 下放自己的配置（键值任意、可嵌套）。插件名是点分的，
+所以 `[plugin.fuyubot.manage]` 就是插件 `fuyubot.manage` 那段：
+
+```toml
+[plugin.fuyubot.manage]
+reply_prefix = "已安装插件："
+
+[plugin.my.weather]
+city = "上海"
+```
+
+插件经 ABI 读写它：`get_config(section, key)` 能读**任意**段（自己 + 别人），
+`set_config(key, value)` 只能写**自己**那段（宿主按调用者身份判定，写完回写本文件）。
+Rust / C / Python / JS 四种写法见
+[配置文件](https://catmoecircle.github.io/FuyuBot-docs/docs/usage/config)。
+
+⚠️ `set_config` 回写是**全量重写**，本文件里手写的注释会丢。
+
 ## 插件
 
 内置三个：`/start`、`/help`、`/plugins`。自己的插件放进 `plugins/` 即可，一个动态库就是一个插件；

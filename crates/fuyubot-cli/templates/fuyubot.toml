@@ -32,3 +32,16 @@ path = ""
 # 日志详细度：默认 **1**（保留警告与错误）。TDLib 自己的默认更啰嗦——每轮 `td_receive`
 # 的超时、`Begin to wait for updates…` 之类都会打到 stderr。要排查问题就调大。
 log_verbosity = 1
+
+# ── 插件配置段 ──────────────────────────────────────────────────────
+# 每个插件在 `[plugin.<插件名>]` 下可以有自己的配置（键值任意、可嵌套）。
+# 插件名 = `define_plugin!` / 脚手架里登记的那个名字（如 `fuyubot.manage`）。
+# 运行时经 ABI 接口 `get_config` 读任意段（自己或别人的），经 `set_config`
+# 只能写**自己**这一段——写别的插件那段会被宿主拒绝。
+#
+# 例：
+# [plugin.fuyubot.manage]
+# reply_prefix = "已安装插件："
+# [plugin.my.weather]
+# city = "上海"
+# api_key = "……"

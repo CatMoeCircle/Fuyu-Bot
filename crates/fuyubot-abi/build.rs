@@ -16,7 +16,7 @@ const HEADER: &str = r#"/**
  * 1. **谁分配谁释放。** 插件通过 `plugin_init` 返回的 `name`、以及插件自己
  *    分配的任何字符串，都由插件持有；宿主绝不会 free 它们。插件若要给出一个
  *    临时的、需要宿主接管的字符串，只能走 `plugin_free_string` 那套约定。
- * 2. **宿主返回的字符串是线程局部缓冲。** `list_tools` 与
+ * 2. **宿主返回的字符串是线程局部缓冲。** `list_tools`、`get_config` 与
  *    `WaitHandle::payload_json` 指向宿主的一块复用缓冲，
  *    **只在下一次调用宿主函数之前有效**。要留着就必须当场拷走，
  *    并且**不要试图释放它**——宿主 VTable 里没有 host 侧的 free 函数，
@@ -37,7 +37,7 @@ const HEADER: &str = r#"/**
  *
  * Rust 1.99 的 `extern "C" fn(.., ...)` 已经稳定（可以写、cbindgen 也能生成），
  * 但**本 ABI 一个都没用**：`...` 会把参数类型和个数校验全部丢掉，而 VTable 里
- * 15 个函数的参数都是固定的，用 `...` 只会让 C 侧传错参数从编译错误降级成运行期 UB。 * 如果将来真要加，正确的 C 声明形状是：
+ * 各个函数的参数都是固定的，用 `...` 只会让 C 侧传错参数从编译错误降级成运行期 UB。 * 如果将来真要加，正确的 C 声明形状是：
  *
  *     typedef void (*FuyubotLogFn)(uint32_t level, const char *format, ...);
  *     // Rust 侧对应：unsafe extern "C" fn(level: u32, format: *const c_char, ...)

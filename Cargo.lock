@@ -426,6 +426,7 @@ dependencies = [
  "libloading",
  "serde_json",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

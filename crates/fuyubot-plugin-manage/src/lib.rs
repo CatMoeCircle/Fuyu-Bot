@@ -33,12 +33,17 @@ impl Plugin for ManagePlugin {
     fn start(&mut self, config_json: &str) -> Result<(), String> {
         let host = self.host;
         let plugins_dir = plugins_dir_from(config_json);
+        // 读自己的配置段 `[plugin.fuyubot.manage]`（经 ABI 的 get_config），没配就用默认值。
+        // 这演示了「插件读全局配置」：只能读，写别的段会被宿主拒绝。
+        let prefix = host
+            .get_config("fuyubot.manage", "reply_prefix")
+            .unwrap_or_else(|| "已安装 ".to_owned());
         let subscription = on_command(host, move |command: &Command| {
             if !command.is("plugins") {
                 return;
             }
             let params = SendMessageParams {
-                text: Some(Text::plain(list_plugins(&plugins_dir))),
+                text: Some(Text::plain(list_plugins(&plugins_dir, &prefix))),
                 reply_to_message_id: Some(command.message_id),
                 ..SendMessageParams::default()
             };
@@ -65,7 +70,7 @@ fn plugins_dir_from(config_json: &str) -> PathBuf {
 }
 
 /// 插件目录里的动态库（按文件名排序）。
-fn list_plugins(dir: &Path) -> String {
+fn list_plugins(dir: &Path, prefix: &str) -> String {
     let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = entry.path();
@@ -85,7 +90,7 @@ fn list_plugins(dir: &Path) -> String {
     if names.is_empty() {
         return format!("{} 里还没有插件。", dir.display());
     }
-    let mut text = format!("已安装 {} 个插件：\n", names.len());
+    let mut text = format!("{prefix}{} 个插件：\n", names.len());
     for name in names {
         text.push_str(&format!("• {name}\n"));
     }
