@@ -2,6 +2,8 @@
 
 **基于 TDLib 的 Telegram bot / user 框架**：Rust 内核 + C ABI 插件。
 
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
+
 - **插件就是动态库**（`.dll` / `.so` / `.dylib`），Rust / C / C++ / Python / JS / TypeScript 都能写。
 - **下载即用**：Release 包里可执行文件、TDLib（`tdjson`）和内置插件都是齐的，不用装 Rust。
 - **bot 与 user 两种账号**都支持；登录一次，session 由 TDLib 存进 `data/`，之后不用再登。
