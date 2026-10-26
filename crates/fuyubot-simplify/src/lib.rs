@@ -995,6 +995,19 @@ pub fn edit_caption_params(
     Value::Object(payload)
 }
 
+/// `editMessageReplyMarkup` 的参数。
+///
+/// 与另外三个 `editMessage*` 不一样：这里的 `reply_markup` 是**必需**字段
+/// （真签名 `editMessageReplyMarkup chat_id message_id reply_markup`），
+/// 所以空键盘按「移除键盘」发（`replyMarkupRemoveKeyboard`），不是省略这个字段。
+pub fn edit_markup_params(chat_id: i64, message_id: i64, rows: &[Vec<ReplyButton>]) -> Value {
+    let mut payload = edit_params(chat_id, message_id, rows);
+    payload
+        .entry("reply_markup")
+        .or_insert_with(|| json!({ "@type": "replyMarkupRemoveKeyboard" }));
+    Value::Object(payload)
+}
+
 /// `editMessageMedia` 的参数。
 pub fn edit_media_params(
     chat_id: i64,
@@ -1545,6 +1558,23 @@ impl Simplify {
         Ok(self
             .host
             .td_invoke_simplified("editMessageMedia", &payload.to_string())?)
+    }
+
+    /// 只改一条消息的键盘（`editMessageReplyMarkup`）——**相册要挂键盘就只能用这条**：
+    /// `sendMessageAlbum` 的真签名里没有 `reply_markup`，发的时候带不上。
+    ///
+    /// 返回**请求号**：改完的 `Message` 从响应通道回来（要拿就 [`wait_response`](Self::wait_response)）。
+    /// 空键盘 = **移除键盘**（`replyMarkupRemoveKeyboard`），不是「什么都不改」。
+    pub fn edit_message_reply_markup(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        reply_markup: &[Vec<ReplyButton>],
+    ) -> Result<RequestId> {
+        let payload = edit_markup_params(chat_id, message_id, reply_markup);
+        Ok(self
+            .host
+            .td_invoke_simplified("editMessageReplyMarkup", &payload.to_string())?)
     }
 
     /// 删消息（`deleteMessages`），`revoke = true` 表示对所有人撤回。
@@ -2192,6 +2222,35 @@ mod tests {
         );
     }
 
+    /// 相册**发的时候带不上键盘**（真签名里没有 `reply_markup`），只能事后改：
+    /// `editMessageReplyMarkup` 就是那条路，而它的 `reply_markup` 是必需字段——
+    /// 空键盘按「移除键盘」发，不是省略。
+    #[test]
+    fn edit_reply_markup_is_how_an_album_gets_a_keyboard() {
+        let rt = runtime();
+        let simplify = simplify(&rt);
+
+        simplify
+            .edit_message_reply_markup(7, 9, &[vec![ReplyButton::callback("ok", "x")]])
+            .unwrap();
+        simplify.edit_message_reply_markup(7, 9, &[]).unwrap();
+
+        let sent = rt.sent_requests();
+        assert_eq!(sent[0].method, "editMessageReplyMarkup");
+        assert_eq!(sent[0].params["chat_id"], 7);
+        assert_eq!(sent[0].params["message_id"], 9);
+        assert_eq!(
+            sent[0].params["reply_markup"]["@type"],
+            "replyMarkupInlineKeyboard"
+        );
+
+        // 空键盘：真签名里 reply_markup 必填，所以发的是「移除键盘」
+        assert_eq!(
+            sent[1].params["reply_markup"]["@type"],
+            "replyMarkupRemoveKeyboard"
+        );
+    }
+
     /// 模拟 TDLib：看到 `sendMessageAlbum` 就先回响应，再逐条推成功更新。
     fn album_responder(
         rt: Arc<HostRuntime>,
@@ -2740,6 +2799,11 @@ mod tests {
                 },
             )
             .unwrap();
+        simplify
+            .edit_message_reply_markup(7, 9, &[vec![ReplyButton::callback("ok", "x")]])
+            .unwrap();
+        // 空键盘 = 移除键盘：reply_markup 是必需字段，不能省
+        simplify.edit_message_reply_markup(7, 9, &[]).unwrap();
         simplify.delete_message(7, [9, 10], true).unwrap();
         simplify
             .answer_callback_query(555, Some("好的"), true)
