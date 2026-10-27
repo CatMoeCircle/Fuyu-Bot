@@ -491,7 +491,7 @@ impl HostRuntime {
         Ok(total)
     }
 
-    /// 插件日志的门槛：级别数值 **小于等于** 它的才记（`Error = 1 … Trace = 5`）。
+    /// 读当前插件日志门槛（语义见上方 `log_verbosity` 字段）。
     pub fn log_verbosity(&self) -> u32 {
         self.log_verbosity.load(Ordering::Relaxed)
     }

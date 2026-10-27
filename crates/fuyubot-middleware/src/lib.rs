@@ -86,7 +86,7 @@ pub struct Next<'a> {
 impl Next<'_> {
     /// 执行下一层；已经是最后一层就直接返回。
     ///
-    /// ponytail: 递归实现，层数 = 调用栈深度；管道上百层再改成迭代
+    /// 递归实现，层数 = 调用栈深度；管道上百层再改成迭代。
     pub fn run(self, ctx: &mut MiddlewareContext) -> fuyubot_core::Result<()> {
         let Some(layer) = self.layers.get(self.index) else {
             return Ok(());

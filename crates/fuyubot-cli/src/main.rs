@@ -265,7 +265,7 @@ fn run_background(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     {
         // DETACHED_PROCESS：子进程不要控制台（否则父进程退出 / 终端关掉会影响它）。
-        // `# ponytail:` 没做 Unix 的 setsid（std 不提供）——那边靠「stdio 都重定向了、
+        // 没做 Unix 的 setsid（std 不提供）——那边靠「stdio 都重定向了、
         // 也不在终端的进程组前台」撑着，关终端发 SIGHUP 时可能被带走；要真守护进程再引守护库。
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -415,7 +415,7 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .runtime()
         .set_log_verbosity(config.plugins.log_level()?);
 
-    // ── 顺序（用户 2026 指定）──────────────────────────────────────
+    // ── 启动顺序 ────────────────────────────────────────────────
     //
     //   ① 自动 init（上面刚做）
     //   ② **交互式问 api_id / api_hash**（缺了才问；环境变量/配置都有就不问）
@@ -806,7 +806,7 @@ impl fuyubot_tdlib::Prompter for ConsolePrompter {
 
 /// 把登录要用的 TDLib 参数凑齐：**缺什么就交互式问用户**。
 ///
-/// 优先级：环境变量 → 配置 → **交互式提问**（用户 2026 要的就是这一步：`run` 自己问，
+/// 优先级：环境变量 → 配置 → **交互式提问**（`run` 自己问，
 /// 不让用户先去翻文档找配置项）。
 /// - `api_id` **不是**凭据（约束 41 只禁 api_hash / token / 手机号 / 密码），所以环境变量与
 ///   配置都认；
@@ -853,7 +853,7 @@ fn resolve_parameters(
             .into());
     }
 
-    // **配置与凭据都齐了就直接进下一步**（用户 2026 要的）：一次都没问过就说清凭据是从哪来的，
+    // **配置与凭据都齐了就直接进下一步**：一次都没问过就说清凭据是从哪来的，
     // 免得用户以为「没提问 = 凭据没被用上」。
     if !prompter.asked {
         let id_src = if id_from_env.is_some() {

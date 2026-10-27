@@ -471,7 +471,7 @@ impl ToolRegistry {
         self.lock().tools.is_empty()
     }
 
-    /// ponytail: 监听器报错只忽略（注册路径没地方报）；要观测就让监听器自己记日志
+    /// 监听器报错只忽略（注册路径没地方报）；要观测就让监听器自己记日志
     fn broadcast(&self, event: ToolEvent) {
         broadcast_to(&self.inner, event);
     }
@@ -528,7 +528,7 @@ fn validate(
     if is_empty_schema(schema) {
         return Ok(());
     }
-    // ponytail: 每次调用都重新编译 schema；调用量大时把 Validator 缓存进 ToolDescriptor
+    // 每次调用都重新编译 schema；调用量大时把 Validator 缓存进 ToolDescriptor。
     let validator = jsonschema::validator_for(schema).map_err(|e| ToolError::BadSchema {
         name: name.to_owned(),
         detail: e.to_string(),

@@ -133,7 +133,7 @@ fn vendored_library_is_used() {
     assert_eq!(fuyubot_tdlib::TDLIB_VERSION, "1.8.68");
 }
 
-// ── 真 Bot 登录（规格变更 3 的验收）──────────────────────────────────────
+// ── 真 Bot 登录验收 ──────────────────────────────────────────────
 //
 // 凭据**只走环境变量，不落任何文件**（变更 2/3：配置文件不存凭据，
 // session 持久化在 `database_dir`）：
@@ -287,7 +287,7 @@ fn await_response(client: &TdClient, id: fuyubot_tdlib::RequestId, budget: Durat
 
 /// 真 Bot 登录：`setTdlibParameters` → `waitPhoneNumber` → `checkAuthenticationBotToken`
 /// → `ready` → `getMe` 拿到这个 bot；**然后重启一个客户端**，证明 session 已经落进
-/// `database_dir`，第二次不再需要凭据（这正是规格变更 3 的核心主张）。
+/// `database_dir`，第二次不再需要凭据（这正是登录态持久化的核心主张）。
 #[test]
 #[ignore = "需要真实 TDLib + 真实 tg api_id/api_hash/bot token（环境变量 TG_API_ID/TG_API_HASH/TG_BOT_TOKEN）"]
 fn real_bot_login_reaches_ready_and_reuses_the_session() {

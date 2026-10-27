@@ -99,7 +99,7 @@ fn stage_next_to_binary(vendored_dir: Option<&Path>, version: &str) {
     let Some(out_dir) = std::env::var_os("OUT_DIR").map(PathBuf::from) else {
         return;
     };
-    // 形状对不上就什么都不拷（宁可不拷，也不往一个猜出来的目录里写）。
+    // 宁可不拷，也不往一个猜出来的目录里写。
     let Some(dest_dir) = vendored::binary_dir_from(&out_dir) else {
         return;
     };

@@ -316,7 +316,7 @@ fn plugin_name(handle: &PluginHandle, path: &Path) -> String {
 /// 只导出 `//export` 的那几个函数，`crosscall2` 之类并不在导出表里（踩过）；
 /// 也不能只看文件末尾——PE 里这段在中间的数据段（也踩过）。
 ///
-/// ponytail: 整份读进内存找魔数，插件就几 MB，加载一次的开销可以忽略；
+/// 整份读进内存找魔数，插件就几 MB，加载一次的开销可以忽略；
 /// 真到「插件动辄上百 MB」再改成带重叠加窗的分块扫描。
 fn looks_like_go_binary(path: &Path) -> bool {
     const MAGIC: &[u8] = b"\xff Go buildinf:";

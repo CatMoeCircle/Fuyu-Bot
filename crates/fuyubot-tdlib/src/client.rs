@@ -267,7 +267,7 @@ impl TdClient {
         let this = Arc::clone(self);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
-        // ponytail: 固定 1s 轮询；要低延迟就换 TDLib 的 update callback 注册。
+        // 固定 1s 轮询；要低延迟就换 TDLib 的 update callback 注册。
         // 代价是 stop() 之后最长还要 1s 才真的停下（见 ReceiveLoop::stop）。
         let handle = tokio::task::spawn_blocking(move || {
             while !flag.load(Ordering::Relaxed) {

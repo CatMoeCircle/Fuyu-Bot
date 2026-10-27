@@ -18,8 +18,8 @@ use std::ffi::{CStr, CString};
 
 /// ABI 版本。字段只增不改，新增一律追加在尾部。
 ///
-/// v3：新增 [`HostApiVTable::get_config`] 与 [`HostApiVTable::set_config`]——
-/// 插件读全局配置（自己的段 + 别人的段），只能写自己的段。
+/// 经 [`HostApiVTable::get_config`] 与 [`HostApiVTable::set_config`]，
+/// 插件可读取全局配置（自己的段 + 别人的段），但**只能写自己的段**。
 pub const ABI_VERSION: u32 = 3;
 
 /// cbindgen 生成的头文件**原文**。
@@ -35,7 +35,6 @@ pub const SYM_PLUGIN_STOP: &[u8] = b"plugin_stop";
 pub const SYM_PLUGIN_FREE_STRING: &[u8] = b"plugin_free_string";
 
 // ── 事件通道约定 ───────────────────────────────────────────────────
-//
 // 这三个名字是宿主与插件之间的约定，所以由 ABI crate 定，两边都从这里取。
 
 /// 更新的**兜底通道**：每条更新都会同时发到「具体的 `@type` 通道」和这条上。

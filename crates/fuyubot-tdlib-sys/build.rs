@@ -74,7 +74,7 @@ fn acquire_schema(version: &str, configured_repo: Option<&str>) -> PathBuf {
     }
 
     // 缓存命中就**静默**复用：用的是哪份、多少条，`bake_schema` 那条汇总日志已经带了路径，
-    // 再说一遍只是每次重跑构建脚本都刷一条 warning（用户 2026 抱怨过）。
+    // 再说一遍只是每次重跑构建脚本都刷一条 warning。
     let relative = Path::new(version).join("td_api.tl");
     if let Some(cached) = build_support::find_cached(&relative) {
         return cached;
