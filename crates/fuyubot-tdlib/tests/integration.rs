@@ -130,7 +130,7 @@ fn vendored_library_is_used() {
         fuyubot_tdlib::LibrarySource::Vendored,
         "没走 vendored 优先级（TDLIB_TDJSON_PATH 是否被设置了？）"
     );
-    assert_eq!(fuyubot_tdlib::TDLIB_VERSION, "1.8.68");
+    assert_eq!(fuyubot_tdlib::TDLIB_VERSION, "1.8.69");
 }
 
 // ── 真 Bot 登录验收 ──────────────────────────────────────────────
@@ -142,7 +142,7 @@ fn vendored_library_is_used() {
 // $env:TG_API_ID   = "12345678"
 // $env:TG_API_HASH = "..."
 // $env:TG_BOT_TOKEN = "123456:AA..."
-// $env:TDLIB_TDJSON_PATH = "F:\Rust\FuyuBot\.tdlib-cache\1.8.68\windows-x86_64"
+// $env:TDLIB_TDJSON_PATH = "F:\Rust\FuyuBot\.tdlib-cache\1.8.69\windows-x86_64"
 // cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_login --nocapture
 // ```
 

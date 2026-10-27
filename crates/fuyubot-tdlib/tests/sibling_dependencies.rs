@@ -18,7 +18,7 @@
 //! 所以它必须独占一个进程。跑法：
 //!
 //! ```powershell
-//! $env:TDLIB_TDJSON_PATH = ".tdlib-cache\1.8.68\windows-x86_64"
+//! $env:TDLIB_TDJSON_PATH = ".tdlib-cache\1.8.69\windows-x86_64"
 //! cargo test -p fuyubot-tdlib --test sibling_dependencies --offline -- --ignored
 //! ```
 

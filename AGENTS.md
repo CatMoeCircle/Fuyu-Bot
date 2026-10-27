@@ -56,7 +56,7 @@ cargo package-bot                     # release：fuyubot.exe + 三个内置插�
 
 ```powershell
 # 真库（真 tdjson + 真 schema）：改 ffi 符号/arity、loader、tl_schema/tl_codegen、登录授权后必跑
-$env:TDLIB_TDJSON_PATH = "F:\Rust\FuyuBot\.tdlib-cache\1.8.68\windows-x86_64"
+$env:TDLIB_TDJSON_PATH = "F:\Rust\FuyuBot\.tdlib-cache\1.8.69\windows-x86_64"
 cargo test -p fuyubot-tdlib --test integration --offline -- --ignored
 cargo test -p fuyubot-tdlib --test sibling_dependencies --offline -- --ignored   # 必须单独跑（独占进程）
 

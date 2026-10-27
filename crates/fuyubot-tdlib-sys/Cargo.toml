@@ -16,7 +16,7 @@ repository.workspace = true
 # ⚠️ `tdlib-version` 必须与 **CI 跑 build-tdlib 时填的 `tdlib_version` 输入**一致：
 #    资产放在 tag `TDLib-v<tdlib-version>` 下，填错就是 404。
 [package.metadata.fuyubot]
-tdlib-version = "1.8.68"
+tdlib-version = "1.8.69"
 releases-repo = "CatMoeCircle/Fuyu-Bot"
 
 [dependencies]
