@@ -478,28 +478,36 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .name
         .clone()
         .unwrap_or_else(|| "fuyubot".to_owned());
-    // 插件速览：`status` 是**另一个进程**，只能从这份文件读，所以要在这里写下来。
-    // 同时刷给宿主运行时——插件经 `get_service` 读到的就是它（缺口 31 的宿主那半）。
-    let report = kernel.report();
-    let detail = instance::PluginDetail::from_report(&report);
-    loader.runtime().install_plugin_report(&report);
+    // 插件速览：`status` 是**另一个进程**，只能从这份文件读，所以要写下来。
+    // （插件自己那条路走 `fuyubot.host.plugins` 服务，`load_plugins` 里已经装了活来源。）
+    let detail = instance::PluginDetail::from_report(&kernel.report());
     println!(
         "{bot_name}（fuyubot {}）已启动：插件 {} 个，工具 {} 个",
         env!("CARGO_PKG_VERSION"),
         detail.active.len(),
         loader.runtime().tools().len()
     );
-    // 状态**这时候才发布**：`run --background` 的父进程等的就是它（拿上锁只说明进程活着）。
-    if let Some(lock) = instance_lock.as_ref() {
+    // 发布 / 重发状态用同一份计算：`--background` 的父进程等的是**第一次**发布，
+    // 而运行期插件上下线之后要让 `status` 跟上——两处算的必须是同一个东西。
+    let publish = |detail: instance::PluginDetail| -> Result<(), Box<dyn std::error::Error>> {
+        let Some(lock) = instance_lock.as_ref() else {
+            return Ok(());
+        };
         lock.publish(&instance::Info {
             pid: std::process::id(),
             started: started_at,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             plugins: detail.active.len(),
-            name: bot_name,
+            name: bot_name.clone(),
             detail,
         })?;
-    }
+        Ok(())
+    };
+    // 状态**这时候才发布**：`run --background` 的父进程等的就是它（拿上锁只说明进程活着）。
+    publish(detail.clone())?;
+    // 运行循环用它判断「要不要重发」——不记下来的话，每圈都算得出差异、
+    // 或者干脆每圈都写一遍。
+    let mut last_detail = detail;
 
     if let Some(replay) = args.replay {
         // 脚本插件在**另一个进程**里跑，反应要经管道回来，还可能捎带网络请求；
@@ -560,6 +568,20 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     //    要优雅退出就走 `fuyubot stop`（它写停止标记，我们在下面这一圈里看到就自己收摊）。
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // 插件在运行期会自行上下线（依赖消失就退回 Pending，回来再自动激活），
+        // 而 `fuyubot status` 是**另一个进程**、只能读这份文件。所以这一圈顺带把
+        // 变了的状态重新发布一次。
+        //
+        // ⚠️ **只在真的变了才写**：`publish` 会整份重写文件，每 500ms 都写一遍
+        // 是白费 I/O，还会让 `status` 的读和写撞上（Windows 上偶尔读到半份）。
+        {
+            let current = instance::PluginDetail::from_report(&kernel.report());
+            if current != last_detail {
+                publish(current.clone())?;
+                last_detail = current;
+            }
+        }
 
         // `fuyubot stop` 请我们停下：**优雅收摊**——停接收循环 → 卸载插件（跑 `plugin_stop`）
         // → 停内核 → 放锁（`InstanceLock` 随作用域 drop）。
@@ -1104,10 +1126,9 @@ fn load_plugins(
         .collect();
     kernel.plugins().load_all(plugins)?;
 
-    // 让插件经 ABI 问得到「进程里加载了哪些」：宿主把自己的清单注册成一个服务
-    // （`fuyubot.host.plugins`），这里刷成当前快照。**放在这一层**是因为
-    // `run` / `--replay` / `plugin list` 三条路径都经过这里。
-    loader.runtime().install_plugin_report(&kernel.report());
+    // 让插件经 ABI 问得到「进程里加载了哪些」：装的是**活来源**而不是快照，
+    // 所以之后插件怎么上下线都不用手动刷新（旧接口要求每次变化后刷，实际没人刷得到）。
+    loader.runtime().install_plugin_reporter(kernel.reporter());
 
     // Pending 的要说清楚：不说的话，人就会以为它在正常跑。
     for (name, missing) in kernel.plugins().pending() {

@@ -16,7 +16,7 @@ use fuyubot_abi::{
     MiddlewareHandle, RequestId, ServiceHandle, ServiceMethod, ServiceVTable, SubscriptionHandle,
     ToolHandle, WaitHandle,
 };
-use fuyubot_core::{Context, Effect, Report};
+use fuyubot_core::{Context, Effect, PluginReporter, Report};
 use fuyubot_event::{EventBus, Filter, SubscriptionHandle as EventSubscription};
 use fuyubot_middleware::{
     Middleware, MiddlewareContext, MiddlewareHandle as MwRegistration, Next, Pipeline,
@@ -220,12 +220,16 @@ pub struct HostRuntime {
     config: Mutex<ConfigState>,
     /// 插件 owner id → 插件名（`set_config` 按它判定「这是谁的段」）。
     owner_names: Mutex<HashMap<u64, String>>,
-    /// 最近一次插件报告（`PluginManager::report` 的 JSON 快照）。
+    /// **活的**插件报告来源（装了内核的 [`PluginReporter`] 之后才有）。
     ///
-    /// 为什么是「快照」而不是让运行时自己去问内核：`HostRuntime` 只持有 `Context`，
-    /// **刻意不持有 `PluginManager`**——那会让 loader 反过来攥住内核的生命周期。
-    /// CLI 在加载/卸载之后刷新这里，插件经 `get_service` 读到的就是最近一次。
-    plugin_report: Mutex<String>,
+    /// 为什么是「来源」而不是「快照」：`HostRuntime` 只持有 `Context`，**刻意不持有
+    /// `PluginManager`**——那会让 loader 反过来攥住内核的生命周期。但把算好的
+    /// 快照存下来又要求调用方记得刷新，而没人记得（运行期插件上下线之后
+    /// `/plugins` 还在报旧状态，说三个在跑、其实退了两个）。
+    ///
+    /// [`PluginReporter`] 两边都满足：它持 `Weak<Mutex<Vec<Fiber>>>`，管理器没了
+    /// 就报空表，不会把内核吊住；而每次问都现算，**结构上不存在过期**。
+    plugin_report: Mutex<Option<PluginReporter>>,
 }
 
 /// 一条已经发出的请求。
@@ -311,7 +315,7 @@ impl HostRuntime {
             },
             config: Mutex::new(ConfigState::default()),
             owner_names: Mutex::new(HashMap::new()),
-            plugin_report: Mutex::new("{}".to_owned()),
+            plugin_report: Mutex::new(None),
             // `host_ctx` 指向这个 `Arc` 内部；地址稳定，插件活着期间一直有效。
             vtable: HostApiVTable {
                 version: ABI_VERSION,
@@ -523,21 +527,27 @@ impl HostRuntime {
         &self.middleware
     }
 
-    /// 刷新「进程里加载了哪些插件」的快照（CLI 在加载/卸载之后调）。
+    /// 装上内核的**活报告来源**。装一次就够，之后不必再管。
     ///
-    /// 只留**结论**，不在这里判断谁对谁错：报告怎么来是内核的事，这里只负责
-    /// 让插件经 ABI 问得到。
-    pub fn install_plugin_report(&self, report: &Report) {
-        let text = report_json(report);
-        *self.plugin_report.lock().unwrap_or_else(|e| e.into_inner()) = text;
+    /// 与旧接口（`install_plugin_report(&Report)`）的区别：那个要调用方在**每次**
+    /// 状态变化后主动刷，实际没人刷得到；这个交出去的是计算能力，问一次算一次。
+    pub fn install_plugin_reporter(&self, reporter: PluginReporter) {
+        *self.plugin_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(reporter);
     }
 
-    /// 最近一次快照（JSON）。插件没问过就是 `{}`。
+    /// 此刻的插件报告（JSON）。没装来源就是空表。
     pub fn plugin_report(&self) -> String {
-        self.plugin_report
+        let reporter = self
+            .plugin_report
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .clone();
+        match reporter {
+            Some(reporter) => report_json(&reporter.report()),
+            None => report_json(&Report {
+                plugins: Vec::new(),
+            }),
+        }
     }
 
     /// 接上 TDLib 客户端（可选）。没接时 `td_invoke*` 返回无效请求号。

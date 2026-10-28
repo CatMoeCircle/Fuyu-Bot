@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use crate::context::Context;
 use crate::effect::Effect;
@@ -83,6 +83,62 @@ fn is_available(ctx: &Context, fibers: &[Fiber], capability: &str) -> bool {
         || fibers
             .iter()
             .any(|other| other.state.is_active() && other.name() == capability)
+}
+
+/// 把当前 fiber 表拍成一份 [`Report`]。**加锁由调用方负责**（它可能已经持锁）。
+fn snapshot(ctx: &Context, fibers: &[Fiber]) -> Report {
+    let mut plugins = Vec::with_capacity(fibers.len());
+    for fiber in fibers.iter() {
+        let state = match &fiber.state {
+            State::Pending => ReportState::Pending,
+            State::Activating => ReportState::Activating,
+            State::Active { .. } => ReportState::Active,
+            State::Failed { .. } => ReportState::Failed,
+        };
+        // 只有「还没起来」的才值得报缺什么：活着的那些依赖自然是齐的。
+        let missing = match state {
+            ReportState::Pending => fiber.missing(ctx, fibers),
+            _ => Vec::new(),
+        };
+        let reason = match &fiber.state {
+            State::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        };
+        plugins.push(ReportEntry {
+            name: fiber.name().to_owned(),
+            state,
+            missing,
+            reason,
+            // 激活序号：宿主按它排出「谁先起来的」，比登记顺序有意义。
+            seq: fiber.seq,
+        });
+    }
+    Report { plugins }
+}
+
+/// 一个**活的**报告来源，见 [`PluginManager::reporter`]。
+///
+/// 与 [`Report`]（一次性快照）的区别就是这一个：问几次算几次。
+/// 它持**弱**引用，所以不会把管理器吊在那儿——管理器没了就报空表，
+/// 这比 panic 或返回过期数据都好。
+#[derive(Debug, Clone)]
+pub struct PluginReporter {
+    ctx: Context,
+    fibers: Weak<Mutex<Vec<Fiber>>>,
+}
+
+impl PluginReporter {
+    /// 现算一份。管理器已经没了就是空表（不是错误：调用它的多半是插件，
+    /// 而插件可能比管理器活得久）。
+    pub fn report(&self) -> Report {
+        let Some(fibers) = self.fibers.upgrade() else {
+            return Report {
+                plugins: Vec::new(),
+            };
+        };
+        let guard = fibers.lock().unwrap_or_else(|e| e.into_inner());
+        snapshot(&self.ctx, &guard)
+    }
 }
 
 /// [`PluginManager::report`] 的产物：一次加锁拿到的一致视图。
@@ -248,35 +304,27 @@ impl PluginManager {
     /// 这里合成**一次加锁**的一致视图——分开调会在两次之间漏掉状态变化。
     ///
     /// 返回纯数据（不含 serde），序列化由宿主层做：`core` 不引 serde。
+    ///
+    /// ⚠️ 这是一份**快照**：拿到之后管理器再怎么变，它都不变。要给外部消费者
+    /// （比如插件的 `fuyubot.host.plugins` 服务）用，请拿
+    /// [`reporter`](Self::reporter) ——那个每次被问都现算，不会过期。
     pub fn report(&self) -> Report {
-        let fibers = self.lock_fibers();
-        let mut plugins = Vec::with_capacity(fibers.len());
-        for fiber in fibers.iter() {
-            let state = match &fiber.state {
-                State::Pending => ReportState::Pending,
-                State::Activating => ReportState::Activating,
-                State::Active { .. } => ReportState::Active,
-                State::Failed { .. } => ReportState::Failed,
-            };
-            // 只有「还没起来」的才值得报缺什么：活着的那些依赖自然是齐的。
-            let missing = match state {
-                ReportState::Pending => fiber.missing(&self.ctx, &fibers),
-                _ => Vec::new(),
-            };
-            let reason = match &fiber.state {
-                State::Failed { reason } => Some(reason.clone()),
-                _ => None,
-            };
-            plugins.push(ReportEntry {
-                name: fiber.name().to_owned(),
-                state,
-                missing,
-                reason,
-                // 激活序号：宿主按它排出「谁先起来的」，比登记顺序有意义。
-                seq: fiber.seq,
-            });
+        snapshot(&self.ctx, &self.lock_fibers())
+    }
+
+    /// 一个**活的**报告来源：每次 [`PluginReporter::report`] 都现算。
+    ///
+    /// 这就是修掉「快照只在加载时刷一次」毛病的地方。之前宿主把手算的快照塞进
+    /// 一个 `Mutex<String>`，指望调用方记得刷新——没人记得，于是运行期插件上下线
+    /// 之后 `/plugins` 还在报旧状态（说三个在跑，其实退了两个）。
+    ///
+    /// 现在把**计算能力**交出去，而不是交结果：句柄持的是 `Arc<Mutex<Vec<Fiber>>>`
+    /// 的弱引用 + `Context` 的克隆，问一次算一次，结构上不存在过期。
+    pub fn reporter(&self) -> PluginReporter {
+        PluginReporter {
+            ctx: self.ctx.clone(),
+            fibers: Arc::downgrade(&self.fibers),
         }
-        Report { plugins }
     }
 
     pub fn len(&self) -> usize {
@@ -864,5 +912,42 @@ mod tests {
         assert!(report.plugins.is_empty());
         assert!(report.active().is_empty());
         assert!(report.pending().is_empty());
+    }
+
+    /// `reporter()` 是**活的**：管理器状态一变，同一个句柄问出来就不一样。
+    ///
+    /// 这条守的是「快照被人存下来忘了刷」那个 bug——旧实现把算好的 `Report`
+    /// 序列化进一个 `Mutex<String>`，运行期插件上下线之后它一直是旧的。
+    #[test]
+    fn a_reporter_tracks_state_instead_of_freezing_it() {
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let mut manager = PluginManager::new(Context::new());
+        let reporter = manager.reporter();
+
+        assert!(reporter.report().plugins.is_empty(), "一开始没人");
+
+        manager.load_shared(Named::new("A", &[], &log)).unwrap();
+        assert_eq!(
+            reporter.report().active(),
+            vec!["A"],
+            "加载后同一个句柄就该看到"
+        );
+
+        manager.unload_all().unwrap();
+        assert!(
+            reporter.report().plugins.is_empty(),
+            "卸完之后它必须报空，而不是留着旧的那份"
+        );
+    }
+
+    /// 管理器没了之后 reporter 报空表，**不 panic**：它持有的是弱引用
+    /// （插件可能比管理器活得久，那种时候「没人了」是正确的答案）。
+    #[test]
+    fn a_reporter_outliving_its_manager_reports_nothing() {
+        let reporter = {
+            let manager = PluginManager::new(Context::new());
+            manager.reporter()
+        };
+        assert!(reporter.report().plugins.is_empty());
     }
 }

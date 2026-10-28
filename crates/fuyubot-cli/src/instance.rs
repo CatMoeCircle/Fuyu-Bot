@@ -750,6 +750,38 @@ mod tests {
         assert_eq!(parsed.detail, detail);
     }
 
+    /// 「变了才重发」靠的是 `PluginDetail` 的相等判定——它要是永远相等，
+    /// 运行循环就永远不会重发，`status` 会一直显示启动那一刻的样子。
+    #[test]
+    fn different_details_compare_unequal() {
+        let base = PluginDetail {
+            active: vec!["a".to_owned()],
+            pending: Vec::new(),
+            failed: Vec::new(),
+        };
+        // 插件从「跑着」变成「等依赖」：必须不等。
+        let waiting = PluginDetail {
+            active: Vec::new(),
+            pending: vec![("a".to_owned(), vec!["database".to_owned()])],
+            failed: Vec::new(),
+        };
+        assert_ne!(base, waiting);
+
+        // 缺的能力多了一个：也得不等（否则依赖变化就看不见了）。
+        let more_missing = PluginDetail {
+            active: Vec::new(),
+            pending: vec![(
+                "a".to_owned(),
+                vec!["database".to_owned(), "cache".to_owned()],
+            )],
+            failed: Vec::new(),
+        };
+        assert_ne!(waiting, more_missing);
+
+        // 什么都没变：必须相等（否则每 500ms 白写一次盘）。
+        assert_eq!(base.clone(), base);
+    }
+
     /// 老实例（这次改动之前发布的 `status` 文件）没有 `active=` / `pending=` / `failed=`
     /// 三行：必须当空表读出来，而不是判成「读不出状态」。
     #[test]

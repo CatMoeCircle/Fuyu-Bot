@@ -541,8 +541,8 @@ fn plugins_can_read_the_report_through_a_host_service() {
         ])
         .expect("登记不该失败");
 
-    // CLI 在加载之后刷一次，插件读到的就是这次。
-    loader.runtime().install_plugin_report(&kernel.report());
+    // 装一次活来源。之后**不再刷新**——这正是旧实现（存算好的快照）挂掉的地方。
+    loader.runtime().install_plugin_reporter(kernel.reporter());
 
     // 走宿主侧的方法调用（和插件经 vtable 调进去完全同一条路）。
     let json = loader
@@ -554,9 +554,8 @@ fn plugins_can_read_the_report_through_a_host_service() {
     assert_eq!(value["plugins"][0]["name"], "fuyubot.demo");
     assert_eq!(value["plugins"][0]["state"], "active");
 
-    // 卸载之后快照要跟着变（不然这个 service 只会说谎）。
+    // 卸载之后报告要跟着变（不然这个 service 只会说谎）——**不需要谁再刷一次**。
     kernel.plugins().unload("fuyubot.demo").expect("卸载");
-    loader.runtime().install_plugin_report(&kernel.report());
     let json = loader
         .runtime()
         .call_service("fuyubot.host.plugins", "report", "{}")
@@ -565,7 +564,10 @@ fn plugins_can_read_the_report_through_a_host_service() {
     assert_eq!(value["count"], 0, "卸完了就不该再有它");
 }
 
-/// 诊断用（临时）：确认宿主预置的 service 到底在不在表里、叫什么。
+/// 宿主预置的「插件清单」service 必须真的在服务表里。
+///
+/// 少了它，插件侧的 `get_service` 返回 null，`/plugins` 会静默回退到目录清单——
+/// 也就是这个功能**看起来**还在、只是报的东西不对。那种退化最难察觉，所以单钉一条。
 #[test]
 fn host_report_service_is_registered() {
     let ctx = Context::new();
@@ -574,5 +576,60 @@ fn host_report_service_is_registered() {
     assert!(
         names.iter().any(|n| n == "fuyubot.host.plugins"),
         "服务表里该有 fuyubot.host.plugins，实际有 {names:?}"
+    );
+}
+
+/// 报告是**活的**：插件运行期上下线之后，再问一次就是新状态。
+///
+/// 这条守的是修掉的那个真 bug——旧实现存的是「算好的快照」，只在加载时刷一次，
+/// 于是运行期依赖消失后 `/plugins` 还在报「三个在跑」，而其实退了两个。
+/// 那种 bug 不会让任何测试变红，只会让人对着输出做错判断。
+#[test]
+fn the_report_reflects_runtime_changes_without_anyone_refreshing() {
+    let demo = build_fixture("fuyubot-plugin-demo");
+    let mut kernel = fuyubot_core::Kernel::new();
+    let ctx = kernel.context().clone();
+    let loader = PluginLoader::new(ctx.clone()).unwrap();
+    with_inject(&loader, "fuyubot.demo", &["database"]);
+
+    let shared = std::sync::Arc::new(
+        fuyubot_loader::DylibPlugin::probe(&loader, &demo, "").expect("探测成功"),
+    );
+    kernel
+        .plugins()
+        .load_all(vec![
+            std::sync::Arc::clone(&shared) as std::sync::Arc<dyn fuyubot_core::Plugin>
+        ])
+        .expect("登记不该失败");
+
+    // 装一次活来源，之后**再也不碰它**——这正是旧实现挂掉的地方。
+    loader.runtime().install_plugin_reporter(kernel.reporter());
+
+    let read = || -> serde_json::Value {
+        let json = loader
+            .runtime()
+            .call_service("fuyubot.host.plugins", "report", "{}")
+            .expect("service 该在");
+        serde_json::from_str(&json).expect("要是合法 JSON")
+    };
+
+    // 此刻：等待依赖。
+    let before = read();
+    assert_eq!(before["plugins"][0]["state"], "pending", "{before}");
+
+    // 能力到位 → 它自己起来。**没有人去刷新报告。**
+    let capability = ctx.provide_named("database", 1_u8).expect("注册能力");
+    let after = read();
+    assert_eq!(
+        after["plugins"][0]["state"], "active",
+        "依赖到位后报告该自己变成 active，实际 {after}"
+    );
+
+    // 能力消失 → 它自己退回去。
+    drop(capability);
+    let back = read();
+    assert_eq!(
+        back["plugins"][0]["state"], "pending",
+        "能力没了报告该自己变回 pending，实际 {back}"
     );
 }
