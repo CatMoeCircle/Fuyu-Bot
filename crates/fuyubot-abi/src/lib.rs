@@ -360,6 +360,7 @@ pub struct HostApiVTable {
             user_data: *mut c_void,
         ) -> MiddlewareHandle,
     >,
+    /// **阻塞**等一条更新（底层原语）。可 `await` 的版本见 [`ResponseRouter::wait_for_update`]。
     pub wait_for_update: Option<
         unsafe extern "C" fn(
             host: *mut c_void,
@@ -800,6 +801,10 @@ impl HostApi {
 
     /// 等一条匹配 `filter_json` 的更新。**阻塞当前线程**，直到匹配、超时或被
     /// [`cancel_wait`](Self::cancel_wait) 取消。`timeout_ms` 为 0 表示只检查当前状态。
+    ///
+    /// ⚠️ 这是**底层阻塞原语**，不是插件作者的首选：Rust 插件用
+    /// [`ResponseRouter::wait_for_update`]（可 `await`、可取消）；同步上下文再用这个。
+    /// 别在宿主事件回调里调它——那等于让收件人自己等自己。
     pub fn wait_for_update(&self, filter_json: &str, timeout_ms: u64) -> WaitHandle {
         let Ok(filter) = CString::new(filter_json) else {
             return WaitHandle::INVALID;

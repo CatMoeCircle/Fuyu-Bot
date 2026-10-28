@@ -1,5 +1,10 @@
 //! TDLib 便捷封装：**只简化输入，不改变输出**。
 //!
+//! ⚠️ **新代码优先 `fuyubot_abi::ResponseRouter`**：本 crate 的方法是**同步阻塞**的
+//! （内部 `wait_for_update`），只适合已经在同步上下文里的代码；在宿主事件回调里请用
+//! `*_then`（把等待丢到新线程），或者直接用 `ResponseRouter::invoke_simplified(..).await`。
+//! 这里的阻塞 API 保留给同步宿主 / 兼容层，不再是推荐的插件写法。
+//!
 //! 参数形状刻意跟「写 TDLib 的人已经习惯的那一套」保持一致——一个方法一个参数结构体，
 //! 字段用短名字（`text` / `media` / `topic_id` / `reply_to_message_id` / `reply_markup` /
 //! `link_preview` / `timeout_ms`），**不暴露 TDLib 的嵌套 JSON**：
