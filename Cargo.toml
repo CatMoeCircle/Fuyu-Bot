@@ -6,9 +6,9 @@ default-members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-# 首次公开版本就是 0.1.0：crates.io 上 `fuyubot-abi` / `fuyubot-tdlib-sys`
-# 一个版本都没有，摆成 0.1.2 只会让人问「0.1.0 和 0.1.1 去哪了」。
-# 内部迭代期间用过的 0.1.1 / 0.1.2 从未发布，不作为公开版本号。
+# 0.1.0 是首次公开版本（crates.io 上这两个 crate 之前一个版本都没有）。
+# 0.1.1 给 `HostApiVTable` 尾部加了 `provide_service_shared`（服务作用域），
+# 属于破坏性改动，所以 SDK 侧的依赖也一起顶到 0.1.1。
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.99"

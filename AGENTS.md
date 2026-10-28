@@ -36,13 +36,13 @@ TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` �
 
 ## 构建
 
-`td_api.tl` 是**必需输入**：`TDLIB_TD_API_TL` → 缓存（`<缓存根>/<版本>/td_api.tl`）→ 从 Releases 下载。
+`td_api.tl` 是**必需输入**：`TDLIB_TD_API_TL` → **包内 `vendor/<tdlib-version>/td_api.tl`**（随 crate 发布，crates.io 下游与 docs.rs 靠它，不联网）→ 缓存（`<缓存根>/<版本>/td_api.tl`）→ 从 Releases 下载。
 缓存根顺序：`FUYUBOT_TDLIB_VENDORED_CACHE` → `$CARGO_HOME/fuyubot-tdlib-vendored` → 项目本地 `.tdlib-cache/`。
 仓里的 `.cargo/config.toml` 已经把缓存指向仓内 `.tdlib-cache`（`relative = true`），本地直接敲命令即可。
 
 ```powershell
 cargo build --workspace --offline     # 0 退出、0 warning
-cargo test  --workspace --offline     # 269 passed / 0 failed / 10 ignored
+cargo test  --workspace --offline     # 341 passed / 0 failed / 12 ignored
 cargo tree  --workspace --offline     # 无环
 cargo fmt --all --check               # 0 diff
 
@@ -123,7 +123,7 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 22. **插件与中间件回调必须 `C-unwind`**；`define_plugin!` 自己也要包 `catch_unwind`。
 23. **一个 crate 只能展开一次 `define_plugin!`**（四个符号名是 ABI 定死的）。
 24. **`td_api.tl` 的函数/构造器只认 `---functions---` / `---types---` 标记**，不做首字母启发式。
-25. **`td_api.tl` 是必需输入**，拿不到就构建失败；缓存根顺序见上文。
+25. **`td_api.tl` 是必需输入**，拿不到就构建失败；顺序是 `TDLIB_TD_API_TL` → **包内 `vendor/<tdlib-version>/td_api.tl`** → 缓存 → 下载，缓存根顺序见上文。升 `tdlib-version` 时记得一起加 `vendor/<新版本>/`，否则下游又变回「要联网」。
 26. **转换只在编译期**：`td_api.json` + `td_api_generated.rs` 来自同一份 `tl_schema` 实现。
 27. **转换失败 = 构建失败**（读不了 / 解析不了 / 没分区标记都 panic）。
 28. 生成器规则：类字段 `Option<Box<T>>`、认不出的类型降级 `serde_json::Value`、类 enum 变体字段不写 `pub`、函数 struct 字段写 `pub`。
