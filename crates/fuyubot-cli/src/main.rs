@@ -565,6 +565,10 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let loader = PluginLoader::new(kernel.context().clone())?;
     let pipeline = Arc::new(loader.pipeline());
 
+    // 缺口 12 的宿主消费者：插件的 Loaded / Activated / Deactivated / Failed / Unloaded
+    // 发到事件总线（`plugin_*` 通道），插件自己也能订阅。守卫要留住，drop 就退订。
+    let _lifecycle = loader.runtime().install_lifecycle_bridge(kernel.plugins());
+
     // 把全局配置装进宿主运行时：插件经 ABI 的 `get_config` / `set_config` 读写它。
     // 必须在插件加载之前——插件 `start` 里就可能读自己的段。
     let config_json = config.to_json()?;
