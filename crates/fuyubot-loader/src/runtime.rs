@@ -24,7 +24,7 @@ use fuyubot_middleware::{
 };
 use fuyubot_service::{ServiceContextExt as _, ServiceHandle as SvcRegistration};
 use fuyubot_tdlib::TdClient;
-use fuyubot_tool::{ToolDescriptor, ToolHandle as ToolRegistration, ToolRegistry};
+use fuyubot_tool::{ToolDescriptor, ToolHandle as ToolRegistration, ToolHandlerFn, ToolRegistry};
 use serde_json::{Value, json};
 
 /// 插件日志级别。宿主调 [`HostRuntime::set_log_verbosity`] 时用它，
@@ -327,6 +327,7 @@ impl HostRuntime {
                 register_tool: Some(api_register_tool),
                 call_tool: Some(api_call_tool),
                 list_tools: Some(api_list_tools),
+                list_plugins: Some(api_list_plugins),
                 provide_service: Some(api_provide_service),
                 get_service: Some(api_get_service),
                 td_invoke: Some(api_td_invoke),
@@ -1365,6 +1366,8 @@ unsafe extern "C" fn api_emit(
 unsafe extern "C" fn api_register_tool(
     host: *mut c_void,
     descriptor_json: *const c_char,
+    handler: Option<ToolHandlerFn>,
+    user_data: *mut c_void,
 ) -> ToolHandle {
     // SAFETY: ABI 契约保证 host 来自本运行时。
     let Some(rt) = (unsafe { runtime(host) }) else {
@@ -1374,13 +1377,16 @@ unsafe extern "C" fn api_register_tool(
     let Some(text) = (unsafe { cstr(descriptor_json) }) else {
         return ToolHandle::INVALID;
     };
-    let descriptor = match descriptor_from_json(text) {
+    let mut descriptor = match descriptor_from_json(text) {
         Ok(descriptor) => descriptor,
         Err(e) => {
             rt.warn(&format!("工具描述不合法: {e}"));
             return ToolHandle::INVALID;
         }
     };
+    // ABI 传来的处理器 + user_data 直接塞进描述（签名已对齐）。
+    descriptor.handler = handler;
+    descriptor.user_data = user_data;
     match rt.tools.register_tool(descriptor) {
         Ok(handle) => ToolHandle {
             id: rt.remember(RegistrationKind::Tool(handle)),
@@ -1423,6 +1429,14 @@ unsafe extern "C" fn api_list_tools(host: *mut c_void) -> *const c_char {
         return core::ptr::null();
     };
     host_shared_string(rt.tools_json())
+}
+
+unsafe extern "C" fn api_list_plugins(host: *mut c_void) -> *const c_char {
+    // SAFETY: ABI 契约保证 host 来自本运行时。
+    let Some(rt) = (unsafe { runtime(host) }) else {
+        return core::ptr::null();
+    };
+    host_string(&rt.plugin_report())
 }
 
 unsafe extern "C" fn api_provide_service(
@@ -2161,7 +2175,7 @@ mod tests {
         assert_eq!(MW_HITS.load(Ordering::SeqCst), 1);
 
         // 工具：注册声明 → 列表 → 调用（没有处理器，应报 NoHandler 并返回无效请求号）
-        let tool = api.register_tool(
+        let tool = api.register_tool_meta(
             r#"{"name":"demo.echo","description":"回显","input_schema":{"type":"object"}}"#,
         );
         assert!(tool.is_valid());
@@ -2557,7 +2571,7 @@ mod tests {
         scope_enter(svc, scope_a);
         let hits_a = AtomicUsize::new(0);
         let _sub_a = api.on("notice", None, count_event, as_user_data(&hits_a));
-        let _tool_a = api.register_tool(r#"{"name":"a.tool"}"#);
+        let _tool_a = api.register_tool_meta(r#"{"name":"a.tool"}"#);
         let mw_hits = AtomicUsize::new(0);
         let _mw_a = api.use_middleware(
             fuyubot_abi::Stage::PreUpdate,
@@ -2568,7 +2582,7 @@ mod tests {
 
         // 在 scope_b 里只注册一个工具。
         scope_enter(svc, scope_b);
-        let _tool_b = api.register_tool(r#"{"name":"b.tool"}"#);
+        let _tool_b = api.register_tool_meta(r#"{"name":"b.tool"}"#);
         scope_leave(svc);
 
         // 撤销 scope_a。
@@ -2621,7 +2635,7 @@ mod tests {
         // 建一个子作用域，往里注册一个工具，但不显式 drop。
         let scope = scope_create(svc);
         scope_enter(svc, scope);
-        let _tool = api.register_tool(r#"{"name":"child.tool"}"#);
+        let _tool = api.register_tool_meta(r#"{"name":"child.tool"}"#);
         scope_leave(svc);
 
         // 直接回滚 owner（模拟插件被卸载），子作用域的注册应连带消失。
@@ -2722,7 +2736,7 @@ mod tests {
         });
 
         for name in ["t1", "t2", "t3"] {
-            let handle = api.register_tool(&format!(r#"{{"name":"{name}"}}"#));
+            let handle = api.register_tool_meta(&format!(r#"{{"name":"{name}"}}"#));
             assert!(handle.is_valid(), "{name} 应注册成功");
         }
 
@@ -2788,5 +2802,58 @@ mod tests {
             assert!(error.contains("nope"), "{error}");
         }
         // vtable 是局部变量，活到本函数末尾——比所有调用都久。
+    }
+
+    /// ABI v4 核心：`register_tool` 带 handler 之后 `call_tool` 真的调到它。
+    ///
+    /// 这是缺口 6 的正解——之前 `register_tool` 只带元数据，`call_tool` 一律报
+    /// `NoHandler`。现在 handler 是 C 函数指针 + user_data，宿主侧包装后存进
+    /// `ToolDescriptor`，`call_tool` 直接调。
+    #[test]
+    fn a_registered_handler_is_invoked_by_call_tool() {
+        let rt = runtime();
+
+        // handler 把入参回显成 `{"echo":<入参>}`。
+        unsafe extern "C-unwind" fn echo(
+            user_data: *mut c_void,
+            input: *const c_char,
+        ) -> *const c_char {
+            let counter = unsafe { &*(user_data as *const AtomicUsize) };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let raw = unsafe { CStr::from_ptr(input) }.to_string_lossy();
+            host_string(&format!(r#"{{"echo":{raw}}}"#))
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let handle = unsafe {
+            (rt.vtable.register_tool.unwrap())(
+                rt.vtable.host_ctx,
+                c"{\"name\":\"v4.echo\",\"description\":\"回显\",\"input_schema\":{\"type\":\"object\"}}".as_ptr(),
+                Some(echo),
+                Arc::as_ptr(&counter) as *mut c_void,
+            )
+        };
+        assert!(handle.is_valid(), "带 handler 的注册应该成功");
+
+        // 走 VTable 调用：handler 必须被调到。
+        let request_id = unsafe {
+            (rt.vtable.call_tool.unwrap())(
+                rt.vtable.host_ctx,
+                c"v4.echo".as_ptr(),
+                c"{\"x\":1}".as_ptr(),
+            )
+        };
+        assert!(request_id.is_valid(), "call_tool 应该发出请求");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "handler 必须被调到一次");
+    }
+
+    /// `list_plugins` 返回宿主那份报告（与 `fuyubot.host.plugins` service 同源）。
+    #[test]
+    fn list_plugins_returns_the_host_report() {
+        let rt = runtime();
+        let raw = unsafe { (rt.vtable.list_plugins.unwrap())(rt.vtable.host_ctx) };
+        assert!(!raw.is_null(), "list_plugins 该返回 JSON");
+        let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy();
+        assert!(text.contains("plugins"), "该是插件报告 JSON：{text}");
     }
 }

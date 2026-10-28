@@ -20,7 +20,7 @@ use std::ffi::{CStr, CString};
 ///
 /// 经 [`HostApiVTable::get_config`] 与 [`HostApiVTable::set_config`]，
 /// 插件可读取全局配置（自己的段 + 别人的段），但**只能写自己的段**。
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// cbindgen 生成的头文件**原文**。
 ///
@@ -33,6 +33,12 @@ pub const SYM_PLUGIN_INIT: &[u8] = b"plugin_init";
 pub const SYM_PLUGIN_START: &[u8] = b"plugin_start";
 pub const SYM_PLUGIN_STOP: &[u8] = b"plugin_stop";
 pub const SYM_PLUGIN_FREE_STRING: &[u8] = b"plugin_free_string";
+/// 释放 `plugin_init` 分配的状态（ABI 版本不匹配时 `plugin_stop` 不安全，用它）。
+pub const SYM_PLUGIN_FREE_HANDLE: &[u8] = b"plugin_free_handle";
+/// 静态导出插件编译时的 ABI 版本，`fuyubot-sdk check` 不 dlopen 也能读到。
+pub const SYM_PLUGIN_ABI_VERSION: &[u8] = b"fuyubot_abi_version";
+/// 自描述元数据（名字 / 版本 / 依赖），宿主在 `plugin_init` 之前读。
+pub const SYM_PLUGIN_MANIFEST: &[u8] = b"plugin_manifest";
 
 // ── 事件通道约定 ───────────────────────────────────────────────────
 // 这三个名字是宿主与插件之间的约定，所以由 ABI crate 定，两边都从这里取。
@@ -297,7 +303,12 @@ pub struct HostApiVTable {
         ) -> i32,
     >,
     pub register_tool: Option<
-        unsafe extern "C" fn(host: *mut c_void, descriptor_json: *const c_char) -> ToolHandle,
+        unsafe extern "C" fn(
+            host: *mut c_void,
+            descriptor_json: *const c_char,
+            handler: Option<ToolHandlerFn>,
+            user_data: *mut c_void,
+        ) -> ToolHandle,
     >,
     pub call_tool: Option<
         unsafe extern "C" fn(
@@ -375,9 +386,14 @@ pub struct HostApiVTable {
             value_json: *const c_char,
         ) -> i32,
     >,
+    /// 进程里加载了哪些插件（JSON 数组）。
+    ///
+    /// 每项：`{"name":"…","state":"active|pending|failed","missing":[…],"reason":"…"}`
+    /// 返回宿主线程局部缓冲里的字符串（读完即弃）。没插件就是空数组 `[]`。
+    pub list_plugins: Option<unsafe extern "C" fn(host: *mut c_void) -> *const c_char>,
 }
 
-/// VTable 就是「两个 u32 + 18 个指针」；布局一改，这里立刻编译不过。
+/// VTable 就是「两个 u32 + 19 个指针」；布局一改，这里立刻编译不过。
 const _: () = {
     use core::mem::{offset_of, size_of};
 
@@ -385,7 +401,7 @@ const _: () = {
     assert!(offset_of!(HostApiVTable, size) == 4);
     assert!(offset_of!(HostApiVTable, host_ctx) == 8);
     assert!(size_of::<Option<unsafe extern "C" fn()>>() == size_of::<*const c_void>());
-    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 18 * size_of::<*const c_void>());
+    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 19 * size_of::<*const c_void>());
 
     // 句柄要能按值跨 ABI：必须恰好一个 u64。
     assert!(size_of::<SubscriptionHandle>() == size_of::<u64>());
@@ -436,9 +452,15 @@ pub struct HostApi {
     ) -> SubscriptionHandle,
     off: unsafe extern "C" fn(*mut c_void, SubscriptionHandle),
     emit: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> i32,
-    register_tool: unsafe extern "C" fn(*mut c_void, *const c_char) -> ToolHandle,
+    register_tool: unsafe extern "C" fn(
+        *mut c_void,
+        *const c_char,
+        Option<ToolHandlerFn>,
+        *mut c_void,
+    ) -> ToolHandle,
     call_tool: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> RequestId,
     list_tools: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    list_plugins: unsafe extern "C" fn(*mut c_void) -> *const c_char,
     provide_service:
         unsafe extern "C" fn(*mut c_void, *const c_char, *const ServiceVTable) -> ServiceHandle,
     get_service: unsafe extern "C" fn(*mut c_void, *const c_char) -> *const ServiceVTable,
@@ -516,6 +538,7 @@ impl HostApi {
             register_tool: required!(register_tool),
             call_tool: required!(call_tool),
             list_tools: required!(list_tools),
+            list_plugins: required!(list_plugins),
             provide_service: required!(provide_service),
             get_service: required!(get_service),
             td_invoke: required!(td_invoke),
@@ -590,12 +613,25 @@ impl HostApi {
 
     /// 注册工具。`descriptor_json` 是 `fuyubot-tool::ToolDescriptor` 的 JSON 形态，
     /// 但**不含处理器指针**：本版 ABI 只能登记声明，没法让宿主回调进插件执行工具。
-    pub fn register_tool(&self, descriptor_json: &str) -> ToolHandle {
+    /// 注册一个工具。`handler` 是处理器（`None` = 只登记元数据，`call_tool` 报 `NoHandler`）。
+    ///
+    /// `user_data` 会在调用处理器时原样回传；生命周期由调用方保证（通常存进插件状态）。
+    pub fn register_tool(
+        &self,
+        descriptor_json: &str,
+        handler: Option<ToolHandlerFn>,
+        user_data: *mut c_void,
+    ) -> ToolHandle {
         let Ok(descriptor) = CString::new(descriptor_json) else {
             return ToolHandle::INVALID;
         };
         // SAFETY: 同 log。
-        unsafe { (self.register_tool)(self.host_ctx, descriptor.as_ptr()) }
+        unsafe { (self.register_tool)(self.host_ctx, descriptor.as_ptr(), handler, user_data) }
+    }
+
+    /// 只登记元数据的便捷重载（不带处理器）。
+    pub fn register_tool_meta(&self, descriptor_json: &str) -> ToolHandle {
+        self.register_tool(descriptor_json, None, core::ptr::null_mut())
     }
 
     pub fn call_tool(&self, name: &str, input_json: &str) -> Result<RequestId, AbiError> {
@@ -609,6 +645,14 @@ impl HostApi {
     pub fn list_tools(&self) -> String {
         // SAFETY: 同 log；宿主保证返回的指针在读完之前有效。
         let raw = unsafe { (self.list_tools)(self.host_ctx) };
+        unsafe { cstr_to_string(raw) }
+    }
+
+    /// 进程里加载了哪些插件（JSON 数组）。宿主临时字符串，读完即弃。
+    pub fn list_plugins(&self) -> String {
+        // SAFETY: 同 list_tools。`self.list_plugins` 是 VTable 字段（函数指针），
+        // 这里必须走 `(self.list_plugins)(…)` 调用约定，不能和方法名混。
+        let raw = unsafe { (self.list_plugins)(self.host_ctx) };
         unsafe { cstr_to_string(raw) }
     }
 
@@ -854,6 +898,29 @@ pub type PluginStopFn = unsafe extern "C" fn(handle: PluginHandle);
 /// 释放**插件自己**分配的字符串。
 pub type PluginFreeStringFn = unsafe extern "C" fn(ptr: *mut c_char);
 
+/// `plugin_free_handle`：释放 `plugin_init` 分配的状态。
+///
+/// 只在 ABI 版本不匹配时用（那时 `plugin_stop` 是对不认识的 ABI 下手）。
+/// 正常卸载走 `plugin_stop`。
+pub type PluginFreeHandleFn = unsafe extern "C" fn(handle: PluginHandle);
+
+/// `fuyubot_abi_version`：返回插件编译时的 ABI 版本（静态导出，不走 VTable）。
+///
+/// `fuyubot-sdk check` 靠它做**静态**兼容性检查，不必 dlopen。
+pub type PluginAbiVersionFn = unsafe extern "C" fn() -> u32;
+
+/// `plugin_manifest`：返回自描述元数据 JSON（静态导出，不走 VTable）。
+///
+/// 形状：`{"name":"…","version":"…","inject":[…],"soft_inject":[…]}`
+/// 宿主在 `plugin_init` 之前读它拿到依赖声明，不再依赖配置段。
+pub type PluginManifestFn = unsafe extern "C" fn() -> *const c_char;
+
+/// 工具处理器：`user_data` 是注册时传的不透明指针，`input_json` 是调用入参。
+///
+/// 返回宿主线程局部缓冲里的 JSON 响应（读完即弃）；返回 NULL 表示失败。
+/// 与 [`ServiceMethodFn`] 同一套约定（不跨线程分配、不 free 对方的指针）。
+pub type ToolHandlerFn = unsafe extern "C-unwind" fn(*mut c_void, *const c_char) -> *const c_char;
+
 // ── 插件作者视角 ───────────────────────────────────────────────────
 
 /// Rust 插件作者只需要实现它，剩下的 C ABI 导出交给 [`define_plugin!`](crate::define_plugin)。
@@ -866,10 +933,21 @@ pub trait Plugin: Sized + Send + 'static {
 
     /// 宿主调用 `plugin_stop`（或插件被卸载）。默认什么都不做。
     fn stop(&mut self) {}
+
+    /// 硬依赖（Cordis `inject`）：缺了就不激活。写进 `plugin_manifest`。
+    fn inject() -> Vec<String> {
+        Vec::new()
+    }
+
+    /// 软依赖：缺了照常加载，有了优先排前面。写进 `plugin_manifest`。
+    fn soft_inject() -> Vec<String> {
+        Vec::new()
+    }
 }
 
-/// 为 `$ty` 生成 4 个 C ABI 导出符号（`plugin_init` / `plugin_start` / `plugin_stop` /
-/// `plugin_free_string`）。
+/// 为 `$ty` 生成 **7 个** C ABI 导出符号：
+/// `plugin_init` / `plugin_start` / `plugin_stop` / `plugin_free_string` /
+/// `plugin_free_handle` / `fuyubot_abi_version` / `plugin_manifest`。
 ///
 /// ```ignore
 /// struct MyPlugin { host: fuyubot_abi::HostApi }
@@ -960,7 +1038,71 @@ macro_rules! define_plugin {
             // SAFETY: 契约要求 ptr 来自本插件的 CString::into_raw，且只释放一次。
             drop(unsafe { ::std::ffi::CString::from_raw(ptr) });
         }
+
+        /// ABI 版本不匹配时释放 `plugin_init` 分配的状态（那时 `plugin_stop` 不安全）。
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn plugin_free_handle(handle: $crate::PluginHandle) {
+            if handle.context.is_null() {
+                return;
+            }
+            // SAFETY: context 由 plugin_init 里的 Box::into_raw 产生，只在这里取回。
+            drop(unsafe { ::std::boxed::Box::from_raw(handle.context as *mut $ty) });
+        }
+
+        /// 静态导出 ABI 版本，`fuyubot-sdk check` 不 dlopen 就能读。
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn fuyubot_abi_version() -> u32 {
+            $crate::ABI_VERSION
+        }
+
+        /// 自描述元数据（名字 + 依赖），宿主在 `plugin_init` 之前读。
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn plugin_manifest() -> *const ::core::ffi::c_char {
+            $crate::__macro_support::manifest_json(
+                $name,
+                <$ty as $crate::Plugin>::inject(),
+                <$ty as $crate::Plugin>::soft_inject(),
+            )
+        }
     };
+}
+
+/// `define_plugin!` 内部用的辅助函数。**不是公开 API**——它只服务宏展开。
+///
+/// 单独成模块是因为 `macro_rules!` 展开时 `$crate::__macro_support::…` 要能解析到
+/// 一个稳定的路径（约束 37：内部走 `$crate::__macro_support::…`，不额外要求插件
+/// 依赖别的 crate）。
+pub mod __macro_support {
+    /// 把名字与依赖列表拼成 `plugin_manifest` 的 JSON。
+    ///
+    /// 手写 JSON 拼接（不引 serde）：`fuyubot-abi` 是最底层的 crate，
+    /// 依赖越少越好（约束 2/3）。名字是代码里的字面量、依赖是 `&'static str`，
+    /// 不含需要转义的字符——如果将来插件名允许引号，这里要换。
+    pub fn manifest_json(
+        name: &str,
+        inject: Vec<String>,
+        soft_inject: Vec<String>,
+    ) -> *const core::ffi::c_char {
+        fn join(items: &[String]) -> String {
+            items
+                .iter()
+                .map(|s| format!("\"{s}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        let json = format!(
+            "{{\"name\":\"{name}\",\"version\":\"0.0.0\",\"inject\":[{}],\"soft_inject\":[{}]}}",
+            join(&inject),
+            join(&soft_inject)
+        );
+        // 返回的是 `CString::into_raw`——契约是「调用方读完用 `plugin_free_string` 释放」。
+        // 这里用 `into_raw` 是因为 `manifest_json` 每次调用都生成新串，
+        // 让调用方负责释放比「线程局部缓冲」更简单（manifest 只在加载时调一次）。
+        match std::ffi::CString::new(json) {
+            Ok(c) => c.into_raw(),
+            Err(_) => core::ptr::null(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -996,7 +1138,12 @@ mod tests {
     unsafe extern "C" fn noop_emit(_: *mut c_void, _: *const c_char, _: *const c_char) -> i32 {
         0
     }
-    unsafe extern "C" fn noop_register_tool(_: *mut c_void, _: *const c_char) -> ToolHandle {
+    unsafe extern "C" fn noop_register_tool(
+        _: *mut c_void,
+        _: *const c_char,
+        _: Option<ToolHandlerFn>,
+        _: *mut c_void,
+    ) -> ToolHandle {
         ToolHandle::INVALID
     }
     unsafe extern "C" fn noop_call_tool(
@@ -1007,6 +1154,10 @@ mod tests {
         RequestId::INVALID
     }
     unsafe extern "C" fn noop_list_tools(_: *mut c_void) -> *const c_char {
+        core::ptr::null()
+    }
+
+    unsafe extern "C" fn noop_list_plugins(_: *mut c_void) -> *const c_char {
         core::ptr::null()
     }
     unsafe extern "C" fn noop_provide(
@@ -1066,6 +1217,7 @@ mod tests {
             register_tool: Some(noop_register_tool),
             call_tool: Some(noop_call_tool),
             list_tools: Some(noop_list_tools),
+            list_plugins: Some(noop_list_plugins),
             provide_service: Some(noop_provide),
             get_service: Some(noop_get),
             td_invoke: Some(noop_td),

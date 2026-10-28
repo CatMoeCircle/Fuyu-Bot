@@ -47,7 +47,7 @@ impl Plugin for DemoPlugin {
         // 经 VTable 注册一个工具声明。宿主那边能观察到，集成测试就断言这个。
         let tool = self
             .host
-            .register_tool(r#"{"name":"demo.echo","description":"回显入参"}"#);
+            .register_tool_meta(r#"{"name":"demo.echo","description":"回显入参"}"#);
         if !tool.is_valid() {
             return Err("注册工具失败".to_owned());
         }

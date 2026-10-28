@@ -14,7 +14,15 @@ use serde_json::{Value, json};
 ///
 /// 返回的指针只需活到**下一次调用本函数之前**：registry 拿到后立刻拷贝。
 /// Rust 侧实现用 [`reply`] 生成返回值。
-pub type ToolHandlerFn = extern "C" fn(input_json: *const c_char) -> *const c_char;
+/// 工具处理器：`user_data` 是注册时传的不透明指针（生命周期由插件保证），
+/// `input_json` 是入参；返回宿主线程局部缓冲里的 JSON 响应（NULL = 失败）。
+///
+/// 与 `fuyubot-abi` 的 `ToolHandlerFn` 签名一致（同进程内直接传函数指针，
+/// 不需要包装）。
+pub type ToolHandlerFn = unsafe extern "C-unwind" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_char,
+) -> *const core::ffi::c_char;
 
 thread_local! {
     static REPLY: std::cell::RefCell<CString> = std::cell::RefCell::new(CString::default());
@@ -63,7 +71,15 @@ pub struct ToolDescriptor {
     pub is_async: bool,
     /// `None` = 只有元数据的声明型工具（跨语言注册时常见，本进程没有可调代码）。
     pub handler: Option<ToolHandlerFn>,
+    /// 调用处理器时原样回传的不透明指针。生命周期由注册方保证。
+    pub user_data: *mut core::ffi::c_void,
 }
+
+// SAFETY: `handler` + `user_data` 由插件注册时给出，ABI 契约要求插件保证
+// `user_data` 在注销之前一直有效（跨线程调用也一样）。`ToolDescriptor` 的其余
+// 字段都是普通 Rust 值。
+unsafe impl Send for ToolDescriptor {}
+unsafe impl Sync for ToolDescriptor {}
 
 impl ToolDescriptor {
     /// 建一个描述：版本默认 `0.1.0`、权限为空、`timeout_ms` 为 30000。
@@ -85,6 +101,7 @@ impl ToolDescriptor {
             timeout_ms: 30_000,
             is_async: false,
             handler,
+            user_data: core::ptr::null_mut(),
         }
     }
 
@@ -240,7 +257,10 @@ enum Direction {
 /// 变更监听器。
 type Listener = Arc<dyn Fn(&ToolEvent) -> fuyubot_core::Result<()> + Send + Sync>;
 
-#[derive(Default)]
+/// 工具表的内部状态。
+///
+/// `next_id` 从 **1** 开始：`ToolRequestId(0)` 会被 ABI 层当成 `RequestId::INVALID`
+/// （`is_valid()` 判 `id != 0`），所以 0 必须永远不分配。
 struct Inner {
     next_id: u64,
     /// `BTreeMap`：`list_tools` 的输出稳定，跨语言比对不会因顺序抖动。
@@ -252,6 +272,18 @@ struct Inner {
     /// 给缓存了 [`ToolRegistry::list_tools_json`] 结果的调用方做失效判断——
     /// 工具表变更不频繁，而列工具是热路径（插件每次都要问一遍）。
     revision: u64,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            tools: BTreeMap::new(),
+            permissions: BTreeSet::new(),
+            listeners: Vec::new(),
+            revision: 0,
+        }
+    }
 }
 
 /// 工具注册表。`Clone` 共享同一张表。
@@ -337,7 +369,8 @@ impl ToolRegistry {
             .ok_or_else(|| ToolError::NoHandler(name.to_owned()))?;
 
         let request = CString::new(input.to_string()).map_err(|_| ToolError::InteriorNul)?;
-        let raw = handler(request.as_ptr());
+        // SAFETY: handler 与 user_data 由注册方保证有效（ABI 契约）。
+        let raw = unsafe { handler(descriptor.user_data, request.as_ptr()) };
         let output = if raw.is_null() {
             Value::Null
         } else {
@@ -670,14 +703,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    extern "C" fn echo_handler(input: *const c_char) -> *const c_char {
+    unsafe extern "C-unwind" fn echo_handler(
+        _: *mut core::ffi::c_void,
+        input: *const core::ffi::c_char,
+    ) -> *const core::ffi::c_char {
         // SAFETY: registry 保证传入的是 NUL 结尾的合法字符串。
         let text = unsafe { CStr::from_ptr(input) }.to_string_lossy();
         let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         reply(&json!({ "echo": value }).to_string())
     }
 
-    extern "C" fn boom_handler(_: *const c_char) -> *const c_char {
+    unsafe extern "C-unwind" fn boom_handler(
+        _: *mut core::ffi::c_void,
+        _: *const core::ffi::c_char,
+    ) -> *const core::ffi::c_char {
         reply("这不是 JSON")
     }
 
@@ -715,7 +754,11 @@ mod tests {
         let call = registry.call_tool("foo", &json!({ "text": "hi" })).unwrap();
         assert_eq!(call.name, "foo");
         assert_eq!(call.output["echo"]["text"], json!("hi"));
-        assert_eq!(call.request_id.to_string(), "#0");
+        assert_eq!(
+            call.request_id.to_string(),
+            "#1",
+            "next_id 从 1 开始（0 是 INVALID）"
+        );
 
         drop(handle);
         assert!(!registry.contains("foo"));
