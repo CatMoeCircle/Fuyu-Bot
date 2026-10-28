@@ -354,13 +354,30 @@ fn a_panicking_plugin_does_not_take_down_the_host() {
     drop(plugin);
 }
 
-/// 验收：版本不兼容时 `load` 返回明确错误，不 panic。
+/// 验收：版本不兼容时 `load` 返回明确错误，不 panic，**并且把插件侧的状态还回去**。
 #[test]
 fn refuses_a_plugin_with_an_incompatible_abi() {
     let path = build_fixture("fuyubot-plugin-badabi");
+
+    // 先自己打开一份：loader 的失败路径会把它的引用还掉，模块一旦卸载 static 就重置，
+    // 计数器归零就测不到「刚才到底还回去了没有」。
+    // SAFETY: 只从同一个 dll 取一个签名固定的导出函数。
+    let probe_lib = unsafe { libloading::Library::new(&path) }.expect("再打开一次 badabi");
+    let free_calls: libloading::Symbol<extern "C" fn() -> usize> =
+        unsafe { probe_lib.get(b"badabi_free_calls") }.expect("badabi 应当导出 badabi_free_calls");
+
     let loader = PluginLoader::new(Context::new()).unwrap();
     // 宿主内置工具在加载前就在表里；这里要的是「失败没有新增注册」。
     let tools_before = loader.runtime().tools().len();
+
+    // 探测路径同样会调 init，所以同样必须在收手之前归还（版本不匹配也得还）。
+    let probed = loader.probe(&path).expect("probe 只读元数据，不校验版本");
+    assert_eq!(probed.abi_version, fuyubot_abi::ABI_VERSION + 100);
+    assert_eq!(
+        free_calls(),
+        1,
+        "probe 也要调 plugin_free_handle——一次探测不该在插件侧留下状态"
+    );
 
     let error = loader.load(&path).unwrap_err();
     let text = error.to_string();
@@ -376,6 +393,14 @@ fn refuses_a_plugin_with_an_incompatible_abi() {
     // 失败之后宿主必须干净：不能留下半个插件注册的东西。
     assert_eq!(loader.runtime().tools().len(), tools_before);
     assert!(loader.runtime().events().subscriber_count("demo.event") == 0);
+
+    // 插件侧也一样：版本对不上时不能调 plugin_stop（那是对不认识的 ABI 下手），
+    // 但 v4 的 plugin_free_handle 就是为这一刻留的出口。
+    assert_eq!(
+        free_calls(),
+        2,
+        "版本不匹配时宿主应当调 plugin_free_handle 把 init 分配的状态还回来"
+    );
 }
 
 /// 不是插件的东西：要么打不开，要么缺 `plugin_init`，两种都不 panic。

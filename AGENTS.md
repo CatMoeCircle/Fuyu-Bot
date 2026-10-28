@@ -158,6 +158,7 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 54. **`reconcile` 不许在 `apply` 期间递归推进**：`apply` 里注册服务会同步触发服务变更钩子；若钩子就地递归，提供者还在 `Activating`（`start` 没跑完）依赖方就被激活，软依赖「基础设施先起来」直接作废、硬依赖也会提前放人。钩子只置 `Progress::needed` 并返回，由外层 `reconcile_loop` 接着推进（`Progress::running` 是闸门，`RunningGuard` 保证 panic 也不焊死）。
 55. **新增插件导出符号要三处同步**：`fuyubot-abi` 的 `SYM_*` 常量、`build.rs` 的 `TRAILER`（手写声明）、SDK 的 `sdk check` 的 `ABI_SYMBOLS`。约束 18 只管**类型**（`export.include`），不管函数声明——ABI v4 的 `plugin_manifest` / `fuyubot_abi_version` / `plugin_free_handle` 就漏在头文件外过一轮，C 作者据此**根本不知道要写**。`TRAILER` 里用到 ABI 类型的声明必须留在 trailer（`after_includes` 在所有类型定义之前，放那儿 `-fsyntax-only` 直接报错，约束 33）。
 56. **`plugin_manifest` 的 `version` 取 `env!("CARGO_PKG_VERSION")`**（宏在调用点展开，所以是**插件 crate** 的版本，不是 abi 的）：它是真值，不是 `"0.0.0"` 占位。所有字符串过 `quote()` 转义（`"` / `\` / `< 0x20` → `\u00XX`），非 ASCII 原样写 UTF-8。宿主侧 `declared()` 的优先级是「manifest 该侧非空 → 用它，否则回退 `[plugin.<名>].inject`」，**覆盖而非合并、且逐侧判定**——所以插件一旦声明 `inject`，配置里那份就静默失效。
+57. **`plugin_free_handle` 的签名永久冻结**：`void plugin_free_handle(PluginHandle)` 只接 handle 本身、**不碰 VTable**，宿主正是在「版本对不上、VTable 一律不可信」那一刻调它（`probe` 与 `load_with_config` 两条路径都必须调，否则 `init` 里分配的状态就漏了）。所以它不能加参数、不能改语义——改了等于让老宿主在未来的插件上乱调。没导出它的 v3 插件只能像以前一样把状态留在那儿，`load` 照样返回 `AbiMismatch`。
 
 ## 文档
 

@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use core::ffi::c_char;
 
 use fuyubot_abi::{
-    ABI_VERSION, PluginHandle, PluginInitFn, PluginStartFn, PluginStopFn, SYM_PLUGIN_FREE_STRING,
-    SYM_PLUGIN_INIT, SYM_PLUGIN_MANIFEST, SYM_PLUGIN_START, SYM_PLUGIN_STOP,
+    ABI_VERSION, PluginFreeHandleFn, PluginHandle, PluginInitFn, PluginStartFn, PluginStopFn,
+    SYM_PLUGIN_FREE_HANDLE, SYM_PLUGIN_FREE_STRING, SYM_PLUGIN_INIT, SYM_PLUGIN_MANIFEST,
+    SYM_PLUGIN_START, SYM_PLUGIN_STOP,
 };
 use fuyubot_core::{Context, Effect};
 use libloading::{Library, Symbol};
@@ -186,7 +187,7 @@ impl PluginLoader {
         let go_runtime = looks_like_go_binary(&location);
 
         // 先把符号取成裸函数指针，再让库可以被移动进 LoadedPlugin。
-        let (init, start, stop) = {
+        let (init, start, stop, free_handle) = {
             // SAFETY: 只从刚加载的库里取符号，名字与类型由 ABI 约定。
             let init: Symbol<PluginInitFn> =
                 unsafe { lib.get(SYM_PLUGIN_INIT) }.map_err(|source| LoadError::MissingSymbol {
@@ -202,7 +203,11 @@ impl PluginLoader {
             let stop = unsafe { lib.get::<PluginStopFn>(SYM_PLUGIN_STOP) }
                 .ok()
                 .map(|symbol| *symbol);
-            (init, start, stop)
+            // v4 的出口，同样可选：v3 插件没有它（那就只能像以前一样把状态留在那儿）。
+            let free_handle = unsafe { lib.get::<PluginFreeHandleFn>(SYM_PLUGIN_FREE_HANDLE) }
+                .ok()
+                .map(|symbol| *symbol);
+            (init, start, stop, free_handle)
         };
 
         // 从这里开始，任何提前返回都会让 `scope` 在 drop 时把这批注册整批回滚。
@@ -219,7 +224,14 @@ impl PluginLoader {
 
         if handle.abi_version != ABI_VERSION {
             // 版本不兼容时**不能**调 plugin_stop：那是对一个我们不认识的 ABI 下手。
-            // 只能回滚宿主侧资源；插件在 init 里自己分配的状态这一版无法回收（见 docs/gaps.md 缺口 7）。
+            // 但 v4 留了一个专门的出口：plugin_free_handle 只接 handle 本身、不碰
+            // VTable，签名在契约里是**永久冻结**的（AGENTS 约束 57），所以在这一刻
+            // 调用它是安全的——插件在 init 里分配的状态就靠它归还。
+            // 没导出这个符号的（v3 插件）只能像以前一样把状态留在那儿。
+            if let Some(free) = free_handle {
+                // SAFETY: handle 来自同一轮 init；该符号只读 handle 里的 context。
+                unsafe { free(handle) };
+            }
             return Err(LoadError::AbiMismatch {
                 path: path.to_owned(),
                 plugin: handle.abi_version,
@@ -305,6 +317,9 @@ impl PluginLoader {
         let stop = unsafe { lib.get::<PluginStopFn>(SYM_PLUGIN_STOP) }
             .ok()
             .map(|symbol| *symbol);
+        let free_handle = unsafe { lib.get::<PluginFreeHandleFn>(SYM_PLUGIN_FREE_HANDLE) }
+            .ok()
+            .map(|symbol| *symbol);
 
         // SAFETY: init / stop 来自本库；vtable 由本运行时持有，地址稳定。
         let handle = unsafe { init(self.runtime.vtable_ptr()) };
@@ -316,12 +331,17 @@ impl PluginLoader {
 
         let name = plugin_name(&handle, path);
 
-        // 礼貌地把 init 期间分配的东西还给插件。
-        if let Some(stop) = stop {
-            if handle.abi_version == ABI_VERSION {
+        // 礼貌地把 init 期间分配的东西还给插件：一次探测不该在插件侧漏状态。
+        if handle.abi_version == ABI_VERSION {
+            if let Some(stop) = stop {
                 // SAFETY: ABI 已校验，stop 是它的 plugin_stop。
                 unsafe { stop(handle) };
             }
+        } else if let Some(free) = free_handle {
+            // 版本对不上时只能走 v4 的 plugin_free_handle（签名永久冻结，
+            // 不碰 VTable），理由同 load_with_config。
+            // SAFETY: 同上，只读 handle 里的 context。
+            unsafe { free(handle) };
         }
         // scope 在这里自然 drop：init 注册过的一切整批撤销。
 
