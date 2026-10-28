@@ -22,7 +22,7 @@ TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` �
 | --- | --- |
 | `fuyubot-cli` | 二进制 `fuyubot`：`init` / `run` / `status` / `stop` / `config` / `plugin`（clap） |
 | `fuyubot-core` | Cordis 内核：`Context`（按**名字**寻址的服务表）/ `Effect` / `Plugin`（含 `inject`）/ `PluginManager`（Fiber 生命周期与依赖跟踪）。不认识 Telegram |
-| `fuyubot-abi` | C ABI：`HostApiVTable`（2 个 u32 + 20 个函数指针）、`PluginHandle`、`define_plugin!`、cbindgen 头文件 |
+| `fuyubot-abi` | C ABI：`HostApiVTable`（2 个 u32 + `host_ctx` + 19 个函数指针）、`PluginHandle`、`define_plugin!`、cbindgen 头文件 |
 | `fuyubot-tdlib-sys` | 绑定层：`td_api.tl` → 类型 + 元数据 + FFI 声明（无 tokio / 无网络） |
 | `fuyubot-tdlib` | `loader`（四级定位）+ `client`（`td_receive` 循环、`ReceiveLoop`）+ `authorize`（授权状态机） |
 | `fuyubot-event` / `service` / `tool` / `middleware` | 四个机制 crate，只依赖 `core`，彼此不依赖 |
