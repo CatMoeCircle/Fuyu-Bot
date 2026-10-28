@@ -3410,9 +3410,10 @@ mod tests {
     /// 验四件事：两个插件注册同名服务**不冲突**；私有服务落在 child 里、根上看不见；
     /// 共享服务落在根上；child 沿父链能看见共享的那份。
     ///
-    /// 只验落点，不验 `get_service` 的端到端可见性——那条路是
-    /// `caller_context().resolve()`，与 `provide` 同源同表；可见性本身由
-    /// `Context` 的作用域单测（`child` / `resolve` / `names`）保证。
+    /// 只验落点（provide 写哪张表）。**真实可见性**由集成测试
+    /// `a_plugin_reads_back_the_service_it_just_provided` 验——那条得真 dlopen 一个
+    /// 插件，因为 owner 栈是线程局部的、由加载路径上的 `plugin_scope()` 压入。
+    /// 手工在这里叠两层 scope 会和那个栈打架（查过，不是产品路径的问题）。
     #[test]
     fn plugin_services_are_private_until_shared() {
         unsafe extern "C" fn echo(_ctx: *mut c_void, input: *const c_char) -> *const c_char {

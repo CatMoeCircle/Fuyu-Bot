@@ -1,0 +1,13 @@
+[package]
+name = "fuyubot-plugin-scope-fixture"
+description = "测试夹具：在 start 里注册私有服务并立刻取回，验证作用域落点与父链可见性"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fuyubot-abi.workspace = true

@@ -184,6 +184,34 @@ fn probe_reads_the_v4_manifest() {
     assert_ne!(manifest.version, "0.0.0", "{manifest:?}");
 }
 
+/// 作用域的端到端：插件在 `start` 里注册私有服务，能不能立刻取回来。
+///
+/// 这条只能靠真 dlopen 才测得到——`api_provide_service` / `api_get_service` 读的是
+/// **线程局部的 owner 栈**，而那个栈由 `plugin_scope()` 在加载路径上压入。
+/// 在单元测试里手工叠两层 scope 会踩到栈的边界（查过一轮没定位到根因），
+/// 用真插件走真实路径反而干净。
+#[test]
+fn a_plugin_reads_back_the_service_it_just_provided() {
+    let path = build_fixture("fuyubot-plugin-scope-fixture");
+    let loader = PluginLoader::new(Context::new()).unwrap();
+
+    let plugin = loader.load(&path).expect("scope 夹具应当加载成功");
+    // `start` 里任何一步失败都会让它返回非零，上面那句就 panic 了；
+    // 这两条断言是给「失败但宿主没报错」留的双保险。
+    let lines = loader.runtime().log_lines();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("拿回了自己注册的那份")),
+        "插件没能取回自己刚注册的服务：{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("公共服务仍然可见")),
+        "插件看不见根上的公共服务（父链断了）：{lines:?}"
+    );
+    assert_eq!(plugin.name, "fuyubot.scope-fixture");
+}
+
 /// 端到端：`plugin_manifest` 里的依赖与版本真的能穿过 dlopen/JSON/`Manifest` 三层。
 ///
 /// 用独立夹具而不是 demo，是因为**版本号必须与 `fuyubot-abi` 不同**才证明得了
