@@ -5,8 +5,9 @@
 //! 宿主侧那条桥在 `fuyubot_loader::HostRuntime::new`（缺口 9）：通道名直接取
 //! [`ToolEvent::kind`]，两条通道分别是 `tool_registered` / `tool_unregistered`。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CStr, CString, c_char};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fuyubot_core::{Context, Effect, KernelError};
@@ -259,6 +260,17 @@ enum Direction {
 /// 变更监听器。
 type Listener = Arc<dyn Fn(&ToolEvent) -> fuyubot_core::Result<()> + Send + Sync>;
 
+/// 一个工具**编译好的** schema 校验器，注册时算一次、之后每次调用复用。
+///
+/// 故意不放进 [`ToolDescriptor`]：那个结构要 `Clone`、要跨 ABI 当普通数据传，
+/// 而 `jsonschema::Validator` 既不是纯数据，也不该跟着描述符到处复制。
+struct CompiledTool {
+    /// `None` = 输入 schema 为空（`null` / `{}`），这个方向不校验。
+    input: Option<jsonschema::Validator>,
+    /// `None` = 输出 schema 为空，这个方向不校验。
+    output: Option<jsonschema::Validator>,
+}
+
 /// 工具表的内部状态。
 ///
 /// `next_id` 从 **1** 开始：`ToolRequestId(0)` 会被 ABI 层当成 `RequestId::INVALID`
@@ -267,6 +279,11 @@ struct Inner {
     next_id: u64,
     /// `BTreeMap`：`list_tools` 的输出稳定，跨语言比对不会因顺序抖动。
     tools: BTreeMap<String, ToolDescriptor>,
+    /// 与 `tools` **同键**的已编译校验器：注册时一起写入，注销时一起清掉。
+    ///
+    /// 用 `Arc` 是为了 `call_tool` 能在锁外校验：处理器必须在锁外调用（它可能回头查表），
+    /// 而输出校验又在处理器之后，所以校验器不能靠锁借用。
+    compiled: HashMap<String, Arc<CompiledTool>>,
     permissions: BTreeSet<String>,
     listeners: Vec<Listener>,
     /// 工具表的版本号：注册 / 注销都 +1。
@@ -281,6 +298,7 @@ impl Default for Inner {
         Self {
             next_id: 1,
             tools: BTreeMap::new(),
+            compiled: HashMap::new(),
             permissions: BTreeSet::new(),
             listeners: Vec::new(),
             revision: 0,
@@ -292,6 +310,11 @@ impl Default for Inner {
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     inner: Arc<Mutex<Inner>>,
+    /// 构造 validator 的次数（每次 `jsonschema::validator_for` 调用 +1，空 schema 不算）。
+    ///
+    /// 和注册表一样 `Clone` 共享。测试靠它证明「注册时编译一次、`call_tool` 不再编译」；
+    /// 也顺带是这个模块的诊断量。
+    schema_compiles: Arc<AtomicU64>,
 }
 
 impl ToolRegistry {
@@ -301,19 +324,31 @@ impl ToolRegistry {
 
     /// 注册工具，返回的句柄 drop 即注销。
     ///
-    /// schema 在这里就先编译一遍：写错了要当场报，别拖到调用时才炸。
+    /// schema 在这里编译一次：写错了要当场报，别拖到调用时才炸；编译结果同时缓存进
+    /// [`Inner::compiled`]，之后 `call_tool` 只做校验、不再编译。
     pub fn register_tool(&self, descriptor: ToolDescriptor) -> Result<ToolHandle, ToolError> {
         if descriptor.name.is_empty() {
             return Err(ToolError::EmptyName);
         }
-        check_schema(&descriptor.name, &descriptor.input_schema)?;
-        check_schema(&descriptor.name, &descriptor.output_schema)?;
+        let compiled = Arc::new(CompiledTool {
+            input: compile_schema(
+                &descriptor.name,
+                &descriptor.input_schema,
+                &self.schema_compiles,
+            )?,
+            output: compile_schema(
+                &descriptor.name,
+                &descriptor.output_schema,
+                &self.schema_compiles,
+            )?,
+        });
 
         {
             let mut inner = self.lock();
             if inner.tools.contains_key(&descriptor.name) {
                 return Err(ToolError::AlreadyRegistered(descriptor.name));
             }
+            inner.compiled.insert(descriptor.name.clone(), compiled);
             inner
                 .tools
                 .insert(descriptor.name.clone(), descriptor.clone());
@@ -327,6 +362,8 @@ impl ToolRegistry {
             {
                 let mut inner = lock(&table);
                 inner.tools.remove(&key);
+                // 校验器和描述符同生同灭：留着就是替已经注销的工具占内存。
+                inner.compiled.remove(&key);
                 inner.revision += 1;
             }
             broadcast_to(&table, ToolEvent::Unregistered(key));
@@ -339,11 +376,20 @@ impl ToolRegistry {
     }
 
     /// 调用工具：查表 → 校验权限 → 校验 input_schema → 调处理器 → 校验 output_schema。
+    ///
+    /// schema 在注册时就编译好了，这里只做 `validate`。
     pub fn call_tool(&self, name: &str, input: &Value) -> Result<ToolCall, ToolError> {
-        let (descriptor, request_id, missing) = {
+        let (descriptor, compiled, request_id, missing) = {
             let mut inner = self.lock();
             let descriptor = inner
                 .tools
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ToolError::NotFound(name.to_owned()))?;
+            // 注册时两者在同一把锁里写入，正常不会缺一半；真缺了就当没注册，
+            // 绝不能拿着「没有校验器」的描述符继续调（那等于跳过校验）。
+            let compiled = inner
+                .compiled
                 .get(name)
                 .cloned()
                 .ok_or_else(|| ToolError::NotFound(name.to_owned()))?;
@@ -355,7 +401,7 @@ impl ToolRegistry {
                 .collect();
             let request_id = ToolRequestId(inner.next_id);
             inner.next_id += 1;
-            (descriptor, request_id, missing)
+            (descriptor, compiled, request_id, missing)
         };
 
         if !missing.is_empty() {
@@ -365,7 +411,7 @@ impl ToolRegistry {
             });
         }
 
-        validate(name, &descriptor.input_schema, input, Direction::Input)?;
+        validate(compiled.input.as_ref(), input, Direction::Input)?;
         let handler = descriptor
             .handler
             .ok_or_else(|| ToolError::NoHandler(name.to_owned()))?;
@@ -381,7 +427,7 @@ impl ToolRegistry {
             serde_json::from_str(&text)
                 .map_err(|_| ToolError::BadHandlerOutput(text.into_owned()))?
         };
-        validate(name, &descriptor.output_schema, &output, Direction::Output)?;
+        validate(compiled.output.as_ref(), &output, Direction::Output)?;
 
         Ok(ToolCall {
             request_id,
@@ -542,32 +588,36 @@ fn is_empty_schema(schema: &Value) -> bool {
     schema.is_null() || schema.as_object().is_some_and(|object| object.is_empty())
 }
 
-fn check_schema(name: &str, schema: &Value) -> Result<(), ToolError> {
+/// 构造 validator 的**唯一**入口：只在注册时走这里，`call_tool` 不再碰它。
+///
+/// `compiles` 每真的构造一个 validator +1（空 schema 不构造，也就 +0）。测试靠这个计数
+/// 证明「注册后多次调用只编译一次」。
+fn compile_schema(
+    name: &str,
+    schema: &Value,
+    compiles: &AtomicU64,
+) -> Result<Option<jsonschema::Validator>, ToolError> {
     if is_empty_schema(schema) {
-        return Ok(());
+        return Ok(None);
     }
+    compiles.fetch_add(1, Ordering::Relaxed);
     jsonschema::validator_for(schema)
-        .map(|_| ())
+        .map(Some)
         .map_err(|e| ToolError::BadSchema {
             name: name.to_owned(),
             detail: e.to_string(),
         })
 }
 
+/// 用注册时编译好的 validator 校验。`None` = 这个方向不校验。
 fn validate(
-    name: &str,
-    schema: &Value,
+    validator: Option<&jsonschema::Validator>,
     value: &Value,
     direction: Direction,
 ) -> Result<(), ToolError> {
-    if is_empty_schema(schema) {
+    let Some(validator) = validator else {
         return Ok(());
-    }
-    // 每次调用都重新编译 schema；调用量大时把 Validator 缓存进 ToolDescriptor。
-    let validator = jsonschema::validator_for(schema).map_err(|e| ToolError::BadSchema {
-        name: name.to_owned(),
-        detail: e.to_string(),
-    })?;
+    };
     validator.validate(value).map_err(|e| match direction {
         Direction::Input => ToolError::InvalidInput(e.to_string()),
         Direction::Output => ToolError::InvalidOutput(e.to_string()),
@@ -797,6 +847,75 @@ mod tests {
             registry.call_tool("foo", &json!({ "text": "hi" })),
             Err(ToolError::InvalidOutput(_))
         ));
+    }
+
+    /// 缺口 18-A 的证据：schema 只在注册时编译，`call_tool` 只做校验；
+    /// 注销要把编译结果一起清掉，重新注册才会再编译一遍。
+    #[test]
+    fn schema_is_compiled_once_at_registration_then_reused() {
+        let compiled =
+            |registry: &ToolRegistry| -> u64 { registry.schema_compiles.load(Ordering::SeqCst) };
+
+        let registry = ToolRegistry::new();
+        let mut descriptor = echo_tool("cached");
+        descriptor.output_schema = json!({
+            "type": "object",
+            "properties": { "echo": { "type": "object" } },
+            "required": ["echo"]
+        });
+
+        let handle = registry.register_tool(descriptor).unwrap();
+        assert_eq!(
+            compiled(&registry),
+            2,
+            "输入的 schema + 输出的 schema 各编译一次"
+        );
+
+        for _ in 0..16 {
+            let call = registry
+                .call_tool("cached", &json!({ "text": "hi" }))
+                .unwrap();
+            assert_eq!(call.output["echo"]["text"], json!("hi"));
+        }
+        assert_eq!(
+            compiled(&registry),
+            2,
+            "call_tool 只 validate，不该再构造 validator"
+        );
+
+        // 校验失败走的也是缓存的 validator，计数不该动。
+        assert!(matches!(
+            registry.call_tool("cached", &json!({ "text": 1 })),
+            Err(ToolError::InvalidInput(_))
+        ));
+        assert_eq!(compiled(&registry), 2);
+
+        // 空 schema（`null` / `{}`）不校验，也不编译。
+        let bare = ToolDescriptor::new("bare", "无 schema", json!({}), Some(echo_handler));
+        let _bare = registry.register_tool(bare).unwrap();
+        assert_eq!(compiled(&registry), 2, "空 schema 不该编译");
+
+        // 注销：描述符和编译结果一起从表里消失。
+        handle.remove();
+        assert!(
+            !registry.lock().compiled.contains_key("cached"),
+            "注销后不该留着这个工具的 validator"
+        );
+        assert!(matches!(
+            registry.call_tool("cached", &json!({ "text": "hi" })),
+            Err(ToolError::NotFound(_))
+        ));
+
+        // 重新注册要重新编译（不能复用已经清掉的旧 validator）。
+        let mut again = echo_tool("cached");
+        again.output_schema = json!({ "type": "object" });
+        let _again = registry.register_tool(again).unwrap();
+        assert_eq!(
+            compiled(&registry),
+            4,
+            "注销后重新注册：输入 + 输出重新各编译一次"
+        );
+        assert_eq!(registry.lock().compiled.len(), 2, "两个工具各一份编译结果");
     }
 
     #[test]
