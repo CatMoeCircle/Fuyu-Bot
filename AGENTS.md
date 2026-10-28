@@ -21,7 +21,7 @@ TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` �
 | crate | 一句话 |
 | --- | --- |
 | `fuyubot-cli` | 二进制 `fuyubot`：`init` / `run` / `status` / `stop` / `config` / `plugin`（clap） |
-| `fuyubot-core` | Cordis 内核：`Context` / `Effect` / `Plugin` / `PluginManager`。不认识 Telegram |
+| `fuyubot-core` | Cordis 内核：`Context`（按**名字**寻址的服务表）/ `Effect` / `Plugin`（含 `inject`）/ `PluginManager`（Fiber 生命周期与依赖跟踪）。不认识 Telegram |
 | `fuyubot-abi` | C ABI：`HostApiVTable`（20 字段）、`PluginHandle`、`define_plugin!`、cbindgen 头文件 |
 | `fuyubot-tdlib-sys` | 绑定层：`td_api.tl` → 类型 + 元数据 + FFI 声明（无 tokio / 无网络） |
 | `fuyubot-tdlib` | `loader`（四级定位）+ `client`（`td_receive` 循环、`ReceiveLoop`）+ `authorize`（授权状态机） |
@@ -97,7 +97,10 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 11. **`Effect` 是 `#[must_use]`**：`let _ =` 会立刻回滚；要么存起来，要么显式 drop / rollback。
 12. **四个机制 crate 只依赖 `core`，彼此不许依赖**；组合由宿主层做。
 13. **与 Context 集成 = `install(ctx)` + 扩展 trait**；服务缺失时报错要带「该怎么 install」。
-14. **扩展 trait 不许与 `Context` 固有方法重名**：命名服务叫 `provide_named` / `resolve`。
+14. **扩展 trait 不许与 `Context` 固有方法重名**：命名服务叫 `provide_named` / `resolve`
+    —— ⚠️ **2026 Cordis 化之后反过来了**：`Context` 自己有了 `provide_named` / `resolve`
+    这两个固有方法（服务表现在按名字寻址），所以 `fuyubot-service` 的扩展 trait
+    改叫 **`provide_service` / `get_service`**。规矩本身没变：固有方法永远优先。
 15. **VTable 每个函数首参是 `host: *mut c_void`，每个函数指针字段都是 `Option<...>`**。
 16. **跨 ABI 字符串谁分配谁释放**：宿主不 free 插件的指针；宿主返回的是线程局部缓冲，下次调用前有效。
 17. **新的宿主桥一律放 `fuyubot-loader`**。

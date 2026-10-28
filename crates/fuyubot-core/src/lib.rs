@@ -28,7 +28,7 @@ mod error;
 mod manager;
 mod plugin;
 
-pub use context::Context;
+pub use context::{Context, ServiceChange};
 pub use effect::Effect;
 pub use error::{BoxError, KernelError, Result};
 pub use manager::PluginManager;

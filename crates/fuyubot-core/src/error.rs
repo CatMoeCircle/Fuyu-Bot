@@ -24,6 +24,20 @@ pub enum KernelError {
     #[error("服务 {0} 没有注册")]
     ServiceMissing(&'static str),
 
+    // —— 命名服务（Cordis 式 Container）：名字不但承担查找，也承担 inject 依赖判定 ——
+    #[error("命名服务 {0} 已经注册过了")]
+    ServiceNameExists(String),
+    #[error("命名服务 {0} 没有注册")]
+    ServiceNameMissing(String),
+    #[error("命名服务 {name} 注册的是 {found}，不是 {expected}")]
+    ServiceTypeMismatch {
+        name: String,
+        expected: &'static str,
+        found: &'static str,
+    },
+    #[error("服务名不能为空")]
+    EmptyServiceName,
+
     #[error("插件 {0} 已经加载过了")]
     PluginAlreadyLoaded(String),
     #[error("插件 {0} 没有加载")]

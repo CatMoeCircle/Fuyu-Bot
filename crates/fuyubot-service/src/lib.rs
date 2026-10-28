@@ -1,141 +1,35 @@
-//! 命名服务容器：`名字 → Arc<dyn Any + Send + Sync>`。
+//! 命名服务：**已经下沉到内核**，这里只剩兼容层。
 //!
-//! 为什么不用内核 [`Context`] 的类型表：跨语言插件报不出 Rust 的 `TypeId`，
-//! 只能报名字。两者并存——`Context` 给宿主内部用，这里是给插件与跨语言调用用的。
+//! 过去这里自己维护一张「名字 → 服务」的表（`ServiceContainer`），与内核
+//! [`Context`] 的「类型 → 服务」表并存。Cordis 化之后 `Context` 本身就是
+//! 按名字寻址的 Container，两套合成一套（`docs/gaps.md` 缺口 5）：
+//! 插件报得出名字、`inject` 判得了依赖、宿主也只有一张表要管。
+//!
+//! 还留在这里的是 [`ServiceHandle`]（带名字的注册守卫，`fuyubot-loader`
+//! 的回滚链仍在用）与 [`install`]（现在返回一个空守卫）。
 //!
 //! 只依赖 `fuyubot-core`。
 
-use std::any::{Any, type_name};
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
 
 use fuyubot_core::{Context, Effect, KernelError};
 
-/// 容器错误。
+/// 服务错误。
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
     #[error("服务 {0} 已经注册过了")]
     AlreadyProvided(String),
     #[error("服务名不能为空")]
     EmptyName,
-    #[error(
-        "Context 里还没有 ServiceContainer：先 `let _guard = fuyubot_service::install(&ctx)?;` 并持有它"
-    )]
-    NotInstalled,
     #[error(transparent)]
     Kernel(#[from] KernelError),
 }
 
-/// 表里一格。
-struct Entry {
-    value: Arc<dyn Any + Send + Sync>,
-    /// 注册时那个 Rust 类型名。只用于诊断：`get::<T>` 返回 `None` 时，
-    /// 用它区分“没注册”和“注册了但类型不对”。
-    type_name: &'static str,
-}
-
-/// 按名字注册的服务容器。`Clone` 共享同一张表。
-#[derive(Clone, Default)]
-pub struct ServiceContainer {
-    services: Arc<RwLock<HashMap<String, Entry>>>,
-}
-
-impl ServiceContainer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 注册服务，返回的句柄 drop 即注销。
-    ///
-    /// 同名重复注册直接报错（不做静默覆盖：覆盖会让先注册者的句柄日后误删新服务）。
-    pub fn provide<T: Any + Send + Sync>(
-        &self,
-        name: impl Into<String>,
-        service: T,
-    ) -> Result<ServiceHandle, ServiceError> {
-        let name = name.into();
-        if name.is_empty() {
-            return Err(ServiceError::EmptyName);
-        }
-
-        {
-            let mut services = self.write();
-            if services.contains_key(&name) {
-                return Err(ServiceError::AlreadyProvided(name));
-            }
-            services.insert(
-                name.clone(),
-                Entry {
-                    value: Arc::new(service),
-                    type_name: type_name::<T>(),
-                },
-            );
-        }
-
-        let table = Arc::clone(&self.services);
-        let key = name.clone();
-        Ok(ServiceHandle {
-            name,
-            effect: Effect::new(move || {
-                table
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&key);
-            }),
-        })
-    }
-
-    /// 类型安全查找。名字不存在、或存的类型不是 `T`，都返回 `None`
-    /// （要区分两者就用 [`contains`](Self::contains) 与 [`type_of`](Self::type_of)）。
-    pub fn get<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
-        self.read()
-            .get(name)
-            .and_then(|entry| Arc::clone(&entry.value).downcast::<T>().ok())
-    }
-
-    pub fn contains(&self, name: &str) -> bool {
-        self.read().contains_key(name)
-    }
-
-    /// 某个名字上注册的实际类型名。
-    pub fn type_of(&self, name: &str) -> Option<&'static str> {
-        self.read().get(name).map(|entry| entry.type_name)
-    }
-
-    /// 已注册的名字，已排序（输出稳定）。
-    pub fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.read().keys().cloned().collect();
-        names.sort();
-        names
-    }
-
-    pub fn len(&self) -> usize {
-        self.read().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.read().is_empty()
-    }
-
-    /// 中毒的锁也照用：一个服务的 panic 不该让整个容器卡死。
-    fn read(&self) -> RwLockReadGuard<'_, HashMap<String, Entry>> {
-        self.services.read().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn write(&self) -> RwLockWriteGuard<'_, HashMap<String, Entry>> {
-        self.services.write().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-impl std::fmt::Debug for ServiceContainer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServiceContainer")
-            .field("services", &self.names())
-            .finish()
-    }
-}
-
-/// 服务句柄。drop 即注销。
+/// 服务注册句柄。drop 即注销。
+///
+/// 比裸的 [`Effect`] 多带了名字：`fuyubot-loader` 回滚时要用它认出注的是什么。
 #[must_use = "服务句柄一被丢弃就立刻注销刚注册的服务；要保留就把它存起来"]
 pub struct ServiceHandle {
     name: String,
@@ -153,56 +47,77 @@ impl ServiceHandle {
     }
 }
 
-impl std::fmt::Debug for ServiceHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ServiceHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServiceHandle")
             .field("name", &self.name)
             .finish()
     }
 }
 
-/// 把容器装进内核 [`Context`]。
+/// 兼容旧调用点。
 ///
-/// 返回的 `Effect` **必须一直持有**：它一 drop，容器就从 Context 里消失了。
-pub fn install(ctx: &Context) -> Result<Effect, ServiceError> {
-    Ok(ctx.provide(ServiceContainer::new())?)
+/// 命名服务现在是 [`Context`] 自带的，不需要再往里装一个容器，所以它只返回
+/// 一个**空守卫**。留着这个函数是因为「先 install 再 provide」的调用点很多，
+/// 让它们保持原样比一次改干净更划算——它们是 `&Context` 上的no-op。
+pub fn install(_ctx: &Context) -> Result<Effect, ServiceError> {
+    Ok(Effect::none())
 }
 
 /// `Context` 上的命名服务入口。
 ///
-/// 方法名故意**不叫** `provide`/`get`：内核 [`Context`] 已经有同名的类型化方法，
-/// 且固有方法优先于 trait 方法——真叫 `provide` 的话 trait 方法根本调不到。
+/// 方法名**不能**叫 `provide_named` / `resolve`：那是内核 `Context` 现在的固有方法，
+/// 而固有方法优先于 trait 方法（约束 14），重名会让这里的永远调不到。
 pub trait ServiceContextExt {
-    /// 取出装好的容器。
-    fn services(&self) -> Result<Arc<ServiceContainer>, ServiceError>;
-
-    /// 按名字注册服务。
-    fn provide_named<T: Any + Send + Sync>(
+    /// 按名字注册服务，返回带名字的守卫。
+    fn provide_service<T: Any + Send + Sync>(
         &self,
         name: impl Into<String>,
         service: T,
     ) -> Result<ServiceHandle, ServiceError>;
 
-    /// 按名字取服务。
-    fn resolve<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>>;
+    /// 按名字取服务。名字不在、或注册的是别的类型，都返回 `None`。
+    fn get_service<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>>;
+
+    /// 名字在不在（不看类型）。
+    fn has_service(&self, name: &str) -> bool;
+
+    /// 已注册的名字，已排序（输出稳定）。
+    fn service_names(&self) -> Vec<String>;
 }
 
 impl ServiceContextExt for Context {
-    fn services(&self) -> Result<Arc<ServiceContainer>, ServiceError> {
-        self.get::<ServiceContainer>()
-            .map_err(|_| ServiceError::NotInstalled)
-    }
-
-    fn provide_named<T: Any + Send + Sync>(
+    fn provide_service<T: Any + Send + Sync>(
         &self,
         name: impl Into<String>,
         service: T,
     ) -> Result<ServiceHandle, ServiceError> {
-        self.services()?.provide(name, service)
+        let name = name.into();
+        if name.is_empty() {
+            return Err(ServiceError::EmptyName);
+        }
+        // 内核报的是自己的错误码，这里翻回本 crate 历史上那几个变体：
+        // 调用方可能已经在 match `AlreadyProvided` 了。
+        let effect = self
+            .provide_named(&name, service)
+            .map_err(|error| match error {
+                KernelError::ServiceNameExists(name) => ServiceError::AlreadyProvided(name),
+                KernelError::EmptyServiceName => ServiceError::EmptyName,
+                other => ServiceError::Kernel(other),
+            })?;
+        Ok(ServiceHandle { name, effect })
     }
 
-    fn resolve<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
-        self.services().ok()?.get::<T>(name)
+    fn get_service<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
+        self.resolve::<T>(name).ok()
+    }
+
+    fn has_service(&self, name: &str) -> bool {
+        self.has(name)
+    }
+
+    fn service_names(&self) -> Vec<String> {
+        self.names()
     }
 }
 
@@ -210,86 +125,61 @@ impl ServiceContextExt for Context {
 mod tests {
     use super::*;
 
-    /// 验收 2：provide 一个 String，get 到；drop ServiceHandle 后，get 返回 None。
     #[test]
-    fn provide_get_then_drop_makes_it_disappear() {
-        let container = ServiceContainer::new();
-        let handle = container
-            .provide("greeting", String::from("hello"))
-            .unwrap();
+    fn provide_then_get_service() {
+        let ctx = Context::new();
+        let _guard = install(&ctx).unwrap();
 
-        assert_eq!(*container.get::<String>("greeting").unwrap(), "hello");
-        assert!(container.contains("greeting"));
+        let handle = ctx.provide_service("db", 1u8).unwrap();
+        assert_eq!(handle.name(), "db");
+        assert_eq!(*ctx.get_service::<u8>("db").unwrap(), 1);
+        assert!(ctx.has_service("db"));
 
         drop(handle);
-        assert!(container.get::<String>("greeting").is_none());
-        assert!(!container.contains("greeting"));
+        assert!(ctx.get_service::<u8>("db").is_none());
+        assert!(!ctx.has_service("db"));
     }
 
     #[test]
-    fn duplicate_name_and_empty_name_are_errors() {
-        let container = ServiceContainer::new();
-        let _handle = container.provide("db", 1u8).unwrap();
+    fn duplicate_and_empty_names_are_errors() {
+        let ctx = Context::new();
+        let _handle = ctx.provide_service("db", 1u8).unwrap();
 
         assert!(matches!(
-            container.provide("db", 2u8),
+            ctx.provide_service("db", 2u8),
             Err(ServiceError::AlreadyProvided(_))
         ));
         assert!(matches!(
-            container.provide("", 3u8),
+            ctx.provide_service("", 3u8),
             Err(ServiceError::EmptyName)
         ));
     }
 
     #[test]
-    fn type_mismatch_is_distinguishable_from_missing() {
-        let container = ServiceContainer::new();
-        let _handle = container.provide("port", 8080u32).unwrap();
+    fn type_mismatch_is_none_and_names_are_sorted() {
+        let ctx = Context::new();
+        let beta = ctx.provide_service("beta", 1u8).unwrap();
+        let _alpha = ctx.provide_service("alpha", 2u8).unwrap();
 
-        // 名字在，但类型不对。
-        assert!(container.get::<String>("port").is_none());
-        assert!(container.contains("port"));
-        assert_eq!(container.type_of("port"), Some("u32"));
-
-        // 名字不在。
-        assert!(container.get::<u32>("nope").is_none());
-        assert_eq!(container.type_of("nope"), None);
-    }
-
-    #[test]
-    fn explicit_remove_and_names_are_sorted() {
-        let container = ServiceContainer::new();
-        let beta = container.provide("beta", 1u8).unwrap();
-        let _alpha = container.provide("alpha", 2u8).unwrap();
-        assert_eq!(container.names(), ["alpha", "beta"]);
-        assert_eq!(container.len(), 2);
+        // 名字在但类型不对：这里只报 None。要区分就用 Context::resolve。
+        assert!(ctx.get_service::<String>("beta").is_none());
+        assert_eq!(ctx.service_names(), ["alpha", "beta"]);
 
         beta.remove();
-        assert_eq!(container.names(), ["alpha"]);
+        assert_eq!(ctx.service_names(), ["alpha"]);
     }
 
+    /// 命名服务和类型化服务是同一张表：
+    /// 这是「两套并存」被消掉的直接证据。
     #[test]
-    fn clones_share_the_same_table() {
-        let container = ServiceContainer::new();
-        let fork = container.clone();
-        let _handle = fork.provide("shared", 7u16).unwrap();
-        assert_eq!(*container.get::<u16>("shared").unwrap(), 7);
-    }
-
-    #[test]
-    fn context_integration() {
+    fn typed_and_named_registrations_share_one_table() {
+        struct Marker;
         let ctx = Context::new();
-        let _guard = install(&ctx).unwrap();
+        let _typed = ctx.provide(Marker);
+        let _named = ctx.provide_service("adb", 1u8).unwrap();
 
-        let handle = ctx.provide_named("greeting", String::from("hi")).unwrap();
-        assert_eq!(*ctx.resolve::<String>("greeting").unwrap(), "hi");
-        drop(handle);
-        assert!(ctx.resolve::<String>("greeting").is_none());
-
-        // 没装容器时给出的错误要能指路。
-        let bare = Context::new();
-        let error = bare.services().unwrap_err();
-        assert!(error.to_string().contains("fuyubot_service::install"));
-        assert!(bare.resolve::<String>("greeting").is_none());
+        // 类型注册的那条，按 type_name 这个「名字」也找得到。
+        assert!(ctx.has_service(&std::any::type_name::<Marker>()));
+        assert_eq!(ctx.len(), 2, "两条注册落在同一张表里");
     }
 }

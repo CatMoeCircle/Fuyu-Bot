@@ -269,7 +269,74 @@ impl PluginLoader {
         drop(plugin);
     }
 
+    /// 扫一个动态库的元数据：名字、ABI 版本。**不启动它。**
+    ///
+    /// 之所以要走这一步：依赖是按**插件名**声明的（点分 ID），而 dll 的文件名
+    /// 常常和它不是一回事，宿主没先验手段知道「这个文件是谁」。所以先礼貌地
+    /// 问一句名字，排好队再正式加载。
+    ///
+    /// 代价是这个库被映射了两次（探测一次、加载一次）。Windows / Linux 都有
+    /// 文件映射缓存，第二次几乎免费；换来的是**正式加载路径完全不用改**，
+    /// 也不必把 `LoadedPlugin` 拆成「已 init / 已 start」两种状态。
+    pub fn probe(&self, path: impl AsRef<Path>) -> Result<Probe, LoadError> {
+        let path = path.as_ref();
+        let location = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        // SAFETY: 加载动态库等于执行其中的代码，只加载可信文件。
+        let lib = unsafe { fuyubot_tdlib::loader::open_library(&location) }.map_err(|source| {
+            LoadError::Library {
+                path: path.to_owned(),
+                source,
+            }
+        })?;
+
+        // 探测期内不能让宿主任就把东西注册了：这个 scope **不 commit**，
+        // drop 时整批回滚（见 `HostRuntime::plugin_scope`）。
+        let scope = self.runtime.plugin_scope();
+
+        let init: Symbol<PluginInitFn> =
+            unsafe { lib.get(SYM_PLUGIN_INIT) }.map_err(|source| LoadError::MissingSymbol {
+                path: path.to_owned(),
+                symbol: "plugin_init",
+                source,
+            })?;
+        let init = *init;
+        let stop = unsafe { lib.get::<PluginStopFn>(SYM_PLUGIN_STOP) }
+            .ok()
+            .map(|symbol| *symbol);
+
+        // SAFETY: init / stop 来自本库；vtable 由本运行时持有，地址稳定。
+        let handle = unsafe { init(self.runtime.vtable_ptr()) };
+        if !handle.is_valid() {
+            return Err(LoadError::InitFailed {
+                path: path.to_owned(),
+            });
+        }
+
+        let name = plugin_name(&handle, path);
+
+        // 礼貌地把 init 期间分配的东西还给插件。
+        if let Some(stop) = stop {
+            if handle.abi_version == ABI_VERSION {
+                // SAFETY: ABI 已校验，stop 是它的 plugin_stop。
+                unsafe { stop(handle) };
+            }
+        }
+        // scope 在这里自然 drop：init 注册过的一切整批撤销。
+
+        // 显式收掉它：`init` 期间注册过的一切在这一刻整批撤销——
+        // 一次探测不该在宿主上留下任何痕迹。
+        drop(scope);
+
+        Ok(Probe {
+            path: path.to_owned(),
+            name,
+            abi_version: handle.abi_version,
+        })
+    }
+
     /// 扫描目录逐个加载；单个失败不中断其余的。
+    ///
+    /// 顺序是文件名字典序——**没有依赖语义**，见 [`Self::load_dir_ordered`]。
     pub fn load_dir(
         &self,
         dir: impl AsRef<Path>,
@@ -281,6 +348,131 @@ impl PluginLoader {
         }
         Ok(results)
     }
+
+    /// 扫描目录，**按依赖顺序**逐个加载。
+    ///
+    /// - `deps_for(插件名)` 返回它要的能力列表（宿主从配置段里读，见
+    ///   `[plugin.<名>].inject`）；将来插件自描述 manifest 就位后可以直接取自那里。
+    /// - `config_for(&probe)` 产出喂给 `plugin_start` 的配置 JSON。
+    ///
+    /// 已经排好序的那些按序加载，依赖没齐的**不加载**（不报错），由
+    /// [`OrderedLoad::blocked`] 汇报——和内核侧 Pending 一个道理。
+    pub fn load_dir_ordered(
+        &self,
+        dir: impl AsRef<Path>,
+        deps_for: impl Fn(&str) -> Vec<String>,
+        config_for: impl Fn(&Probe) -> String,
+    ) -> std::io::Result<OrderedLoad> {
+        let mut errored: Vec<(PathBuf, LoadError)> = Vec::new();
+        let mut good = Vec::new();
+        for path in plugin_files(dir)? {
+            // 探测失败就当它不在本次队列里，但原因要留住——文件在那儿却悄悄
+            // 消失是最难查的那类事。
+            match self.probe(&path) {
+                Ok(probe) => good.push(probe),
+                Err(error) => errored.push((path, error)),
+            }
+        }
+
+        let (sorted, blocked) = pick_ready(good, &deps_for, &|capability| {
+            self.runtime.has_service(capability)
+        });
+
+        let mut loaded = errored
+            .into_iter()
+            .map(|(path, error)| (path, Err(error)))
+            .collect::<Vec<_>>();
+        for probe in sorted {
+            let config = config_for(&probe);
+            let outcome = self.load_with_config(&probe.path, &config);
+            loaded.push((probe.path.clone(), outcome));
+        }
+
+        Ok(OrderedLoad { loaded, blocked })
+    }
+}
+
+/// 一个动态库的**探测结果**：它是谁，还不知道要不要它。
+///
+/// 探测只做「把元数据问出来」：`dlopen` → `plugin_init` → 读名字 →
+/// 交给 `plugin_stop` 收拾 → 释放。全程**不碰 `plugin_start`**，插件的业务
+/// 逻辑一次也没跑过。真正要加载时，正式那条路径会自己再开一遍。
+#[derive(Debug, Clone)]
+pub struct Probe {
+    pub path: PathBuf,
+    /// `plugin_init` 自己报出来的名字（插件名是点分的，和 dll 文件名常常不同）。
+    pub name: String,
+    pub abi_version: u32,
+}
+
+/// 一次按依赖顺序加载的结果。
+pub struct OrderedLoad {
+    /// 真正加载了的，按**实际加载顺序**（不是文件名顺序）。
+    pub loaded: Vec<(PathBuf, Result<LoadedPlugin, LoadError>)>,
+    /// 依赖没齐、被留在原地的：`(探测结果, 还缺哪些能力)`。
+    ///
+    /// 和 Cordis 的 PENDING 一样，这是**等着**而不是失败——日志要说清楚。
+    pub blocked: Vec<(Probe, Vec<String>)>,
+}
+
+/// 依依赖把探针排成加载队列，实在排不进去的留在原处。
+///
+/// 每一轮把「依赖已经全齐」的都挑走；一轮下来没有进展就撒手——
+/// 剩下的是互相等（成环），或在等一个根本不存在的东西。
+///
+/// 一个能力两种满足方式，和内核侧的口径一致：服务表里已经有这个名字，
+/// 或者排在前面的某个插件就叫这个名字。
+fn pick_ready(
+    probes: Vec<Probe>,
+    deps_for: &impl Fn(&str) -> Vec<String>,
+    already_present: &dyn Fn(&str) -> bool,
+) -> (Vec<Probe>, Vec<(Probe, Vec<String>)>) {
+    let mut remaining = probes;
+    let mut sorted: Vec<Probe> = Vec::new();
+
+    loop {
+        let mut taken: Vec<Probe> = Vec::new();
+        let mut rest: Vec<Probe> = Vec::new();
+
+        for probe in remaining {
+            let missing: Vec<String> = deps_for(&probe.name)
+                .into_iter()
+                .filter(|capability| {
+                    !(already_present(capability)
+                        || sorted.iter().any(|done| done.name == *capability))
+                })
+                .collect();
+
+            if missing.is_empty() {
+                taken.push(probe);
+            } else {
+                rest.push(probe);
+            }
+        }
+
+        if taken.is_empty() {
+            remaining = rest;
+            break;
+        }
+        sorted.extend(taken);
+        remaining = rest;
+    }
+
+    let blocked = remaining
+        .into_iter()
+        .map(|probe| {
+            let missing = deps_for(&probe.name)
+                .into_iter()
+                .filter(|capability| {
+                    !(already_present(capability)
+                        || sorted.iter().any(|done| done.name == *capability))
+                })
+                .collect();
+            (probe, missing)
+        })
+        .collect();
+
+    (sorted, blocked)
 }
 
 /// 目录下的候选插件文件（按扩展名筛），已排序。
@@ -310,8 +502,91 @@ fn plugin_name(handle: &PluginHandle, path: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-/// 这个动态库是不是 Go 编出来的（Go 的库不能卸载，见 [`LoadedPlugin`]）。
-///
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    fn probe(name: &str) -> Probe {
+        Probe {
+            path: PathBuf::from(format!("{name}.{DLL_EXTENSION}")),
+            name: name.to_owned(),
+            abi_version: ABI_VERSION,
+        }
+    }
+
+    fn names_of(probes: &[Probe]) -> Vec<&str> {
+        probes.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    /// 传入顺序（= 文件名字典序）不该影响加载顺序，依赖说的才算。
+    #[test]
+    fn dependencies_decide_the_order_not_the_file_names() {
+        let deps = |name: &str| match name {
+            "b" => vec!["a".to_owned()],
+            _ => Vec::new(),
+        };
+
+        // 故意把依赖者排在前面。
+        let (sorted, blocked) = pick_ready(vec![probe("b"), probe("a")], &deps, &|_| false);
+
+        assert!(blocked.is_empty(), "依赖都在同一批里，不该有被卡住的");
+        assert_eq!(names_of(&sorted), ["a", "b"]);
+    }
+
+    /// 已经有人提供的能力也算满足——这就是「依赖某个插件」和
+    /// 「依赖某项能力」能共用一套判定的地方。
+    #[test]
+    fn a_capability_already_in_the_service_table_counts_as_ready() {
+        let deps = |name: &str| match name {
+            "consumer" => vec!["database".to_owned()],
+            _ => Vec::new(),
+        };
+
+        let (sorted, blocked) = pick_ready(vec![probe("consumer")], &deps, &|capability| {
+            capability == "database"
+        });
+
+        assert!(blocked.is_empty());
+        assert_eq!(names_of(&sorted), ["consumer"]);
+    }
+
+    /// 成环 / 依赖一个不存在的东西：留下来排队并重报，而不是报错。
+    #[test]
+    fn cycles_and_absent_dependencies_are_blocked_not_loaded() {
+        let deps = |name: &str| match name {
+            "a" => vec!["b".to_owned()],
+            "b" => vec!["a".to_owned()],
+            _ => vec!["nowhere".to_owned()],
+        };
+
+        let (sorted, blocked) =
+            pick_ready(vec![probe("a"), probe("b"), probe("c")], &deps, &|_| false);
+
+        assert!(sorted.is_empty(), "互相等、或等不到的，都不该被加载");
+        assert_eq!(blocked.len(), 3);
+        for (probe, missing) in &blocked {
+            assert!(!missing.is_empty(), "{:?} 该报得出缺什么", probe.name);
+        }
+    }
+
+    /// 排在前面的插件本身就是一种能力：这正是「依赖某个具体插件」的写法。
+    #[test]
+    fn earlier_plugins_satisfy_later_ones_by_name() {
+        let deps = |name: &str| match name {
+            "c" => vec!["a".to_owned()],
+            "b" => vec!["a".to_owned()],
+            _ => Vec::new(),
+        };
+
+        let (sorted, blocked) =
+            pick_ready(vec![probe("c"), probe("b"), probe("a")], &deps, &|_| false);
+
+        assert!(blocked.is_empty());
+        assert_eq!(names_of(&sorted), ["a", "c", "b"], "同轮的保持原序");
+    }
+}
+
+/// 这个动态库是不是 Go 编出来的（Go 的库不能卸载，见 [`LoadedPlugin`]）。///
 /// 判据是 Go 的构建信息魔数 `\xff Go buildinf:`。**不能靠导出符号**：Go 的 c-shared
 /// 只导出 `//export` 的那几个函数，`crosscall2` 之类并不在导出表里（踩过）；
 /// 也不能只看文件末尾——PE 里这段在中间的数据段（也踩过）。

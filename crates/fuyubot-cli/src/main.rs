@@ -28,7 +28,9 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use fuyubot_core::Kernel;
-use fuyubot_loader::{LoadedPlugin, PluginLoader, UpdatePipeline, plugin_files};
+use fuyubot_loader::{
+    LoadedPlugin, OrderedLoad, PluginLoader, Probe, UpdatePipeline, plugin_files,
+};
 // 扩展 trait 要在作用域里才能对 `ConsolePrompter` 调 `ask`（固有方法不覆盖它）。
 use fuyubot_tdlib::Prompter as _;
 
@@ -654,7 +656,7 @@ fn plugin_list(args: PluginDirArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn print_managed_scripts(loader: &PluginLoader) {
     let runtime = loader.runtime();
     let mut lines: Vec<String> = Vec::new();
-    for service in runtime.services().names() {
+    for service in runtime.service_names() {
         if !service.starts_with("fuyubot.host.scripts") {
             continue;
         }
@@ -1042,29 +1044,58 @@ fn load_plugins(
     // 传绝对路径给中间插件（它读 `scripts_dir`），别让它按 cwd 猜 `plugins/scripts`
     // ——`--config` / `--plugin-dir` 指到别处、或不在项目根目录起进程时那样必错。
     let scripts_dir = absolute.join("scripts");
-    let mut loaded = Vec::new();
-    for path in plugin_files(plugin_dir)? {
-        let config = match scaffold::find_script(&path) {
-            Some(script) => {
-                serde_json::json!({ "script": script, "plugins_dir": absolute, "scripts_dir": scripts_dir, "spawn": spawn })
-            }
-            None => {
-                serde_json::json!({ "plugins_dir": absolute, "scripts_dir": scripts_dir, "spawn": spawn })
-            }
-        };
-        match loader.load_with_config(&path, &config.to_string()) {
+
+    // 依赖声明写在插件自己的配置段里：`[plugin.<插件名>] inject = [...]`。
+    // 插件名是 dll 探测出来的那个，不是文件名。
+    let runtime = loader.runtime();
+    let deps_for = |name: &str| -> Vec<String> {
+        runtime
+            .plugin_config_value(name, "inject")
+            .and_then(|value| value.as_array().cloned())
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.as_str().map(str::to_owned))
+            .collect()
+    };
+
+    // 配置的形状取决于这个插件有没有脚本同伴，和原来那条规则一致。
+    let config_for = |probe: &Probe| {
+        match scaffold::find_script(&probe.path) {
+            Some(script) => serde_json::json!({ "script": script, "plugins_dir": absolute, "scripts_dir": scripts_dir, "spawn": spawn }),
+            None => serde_json::json!({ "plugins_dir": absolute, "scripts_dir": scripts_dir, "spawn": spawn }),
+        }
+        .to_string()
+    };
+
+    let OrderedLoad { loaded, blocked } =
+        loader.load_dir_ordered(plugin_dir, deps_for, config_for)?;
+
+    let mut plugins = Vec::new();
+    for (path, outcome) in loaded {
+        match outcome {
             Ok(plugin) => {
                 // 只有 `run`（spawn = true）要这行进度；`plugin list` 自己有格式化输出，
                 // 只发现模式下再打一遍「已加载」就是噪声。
                 if spawn {
                     println!("已加载插件 {} ({})", plugin.name, path.display());
                 }
-                loaded.push(plugin);
+                plugins.push(plugin);
             }
             Err(e) => eprintln!("跳过 {}: {e}", path.display()),
         }
     }
-    Ok(loaded)
+
+    // 依赖没齐的：`Pending`，不是失败。不说清楚，人就会以为它在正常跑。
+    for (probe, missing) in blocked {
+        let source = probe.path.display();
+        eprintln!(
+            "插件 {} ({source}) 的依赖还没齐，先不启动：缺 {}",
+            probe.name,
+            missing.join(", ")
+        );
+    }
+
+    Ok(plugins)
 }
 
 /// 把一批更新灌进管线：不需要 Telegram 账号，也能验插件的判断与回投。

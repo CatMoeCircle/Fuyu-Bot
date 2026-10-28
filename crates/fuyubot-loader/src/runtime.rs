@@ -22,7 +22,7 @@ use fuyubot_middleware::{
     Middleware, MiddlewareContext, MiddlewareHandle as MwRegistration, Next, Pipeline,
     Stage as MwStage,
 };
-use fuyubot_service::{ServiceContainer, ServiceHandle as SvcRegistration};
+use fuyubot_service::{ServiceContextExt as _, ServiceHandle as SvcRegistration};
 use fuyubot_tdlib::TdClient;
 use fuyubot_tool::{ToolDescriptor, ToolHandle as ToolRegistration, ToolRegistry};
 use serde_json::{Value, json};
@@ -182,7 +182,6 @@ const CONFIG_PLUGIN_KEY: &str = "plugin";
 pub struct HostRuntime {
     ctx: Context,
     events: Arc<EventBus>,
-    services: Arc<ServiceContainer>,
     tools: Arc<ToolRegistry>,
     middleware: Arc<Pipeline>,
     td: OnceLock<Arc<TdClient>>,
@@ -261,7 +260,6 @@ impl HostRuntime {
         guards.push(fuyubot_middleware::install(&ctx).map_err(|e| e.to_string())?);
 
         let events = ctx.get::<EventBus>().map_err(|e| e.to_string())?;
-        let services = ctx.get::<ServiceContainer>().map_err(|e| e.to_string())?;
         let tools = ctx.get::<ToolRegistry>().map_err(|e| e.to_string())?;
         let middleware = ctx.get::<Pipeline>().map_err(|e| e.to_string())?;
 
@@ -269,7 +267,6 @@ impl HostRuntime {
         let rt = Arc::new_cyclic(|weak| Self {
             ctx,
             events,
-            services,
             tools,
             middleware,
             td: OnceLock::new(),
@@ -331,11 +328,11 @@ impl HostRuntime {
     /// 句柄故意 `forget`：它要活到进程结束，不能跟着谁 drop 就注销。
     fn provide_scope_service(&self) {
         let vtable = &self.scope_vtable as *const ServiceVTable;
-        match self.services.provide(
+        match self.ctx.provide_named(
             SCOPE_SERVICE_NAME.to_str().unwrap_or_default(),
             AbiService(vtable),
         ) {
-            Ok(handle) => std::mem::forget(handle),
+            Ok(effect) => std::mem::forget(effect),
             Err(e) => self.warn(&format!("预置 scope service 失败: {e}")),
         }
     }
@@ -459,8 +456,28 @@ impl HostRuntime {
         &self.events
     }
 
-    pub fn services(&self) -> &Arc<ServiceContainer> {
-        &self.services
+    /// 读某个插件**自己那一段**配置里的一个键：也就是
+    /// `[plugin.<插件名>]` 下的 `key`（插件名是点分的，见约束 52）。
+    ///
+    /// 宿主读依赖声明 `inject` 走这里。这不是绕过 `get_config` 的权限模型——
+    /// 那条是给**插件**用的（插件只能写自己的段），这条是宿主自己读，给谁看由它决定。
+    pub fn plugin_config_value(&self, plugin: &str, key: &str) -> Option<Value> {
+        self.read_config(plugin, key)
+    }
+
+    /// 某个能力名是不是已经有了，**不看类型**。
+    ///
+    /// 这是 `inject` 依赖判定的一边：插件等着的能力能不能在报表格里找到。
+    pub fn has_service(&self, name: &str) -> bool {
+        self.ctx.has(name)
+    }
+
+    /// 已注册的**命名**服务清单，已排序。
+    ///
+    /// 现在直接读内核 `Context`：命名服务和类型化服务是同一张表了，
+    /// 宿主侧不必再为一个专用容器留字段。
+    pub fn service_names(&self) -> Vec<String> {
+        self.ctx.names()
     }
 
     pub fn tools(&self) -> &Arc<ToolRegistry> {
@@ -889,10 +906,44 @@ fn ensure_leaf<'a>(node: &'a mut Value, path: &str) -> Result<&'a mut Value, Str
 /// 插件写配置属于「程序化修改」，重写是简单且可预期的一步；要保注释得上保留格式的
 /// 编辑器（超出本框架范围）。序列化失败的典型原因是某段塞进了 TOML 表达不了的 JSON
 /// （比如数组里混类型）——那种情况如实报错，不静默吞掉。
+///
+/// 唯一的例外是 `[telegram].api_hash`：它**不在**这棵配置树里（CLI 不肯把凭据交给插件，
+/// 见 `get_config` 能读任意段），但它是**要落盘**的键——不补回来，插件写一次配置就会把
+/// 用户保存的 api_hash 冲掉，下次启动又得手输。所以落盘前从磁盘上那份捞回这个值。
 fn persist_toml(path: &Path, root: &Value) -> Result<(), String> {
-    let value = toml::Value::try_from(root.clone()).map_err(|e| format!("配置转不了 TOML: {e}"))?;
+    let mut root = root.clone();
+    if let Some(hash) = saved_api_hash(path) {
+        let telegram = root
+            .as_object_mut()
+            .ok_or_else(|| "配置树的根不是对象".to_owned())?
+            .entry("telegram")
+            .or_insert_with(|| json!({}));
+        // 原来的 `telegram` 不是对象（用户手写成别的东西）就**报错**，不静默覆盖：
+        // 那样会把整段配置吃掉，而用户完全看不出是谁干的。
+        let telegram = telegram
+            .as_object_mut()
+            .ok_or_else(|| "[telegram] 段不是一个表，无法保留 api_hash".to_owned())?;
+        telegram.insert("api_hash".to_owned(), Value::String(hash));
+    }
+    let value = toml::Value::try_from(root).map_err(|e| format!("配置转不了 TOML: {e}"))?;
     let text = toml::to_string_pretty(&value).map_err(|e| format!("序列化 TOML 失败: {e}"))?;
     std::fs::write(path, text).map_err(|e| format!("写不了 {}: {e}", path.display()))
+}
+
+/// 读磁盘上那份配置里的 `[telegram].api_hash`（[`persist_toml`] 补回用）。
+///
+/// 读不了 / 没这个键就返回 `None`——那只是「没有要保的凭据」，不是错误。
+fn saved_api_hash(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value = toml::from_str::<toml::Value>(&text).ok()?;
+    value
+        .get("telegram")
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get("api_hash"))
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 /// 从响应里取请求号。
@@ -1294,7 +1345,7 @@ unsafe extern "C" fn api_provide_service(
     let Some(name) = (unsafe { cstr(name) }) else {
         return ServiceHandle::INVALID;
     };
-    match rt.services.provide(name, AbiService(vtable)) {
+    match rt.ctx.provide_service(name, AbiService(vtable)) {
         Ok(handle) => ServiceHandle {
             id: rt.remember(RegistrationKind::Service(handle)),
         },
@@ -1317,9 +1368,9 @@ unsafe extern "C" fn api_get_service(
     let Some(name) = (unsafe { cstr(name) }) else {
         return core::ptr::null();
     };
-    match rt.services.get::<AbiService>(name) {
-        Some(service) => service.0,
-        None => core::ptr::null(),
+    match rt.ctx.resolve::<AbiService>(name) {
+        Ok(service) => service.0,
+        Err(_) => core::ptr::null(),
     }
 }
 
@@ -1344,7 +1395,7 @@ impl HostRuntime {
     ) -> Result<String, String> {
         // 查到的 Arc 要一直持有到调用结束：它是对应表项的唯一强引用，
         // 中间被注销就会让下面的裸指针悬空。
-        let Some(entry) = self.services.get::<AbiService>(service) else {
+        let Ok(entry) = self.ctx.resolve::<AbiService>(service) else {
             return Err(format!("没有名为 {service} 的 service"));
         };
         // SAFETY: 表项活着（上面攥着 Arc），指针来自 provide_service 时校验过的 vtable。
@@ -1826,6 +1877,37 @@ mod tests {
 
         // 回到宿主根作用域（owner 0），没有名字 → 写失败。
         assert!(api.set_config("k", "1").is_err());
+    }
+
+    /// 插件写配置是**全量重写**，别把用户保存的 api_hash 冲掉。
+    ///
+    /// `api_hash` 故意**不在**配置树里（那棵树插件能整棵读走），所以重写时必须从磁盘
+    /// 那份捞回来补上——否则插件改一次自己的设置，用户下次启动就得重新手输凭据。
+    #[test]
+    fn persisting_keeps_the_saved_api_hash() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp/fuyubot-loader");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config-credential.toml");
+        std::fs::write(
+            &path,
+            "[telegram]\napi_id = 123\napi_hash = \"saved-hash\"\n",
+        )
+        .unwrap();
+        // 内存里这棵树没有 api_hash（CLI 只把它写在文件里）。
+        let tree = serde_json::json!({ "telegram": { "api_id": 123 }, "plugin": {} });
+
+        persist_toml(&path, &tree).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("api_hash = \"saved-hash\""), "{on_disk}");
+        // 补回来的凭据只落盘，**不**回到内存里那棵树（那棵树是要给插件读的）。
+        assert!(tree.pointer("/telegram/api_hash").is_none());
+
+        // 空串 = 没存过，不该被当成凭据补进去。
+        std::fs::write(&path, "[telegram]\napi_hash = \"\"\n").unwrap();
+        persist_toml(&path, &serde_json::json!({ "telegram": {} })).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("api_hash"), "{on_disk}");
     }
 
     /// 日志门槛：低于门槛的**既**不留档**也**不写 stderr；调高门槛后又能收到。
