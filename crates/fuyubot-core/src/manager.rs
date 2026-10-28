@@ -75,6 +75,29 @@ impl Fiber {
             .filter(|capability| !is_available(ctx, fibers, capability))
             .collect()
     }
+
+    /// 软依赖是不是也到位了。**不影响激活**，只影响排序——见
+    /// [`Plugin::soft_inject`](crate::Plugin::soft_inject)。
+    fn soft_requirements_met(&self, ctx: &Context, fibers: &[Fiber]) -> bool {
+        self.plugin
+            .soft_inject()
+            .iter()
+            .all(|capability| is_available(ctx, fibers, capability))
+    }
+
+    /// 有没有硬依赖**注定永远拿不到**（提供它的 fiber 已经 `Failed`）。
+    ///
+    /// 返回 `Some(那个名字)` 就说明这条 fiber 该被级联跳过——继续 Pending
+    /// 只会假装「还在等」，而它等的那个东西已经永远回不来了。
+    ///
+    /// ⚠️ **只对 `Failed` fiber 级联**。如果注入名没有任何 fiber 匹配
+    /// （可能是未来出现的服务），不级联——那还是 PENDING 语义。
+    fn permanently_missing(&self, ctx: &Context, fibers: &[Fiber]) -> Option<String> {
+        self.plugin
+            .inject()
+            .into_iter()
+            .find(|capability| is_permanently_missing(ctx, fibers, capability))
+    }
 }
 
 /// 一个能力的名字有没有被满足。
@@ -83,6 +106,114 @@ fn is_available(ctx: &Context, fibers: &[Fiber], capability: &str) -> bool {
         || fibers
             .iter()
             .any(|other| other.state.is_active() && other.name() == capability)
+}
+
+/// 这个能力是不是**注定永远拿不到**（提供它的 fiber 已经 `Failed`）。
+///
+/// 区分三种「拿不到」：
+/// - 服务表里有 → `false`（已经满足了）；
+/// - 有 Pending/Activating/Active 的同名 fiber → `false`（可能将来会满足）；
+/// - 有 `Failed` 的同名 fiber → `true`（提供者挂了，永远回不来）；
+/// - 谁都没有 → `false`（可能是未来出现的服务，保持 PENDING 语义）。
+fn is_permanently_missing(ctx: &Context, fibers: &[Fiber], capability: &str) -> bool {
+    if ctx.has(capability) {
+        return false;
+    }
+    fibers
+        .iter()
+        .any(|other| other.name() == capability && matches!(other.state, State::Failed { .. }))
+}
+
+/// 把因依赖失败而注定拿不到的 Pending fiber **级联标记为 Failed**。
+///
+/// 递归到不动点：B 挂 → A（依赖 B）挂 → C（依赖 A）挂……一次调用搞定整条链。
+///
+/// 只处理**硬依赖**（[`Plugin::inject`]）：软依赖缺了不影响激活，不该级联。
+fn cascade_failed(ctx: &Context, fibers: &mut [Fiber]) {
+    loop {
+        let mut changed = false;
+        for index in 0..fibers.len() {
+            if !matches!(fibers[index].state, State::Pending) {
+                continue;
+            }
+            if let Some(capability) = fibers[index].permanently_missing(ctx, fibers) {
+                fibers[index].state = State::Failed {
+                    reason: format!("依赖 {capability} 加载失败，级联跳过"),
+                };
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// 在注册任何 fiber 之前检测硬依赖环。发现就返回 [`KernelError::DependencyCycle`]。
+///
+/// 只看**硬依赖**（[`Plugin::inject`]）：软依赖成环只是排序上的死循环，不影响
+/// 正确性——`reconcile_loop` 的 budget 兜底就够了，报错反而把合法的「互相软依赖」
+/// 误杀。
+///
+/// 检测用 DFS + 递归栈。`n` 是插件数（通常 < 100），O(n²) 完全够用。
+fn detect_cycle(plugins: &[Arc<dyn Plugin>]) -> Result<(), KernelError> {
+    let n = plugins.len();
+    // name → index，只认本批次里的插件名（注入的服务名不参与环检测）。
+    let by_name: HashMap<&str, usize> = plugins
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.name(), i))
+        .collect();
+
+    // 邻接表：i → [j] 表示 plugin i 的硬依赖指向 plugin j。
+    let mut deps: Vec<Vec<usize>> = vec![vec![]; n];
+    for (i, plugin) in plugins.iter().enumerate() {
+        for cap in plugin.inject() {
+            if let Some(&j) = by_name.get(cap.as_str()) {
+                deps[i].push(j);
+            }
+        }
+    }
+
+    // DFS 三色标记：0 = 未访问，1 = 在递归栈上，2 = 已完成。
+    let mut visited = vec![0u8; n];
+    let mut path = Vec::new();
+    let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
+
+    fn dfs(
+        u: usize,
+        deps: &[Vec<usize>],
+        visited: &mut [u8],
+        path: &mut Vec<usize>,
+        names: &[&str],
+    ) -> Result<(), String> {
+        visited[u] = 1;
+        path.push(u);
+        for &v in &deps[u] {
+            if visited[v] == 0 {
+                if let Err(cycle) = dfs(v, deps, visited, path, names) {
+                    return Err(cycle);
+                }
+            } else if visited[v] == 1 {
+                // 找到环：从 path 里截出环的那段。
+                let start = path.iter().position(|&x| x == v).unwrap();
+                let cycle: Vec<&str> = path[start..].iter().map(|&i| names[i]).collect();
+                return Err(cycle.join(" → "));
+            }
+        }
+        path.pop();
+        visited[u] = 2;
+        Ok(())
+    }
+
+    for i in 0..n {
+        if visited[i] == 0 {
+            if let Err(cycle) = dfs(i, &deps, &mut visited, &mut path, &names) {
+                return Err(KernelError::DependencyCycle { cycle });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 把当前 fiber 表拍成一份 [`Report`]。**加锁由调用方负责**（它可能已经持锁）。
@@ -363,6 +494,8 @@ impl PluginManager {
     /// 剩下的留在 Pending（问我 [`pending`](Self::pending) / [`failed`](Self::failed)）。
     /// 调用方不必再操心传入顺序——谁先谁后都一样，依赖说了算。
     pub fn load_all(&mut self, plugins: Vec<Arc<dyn Plugin>>) -> Result<Vec<String>, KernelError> {
+        // 环在注册前就报掉——不留半加载状态（Cordis 同样是启动期拒绝）。
+        detect_cycle(&plugins)?;
         {
             let mut fibers = self.lock_fibers();
             let mut seen: HashMap<String, ()> = HashMap::with_capacity(plugins.len());
@@ -481,6 +614,9 @@ fn reconcile_loop(ctx: &Context, fibers: &Mutex<Vec<Fiber>>) -> Vec<String> {
         let Ok(mut guard) = fibers.lock() else { break };
 
         // 先处理「依赖不再满足、得退回去」的，再处理「可以起来了」的。
+        //
+        // 级联跳过不在这里做——它由 `cascade_failed` 在 `Step::Activate`
+        // 失败之后统一处理（递归到不动点），而不是每轮都扫一遍。
         let mut next = None;
         for (index, fiber) in guard.iter().enumerate() {
             if fiber.state.is_active() && !fiber.requirements_met(ctx, &guard) {
@@ -489,10 +625,27 @@ fn reconcile_loop(ctx: &Context, fibers: &Mutex<Vec<Fiber>>) -> Vec<String> {
             }
         }
         if next.is_none() {
+            // 软依赖排序偏好：**先激活软依赖也齐了的**，再激活只有硬依赖齐了的。
+            // 这保证「A 软依赖 B」时 B 先于 A 激活（B 没来也行，只是排后面）。
+            //
+            // 两轮扫描，每轮都按注册顺序（= 文件名字典序，见 `plugin_files`），
+            // 所以同层 tie-break 天然是确定的。
             for (index, fiber) in guard.iter().enumerate() {
-                if matches!(fiber.state, State::Pending) && fiber.requirements_met(ctx, &guard) {
+                if matches!(fiber.state, State::Pending)
+                    && fiber.requirements_met(ctx, &guard)
+                    && fiber.soft_requirements_met(ctx, &guard)
+                {
                     next = Some((index, Step::Activate));
                     break;
+                }
+            }
+            if next.is_none() {
+                for (index, fiber) in guard.iter().enumerate() {
+                    if matches!(fiber.state, State::Pending) && fiber.requirements_met(ctx, &guard)
+                    {
+                        next = Some((index, Step::Activate));
+                        break;
+                    }
                 }
             }
         }
@@ -524,6 +677,10 @@ fn reconcile_loop(ctx: &Context, fibers: &Mutex<Vec<Fiber>>) -> Vec<String> {
                     guard[index].seq = Some(NEXT_SEQ.fetch_add(1, Ordering::Relaxed));
                 }
                 guard[index].state = next_state;
+                // 依赖它的 fiber 注定拿不到 → 级联跳过（递归到不动点）。
+                if matches!(guard[index].state, State::Failed { .. }) {
+                    cascade_failed(ctx, &mut guard);
+                }
             }
             Step::Deactivate => {
                 let previous = std::mem::replace(&mut guard[index].state, State::Pending);
@@ -819,18 +976,19 @@ mod tests {
         ));
     }
 
-    /// 保险丝：就算依赖图构了环，reconcile 也必须能收住——谁都满足不了，
-    /// 谁也起不来，循环很快跑完 budget 撒手。
+    /// 环在启动前报错（`load_all` 入口的 `detect_cycle`），不再靠 budget 静默吸收。
     #[test]
-    fn cyclic_dependencies_do_not_hang_reconciliation() {
+    fn cyclic_dependencies_are_rejected_at_load_time() {
         let log = Arc::new(StdMutex::new(Vec::new()));
         let mut manager = PluginManager::new(Context::new());
 
         let batch = vec![Named::new("A", &["B"], &log), Named::new("B", &["A"], &log)];
-        let activated = manager.load_all(batch).unwrap();
-        assert!(activated.is_empty(), "互相等对方，谁都起不来");
-        assert!(manager.active().is_empty());
-        assert_eq!(manager.pending().len(), 2);
+        let result = manager.load_all(batch);
+        assert!(
+            matches!(result, Err(KernelError::DependencyCycle { .. })),
+            "{result:?}"
+        );
+        assert_eq!(manager.len(), 0, "不留半加载状态");
     }
 
     #[test]
@@ -950,4 +1108,227 @@ mod tests {
         };
         assert!(reporter.report().plugins.is_empty());
     }
+}
+
+// ── 硬/软依赖 + 级联跳过 + 环检测 ──────────────────────────────────
+
+/// 软依赖不影响激活，只影响排序：两者都就绪时先激活被依赖的那个。
+#[test]
+fn soft_inject_orders_activation_but_never_blocks_it() {
+    struct Named {
+        name: &'static str,
+        soft: Vec<String>,
+    }
+    impl Plugin for Named {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn soft_inject(&self) -> Vec<String> {
+            self.soft.clone()
+        }
+        fn apply(&self, _ctx: &Context) -> Result<Effect, KernelError> {
+            Ok(Effect::none())
+        }
+    }
+
+    // B 软依赖 A：两者都就绪时 A 先激活。
+    let mut manager = PluginManager::new(Context::new());
+    manager
+        .load_all(vec![
+            Arc::new(Named {
+                name: "b",
+                soft: vec!["a".to_owned()],
+            }),
+            Arc::new(Named {
+                name: "a",
+                soft: vec![],
+            }),
+        ])
+        .unwrap();
+    assert_eq!(manager.active(), ["a", "b"], "A 应先于 B");
+
+    // 软依赖缺失照样加载：A 不在列表里，B 不该等它。
+    let mut manager = PluginManager::new(Context::new());
+    manager
+        .load_all(vec![Arc::new(Named {
+            name: "b",
+            soft: vec!["never-exists".to_owned()],
+        })])
+        .unwrap();
+    assert_eq!(manager.active(), ["b"], "软依赖缺失不该阻塞");
+}
+
+/// 级联跳过：B 加载失败 → 依赖 B 的 A 也不该起；递归传播到 C。
+#[test]
+fn a_failed_provider_cascades_to_its_dependents() {
+    struct Named {
+        name: &'static str,
+        injects: Vec<String>,
+    }
+    impl Plugin for Named {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn inject(&self) -> Vec<String> {
+            self.injects.clone()
+        }
+        fn apply(&self, _ctx: &Context) -> Result<Effect, KernelError> {
+            Ok(Effect::none())
+        }
+    }
+    struct Boom;
+    impl Plugin for Boom {
+        fn name(&self) -> &str {
+            "b"
+        }
+        fn apply(&self, _ctx: &Context) -> Result<Effect, KernelError> {
+            Err(KernelError::ServiceMissing("boom"))
+        }
+    }
+
+    let mut manager = PluginManager::new(Context::new());
+    manager
+        .load_all(vec![
+            Arc::new(Named {
+                name: "c",
+                injects: vec!["a".to_owned()],
+            }),
+            Arc::new(Named {
+                name: "a",
+                injects: vec!["b".to_owned()],
+            }),
+            Arc::new(Boom),
+        ])
+        .unwrap();
+
+    assert!(manager.active().is_empty(), "谁都该起不来");
+    let failed = manager.failed();
+    assert_eq!(failed.len(), 3, "B 挂 → A 挂 → C 挂，递归级联");
+    for (name, reason) in &failed {
+        if name == "b" {
+            assert!(reason.contains("boom"), "{reason}");
+        } else {
+            assert!(reason.contains("级联跳过"), "{name}: {reason}");
+        }
+    }
+    // Pending 应该是空的——级联之后没人还在「假装等待」。
+    assert!(manager.pending().is_empty());
+}
+
+/// 能力名（不是插件名）没有 Failed 提供者时**不级联**——那是 PENDING 语义。
+#[test]
+fn a_service_name_without_a_failed_provider_stays_pending_not_cascaded() {
+    struct Consumer;
+    impl Plugin for Consumer {
+        fn name(&self) -> &str {
+            "consumer"
+        }
+        fn inject(&self) -> Vec<String> {
+            vec!["database".to_owned()]
+        }
+        fn apply(&self, _ctx: &Context) -> Result<Effect, KernelError> {
+            Ok(Effect::none())
+        }
+    }
+
+    let mut manager = PluginManager::new(Context::new());
+    manager.load(Consumer).unwrap();
+    // "database" 没有任何 fiber 提供，也不是 Failed——它可能是未来出现的服务。
+    assert_eq!(manager.pending().len(), 1);
+    assert!(manager.failed().is_empty(), "不该级联——这仍是 PENDING");
+}
+
+/// 环在启动前报错，不留半加载状态。
+#[test]
+fn a_dependency_cycle_is_reported_before_anything_loads() {
+    struct Named {
+        name: &'static str,
+        injects: Vec<String>,
+    }
+    impl Plugin for Named {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn inject(&self) -> Vec<String> {
+            self.injects.clone()
+        }
+        fn apply(&self, _ctx: &Context) -> Result<Effect, KernelError> {
+            Ok(Effect::none())
+        }
+    }
+
+    let mut manager = PluginManager::new(Context::new());
+    let result = manager.load_all(vec![
+        Arc::new(Named {
+            name: "a",
+            injects: vec!["b".to_owned()],
+        }),
+        Arc::new(Named {
+            name: "b",
+            injects: vec!["a".to_owned()],
+        }),
+    ]);
+    assert!(
+        matches!(result, Err(KernelError::DependencyCycle { .. })),
+        "{result:?}"
+    );
+    assert_eq!(manager.len(), 0, "不留半加载状态");
+}
+
+/// 软依赖成环**不报错**——那只是排序上的死循环，不影响正确性。
+#[test]
+fn a_soft_dependency_cycle_is_not_an_error() {
+    struct Named {
+        name: &'static str,
+        soft: Vec<String>,
+    }
+    impl Plugin for Named {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn soft_inject(&self) -> Vec<String> {
+            self.soft.clone()
+        }
+        fn apply(&self, _ctx: &Context) -> Result<Effect, KernelError> {
+            Ok(Effect::none())
+        }
+    }
+
+    let mut manager = PluginManager::new(Context::new());
+    let result = manager.load_all(vec![
+        Arc::new(Named {
+            name: "a",
+            soft: vec!["b".to_owned()],
+        }),
+        Arc::new(Named {
+            name: "b",
+            soft: vec!["a".to_owned()],
+        }),
+    ]);
+    assert!(result.is_ok(), "软依赖成环不该报错：{result:?}");
+    assert_eq!(manager.active().len(), 2);
+}
+
+/// 自环也算环。
+#[test]
+fn a_self_loop_is_a_cycle() {
+    struct SelfDep;
+    impl Plugin for SelfDep {
+        fn name(&self) -> &str {
+            "self"
+        }
+        fn inject(&self) -> Vec<String> {
+            vec!["self".to_owned()]
+        }
+        fn apply(&self, _ctx: &Context) -> Result<Effect, KernelError> {
+            Ok(Effect::none())
+        }
+    }
+
+    let mut manager = PluginManager::new(Context::new());
+    let result = manager.load_all(vec![Arc::new(SelfDep)]);
+    assert!(
+        matches!(result, Err(KernelError::DependencyCycle { .. })),
+        "{result:?}"
+    );
 }

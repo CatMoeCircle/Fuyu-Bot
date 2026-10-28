@@ -583,6 +583,17 @@ impl fuyubot_core::Plugin for DylibPlugin {
             .collect()
     }
 
+    /// 软依赖：`[plugin.<名>].soft_inject = [...]`，缺了不阻塞、有了优先排前面。
+    fn soft_inject(&self) -> Vec<String> {
+        self.runtime
+            .plugin_config_value(&self.name, "soft_inject")
+            .and_then(|value| value.as_array().cloned())
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.as_str().map(str::to_owned))
+            .collect()
+    }
+
     fn apply(&self, _ctx: &Context) -> Result<Effect, fuyubot_core::KernelError> {
         let (handle, stop, lib, owner) = start_library(&self.runtime, &self.path, &self.config)
             .map_err(|error| {
