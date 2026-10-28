@@ -912,6 +912,12 @@ impl HostRuntime {
 
     /// 宿主侧的告警输出。`pub(crate)`：`loader` 的探测阶段也要报「自报名对不上」这类事。
     pub(crate) fn warn(&self, message: &str) {
+        self.info(message);
+    }
+
+    /// 宿主侧的一般信息。与 [`Self::warn`] 走同一条通道（`eprintln` + 统一前缀），
+    /// 区别只在调用点的语义：这条不是「出事了」，是「记一笔」。
+    pub(crate) fn info(&self, message: &str) {
         eprintln!("[fuyubot-host] {message}");
     }
 

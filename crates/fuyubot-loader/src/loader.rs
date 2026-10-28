@@ -749,6 +749,19 @@ impl fuyubot_core::Plugin for DylibPlugin {
                 }
             })?;
 
+        // `manifest.version` 以前读进来就躺在结构里没人用。它的用途是诊断：
+        // 激活时把「插件自己说它是哪个版本、要什么」记一笔——插件名可以撞车
+        // （dll 文件名、目录名、配置都能影响），版本 + 依赖才是这个二进制的事实。
+        if let Some(manifest) = &self.manifest {
+            self.runtime.info(&format!(
+                "激活 {} v{}（硬依赖 {}、软依赖 {}）",
+                self.name,
+                manifest.version,
+                manifest.inject.len(),
+                manifest.soft_inject.len()
+            ));
+        }
+
         *self.lock() = Slot::Running {
             handle,
             stop,
