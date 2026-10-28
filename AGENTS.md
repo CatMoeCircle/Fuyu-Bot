@@ -94,6 +94,13 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 8. **加载优先级不要重排**：`TDLIB_TDJSON_PATH` → vendored → exe 同级目录 → Linux 带版本系统库 → 裸库名。
 9. `tar`/`flate2`/`sha2` 只服务 vendored；`ureq` 是常开 build-dependency；**运行时依赖图里不许出现它们**（`cargo tree -p fuyubot-tdlib -e normal` 只有 sys / libloading / serde_json / thiserror / tokio）。
 10. **`Context` 只暴露 `&self`**：注册走 `provide` 并**持有** `Effect`，不加 `&mut` 接口。
+    ⚠️ **2026 P1 起它有了作用域链**：`Context::new()` 永远造**根**（68 个调用点都靠这个），
+    子作用域必须显式 `child()`。查找**沿父链**走（自己这层 → 父 → …），注册**只写自己那层**；
+    `isolate(name)` 把某个名字从当前作用域及以下的父链查找里摘掉。
+    两个刻意的区分：`names()` 报的是「**能看见**什么」（含父级、去掉被隔离的），
+    `len()` / `is_empty()` 报的是「**这一层**存了几个」。
+    ⚠️ 目前 `PluginManager` 传给插件 `apply` 的仍是**共享的根**，所以插件之间还没有
+    各自的作用域；`isolate` 现在服务于测试替身与宿主自己的代码。
 11. **`Effect` 是 `#[must_use]`**：`let _ =` 会立刻回滚；要么存起来，要么显式 drop / rollback。
 12. **四个机制 crate 只依赖 `core`，彼此不许依赖**；组合由宿主层做。
 13. **与 Context 集成 = `install(ctx)` + 扩展 trait**；服务缺失时报错要带「该怎么 install」。
@@ -101,6 +108,8 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     —— ⚠️ **2026 Cordis 化之后反过来了**：`Context` 自己有了 `provide_named` / `resolve`
     这两个固有方法（服务表现在按名字寻址），所以 `fuyubot-service` 的扩展 trait
     改叫 **`provide_service` / `get_service`**。规矩本身没变：固有方法永远优先。
+    ⚠️ **P1 又占了四个名字**：`child` / `isolate` / `is_isolated` / `has_parent`。
+    起新扩展方法前先 `grep` 一下 `crates/fuyubot-core/src/context.rs` 的 `pub fn`。
 15. **VTable 每个函数首参是 `host: *mut c_void`，每个函数指针字段都是 `Option<...>`**。
 16. **跨 ABI 字符串谁分配谁释放**：宿主不 free 插件的指针；宿主返回的是线程局部缓冲，下次调用前有效。
 17. **新的宿主桥一律放 `fuyubot-loader`**。
