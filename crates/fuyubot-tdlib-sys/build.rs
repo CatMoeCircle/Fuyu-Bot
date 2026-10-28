@@ -73,6 +73,13 @@ fn acquire_schema(version: &str, configured_repo: Option<&str>) -> PathBuf {
         return path;
     }
 
+    // 包内自带的那份（`vendor/<版本>/td_api.tl`）：crates.io 下游与 docs.rs 靠它，
+    // 不必联网、也不必先跑一次下载。路径按版本号拼，所以「改了 metadata 却没换
+    // vendor」时这里自然不命中，会退回缓存/下载——不会静默编一份旧 schema。
+    if let Some(vendored) = vendored_schema(version) {
+        return vendored;
+    }
+
     // 缓存命中就**静默**复用：用的是哪份、多少条，`bake_schema` 那条汇总日志已经带了路径，
     // 再说一遍只是每次重跑构建脚本都刷一条 warning。
     let relative = Path::new(version).join("td_api.tl");
@@ -133,6 +140,22 @@ fn explicit_schema() -> Option<PathBuf> {
         "TDLIB_TD_API_TL 指向的 {} 不存在（拿不到 td_api.tl 就没法生成 TDLib 类型）。\n试过：{tried:?}",
         given.display()
     );
+}
+
+/// 包里自带的 `vendor/<版本>/td_api.tl`（相对 crate 根）。
+///
+/// 发布到 crates.io 时它跟着包走，所以下游（和 docs.rs）不必联网、也不用先跑一次下载。
+/// 只认**与 Cargo.toml 里 `tdlib-version` 一致**的那个目录，缺了就退回缓存/下载。
+fn vendored_schema(version: &str) -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("vendor")
+        .join(version)
+        .join("td_api.tl");
+    if !path.is_file() {
+        return None;
+    }
+    println!("cargo:rerun-if-changed={}", path.display());
+    Some(path)
 }
 
 fn missing_repo_hint() -> String {
