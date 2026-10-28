@@ -4,6 +4,7 @@ description = "工具注册表（JSON Schema 描述，跨语言调用）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
 fuyubot-core.workspace = true

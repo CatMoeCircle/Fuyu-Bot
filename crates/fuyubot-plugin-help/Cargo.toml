@@ -4,6 +4,7 @@ description = "内置插件：/help 列出可用命令"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

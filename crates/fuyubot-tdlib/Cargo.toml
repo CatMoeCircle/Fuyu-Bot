@@ -4,6 +4,7 @@ description = "TDLib 原生库加载与 td_receive 循环（类型绑定在 fuyu
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 # 适配的 TDLib 版本与 Releases 仓库：build.rs（vendored 动态库）与运行时加载器都从这里读。
 #

@@ -13,6 +13,16 @@
 /docs/tech-debt.md
 /docs/design-*.md
 
+# ── 本机运行残留：备份、截图工具、ultralight 运行时 ───────────────────
+# `fuyubot.toml.bak-*` 里有**明文 api_hash**（约束 41 只允许它落在主配置里），
+# 绝不能进版本库；`ultralight/` 那 6.4MB 的 icudt67l.dat 与 image-shot.exe 同理。
+# 2026：`git add -A` 差点把这一批一起提交进去过一次。
+/data.bak-*/
+/fuyubot.toml.bak-*
+/image-shot.exe
+/start-xq-anime.cmd
+/ultralight/
+
 # ── 本机工具数据 ──────────────────────────────────────────────────────
 /.serena/
 

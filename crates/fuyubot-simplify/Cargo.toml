@@ -4,6 +4,7 @@ description = "TDLib 便捷封装层"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
 fuyubot-abi.workspace = true

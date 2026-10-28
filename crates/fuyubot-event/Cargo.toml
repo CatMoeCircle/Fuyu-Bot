@@ -4,6 +4,7 @@ description = "事件系统与更新路由"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
 fuyubot-core.workspace = true

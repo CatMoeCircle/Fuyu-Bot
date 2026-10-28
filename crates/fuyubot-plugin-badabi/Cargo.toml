@@ -4,6 +4,7 @@ description = "手写导出的插件样例：故意报不兼容的 ABI 版本，
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

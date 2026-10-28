@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-abi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cbindgen",
  "serde_json",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "fuyubot-core",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "thiserror",
  "tokio",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-event"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fuyubot-core",
  "serde_json",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-loader"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fuyubot-abi",
  "fuyubot-core",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-middleware"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fuyubot-core",
  "serde_json",
@@ -443,21 +443,21 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-plugin-badabi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fuyubot-abi",
 ]
 
 [[package]]
 name = "fuyubot-plugin-demo"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fuyubot-abi",
 ]
 
 [[package]]
 name = "fuyubot-plugin-help"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fuyubot-abi",
  "fuyubot-simplify",
@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-plugin-manage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fuyubot-abi",
  "fuyubot-simplify",
@@ -473,8 +473,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuyubot-plugin-manifest-fixture"
+version = "2.3.4"
+dependencies = [
+ "fuyubot-abi",
+]
+
+[[package]]
 name = "fuyubot-plugin-start"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fuyubot-abi",
  "fuyubot-simplify",
@@ -482,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-service"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fuyubot-core",
  "thiserror",
@@ -490,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-simplify"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fuyubot-abi",
  "fuyubot-core",
@@ -503,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-tdlib"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "flate2",
  "fuyubot-tdlib-sys",
@@ -520,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-tdlib-sys"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -531,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-tool"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fuyubot-core",
  "jsonschema",

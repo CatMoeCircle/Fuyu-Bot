@@ -4,6 +4,7 @@ description = "fuyubot 命令行入口"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [[bin]]
 name = "fuyubot"

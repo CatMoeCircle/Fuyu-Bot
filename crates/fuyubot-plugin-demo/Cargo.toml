@@ -4,6 +4,7 @@ description = "最小 Rust 插件示例：用 define_plugin! 导出 C ABI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

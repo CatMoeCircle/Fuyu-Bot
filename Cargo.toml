@@ -6,7 +6,9 @@ default-members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.1"
+# 0.1.2：ABI v4 的自描述补齐——`plugin_manifest` 带真实版本号、JSON 转义、
+# 头文件声明 v4 的三个静态导出。SDK 仓库按这个版本顶依赖。
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -14,17 +16,17 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/CatMoeCircle/Fuyu-Bot"
 
 [workspace.dependencies]
-fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.1" }
-fuyubot-cli = { path = "crates/fuyubot-cli", version = "0.1.1" }
-fuyubot-core = { path = "crates/fuyubot-core", version = "0.1.1" }
-fuyubot-event = { path = "crates/fuyubot-event", version = "0.1.1" }
-fuyubot-loader = { path = "crates/fuyubot-loader", version = "0.1.1" }
-fuyubot-middleware = { path = "crates/fuyubot-middleware", version = "0.1.1" }
-fuyubot-service = { path = "crates/fuyubot-service", version = "0.1.1" }
-fuyubot-simplify = { path = "crates/fuyubot-simplify", version = "0.1.1" }
-fuyubot-tdlib = { path = "crates/fuyubot-tdlib", version = "0.1.1" }
-fuyubot-tdlib-sys = { path = "crates/fuyubot-tdlib-sys", version = "0.1.1" }
-fuyubot-tool = { path = "crates/fuyubot-tool", version = "0.1.1" }
+fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.2" }
+fuyubot-cli = { path = "crates/fuyubot-cli", version = "0.1.2" }
+fuyubot-core = { path = "crates/fuyubot-core", version = "0.1.2" }
+fuyubot-event = { path = "crates/fuyubot-event", version = "0.1.2" }
+fuyubot-loader = { path = "crates/fuyubot-loader", version = "0.1.2" }
+fuyubot-middleware = { path = "crates/fuyubot-middleware", version = "0.1.2" }
+fuyubot-service = { path = "crates/fuyubot-service", version = "0.1.2" }
+fuyubot-simplify = { path = "crates/fuyubot-simplify", version = "0.1.2" }
+fuyubot-tdlib = { path = "crates/fuyubot-tdlib", version = "0.1.2" }
+fuyubot-tdlib-sys = { path = "crates/fuyubot-tdlib-sys", version = "0.1.2" }
+fuyubot-tool = { path = "crates/fuyubot-tool", version = "0.1.2" }
 
 cbindgen = "0.29.4"
 clap = { version = "4.6.7", features = ["derive"] }

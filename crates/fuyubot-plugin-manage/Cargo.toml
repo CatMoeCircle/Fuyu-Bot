@@ -4,6 +4,7 @@ description = "内置插件：/plugins 列出插件目录里装了哪些插件"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

@@ -4,6 +4,7 @@ description = "内置插件：/start 回一句欢迎语"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lib]
 crate-type = ["cdylib"]
