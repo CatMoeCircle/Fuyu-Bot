@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use libloading::Library;
 use serde_json::Value;
+use tokio::sync::oneshot;
 
 use crate::ffi::TdApi;
 use crate::loader::{self, TdlibLoadError};
@@ -90,6 +91,12 @@ pub enum TdlibError {
     InteriorNul,
     #[error("TDLib 返回的不是合法 JSON: {0}")]
     BadResponse(String),
+    /// [`TdClient::send_and_wait`] 在预算内没等到这个请求的响应（缺口 17）。
+    #[error("等 {id} 的响应超时（等了 {waited:?}）")]
+    Timeout { id: RequestId, waited: Duration },
+    /// 等待期间客户端被销毁：这个 `id` 的响应不会再有人送进来了。
+    #[error("TDLib 客户端已销毁，{id} 的响应不会再来了")]
+    ClientClosed { id: RequestId },
 }
 
 /// 把 `@extra` 注入请求。不是 JSON 对象就原样不动——TDLib 的请求必须是对象。
@@ -113,6 +120,50 @@ pub fn route(payload: Value) -> Routed {
     Routed::Update(TdUpdate { kind, payload })
 }
 
+/// 谁在等哪个请求的响应（缺口 17）。
+///
+/// 与 [`TdClient::pending`] **不是一张表**：`pending` 是诊断（「已经发出去、还没回」），
+/// 这里只说「**有人正在等**」。没有等待者的请求（`send`）不会进这张表，
+/// 等待者超时 / 取消之后也不会留下悬空条目。
+type Waiters = Arc<Mutex<HashMap<RequestId, oneshot::Sender<TdResponse>>>>;
+
+/// 等待者的清理守卫：**future 被取消**（`select!` / `JoinHandle::abort`）时，
+/// `send_and_wait` 后半段那两行清理根本执行不到，只有 `Drop` 会跑。
+///
+/// 正常路径（响应到达 / 超时）也会经过它，`remove` 是幂等的——响应到达时
+/// [`TdClient::handle`] 已经摘走了，这里再摘一次返回 `None`，无害。
+struct WaiterGuard {
+    id: RequestId,
+    waiters: Waiters,
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        // **不能 panic**：这里也可能在 unwinding 里跑（双重 panic 直接 abort）。
+        self.waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// 把「等一个已经发出去的响应」变成 `Result`：超时与客户端销毁都要有明确错误，不许 panic。
+async fn await_response(
+    id: RequestId,
+    rx: oneshot::Receiver<TdResponse>,
+    timeout: Duration,
+) -> Result<TdResponse, TdlibError> {
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(response)) => Ok(response),
+        // Sender 被 drop：客户端销毁（`Drop` 会清空这张表）。绝不能让调用方永远挂着。
+        Ok(Err(_)) => Err(TdlibError::ClientClosed { id }),
+        Err(_) => Err(TdlibError::Timeout {
+            id,
+            waited: timeout,
+        }),
+    }
+}
+
 /// 一个 TDLib json-client。
 ///
 /// `raw` 由 TDLib 持有，`lib` 只是保证动态库不被卸载。
@@ -120,6 +171,9 @@ pub struct TdClient {
     api: TdApi,
     raw: *mut c_void,
     pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
+    /// 缺口 17：谁在等哪个请求的响应。响应到达时 [`handle`](Self::handle) 摘走并唤醒；
+    /// 超时 / 取消由 [`WaiterGuard`] 摘走；客户端销毁时 [`Drop`] 整表清空。
+    waiters: Waiters,
     next_id: AtomicU64,
     /// 保持动态库存活；`None` 只出现在测试注入符号时。
     _lib: Option<Library>,
@@ -165,6 +219,7 @@ impl TdClient {
             api,
             raw,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            waiters: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             _lib: Some(lib),
         })
@@ -177,6 +232,7 @@ impl TdClient {
             api,
             raw,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            waiters: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             _lib: None,
         }
@@ -195,8 +251,21 @@ impl TdClient {
     /// 发起请求：注入 `@extra`、登记 pending、交给 `td_send`。
     ///
     /// `td_send` 在返回前就把字符串拷走了，所以临时 `CString` 可以立即释放。
-    pub fn send(&self, mut request: Value) -> Result<RequestId, TdlibError> {
+    ///
+    /// 这是**不等响应**的那条路：响应回来还是走接收循环的回调/管线。要「发出去并等它自己的
+    /// 响应」用 [`send_and_wait`](Self::send_and_wait)（缺口 17）。
+    pub fn send(&self, request: Value) -> Result<RequestId, TdlibError> {
         let id = RequestId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        self.send_with_id(request, id)?;
+        Ok(id)
+    }
+
+    /// [`send`](Self::send) 的主体，`id` 由调用方给。
+    ///
+    /// [`send_and_wait`](Self::send_and_wait) 需要**先登记等待者、再发**：接收循环在另一个
+    /// 线程上，响应完全可能在登记之前就回来。所以把「注入 + 登记 + 发送」这段抽出来，
+    /// 两条路共用同一份实现（只差谁先谁后）。
+    fn send_with_id(&self, mut request: Value, id: RequestId) -> Result<(), TdlibError> {
         inject_extra(&mut request, id);
 
         let method = request
@@ -215,7 +284,44 @@ impl TdClient {
         );
         // SAFETY: raw 是有效的客户端句柄，json 在调用期间存活。
         unsafe { (self.api.send)(self.raw, json.as_ptr()) };
-        Ok(id)
+        Ok(())
+    }
+
+    /// 发一条请求，等**它自己的**响应（gaps 缺口 17）。
+    ///
+    /// 响应照样由**接收循环**收进来（[`spawn_receive_loop`](Self::spawn_receive_loop) /
+    /// `UpdatePipeline::spawn_dispatch`），[`handle`](Self::handle) 在走原有回调/管线路径
+    /// **之外**再唤醒这里的等待者——两条路互不影响。
+    ///
+    /// 因此调用时**必须有东西在收**：接收循环已经起来，或者另一条线程在跑
+    /// [`receive`](Self::receive)。没有的话只会等到超时（不会死锁，也不会 panic）。
+    /// ⚠️ 别在接收循环的 `callback` 里 `.await` 它：那等于让收的人等自己要等的东西。
+    ///
+    /// 返回值是**原样的** [`TdResponse`]：TDLib 的业务错误（`@type: "error"`）也是 `Ok`，
+    /// 用 [`TdResponse::is_error`] 判（和 `log_in_with` 的处理方式一致）。
+    ///
+    /// 清理约定（都不留悬空条目）：
+    /// - 响应到达 → [`handle`](Self::handle) 摘走等待者；
+    /// - 超时 → [`TdlibError::Timeout`]，等待者摘掉；请求仍留在 [`pending`](Self::pending) 里
+    ///   （它确实还在途，响应真回来时照常摘除——诊断说的是「在途」，不是「还有人等」）；
+    /// - 客户端销毁 → [`TdlibError::ClientClosed`]；
+    /// - future 被取消（`select!` / `abort`）→ [`WaiterGuard`] 的 `Drop` 摘掉。
+    pub async fn send_and_wait(
+        &self,
+        request: Value,
+        timeout: Duration,
+    ) -> Result<TdResponse, TdlibError> {
+        let id = RequestId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = oneshot::channel();
+        self.waiters.lock().unwrap().insert(id, tx);
+        // 守卫在函数返回/被取消时都会跑；响应先到的情形它再 remove 一次是幂等的。
+        let _guard = WaiterGuard {
+            id,
+            waiters: Arc::clone(&self.waiters),
+        };
+        // 登记之后才发：否则响应可能比等待者先到，谁也叫不醒。
+        self.send_with_id(request, id)?;
+        await_response(id, rx, timeout).await
     }
 
     /// 同步执行无状态方法，不经过接收循环。
@@ -246,11 +352,21 @@ impl TdClient {
         Some(self.handle(payload))
     }
 
-    /// 分流并把对应的 pending 请求摘掉。
+    /// 分流、摘掉对应的 pending 请求，并唤醒等这个响应的等待者。
+    ///
+    /// 「唤醒」放在这里（而不是 `receive` 里）是因为 `handle` 是所有接收路径的共同出口：
+    /// 接收循环、登录状态机自己的同步 `receive`、集成测试的轮询都经过它。
     fn handle(&self, payload: Value) -> Routed {
         let routed = route(payload);
         if let Routed::Response(response) = &routed {
             self.pending.lock().unwrap().remove(&response.id);
+            // 等待者可能已经超时 / 被取消（`send` 返回 `Err`），那不是错误；
+            // 回调/管线那条路已经拿到了 `routed`，这里只负责唤醒。
+            // 先把 sender 摘出来再 `send`：唤醒可能让等待方立刻跑起来，别攥着锁。
+            let waiter = self.waiters.lock().unwrap().remove(&response.id);
+            if let Some(waiter) = waiter {
+                let _ = waiter.send(response.clone());
+            }
         }
         routed
     }
@@ -320,6 +436,13 @@ impl ReceiveLoop {
 
 impl Drop for TdClient {
     fn drop(&mut self) {
+        // 先把等待者放掉（缺口 17）：还在 `send_and_wait` 里的调用方会立刻拿到
+        // `TdlibError::ClientClosed`，而不是一直等一个永远不会再来的响应。
+        // 守卫随后还会 remove 一次，表已经空了，无害。
+        self.waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         if !self.raw.is_null() {
             // SAFETY: raw 由 TDLib 创建，且本结构体是唯一持有者。
             unsafe { (self.api.destroy)(self.raw) };
@@ -433,5 +556,186 @@ mod tests {
         };
         assert!(response.is_error());
         assert_eq!(response.error_message(), Some("unauthorized"));
+    }
+
+    // ── 缺口 17：`send_and_wait` 的 oneshot 路径 ────────────────────────────
+    //
+    // 下面这些测试用 `Capture` 那套假 `TdApi`，**直接调 `handle`** 模拟接收循环
+    // （`handle` 就是所有接收路径的共同出口），不碰真库、不需要账号。
+
+    /// 造一个把请求抓进 `sent` 的假客户端。
+    ///
+    /// `Capture` 故意泄漏到测试进程结束：`TdClient` 的 `raw` 一直指着它，
+    /// 提前释放就是悬空指针（`noop_destroy` 什么都不做，也没有地方回收）。
+    fn fake_client() -> (Arc<TdClient>, Arc<StdMutex<Vec<String>>>) {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let capture = Box::new(Capture {
+            sent: Arc::clone(&sent),
+        });
+        let raw = Box::into_raw(capture) as *mut c_void;
+        let api = TdApi {
+            create: noop_create,
+            destroy: noop_destroy,
+            send: capture_send,
+            receive: noop_receive,
+            execute: noop_execute,
+            set_log_verbosity: noop_set_log_verbosity,
+        };
+        (Arc::new(TdClient::from_parts(api, raw)), sent)
+    }
+
+    /// 等到至少 `expected` 条请求在途，返回 `(id, 方法名)` 列表（按 id 升序）。
+    async fn wait_until_pending(client: &TdClient, expected: usize) -> Vec<(RequestId, String)> {
+        for _ in 0..10_000 {
+            let pending = client.pending();
+            if pending.len() >= expected {
+                return pending
+                    .into_iter()
+                    .map(|(id, method, _)| (id, method))
+                    .collect();
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("等不到 {expected} 条在途请求");
+    }
+
+    fn id_of(pending: &[(RequestId, String)], method: &str) -> RequestId {
+        pending
+            .iter()
+            .find(|(_, name)| name == method)
+            .unwrap_or_else(|| panic!("在途请求里没有 {method}"))
+            .0
+    }
+
+    /// 正常唤醒：响应到达时既走原来的 `Routed` 出口，也唤醒等这个 id 的人。
+    #[tokio::test]
+    async fn send_and_wait_wakes_up_on_its_own_response() {
+        let (client, _sent) = fake_client();
+        let waiting = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .send_and_wait(json!({ "@type": "getMe" }), Duration::from_secs(5))
+                    .await
+            }
+        });
+
+        let pending = wait_until_pending(&client, 1).await;
+        let id = id_of(&pending, "getMe");
+
+        // 模拟接收循环：`handle` 的返回值照旧交给回调/管线，同时唤醒等待者。
+        let routed = client.handle(json!({
+            "@type": "ok",
+            "@extra": id.to_extra(),
+            "value": 7,
+        }));
+        assert!(matches!(routed, Routed::Response(_)));
+
+        let response = waiting.await.unwrap().unwrap();
+        assert_eq!(response.id, id);
+        assert_eq!(response.payload["value"], json!(7));
+        assert!(client.pending().is_empty());
+        assert!(client.waiters.lock().unwrap().is_empty());
+    }
+
+    /// 超时：明确错误、等待者被摘掉，不能 panic、不能留下悬空条目。
+    #[tokio::test]
+    async fn a_timeout_returns_an_error_and_cleans_the_waiter() {
+        let (client, _sent) = fake_client();
+        let error = client
+            .send_and_wait(json!({ "@type": "getMe" }), Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TdlibError::Timeout { .. }), "{error}");
+        assert!(
+            client.waiters.lock().unwrap().is_empty(),
+            "超时之后等待者必须被摘掉"
+        );
+        // 请求本身仍然算在途（响应可能还会来，届时 `handle` 照常摘掉 pending）：
+        // 诊断说的是「发出去、还没回」，不是「还有人等」。
+        assert_eq!(client.pending().len(), 1);
+    }
+
+    /// 响应不属于自己时不受影响：先回 beta，只有 beta 被唤醒，alpha 继续等自己的。
+    #[tokio::test]
+    async fn a_response_for_someone_else_does_not_wake_this_waiter() {
+        let (client, _sent) = fake_client();
+        let alpha = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .send_and_wait(json!({ "@type": "alpha" }), Duration::from_secs(5))
+                    .await
+            }
+        });
+        let beta = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .send_and_wait(json!({ "@type": "beta" }), Duration::from_secs(5))
+                    .await
+            }
+        });
+
+        let pending = wait_until_pending(&client, 2).await;
+        let alpha_id = id_of(&pending, "alpha");
+        let beta_id = id_of(&pending, "beta");
+
+        client.handle(json!({ "@type": "ok", "@extra": beta_id.to_extra(), "who": "beta" }));
+        let response = beta.await.unwrap().unwrap();
+        assert_eq!(response.payload["who"], json!("beta"));
+        // alpha 还在等：它的 id 不能被 beta 的响应顺手摘掉。
+        let still_pending = client.pending();
+        assert_eq!(still_pending.len(), 1);
+        assert_eq!(still_pending[0].0, alpha_id);
+
+        client.handle(json!({ "@type": "ok", "@extra": alpha_id.to_extra(), "who": "alpha" }));
+        let response = alpha.await.unwrap().unwrap();
+        assert_eq!(response.payload["who"], json!("alpha"));
+        assert!(client.pending().is_empty());
+        assert!(client.waiters.lock().unwrap().is_empty());
+    }
+
+    /// 客户端销毁：等待者被唤醒（收到错误），而不是一直等到超时。
+    #[tokio::test]
+    async fn dropping_the_client_wakes_waiters_with_an_error() {
+        let (client, _sent) = fake_client();
+        let (tx, rx) = oneshot::channel();
+        let id = RequestId(41);
+        client.waiters.lock().unwrap().insert(id, tx);
+
+        drop(client);
+
+        let error = await_response(id, rx, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TdlibError::ClientClosed { .. }), "{error}");
+    }
+
+    /// future 被取消（`abort`）时也要摘掉等待者——`Drop` 是唯一会跑到的清理点。
+    #[tokio::test]
+    async fn a_cancelled_waiter_does_not_leak() {
+        let (client, _sent) = fake_client();
+        let task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .send_and_wait(json!({ "@type": "getMe" }), Duration::from_secs(5))
+                    .await
+            }
+        });
+        wait_until_pending(&client, 1).await;
+        assert_eq!(client.waiters.lock().unwrap().len(), 1);
+
+        task.abort();
+        let _ = task.await;
+
+        for _ in 0..10_000 {
+            if client.waiters.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("被取消的等待者没被摘掉");
     }
 }
