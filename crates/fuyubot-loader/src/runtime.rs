@@ -16,7 +16,7 @@ use fuyubot_abi::{
     MiddlewareHandle, RequestId, ServiceHandle, ServiceMethod, ServiceVTable, SubscriptionHandle,
     ToolHandle, WaitHandle,
 };
-use fuyubot_core::{Context, Effect};
+use fuyubot_core::{Context, Effect, Report};
 use fuyubot_event::{EventBus, Filter, SubscriptionHandle as EventSubscription};
 use fuyubot_middleware::{
     Middleware, MiddlewareContext, MiddlewareHandle as MwRegistration, Next, Pipeline,
@@ -194,6 +194,8 @@ pub struct HostRuntime {
     /// 子作用域表：中间插件为每个脚本建一个，卸载单个脚本只撤销它自己的。
     scopes: Mutex<HashMap<u64, ScopeInfo>>,
     next_scope: AtomicU64,
+    /// 内置「插件清单」service 的 vtable（`context` 指向本实例）。按值存，地址稳定。
+    plugins_vtable: ServiceVTable,
     waiters: Mutex<HashMap<u64, Arc<Waiter>>>,
     next_waiter: AtomicU64,
     /// 插件经 `log` 打进来的日志，环形缓冲、有上限。
@@ -218,6 +220,12 @@ pub struct HostRuntime {
     config: Mutex<ConfigState>,
     /// 插件 owner id → 插件名（`set_config` 按它判定「这是谁的段」）。
     owner_names: Mutex<HashMap<u64, String>>,
+    /// 最近一次插件报告（`PluginManager::report` 的 JSON 快照）。
+    ///
+    /// 为什么是「快照」而不是让运行时自己去问内核：`HostRuntime` 只持有 `Context`，
+    /// **刻意不持有 `PluginManager`**——那会让 loader 反过来攥住内核的生命周期。
+    /// CLI 在加载/卸载之后刷新这里，插件经 `get_service` 读到的就是最近一次。
+    plugin_report: Mutex<String>,
 }
 
 /// 一条已经发出的请求。
@@ -293,8 +301,17 @@ impl HostRuntime {
                 methods: SCOPE_METHODS.0.as_ptr(),
                 method_count: SCOPE_METHODS.0.len(),
             },
+            plugins_vtable: ServiceVTable {
+                name: PLUGIN_REPORT_SERVICE_C.as_ptr(),
+                version: 1,
+                size: core::mem::size_of::<ServiceVTable>() as u32,
+                context: weak.as_ptr() as *mut c_void,
+                methods: PLUGIN_METHODS.0.as_ptr(),
+                method_count: PLUGIN_METHODS.0.len(),
+            },
             config: Mutex::new(ConfigState::default()),
             owner_names: Mutex::new(HashMap::new()),
+            plugin_report: Mutex::new("{}".to_owned()),
             // `host_ctx` 指向这个 `Arc` 内部；地址稳定，插件活着期间一直有效。
             vtable: HostApiVTable {
                 version: ABI_VERSION,
@@ -320,10 +337,11 @@ impl HostRuntime {
             },
         });
         rt.provide_scope_service();
+        rt.provide_plugins_service();
         Ok(rt)
     }
 
-    /// 把内置 scope service 预置进命名服务容器。
+    /// 把内置 scope service 预置进服务表。
     ///
     /// 句柄故意 `forget`：它要活到进程结束，不能跟着谁 drop 就注销。
     fn provide_scope_service(&self) {
@@ -334,6 +352,23 @@ impl HostRuntime {
         ) {
             Ok(effect) => std::mem::forget(effect),
             Err(e) => self.warn(&format!("预置 scope service 失败: {e}")),
+        }
+    }
+
+    /// 把内置的「插件清单」service 预置进服务表。
+    ///
+    /// 名字 [`PLUGIN_REPORT_SERVICE`]，方法 `report`（无参）返回最近一次快照的 JSON。
+    /// 插件用现成的 `get_service` + 方法调用就能读，**不需要动 ABI**——
+    /// 这正是缺口 31 里「不碰 ABI 的那一半」。
+    fn provide_plugins_service(&self) {
+        let vtable = &self.plugins_vtable as *const ServiceVTable;
+        match self
+            .ctx
+            .provide_named(PLUGIN_REPORT_SERVICE, AbiService(vtable))
+        {
+            // 句柄故意 `forget`：它要活到进程结束，不能跟着谁 drop 就注销。
+            Ok(effect) => std::mem::forget(effect),
+            Err(e) => self.warn(&format!("预置插件清单 service 失败: {e}")),
         }
     }
 
@@ -486,6 +521,23 @@ impl HostRuntime {
 
     pub fn middleware(&self) -> &Arc<Pipeline> {
         &self.middleware
+    }
+
+    /// 刷新「进程里加载了哪些插件」的快照（CLI 在加载/卸载之后调）。
+    ///
+    /// 只留**结论**，不在这里判断谁对谁错：报告怎么来是内核的事，这里只负责
+    /// 让插件经 ABI 问得到。
+    pub fn install_plugin_report(&self, report: &Report) {
+        let text = report_json(report);
+        *self.plugin_report.lock().unwrap_or_else(|e| e.into_inner()) = text;
+    }
+
+    /// 最近一次快照（JSON）。插件没问过就是 `{}`。
+    pub fn plugin_report(&self) -> String {
+        self.plugin_report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 接上 TDLib 客户端（可选）。没接时 `td_invoke*` 返回无效请求号。
@@ -1147,6 +1199,41 @@ static SCOPE_METHODS: ScopeMethods = ScopeMethods([
     },
 ]);
 
+/// 内置「插件清单」service 的名字。插件用 ABI 的 `get_service` 查它。
+pub const PLUGIN_REPORT_SERVICE: &str = "fuyubot.host.plugins";
+
+/// 同一个名字的 `CString` 版（`ServiceVTable.name` 要 NUL 结尾的指针）。
+const PLUGIN_REPORT_SERVICE_C: &core::ffi::CStr = c"fuyubot.host.plugins";
+
+/// 「插件清单」service 的方法表。
+///
+/// 现在只有一个方法 `report`：无参，返回宿主最近一次快照的 JSON。
+/// 加方法只要在这张表里追加一项——插件侧本来就是按名字调的。
+struct PluginMethods([ServiceMethod; 1]);
+
+// SAFETY: 与 `ScopeMethods` 同理：`name` 指向 `'static` 字面量，`func` 是纯函数指针。
+unsafe impl Sync for PluginMethods {}
+
+static PLUGIN_METHODS: PluginMethods = PluginMethods([ServiceMethod {
+    name: c"report".as_ptr(),
+    func: Some(api_plugin_report),
+}]);
+
+/// `report` 方法的实现：无参，返回快照 JSON。
+///
+/// 用 `host_string`（线程局部缓冲）而不是自己分配：契约是「提供方持有返回值、
+/// 调用方读完即弃」，和 `api_list_tools` 一个套路。
+unsafe extern "C" fn api_plugin_report(
+    context: *mut c_void,
+    _input: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    host_string(&rt.plugin_report())
+}
+
 // ── VTable 实现 ────────────────────────────────────────────────────
 
 unsafe extern "C" fn api_log(host: *mut c_void, level: u32, message: *const c_char) {
@@ -1732,6 +1819,45 @@ impl Drop for PluginScope<'_> {
         }
         self.runtime.end_plugin();
     }
+}
+
+/// 把内核的报告序列化成 JSON。
+///
+/// 形状故意**稳定**（插件会按字段名读它，改字段就是改契约）：
+///
+/// ```json
+/// {
+///   "count": 2,
+///   "plugins": [
+///     {"name": "a", "state": "active"},
+///     {"name": "b", "state": "pending", "missing": ["database"]}
+///   ]
+/// }
+/// ```
+///
+/// 只写有意义的字段：`missing` 只在 pending 时出现，`reason` 只在 failed 时出现。
+/// 空数组一律写出来（`"missing": []` 会被省掉）——调用方按 `state` 判断即可，
+/// 不必猜「字段不在」是什么意思。
+fn report_json(report: &Report) -> String {
+    let plugins: Vec<Value> = report
+        .plugins
+        .iter()
+        .map(|entry| {
+            let mut item = json!({
+                "name": entry.name,
+                "state": entry.state.as_str(),
+            });
+            let object = item.as_object_mut().expect("刚造的对象");
+            if !entry.missing.is_empty() {
+                object.insert("missing".to_owned(), json!(entry.missing));
+            }
+            if let Some(reason) = &entry.reason {
+                object.insert("reason".to_owned(), json!(reason));
+            }
+            item
+        })
+        .collect();
+    json!({ "count": report.plugins.len(), "plugins": plugins }).to_string()
 }
 
 /// 把 ABI 的 JSON 描述转成 [`ToolDescriptor`]。

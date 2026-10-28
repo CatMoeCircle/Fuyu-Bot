@@ -31,7 +31,7 @@ mod plugin;
 pub use context::{Context, ServiceChange};
 pub use effect::Effect;
 pub use error::{BoxError, KernelError, Result};
-pub use manager::PluginManager;
+pub use manager::{PluginManager, Report, ReportEntry, ReportState};
 pub use plugin::Plugin;
 
 /// 内核生命周期阶段。
@@ -72,6 +72,11 @@ impl Kernel {
     /// 加载 / 卸载插件走这里。
     pub fn plugins(&mut self) -> &mut PluginManager {
         &mut self.plugins
+    }
+
+    /// 只读快照：谁在跑、谁在等。`&self`——诊断不该要求独占。
+    pub fn report(&self) -> Report {
+        self.plugins.report()
     }
 
     /// `Created` → `Started`。

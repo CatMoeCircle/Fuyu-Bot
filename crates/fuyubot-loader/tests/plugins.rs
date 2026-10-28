@@ -521,3 +521,58 @@ fn unloading_a_provider_retracts_dependents_first() {
     );
     assert_eq!(kernel.plugins().pending().len(), 1);
 }
+
+/// 宿主把自己那份报告注册成 service，**插件经 ABI 能读到**——
+/// 这就是「插件问不到进程里加载了哪些」那个缺口的答案，且没动 ABI。
+#[test]
+fn plugins_can_read_the_report_through_a_host_service() {
+    let demo = build_fixture("fuyubot-plugin-demo");
+    let mut kernel = fuyubot_core::Kernel::new();
+    let ctx = kernel.context().clone();
+    let loader = PluginLoader::new(ctx.clone()).unwrap();
+
+    let shared = std::sync::Arc::new(
+        fuyubot_loader::DylibPlugin::probe(&loader, &demo, "").expect("探测成功"),
+    );
+    kernel
+        .plugins()
+        .load_all(vec![
+            std::sync::Arc::clone(&shared) as std::sync::Arc<dyn fuyubot_core::Plugin>
+        ])
+        .expect("登记不该失败");
+
+    // CLI 在加载之后刷一次，插件读到的就是这次。
+    loader.runtime().install_plugin_report(&kernel.report());
+
+    // 走宿主侧的方法调用（和插件经 vtable 调进去完全同一条路）。
+    let json = loader
+        .runtime()
+        .call_service("fuyubot.host.plugins", "report", "{}")
+        .expect("宿主该预置了这个 service");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("要是合法 JSON");
+    assert_eq!(value["count"], 1);
+    assert_eq!(value["plugins"][0]["name"], "fuyubot.demo");
+    assert_eq!(value["plugins"][0]["state"], "active");
+
+    // 卸载之后快照要跟着变（不然这个 service 只会说谎）。
+    kernel.plugins().unload("fuyubot.demo").expect("卸载");
+    loader.runtime().install_plugin_report(&kernel.report());
+    let json = loader
+        .runtime()
+        .call_service("fuyubot.host.plugins", "report", "{}")
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["count"], 0, "卸完了就不该再有它");
+}
+
+/// 诊断用（临时）：确认宿主预置的 service 到底在不在表里、叫什么。
+#[test]
+fn host_report_service_is_registered() {
+    let ctx = Context::new();
+    let loader = PluginLoader::new(ctx.clone()).unwrap();
+    let names = loader.runtime().service_names();
+    assert!(
+        names.iter().any(|n| n == "fuyubot.host.plugins"),
+        "服务表里该有 fuyubot.host.plugins，实际有 {names:?}"
+    );
+}

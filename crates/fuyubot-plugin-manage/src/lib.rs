@@ -48,8 +48,14 @@ impl Plugin for ManagePlugin {
             if !command.is("plugins") {
                 return;
             }
+            // 优先报**进程里真在跑的**（宿主预置的 `fuyubot.host.plugins` service），
+            // 读不到才回退到目录清单——那条路只能看到「装了哪些文件」。
+            let text = match running_plugins(host) {
+                Some(report) => report,
+                None => list_plugins(&plugins_dir, &prefix),
+            };
             let params = SendMessageParams {
-                text: Some(Text::plain(list_plugins(&plugins_dir, &prefix))),
+                text: Some(Text::plain(text)),
                 reply_to_message_id: Some(command.message_id),
                 ..SendMessageParams::default()
             };
@@ -87,6 +93,60 @@ fn plugins_dir_from(config_json: &str) -> PathBuf {
         .ok()
         .and_then(|config| config.get("plugins_dir")?.as_str().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("plugins"))
+}
+
+/// 宿主预置的「插件清单」service 的名字（`fuyubot-loader` 的
+/// `PLUGIN_REPORT_SERVICE`；这里写死一份是因为插件不该依赖 loader——那会把
+/// 宿主的依赖图拖进插件）。
+const REPORT_SERVICE: &str = "fuyubot.host.plugins";
+
+/// 问宿主「进程里到底加载了哪些插件」。读不到就 `None`（回退到目录清单）。
+///
+/// 走的是 ABI 现成的 `get_service` + 方法调用，**没有新桥**：服务表按名字寻址，
+/// 宿主把自己的清单也注册成一个服务，插件就当它是别人提供的服务来用。
+fn running_plugins(host: HostApi) -> Option<String> {
+    let json = host.call_service(REPORT_SERVICE, "report", "{}").ok()?;
+    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let plugins = value.get("plugins")?.as_array()?;
+    if plugins.is_empty() {
+        return Some("宿主进程里还没有插件在跑。".to_owned());
+    }
+
+    let mut active = Vec::new();
+    let mut waiting = Vec::new();
+    for entry in plugins {
+        let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        match entry.get("state").and_then(|v| v.as_str()) {
+            Some("active") => active.push(name.to_owned()),
+            Some("pending") => {
+                let missing: Vec<&str> = entry
+                    .get("missing")
+                    .and_then(|v| v.as_array())
+                    .map(|items| items.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                waiting.push(format!("{name}（等 {}）", missing.join(", ")));
+            }
+            Some("failed") => {
+                let reason = entry.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+                waiting.push(format!("{name}（起不来：{reason}）"));
+            }
+            // `activating` 是瞬时态，不报——报了会让人以为它卡住了。
+            _ => {}
+        }
+    }
+
+    let mut text = format!("宿主里 {} 个插件在跑：\n", active.len());
+    for name in &active {
+        text.push_str(&format!("• {name}\n"));
+    }
+    if !waiting.is_empty() {
+        text.push_str(&format!("\n还没起来 {} 个：\n", waiting.len()));
+        for item in &waiting {
+            text.push_str(&format!("• {item}\n"));
+        }
+    }
+    text.push_str("\n（这是宿主进程里的真实状态，不是目录里的文件。）");
+    Some(text)
 }
 
 /// 插件目录里的动态库（按文件名排序）。

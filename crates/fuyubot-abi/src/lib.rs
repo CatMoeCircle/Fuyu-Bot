@@ -634,6 +634,63 @@ impl HostApi {
         unsafe { (self.get_service)(self.host_ctx, name.as_ptr()) }
     }
 
+    /// 按名字 + 方法名调一个 service，返回它给的 JSON 文本。
+    ///
+    /// 这是 [`get_service`](Self::get_service) 的安全封装：那条路给出的是裸
+    /// `*const ServiceVTable`，插件作者得自己走指针、自己处理 null——而九成用法
+    /// 就是「查个方法、喂入参、拿结果」。**不新增 ABI 桥**，纯 Rust 侧便利；
+    /// C / Go / Python 侧照旧自己走 vtable（它们的绑定本来就是这样生成的）。
+    ///
+    /// 出错（服务不存在 / 没这个方法 / 返回 NULL）返回 `None`。
+    ///
+    /// # Safety 之外的前提
+    /// 返回的字符串由**提供方**持有、只在本线程下一次调用前有效——这里立刻拷成
+    /// `String`，所以调用方拿到的永远是自己的一份。
+    pub fn call_service(
+        &self,
+        name: &str,
+        method: &str,
+        input_json: &str,
+    ) -> Result<String, AbiError> {
+        let vtable = self.get_service(name);
+        if vtable.is_null() {
+            return Err(AbiError::BadString);
+        }
+        let Ok(method) = CString::new(method) else {
+            return Err(AbiError::BadString);
+        };
+        let wanted = method.to_string_lossy().into_owned();
+        let input = CString::new(input_json).map_err(|_| AbiError::BadString)?;
+        // SAFETY: `get_service` 要么返回宿主校验过的 vtable，要么返回 null（上面挡住了）。
+        // 它的 `methods` / `method_count` 由注册方保证一致（见 `ServiceVTable` 文档）。
+        let table = unsafe { &*vtable };
+        for index in 0..table.method_count {
+            // SAFETY: 契约保证 methods 指向 method_count 个连续项。
+            let entry = unsafe { &*table.methods.add(index) };
+            if entry.name.is_null() {
+                continue;
+            }
+            // SAFETY: 方法名是 NUL 结尾 UTF-8。
+            if unsafe { CStr::from_ptr(entry.name) }.to_string_lossy() != wanted {
+                continue;
+            }
+            let Some(func) = entry.func else {
+                return Err(AbiError::BadString);
+            };
+            // SAFETY: 契约要求返回值由提供方持有、本线程下一次调用前有效——立刻拷走。
+            let raw = unsafe { func(table.context, input.as_ptr()) };
+            if raw.is_null() {
+                // 与宿主内部的约定一致：null = 成功但没有输出。
+                return Ok(String::new());
+            }
+            // SAFETY: raw 是提供方的 NUL 结尾字符串。
+            return Ok(unsafe { CStr::from_ptr(raw) }
+                .to_string_lossy()
+                .into_owned());
+        }
+        Err(AbiError::BadString)
+    }
+
     pub fn td_invoke(&self, method_json: &str) -> Result<RequestId, AbiError> {
         let method = CString::new(method_json).map_err(|_| AbiError::BadString)?;
         // SAFETY: 同 log。

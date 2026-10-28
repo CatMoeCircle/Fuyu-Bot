@@ -478,10 +478,15 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .name
         .clone()
         .unwrap_or_else(|| "fuyubot".to_owned());
+    // 插件速览：`status` 是**另一个进程**，只能从这份文件读，所以要在这里写下来。
+    // 同时刷给宿主运行时——插件经 `get_service` 读到的就是它（缺口 31 的宿主那半）。
+    let report = kernel.report();
+    let detail = instance::PluginDetail::from_report(&report);
+    loader.runtime().install_plugin_report(&report);
     println!(
         "{bot_name}（fuyubot {}）已启动：插件 {} 个，工具 {} 个",
         env!("CARGO_PKG_VERSION"),
-        loaded.len(),
+        detail.active.len(),
         loader.runtime().tools().len()
     );
     // 状态**这时候才发布**：`run --background` 的父进程等的就是它（拿上锁只说明进程活着）。
@@ -490,8 +495,9 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             pid: std::process::id(),
             started: started_at,
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            plugins: loaded.len(),
+            plugins: detail.active.len(),
             name: bot_name,
+            detail,
         })?;
     }
 
@@ -1097,6 +1103,11 @@ fn load_plugins(
         .map(|adapter| Arc::clone(adapter) as Arc<dyn fuyubot_core::Plugin>)
         .collect();
     kernel.plugins().load_all(plugins)?;
+
+    // 让插件经 ABI 问得到「进程里加载了哪些」：宿主把自己的清单注册成一个服务
+    // （`fuyubot.host.plugins`），这里刷成当前快照。**放在这一层**是因为
+    // `run` / `--replay` / `plugin list` 三条路径都经过这里。
+    loader.runtime().install_plugin_report(&kernel.report());
 
     // Pending 的要说清楚：不说的话，人就会以为它在正常跑。
     for (name, missing) in kernel.plugins().pending() {

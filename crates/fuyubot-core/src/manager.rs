@@ -85,6 +85,78 @@ fn is_available(ctx: &Context, fibers: &[Fiber], capability: &str) -> bool {
             .any(|other| other.state.is_active() && other.name() == capability)
 }
 
+/// [`PluginManager::report`] 的产物：一次加锁拿到的一致视图。
+///
+/// 故意不是 serde 类型：`fuyubot-core` 不引 serde（它连 Telegram 都不认识），
+/// 序列化在宿主层（`fuyubot-loader`）做。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// 登记顺序。**不是**激活顺序——要那个看每项的 `seq`。
+    pub plugins: Vec<ReportEntry>,
+}
+
+impl Report {
+    /// 真在跑的插件名，按激活先后。
+    pub fn active(&self) -> Vec<&str> {
+        let mut live: Vec<(u64, &str)> = self
+            .plugins
+            .iter()
+            .filter(|entry| entry.state == ReportState::Active)
+            .map(|entry| (entry.seq.unwrap_or(0), entry.name.as_str()))
+            .collect();
+        live.sort_by_key(|(seq, _)| *seq);
+        live.into_iter().map(|(_, name)| name).collect()
+    }
+
+    /// 还在等依赖的：`(插件名, 缺哪些能力)`。
+    pub fn pending(&self) -> Vec<(&str, &[String])> {
+        self.plugins
+            .iter()
+            .filter(|entry| entry.state == ReportState::Pending)
+            .map(|entry| (entry.name.as_str(), entry.missing.as_slice()))
+            .collect()
+    }
+}
+
+/// 一个插件在快照里的样子。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportEntry {
+    pub name: String,
+    pub state: ReportState,
+    /// 只对 `Pending` 有意义：还缺哪些能力。
+    pub missing: Vec<String>,
+    /// 只对 `Failed` 有意义：`apply` 报的错。
+    pub reason: Option<String>,
+    /// 激活序号（没激活过是 `None`）。宿主按它排「谁先起来的」。
+    pub seq: Option<u64>,
+}
+
+/// 对外暴露的状态名。**故意只有四态**：内核内部还有 `Activating` 这种瞬时态，
+/// 但对外报它只会让人以为插件卡住了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportState {
+    /// 依赖没齐，等着。**不是失败。**
+    Pending,
+    /// `apply` 正在跑。
+    Activating,
+    /// 活着。
+    Active,
+    /// `apply` 报错。
+    Failed,
+}
+
+impl ReportState {
+    /// 稳定的短名（进日志、进 JSON）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Activating => "activating",
+            Self::Active => "active",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// 插件管理器。
 ///
 /// 持有 [`Context`]，并在它上面挂了服务变更钩子：能力出现/消失时自动重新求值
@@ -166,6 +238,45 @@ impl PluginManager {
                 _ => None,
             })
             .collect()
+    }
+
+    /// 一份**结构化**快照：谁登记了、谁真在跑、谁在等什么、谁挂了。
+    ///
+    /// 这是「插件问不到进程里加载了哪些」那个缺口的宿主侧答案：数据本来就有，
+    /// 四个查询（[`loaded`](Self::loaded) / [`active`](Self::active) /
+    /// [`pending`](Self::pending) / [`failed`](Self::failed)）各自答一半，
+    /// 这里合成**一次加锁**的一致视图——分开调会在两次之间漏掉状态变化。
+    ///
+    /// 返回纯数据（不含 serde），序列化由宿主层做：`core` 不引 serde。
+    pub fn report(&self) -> Report {
+        let fibers = self.lock_fibers();
+        let mut plugins = Vec::with_capacity(fibers.len());
+        for fiber in fibers.iter() {
+            let state = match &fiber.state {
+                State::Pending => ReportState::Pending,
+                State::Activating => ReportState::Activating,
+                State::Active { .. } => ReportState::Active,
+                State::Failed { .. } => ReportState::Failed,
+            };
+            // 只有「还没起来」的才值得报缺什么：活着的那些依赖自然是齐的。
+            let missing = match state {
+                ReportState::Pending => fiber.missing(&self.ctx, &fibers),
+                _ => Vec::new(),
+            };
+            let reason = match &fiber.state {
+                State::Failed { reason } => Some(reason.clone()),
+                _ => None,
+            };
+            plugins.push(ReportEntry {
+                name: fiber.name().to_owned(),
+                state,
+                missing,
+                reason,
+                // 激活序号：宿主按它排出「谁先起来的」，比登记顺序有意义。
+                seq: fiber.seq,
+            });
+        }
+        Report { plugins }
     }
 
     pub fn len(&self) -> usize {
@@ -683,5 +794,75 @@ mod tests {
         manager.load_shared(Named::new("B", &["A"], &log)).unwrap();
         assert_eq!(manager.unload_all().unwrap(), ["B", "A"]);
         assert_eq!(*log.lock().unwrap(), ["B", "A"]);
+    }
+
+    /// 报告要一次给出**四种状态**的全貌，并且只在有意义的字段上带细节。
+    #[test]
+    fn report_covers_every_state_without_noise() {
+        struct Provider;
+        impl Plugin for Provider {
+            fn name(&self) -> &str {
+                "provider"
+            }
+            fn apply(&self, ctx: &Context) -> Result<Effect, KernelError> {
+                ctx.provide_named("database", 1_u8)
+            }
+        }
+
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let mut manager = PluginManager::new(Context::new());
+        manager.load(Provider).unwrap();
+        manager
+            .load_shared(Named::new("waiter", &["nope"], &log))
+            .unwrap();
+        manager.load(Failing).unwrap();
+
+        let report = manager.report();
+        assert_eq!(report.plugins.len(), 3);
+
+        // 活着的：有 seq、没有 missing、没有 reason。
+        let provider = report
+            .plugins
+            .iter()
+            .find(|entry| entry.name == "provider")
+            .expect("provider 在报告里");
+        assert_eq!(provider.state, ReportState::Active);
+        assert!(provider.seq.is_some(), "激活过就该有 seq");
+        assert!(provider.missing.is_empty());
+        assert!(provider.reason.is_none());
+
+        // 等着的：报出缺什么，且**没有** seq。
+        let pending = report.pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "waiter");
+        assert_eq!(pending[0].1, ["nope".to_owned()].as_slice());
+        let waiter = report
+            .plugins
+            .iter()
+            .find(|entry| entry.name == "waiter")
+            .expect("waiter 在报告里");
+        assert!(waiter.seq.is_none(), "没激活过就不该有 seq");
+
+        // 失败的：带原因，不报 missing（它压根不是因为缺依赖躺着）。
+        let failing = report
+            .plugins
+            .iter()
+            .find(|entry| entry.name == "failing")
+            .expect("failing 在报告里");
+        assert_eq!(failing.state, ReportState::Failed);
+        assert!(failing.reason.is_some());
+        assert!(failing.missing.is_empty());
+
+        assert_eq!(report.active(), vec!["provider"]);
+    }
+
+    /// 空管理器也要能出报告（`status` 在「一个插件都没加载」时照样调）。
+    #[test]
+    fn an_empty_manager_reports_an_empty_snapshot() {
+        let manager = PluginManager::new(Context::new());
+        let report = manager.report();
+        assert!(report.plugins.is_empty());
+        assert!(report.active().is_empty());
+        assert!(report.pending().is_empty());
     }
 }

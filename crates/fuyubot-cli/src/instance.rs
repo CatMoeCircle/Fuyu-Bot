@@ -62,15 +62,150 @@ pub struct Info {
     /// 启动时刻（Unix 秒）。
     pub started: u64,
     pub version: String,
+    /// 已加载的插件数。
+    ///
+    /// ⚠️ 保留这个**独立**字段是为了兼容两处旧消费者：`--background` 的父进程等的是
+    /// 整份文件、老的 `status` 文件也带这一行。新代码要看细节请用 [`detail`](Self::detail)；
+    /// 真在跑的数量是 `detail.active.len()`，两者可能不等（有插件还在等依赖）。
     pub plugins: usize,
     pub name: String,
+    /// 插件速览：真在跑的、还在等的（含缺什么）。
+    ///
+    /// 放在 `status` 文件里而不是让 `status` 子命令自己去问进程——它是**另一个进程**，
+    /// 没有共享内存可读，而报告要反映的是「那个进程里的状态」。
+    /// 老实例写不出这个字段，所以缺了就当空表（`parse` 不因此失败）。
+    pub detail: PluginDetail,
+}
+
+/// 插件速览（`/plugins` 与 `fuyubot status` 共用）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginDetail {
+    /// 真在跑的插件名（激活顺序）。
+    pub active: Vec<String>,
+    /// 还在等的：`(名字, 缺哪些能力)`。
+    pub pending: Vec<(String, Vec<String>)>,
+    /// 起来失败的：`(名字, 原因)`。
+    pub failed: Vec<(String, String)>,
+}
+
+impl PluginDetail {
+    /// 从 [`fuyubot_core::Report`] 取。
+    pub fn from_report(report: &fuyubot_core::Report) -> Self {
+        let mut detail = Self::default();
+        for entry in &report.plugins {
+            match entry.state {
+                fuyubot_core::ReportState::Active => detail.active.push(entry.name.clone()),
+                fuyubot_core::ReportState::Pending => {
+                    detail
+                        .pending
+                        .push((entry.name.clone(), entry.missing.clone()));
+                }
+                fuyubot_core::ReportState::Failed => detail.failed.push((
+                    entry.name.clone(),
+                    entry
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "未知原因".to_owned()),
+                )),
+                // `Activating` 是瞬时的：快照正好抓到它时按「还没跑起来」处理，
+                // 报出去会让人以为插件卡住了。
+                fuyubot_core::ReportState::Activating => {}
+            }
+        }
+        detail
+    }
+
+    /// 一行摘要：「3 个在跑」/「3 个在跑，1 个等依赖」/「都还没起来」。
+    pub fn summary(&self) -> String {
+        if self.active.is_empty() && self.pending.is_empty() && self.failed.is_empty() {
+            return "没有插件".to_owned();
+        }
+        let mut parts = vec![format!("{} 个在跑", self.active.len())];
+        if !self.pending.is_empty() {
+            parts.push(format!("{} 个等依赖", self.pending.len()));
+        }
+        if !self.failed.is_empty() {
+            parts.push(format!("{} 个起不来", self.failed.len()));
+        }
+        parts.join("，")
+    }
+
+    /// 写进 status 文件的一行（名字用 `,` 分隔；名字里不会有逗号——插件名是点分标识符）。
+    fn render(&self) -> String {
+        let join = |items: &[String]| items.join(",");
+        let pending = self
+            .pending
+            .iter()
+            .map(|(name, missing)| format!("{name}:{}", missing.join("+")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let failed = self
+            .failed
+            .iter()
+            .map(|(name, reason)| format!("{name}:{}", reason.replace(['\n', '\r'], " ")))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "active={}\npending={}\nfailed={}\n",
+            join(&self.active),
+            pending,
+            failed
+        )
+    }
+
+    /// 解析 [`Self::render`] 的产物；缺字段当空表。
+    fn parse(text: &str) -> Self {
+        let field = |key: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+                .map(str::trim)
+                .unwrap_or("")
+        };
+        let split = |value: &str| -> Vec<String> {
+            value
+                .split(',')
+                .filter(|item| !item.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        let pairs = |value: &str| -> Vec<(String, String)> {
+            value
+                .split(',')
+                .filter(|item| !item.is_empty())
+                .filter_map(|item| {
+                    let (name, rest) = item.split_once(':')?;
+                    Some((name.to_owned(), rest.to_owned()))
+                })
+                .collect()
+        };
+        Self {
+            active: split(field("active")),
+            pending: pairs(field("pending"))
+                .into_iter()
+                .map(|(name, missing)| {
+                    let parts = missing
+                        .split('+')
+                        .filter(|item| !item.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    (name, parts)
+                })
+                .collect(),
+            failed: pairs(field("failed")),
+        }
+    }
 }
 
 impl Info {
     pub fn render(&self) -> String {
         format!(
-            "pid={}\nstarted={}\nversion={}\nplugins={}\nname={}\n",
-            self.pid, self.started, self.version, self.plugins, self.name
+            "pid={}\nstarted={}\nversion={}\nplugins={}\nname={}\n{}",
+            self.pid,
+            self.started,
+            self.version,
+            self.plugins,
+            self.name,
+            self.detail.render()
         )
     }
 
@@ -91,6 +226,8 @@ impl Info {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
             name: field("name").unwrap_or("fuyubot").to_owned(),
+            // 老实例（这次改动之前发布的 status）没有这三行：当空表，不因此判失败。
+            detail: PluginDetail::parse(text),
         })
     }
 }
@@ -270,14 +407,24 @@ pub fn status_lines(root: &Path) -> Vec<String> {
             format!("{}：有实例在跑（**启动中**，状态还没发布）", root.display()),
             "  稍等一两秒再看；起不来就查日志".to_owned(),
         ],
-        State::Running(Some(info)) => vec![
-            format!("{}：运行中", root.display()),
-            format!("  pid        {}", info.pid),
-            format!("  已运行     {}", uptime_text(info.started, unix_now())),
-            format!("  版本       {}", info.version),
-            format!("  名字       {}", info.name),
-            format!("  插件       {} 个", info.plugins),
-        ],
+        State::Running(Some(info)) => {
+            let mut lines = vec![
+                format!("{}：运行中", root.display()),
+                format!("  pid        {}", info.pid),
+                format!("  已运行     {}", uptime_text(info.started, unix_now())),
+                format!("  版本       {}", info.version),
+                format!("  名字       {}", info.name),
+                format!("  插件       {}", info.detail.summary()),
+            ];
+            // 「谁在等什么」是这个功能存在的理由：只说数量，人还是不知道该去配什么。
+            for (name, missing) in &info.detail.pending {
+                lines.push(format!("    · {name} 在等 {}", missing.join(", ")));
+            }
+            for (name, reason) in &info.detail.failed {
+                lines.push(format!("    · {name} 起不来：{reason}"));
+            }
+            lines
+        }
     }
 }
 
@@ -393,6 +540,7 @@ mod tests {
             version: "0.1.0".to_owned(),
             plugins: 3,
             name: "mybot".to_owned(),
+            detail: PluginDetail::default(),
         };
         assert_eq!(Info::parse(&info.render()).unwrap(), info);
         // 没有 pid 的（半份 / 别的东西）读不出来，不许编一个 pid 出来。
@@ -430,6 +578,7 @@ mod tests {
             version: "0.1.0".to_owned(),
             plugins: 2,
             name: "bot".to_owned(),
+            detail: PluginDetail::default(),
         };
         lock.publish(&info).unwrap();
         assert_eq!(probe(&root), State::Running(Some(info.clone())));
@@ -462,6 +611,7 @@ mod tests {
                 version: "0".to_owned(),
                 plugins: 0,
                 name: "old".to_owned(),
+                detail: PluginDetail::default(),
             })
             .unwrap();
         }
@@ -484,6 +634,7 @@ mod tests {
             version: "0.1.0".to_owned(),
             plugins: 1,
             name: "bot".to_owned(),
+            detail: PluginDetail::default(),
         })
         .unwrap();
         drop(lock);
@@ -505,6 +656,7 @@ mod tests {
             version: "0.1.0".to_owned(),
             plugins: 0,
             name: "me".to_owned(),
+            detail: PluginDetail::default(),
         })
         .unwrap();
         let error = stop(&root).unwrap_err();
@@ -550,11 +702,62 @@ mod tests {
             version: "9.9.9".to_owned(),
             plugins: 7,
             name: "bot".to_owned(),
+            detail: PluginDetail {
+                active: vec!["a".to_owned(), "b".to_owned()],
+                pending: vec![("c".to_owned(), vec!["database".to_owned()])],
+                failed: vec![("d".to_owned(), "apply 报错".to_owned())],
+            },
         })
         .unwrap();
         let lines = status_lines(&root).join("\n");
         assert!(lines.contains("运行中"), "{lines}");
-        assert!(lines.contains("1234") && lines.contains("7 个"), "{lines}");
+        // 报的是**真在跑的**数量（detail 说了算），不是登记过的那个数。
+        assert!(
+            lines.contains("1234") && lines.contains("2 个在跑"),
+            "{lines}"
+        );
+        assert!(lines.contains("1 个等依赖"), "{lines}");
+        assert!(lines.contains("1 个起不来"), "{lines}");
         assert!(lines.contains("9.9.9"), "{lines}");
+        // 「谁在等什么」是这个功能存在的理由：只说数量人还是不知道该去配什么。
+        assert!(lines.contains("c 在等 database"), "{lines}");
+        assert!(lines.contains("d 起不来：apply 报错"), "{lines}");
+    }
+
+    /// 插件速览要能跨进程往返：`run` 写、`status`（另一个进程）读。
+    ///
+    /// 这条守的是**格式**：`render` / `parse` 一旦不对称，`status` 就会静默地
+    /// 显示「0 个在跑」——比报错更难查。
+    #[test]
+    fn plugin_detail_survives_the_status_file_round_trip() {
+        let detail = PluginDetail {
+            active: vec!["fuyubot.start".to_owned(), "fuyubot.help".to_owned()],
+            pending: vec![(
+                "fuyubot.demo".to_owned(),
+                vec!["database".to_owned(), "cache".to_owned()],
+            )],
+            failed: vec![("broken".to_owned(), "plugin_start 返回 3".to_owned())],
+        };
+        let info = Info {
+            pid: 7,
+            started: 1,
+            version: "1.0".to_owned(),
+            plugins: 2,
+            name: "bot".to_owned(),
+            detail: detail.clone(),
+        };
+        let parsed = Info::parse(&info.render()).expect("该能读回来");
+        assert_eq!(parsed.detail, detail);
+    }
+
+    /// 老实例（这次改动之前发布的 `status` 文件）没有 `active=` / `pending=` / `failed=`
+    /// 三行：必须当空表读出来，而不是判成「读不出状态」。
+    #[test]
+    fn an_old_status_file_without_plugin_detail_still_parses() {
+        let text = "pid=42\nstarted=1\nversion=0.1\nplugins=5\nname=old\n";
+        let info = Info::parse(text).expect("老格式还要能读");
+        assert_eq!(info.plugins, 5);
+        assert_eq!(info.detail, PluginDetail::default());
+        assert_eq!(info.detail.summary(), "没有插件");
     }
 }
