@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use crate::context::Context;
 use crate::effect::Effect;
 use crate::error::KernelError;
+use crate::lifecycle::{LifecycleEvent, LifecycleHooks, subscribe};
 use crate::plugin::Plugin;
 
 /// 激活序号的来源。只用来**排序**（谁先活、谁后活），跨 `Context` 共享也无所谓。
@@ -129,7 +130,7 @@ fn is_permanently_missing(ctx: &Context, fibers: &[Fiber], capability: &str) -> 
 /// 递归到不动点：B 挂 → A（依赖 B）挂 → C（依赖 A）挂……一次调用搞定整条链。
 ///
 /// 只处理**硬依赖**（[`Plugin::inject`]）：软依赖缺了不影响激活，不该级联。
-fn cascade_failed(ctx: &Context, fibers: &mut [Fiber]) {
+fn cascade_failed(ctx: &Context, fibers: &mut [Fiber], events: &mut Vec<LifecycleEvent>) {
     loop {
         let mut changed = false;
         for index in 0..fibers.len() {
@@ -137,9 +138,12 @@ fn cascade_failed(ctx: &Context, fibers: &mut [Fiber]) {
                 continue;
             }
             if let Some(capability) = fibers[index].permanently_missing(ctx, fibers) {
-                fibers[index].state = State::Failed {
-                    reason: format!("依赖 {capability} 加载失败，级联跳过"),
-                };
+                let reason = format!("依赖 {capability} 加载失败，级联跳过");
+                events.push(LifecycleEvent::Failed {
+                    name: fibers[index].name().to_owned(),
+                    reason: reason.clone(),
+                });
+                fibers[index].state = State::Failed { reason };
                 changed = true;
             }
         }
@@ -352,24 +356,43 @@ pub struct PluginManager {
     ctx: Context,
     /// 按登记顺序排列。`Mutex` 是为了让服务变更钩子也能碰它。
     fibers: Arc<Mutex<Vec<Fiber>>>,
+    /// 生命周期监听器（缺口 12）。和 fibers 一样用 `Arc`：服务变更钩子也要能发事件。
+    lifecycle: Arc<LifecycleHooks>,
 }
 
 impl PluginManager {
     pub fn new(ctx: Context) -> Self {
         let fibers = Arc::new(Mutex::new(Vec::new()));
+        let lifecycle = Arc::new(LifecycleHooks::default());
 
         // 能力一增删就重新求值：这是「依赖持续跟踪」的驱动源。
         // 持**弱**引用——钩子被 Context 拿着，这里再持强引用双方都放不了手。
         let weak = Arc::downgrade(&fibers);
         let ctx_for_hook = ctx.clone();
+        let hooks = Arc::clone(&lifecycle);
         ctx.on_service_change(move |_name, _change| {
             let Some(fibers) = weak.upgrade() else {
                 return;
             };
-            reconcile_if_free(&ctx_for_hook, &fibers);
+            reconcile_if_free(&ctx_for_hook, &fibers, &hooks);
         });
 
-        Self { ctx, fibers }
+        Self {
+            ctx,
+            fibers,
+            lifecycle,
+        }
+    }
+
+    /// 订阅插件生命周期事件（缺口 12）。返回的 [`Effect`] drop 即退订。
+    ///
+    /// 事件在**锁外面**发，监听器里可以安全地查内核。一个监听器 panic 只丢它自己
+    /// 那条事件，不会打断状态机，也不会连累后面的监听器。
+    pub fn on_lifecycle(
+        &self,
+        listener: impl Fn(&LifecycleEvent) + Send + Sync + 'static,
+    ) -> Effect {
+        subscribe(&self.lifecycle, listener)
     }
 
     pub fn context(&self) -> &Context {
@@ -485,6 +508,8 @@ impl PluginManager {
                 seq: None,
             });
         }
+        self.lifecycle
+            .emit(&LifecycleEvent::Loaded { name: name.clone() });
         self.reconcile();
         Ok(name)
     }
@@ -509,15 +534,23 @@ impl PluginManager {
                 }
             }
         }
+        let mut names = Vec::with_capacity(plugins.len());
         {
             let mut fibers = self.lock_fibers();
             for plugin in plugins {
+                names.push(plugin.name().to_owned());
                 fibers.push(Fiber {
                     plugin,
                     state: State::Pending,
                     seq: None,
                 });
             }
+        }
+        // 先把整批 `Loaded` 发完再 reconcile：监听器看到的是「登记完成、开始求值」，
+        // 而不是 Loaded/Activated 交错的一半状态。
+        for name in &names {
+            self.lifecycle
+                .emit(&LifecycleEvent::Loaded { name: name.clone() });
         }
         Ok(self.reconcile())
     }
@@ -535,8 +568,10 @@ impl PluginManager {
             };
             fibers.remove(position)
         };
+        let name = taken.name().to_owned();
         self.reconcile();
         dispose(&self.ctx, taken);
+        self.lifecycle.emit(&LifecycleEvent::Unloaded { name });
         Ok(())
     }
 
@@ -561,8 +596,10 @@ impl PluginManager {
                 };
                 fibers.remove(index)
             };
-            names.push(taken.name().to_owned());
+            let name = taken.name().to_owned();
+            names.push(name.clone());
             dispose(&self.ctx, taken);
+            self.lifecycle.emit(&LifecycleEvent::Unloaded { name });
         }
         Ok(names)
     }
@@ -586,7 +623,7 @@ impl PluginManager {
     ///
     /// 返回这次**新激活**的顺序。
     pub fn reconcile(&mut self) -> Vec<String> {
-        reconcile_loop(&self.ctx, &self.fibers)
+        reconcile_loop(&self.ctx, &self.fibers, &self.lifecycle)
     }
 
     fn lock_fibers(&self) -> MutexGuard<'_, Vec<Fiber>> {
@@ -596,16 +633,20 @@ impl PluginManager {
 
 /// 钩子侧的入口：抢不到锁说明正有人在 reconcile（`apply` 里注册了服务就会这样），
 /// 那一层的 loop 会把剩下的推进完，这里不必逞强。
-fn reconcile_if_free(ctx: &Context, fibers: &Mutex<Vec<Fiber>>) {
+fn reconcile_if_free(ctx: &Context, fibers: &Mutex<Vec<Fiber>>, lifecycle: &LifecycleHooks) {
     let Ok(guard) = fibers.try_lock() else {
         return;
     };
     drop(guard);
-    reconcile_loop(ctx, fibers);
+    reconcile_loop(ctx, fibers, lifecycle);
 }
 
 /// 反复推进直到没有状态要变。返回**这次**新激活的顺序。
-fn reconcile_loop(ctx: &Context, fibers: &Mutex<Vec<Fiber>>) -> Vec<String> {
+fn reconcile_loop(
+    ctx: &Context,
+    fibers: &Mutex<Vec<Fiber>>,
+    lifecycle: &LifecycleHooks,
+) -> Vec<String> {
     let mut activated = Vec::new();
     // 保险丝：一轮最多推进一个 fiber。给足冗余再撒手，免得依赖图万一构了环
     // 把这里卡成死循环。
@@ -618,6 +659,8 @@ fn reconcile_loop(ctx: &Context, fibers: &Mutex<Vec<Fiber>>) -> Vec<String> {
 
     for _ in 0..budget {
         let Ok(mut guard) = fibers.lock() else { break };
+        // 这一轮的状态迁移先攒着：等锁放开再发，监听器里查内核不会自锁。
+        let mut events: Vec<LifecycleEvent> = Vec::new();
 
         // 先处理「依赖不再满足、得退回去」的，再处理「可以起来了」的。
         //
@@ -672,12 +715,18 @@ fn reconcile_loop(ctx: &Context, fibers: &Mutex<Vec<Fiber>>) -> Vec<String> {
                 let mut guard = fibers.lock().unwrap_or_else(|e| e.into_inner());
                 let next_state = match outcome {
                     Ok(effect) => {
-                        activated.push(name);
+                        activated.push(name.clone());
+                        events.push(LifecycleEvent::Activated { name });
                         State::Active { effect }
                     }
-                    Err(error) => State::Failed {
-                        reason: error.to_string(),
-                    },
+                    Err(error) => {
+                        let reason = error.to_string();
+                        events.push(LifecycleEvent::Failed {
+                            name: name.clone(),
+                            reason: reason.clone(),
+                        });
+                        State::Failed { reason }
+                    }
                 };
                 if next_state.is_active() {
                     guard[index].seq = Some(NEXT_SEQ.fetch_add(1, Ordering::Relaxed));
@@ -685,10 +734,11 @@ fn reconcile_loop(ctx: &Context, fibers: &Mutex<Vec<Fiber>>) -> Vec<String> {
                 guard[index].state = next_state;
                 // 依赖它的 fiber 注定拿不到 → 级联跳过（递归到不动点）。
                 if matches!(guard[index].state, State::Failed { .. }) {
-                    cascade_failed(ctx, &mut guard);
+                    cascade_failed(ctx, &mut guard, &mut events);
                 }
             }
             Step::Deactivate => {
+                let name = guard[index].name().to_owned();
                 let previous = std::mem::replace(&mut guard[index].state, State::Pending);
                 guard[index].seq = None;
                 let plugin = Arc::clone(&guard[index].plugin);
@@ -696,7 +746,12 @@ fn reconcile_loop(ctx: &Context, fibers: &Mutex<Vec<Fiber>>) -> Vec<String> {
 
                 plugin.dispose(ctx);
                 drop(previous);
+                events.push(LifecycleEvent::Deactivated { name });
             }
+        }
+        // 锁已经放开（两个分支都在发事件之前 drop 了 guard）。
+        for event in events {
+            lifecycle.emit(&event);
         }
     }
 
@@ -984,6 +1039,165 @@ mod tests {
         // 调用方却以为整批都没加载。
         assert_eq!(fresh.len(), 0, "重名失败不能留下半批插件");
         assert!(fresh.active().is_empty());
+    }
+
+    /// 缺口 12：监听器看到 `Loaded → Activated → Unloaded` 的整条链，
+    /// 而且回调里能安全地查内核（事件在锁外发）。
+    #[test]
+    fn lifecycle_listeners_see_the_whole_plugin_cycle() {
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let mut manager = PluginManager::new(Context::new());
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let probe = manager.context().clone();
+        let _hook = manager.on_lifecycle(move |event| {
+            // 回调在锁外面跑：查服务表不能死锁。
+            let _ = probe.names();
+            sink.lock().unwrap().push(event.clone());
+        });
+
+        manager.load_shared(Named::new("A", &[], &log)).unwrap();
+        manager.unload("A").unwrap();
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                LifecycleEvent::Loaded {
+                    name: "A".to_owned()
+                },
+                LifecycleEvent::Activated {
+                    name: "A".to_owned()
+                },
+                LifecycleEvent::Unloaded {
+                    name: "A".to_owned()
+                },
+            ]
+        );
+        assert_eq!(
+            events.lock().unwrap()[1].kind(),
+            "plugin_activated",
+            "kind() 是给跨进程桥用的通道名"
+        );
+    }
+
+    /// 缺口 12：`apply` 失败要报 `Failed`（带原因），依赖它的也要各自收到一条级联失败。
+    #[test]
+    fn lifecycle_reports_failures_and_cascades() {
+        struct Injects {
+            name: &'static str,
+            injects: Vec<String>,
+        }
+        impl Plugin for Injects {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn inject(&self) -> Vec<String> {
+                self.injects.clone()
+            }
+            fn apply(&self, _ctx: &Context) -> Result<Effect, KernelError> {
+                Ok(Effect::none())
+            }
+        }
+        struct Boom;
+        impl Plugin for Boom {
+            fn name(&self) -> &str {
+                "b"
+            }
+            fn apply(&self, _ctx: &Context) -> Result<Effect, KernelError> {
+                Err(KernelError::ServiceMissing("boom"))
+            }
+        }
+
+        let mut manager = PluginManager::new(Context::new());
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let _hook = manager.on_lifecycle(move |event| {
+            sink.lock().unwrap().push(event.clone());
+        });
+
+        manager
+            .load_all(vec![
+                Arc::new(Injects {
+                    name: "c",
+                    injects: vec!["a".to_owned()],
+                }),
+                Arc::new(Injects {
+                    name: "a",
+                    injects: vec!["b".to_owned()],
+                }),
+                Arc::new(Boom),
+            ])
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        let timeline: Vec<(&str, &str)> = events.iter().map(|e| (e.kind(), e.name())).collect();
+        assert_eq!(
+            timeline,
+            [
+                ("plugin_loaded", "c"),
+                ("plugin_loaded", "a"),
+                ("plugin_loaded", "b"),
+                ("plugin_failed", "b"),
+                ("plugin_failed", "a"),
+                ("plugin_failed", "c"),
+            ],
+            "{events:?}"
+        );
+        assert!(events[3].reason().is_some_and(|r| r.contains("boom")));
+        assert!(
+            events[4].reason().is_some_and(|r| r.contains("级联")),
+            "a 是被 b 的失败级联的：{:?}",
+            events[4]
+        );
+    }
+
+    /// 缺口 12：提供者被卸载时，依赖它的插件先报 `Deactivated`，然后才是提供者的 `Unloaded`。
+    #[test]
+    fn lifecycle_reports_deactivation_before_unload() {
+        struct Db;
+        impl Plugin for Db {
+            fn name(&self) -> &str {
+                "db-provider"
+            }
+            fn apply(&self, ctx: &Context) -> Result<Effect, KernelError> {
+                ctx.provide_named("database", 1_u8)
+            }
+        }
+        struct User;
+        impl Plugin for User {
+            fn name(&self) -> &str {
+                "db-user"
+            }
+            fn inject(&self) -> Vec<String> {
+                vec!["database".to_owned()]
+            }
+            fn apply(&self, _ctx: &Context) -> Result<Effect, KernelError> {
+                Ok(Effect::none())
+            }
+        }
+
+        let mut manager = PluginManager::new(Context::new());
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let _hook = manager.on_lifecycle(move |event| {
+            sink.lock().unwrap().push(event.clone());
+        });
+
+        manager.load(Db).unwrap();
+        manager.load(User).unwrap();
+        events.lock().unwrap().clear();
+        manager.unload("db-provider").unwrap();
+
+        let events = events.lock().unwrap();
+        let timeline: Vec<(&str, &str)> = events.iter().map(|e| (e.kind(), e.name())).collect();
+        assert_eq!(
+            timeline,
+            [
+                ("plugin_deactivated", "db-user"),
+                ("plugin_unloaded", "db-provider"),
+            ],
+            "{events:?}"
+        );
     }
 
     /// 环在启动前报错（`load_all` 入口的 `detect_cycle`），不再靠 budget 静默吸收。

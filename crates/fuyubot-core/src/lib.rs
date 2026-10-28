@@ -25,12 +25,14 @@
 mod context;
 mod effect;
 mod error;
+mod lifecycle;
 mod manager;
 mod plugin;
 
 pub use context::{Context, ServiceChange};
 pub use effect::Effect;
 pub use error::{BoxError, KernelError, Result};
+pub use lifecycle::LifecycleEvent;
 pub use manager::{PluginManager, PluginReporter, Report, ReportEntry, ReportState};
 pub use plugin::Plugin;
 
