@@ -16,6 +16,10 @@
 use core::ffi::{c_char, c_void};
 use std::ffi::{CStr, CString};
 
+mod response;
+
+pub use response::{ResponseFuture, ResponseRouter, UpdateFuture};
+
 /// ABI 版本。字段只增不改，新增一律追加在尾部。
 ///
 /// 经 [`HostApiVTable::get_config`] 与 [`HostApiVTable::set_config`]，
@@ -431,6 +435,18 @@ pub enum AbiError {
     BadString,
     #[error("宿主调用失败（返回值 {0}）")]
     HostCall(i32),
+    #[error("宿主拒绝了响应订阅（句柄无效）")]
+    SubscriptionRejected,
+    #[error("宿主拒绝了请求（返回无效请求号）")]
+    RequestRejected,
+    #[error("宿主的作用域服务不可用（scope_enter 失败）")]
+    ScopeUnavailable,
+    #[error("过滤条件不合法：{0}")]
+    BadFilter(String),
+    #[error("这个通道不支持异步等待：{0}")]
+    UnsupportedChannel(String),
+    #[error("响应路由器已关闭")]
+    RouterClosed,
 }
 
 // ── 插件侧的宿主门面 ───────────────────────────────────────────────

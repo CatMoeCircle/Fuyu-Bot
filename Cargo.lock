@@ -379,7 +379,9 @@ name = "fuyubot-abi"
 version = "0.1.0"
 dependencies = [
  "cbindgen",
+ "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -426,6 +428,7 @@ dependencies = [
  "libloading",
  "serde_json",
  "thiserror",
+ "tokio",
  "toml",
 ]
 

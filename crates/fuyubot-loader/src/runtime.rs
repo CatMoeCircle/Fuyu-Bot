@@ -2422,6 +2422,83 @@ mod tests {
         assert_eq!(unloaded[0]["name"], "lifecycle.probe");
     }
 
+    /// 缺口 10 的 async 形态走**真宿主**（不是 fake vtable）：插件作用域 → 发请求 →
+    /// 另一个线程投递响应 → `await` 被唤醒。验证归属订阅、`request_id` 与 waker 三件事。
+    #[tokio::test]
+    async fn response_router_awaits_a_real_host_response() {
+        let rt = runtime();
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+        let scope = rt.plugin_scope();
+        let router = fuyubot_abi::ResponseRouter::new(api).expect("注册响应订阅");
+        // 关键：在**插件自己的线程**上发请求（没有宿主作用域）。路由器会用 scope service
+        // 把归属切回插件，否则响应会按 owner 0 全局投递、这里的 scoped 订阅收不到。
+        let (id, future) = {
+            let router = router.clone();
+            std::thread::spawn(move || router.invoke_simplified("getMe", "{}"))
+                .join()
+                .expect("发送线程不能 panic")
+                .expect("发送请求")
+        };
+
+        let responder = {
+            let rt = Arc::clone(&rt);
+            std::thread::spawn(move || {
+                rt.deliver_response(&json!({
+                    "@type": "ok",
+                    "@extra": id.id.to_string(),
+                }))
+                .expect("投递响应");
+            })
+        };
+
+        let value = tokio::time::timeout(Duration::from_secs(2), future)
+            .await
+            .expect("宿主响应没叫醒 future（waker 没被调用？）")
+            .expect("响应应该成功");
+        responder.join().unwrap();
+        assert_eq!(value["@type"], "ok");
+        assert_eq!(value["request_id"], id.id);
+
+        drop(router);
+        scope.commit();
+    }
+
+    /// 同一路由器的更新等待：真 HostRuntime 的 `publish_update` → `await` 返回。
+    #[tokio::test]
+    async fn event_router_awaits_a_real_update() {
+        let rt = runtime();
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+        let scope = rt.plugin_scope();
+        let router = fuyubot_abi::ResponseRouter::new(api).expect("注册订阅");
+        let update = router
+            .wait_for_update(json!({"@type": "updateNewMessage", "message.chat.id": -7}))
+            .expect("等更新");
+
+        let publisher = {
+            let rt = Arc::clone(&rt);
+            std::thread::spawn(move || {
+                rt.publish_update(&json!({
+                    "@type": "updateNewMessage",
+                    "message": { "chat": { "id": -7 } },
+                }))
+                .expect("发布更新");
+            })
+        };
+
+        let value = tokio::time::timeout(Duration::from_secs(2), update)
+            .await
+            .expect("更新没叫醒 future")
+            .expect("更新应该成功");
+        publisher.join().unwrap();
+        assert_eq!(value["@type"], "updateNewMessage");
+        assert_eq!(value["message"]["chat"]["id"], -7);
+
+        drop(router);
+        scope.commit();
+    }
+
     /// 缺口 13③：函数表是**能调**的工具，不是躺在库里的死数据。
     #[test]
     fn builtin_td_functions_tool_is_callable() {

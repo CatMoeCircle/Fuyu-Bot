@@ -8,8 +8,15 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dev-dependencies]
+# 只用 `#[tokio::test]` 验一次「真 waker + 跨线程唤醒」；运行时不依赖 tokio。
+tokio.workspace = true
+
 [dependencies]
 thiserror.workspace = true
+# `ResponseRouter` 要从响应 payload 里读 `request_id`（缺口 10 的 async 形态）。
+# 只给 Rust 侧用；C 插件不受影响（头文件里没有它）。
+serde_json.workspace = true
 
 [build-dependencies]
 cbindgen.workspace = true

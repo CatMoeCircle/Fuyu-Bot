@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[dev-dependencies]
+# 只给 `#[tokio::test]` 的 async 响应等待用例（缺口 10）；运行时不直接依赖 tokio。
+tokio.workspace = true
+
 [dependencies]
 fuyubot-abi.workspace = true
 fuyubot-core.workspace = true
