@@ -910,7 +910,8 @@ impl HostRuntime {
         drop(removed);
     }
 
-    fn warn(&self, message: &str) {
+    /// 宿主侧的告警输出。`pub(crate)`：`loader` 的探测阶段也要报「自报名对不上」这类事。
+    pub(crate) fn warn(&self, message: &str) {
         eprintln!("[fuyubot-host] {message}");
     }
 

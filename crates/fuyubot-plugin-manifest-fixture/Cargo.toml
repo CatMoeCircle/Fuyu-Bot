@@ -1,0 +1,15 @@
+[package]
+name = "fuyubot-plugin-manifest-fixture"
+description = "测试夹具：声明依赖的空插件，只给 loader 的 manifest 端到端测试用"
+# 故意不用 workspace 版本：`plugin_manifest.version` 要证明取的是**插件 crate** 的
+# `CARGO_PKG_VERSION`，同版本号证明不了这件事（见 src/lib.rs 的模块文档）。
+version = "2.3.4"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fuyubot-abi.workspace = true

@@ -4,9 +4,11 @@ use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use core::ffi::c_char;
+
 use fuyubot_abi::{
-    ABI_VERSION, PluginHandle, PluginInitFn, PluginStartFn, PluginStopFn, SYM_PLUGIN_INIT,
-    SYM_PLUGIN_START, SYM_PLUGIN_STOP,
+    ABI_VERSION, PluginHandle, PluginInitFn, PluginStartFn, PluginStopFn, SYM_PLUGIN_FREE_STRING,
+    SYM_PLUGIN_INIT, SYM_PLUGIN_MANIFEST, SYM_PLUGIN_START, SYM_PLUGIN_STOP,
 };
 use fuyubot_core::{Context, Effect};
 use libloading::{Library, Symbol};
@@ -327,10 +329,23 @@ impl PluginLoader {
         // 一次探测不该在宿主上留下任何痕迹。
         drop(scope);
 
+        // 自描述要在同一轮 dlopen 里读：库还热着，省一次开合。
+        // 名字对不上只告警——`plugin_init` 那个名字是内核用来寻址的，以它为准。
+        let manifest = unsafe { read_manifest(&lib) };
+        if let Some(manifest) = &manifest {
+            if !manifest.name.is_empty() && manifest.name != name {
+                self.runtime.warn(&format!(
+                    "插件自报名与 plugin_init 不一致：manifest={} init={name}（以 init 为准）",
+                    manifest.name
+                ));
+            }
+        }
+
         Ok(Probe {
             path: path.to_owned(),
             name,
             abi_version: handle.abi_version,
+            manifest,
         })
     }
 
@@ -391,6 +406,8 @@ pub struct Probe {
     /// `plugin_init` 自己报出来的名字（插件名是点分的，和 dll 文件名常常不同）。
     pub name: String,
     pub abi_version: u32,
+    /// ABI v4 的自描述（名字 / 版本 / 依赖）。老插件没有这个导出，就是 `None`。
+    pub manifest: Option<Manifest>,
 }
 
 /// 目录下的候选插件文件（按扩展名筛），已排序。
@@ -418,6 +435,77 @@ fn plugin_name(handle: &PluginHandle, path: &Path) -> String {
     path.file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// 插件自描述：ABI v4 的 `plugin_manifest` 导出。
+///
+/// 宿主在 `plugin_init` **之前**读它，所以依赖声明不依赖「插件先被启动」——
+/// 这正是内核要的：`inject` 决定要不要激活，激活了才轮到 `start`。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Manifest {
+    /// 插件自报的名字（应当与 `plugin_init` 给的一致，不一致时只告警，以 init 为准）。
+    pub name: String,
+    pub version: String,
+    /// 硬依赖：缺了不激活。
+    pub inject: Vec<String>,
+    /// 软依赖：缺了不阻塞，有了优先排前面。
+    pub soft_inject: Vec<String>,
+}
+
+type PluginManifestFn = unsafe extern "C" fn() -> *const c_char;
+type PluginFreeStringFn = unsafe extern "C" fn(*mut c_char);
+
+/// 读插件自描述。老插件（ABI v3 及以前）没有这个符号，返回 `None`。
+///
+/// `plugin_manifest` 每次调用都新分配一条字符串，契约是**调用方用 `plugin_free_string`
+/// 归还**——不还就是每次加载漏一小段（v4 之前没有这个符号，所以只有新插件会走到）。
+///
+/// # Safety
+/// `lib` 必须是已经加载好的、由本进程持有的插件库。
+unsafe fn read_manifest(lib: &Library) -> Option<Manifest> {
+    // SAFETY: 只从刚加载的库里取符号，名字与类型由 ABI 约定。
+    let manifest: Symbol<PluginManifestFn> = unsafe { lib.get(SYM_PLUGIN_MANIFEST) }.ok()?;
+    // SAFETY: 契约要求它返回 NUL 结尾的 JSON（可能为 NULL）。
+    let raw = unsafe { manifest() };
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: 同上，而且这份字符串在 free 之前一直有效。
+    let text = unsafe { CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: 指针来自本库的 `CString::into_raw`，只还给它一次。没有这个符号就让它漏
+    // 一次（加载期一次性，且说明这是个不合规的 v4 插件）。
+    if let Ok(free) = unsafe { lib.get::<PluginFreeStringFn>(SYM_PLUGIN_FREE_STRING) } {
+        unsafe { free(raw as *mut c_char) };
+    }
+
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let strings = |key: &str| -> Vec<String> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let field = |key: &str| -> String {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    Some(Manifest {
+        name: field("name"),
+        version: field("version"),
+        inject: strings("inject"),
+        soft_inject: strings("soft_inject"),
+    })
 }
 
 /// 从文件里把库打开、init、start 全走一遍，成功后交回活着的那些东西。
@@ -555,6 +643,8 @@ pub struct DylibPlugin {
     runtime: Arc<HostRuntime>,
     /// 探测阶段就知道的 ABI 版本（只为诊断；真加载时会再校验一次）。
     abi_version: u32,
+    /// ABI v4 的自描述：依赖与版本以插件自己说的为准。
+    manifest: Option<Manifest>,
 }
 
 /// 把 dylib 插件伪装成内核插件。
@@ -563,35 +653,69 @@ pub struct DylibPlugin {
 /// 内核只在两处跑它——这个 fiber 退回 Pending（依赖消失），或整个卸载。
 /// 那正是 Cordis 的 `Effect` 语义，所以不需要 `dispose()`（它留给「服务注销之外
 /// 的清理」，dylib 插件没有这种东西）。
+/// 依赖声明的种类。
+#[derive(Debug, Clone, Copy)]
+enum Dependency {
+    /// 硬依赖：缺了不激活。
+    Hard,
+    /// 软依赖：缺了不阻塞，有了优先排前面。
+    Soft,
+}
+
+/// 依赖声明从哪来：**插件自描述优先**（ABI v4 的 `plugin_manifest`），
+/// 没声明才退回配置段。
+///
+/// 为什么反过来了：插件自己最清楚自己调哪个服务，写死在插件代码里就不会出现
+/// 「换了台机器忘了抄 inject」这类配置漂移；配置只给老插件（v3，没有 manifest）
+/// 与临时覆盖兜底。
+fn declared(
+    manifest: Option<&Manifest>,
+    which: Dependency,
+    from_config: Vec<String>,
+) -> Vec<String> {
+    if let Some(manifest) = manifest {
+        let declared = match which {
+            Dependency::Hard => &manifest.inject,
+            Dependency::Soft => &manifest.soft_inject,
+        };
+        if !declared.is_empty() {
+            return declared.clone();
+        }
+    }
+    from_config
+}
+
 impl fuyubot_core::Plugin for DylibPlugin {
     fn name(&self) -> &str {
         &self.name
     }
 
-    /// 依赖来自配置段 `[plugin.<插件名>].inject`。
-    ///
-    /// 为什么不是插件自描述：ABI v3 没有 `plugin_manifest`（见 gaps 缺口 5 的
-    /// 「仍欠 ①」）。宿主读自己的配置表是现在唯一能落地的来源，等 ABI v4 有了
-    /// manifest 再换——换的时候只改这一个方法。
+    /// 硬依赖：manifest 优先，配置段 `[plugin.<插件名>].inject` 兜底。
     fn inject(&self) -> Vec<String> {
-        self.runtime
+        let from_config = self
+            .runtime
             .plugin_config_value(&self.name, "inject")
             .and_then(|value| value.as_array().cloned())
             .into_iter()
             .flatten()
             .filter_map(|item| item.as_str().map(str::to_owned))
-            .collect()
+            .collect();
+        declared(self.manifest.as_ref(), Dependency::Hard, from_config)
     }
 
-    /// 软依赖：`[plugin.<名>].soft_inject = [...]`，缺了不阻塞、有了优先排前面。
+    /// 软依赖：同上，manifest 优先；配置段 `[plugin.<名>].soft_inject` 兜底。
+    ///
+    /// 缺了不阻塞、有了优先排前面——「基础设施先起来」靠的就是它。
     fn soft_inject(&self) -> Vec<String> {
-        self.runtime
+        let from_config = self
+            .runtime
             .plugin_config_value(&self.name, "soft_inject")
             .and_then(|value| value.as_array().cloned())
             .into_iter()
             .flatten()
             .filter_map(|item| item.as_str().map(str::to_owned))
-            .collect()
+            .collect();
+        declared(self.manifest.as_ref(), Dependency::Soft, from_config)
     }
 
     fn apply(&self, _ctx: &Context) -> Result<Effect, fuyubot_core::KernelError> {
@@ -653,7 +777,13 @@ impl DylibPlugin {
             slot: Arc::new(Mutex::new(Slot::Idle)),
             runtime,
             abi_version: probe.abi_version,
+            manifest: probe.manifest,
         }
+    }
+
+    /// 插件自描述（ABI v4）。`None` = 老插件，没有这个导出。
+    pub fn manifest(&self) -> Option<&Manifest> {
+        self.manifest.as_ref()
     }
 
     /// 探测 + 包装一步到位。
@@ -731,5 +861,120 @@ mod go_runtime_tests {
         let plain = dir.join("plain.bin");
         std::fs::write(&plain, vec![7_u8; 4096]).unwrap();
         assert!(!looks_like_go_binary(&plain));
+    }
+}
+
+/// 依赖声明的取值顺序：manifest 优先、配置兜底。
+#[cfg(test)]
+mod declared_tests {
+    use super::{Dependency, Manifest, declared};
+
+    fn manifest(inject: &[&str], soft: &[&str]) -> Manifest {
+        Manifest {
+            name: "xq.anime".to_owned(),
+            version: "0.1.0".to_owned(),
+            inject: inject.iter().map(|s| (*s).to_owned()).collect(),
+            soft_inject: soft.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_manifest_wins_over_the_config_section() {
+        // 插件自描述写了依赖，配置里那套（可能是从别的机器抄来的）就不该再起作用。
+        let described = manifest(&["storage.mongo"], &["media.ffmpeg"]);
+        assert_eq!(
+            declared(
+                Some(&described),
+                Dependency::Hard,
+                vec!["旧的.配置".to_owned()]
+            ),
+            vec!["storage.mongo".to_owned()]
+        );
+        assert_eq!(
+            declared(
+                Some(&described),
+                Dependency::Soft,
+                vec!["旧的.配置".to_owned()]
+            ),
+            vec!["media.ffmpeg".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_empty_manifest_falls_back_to_the_config_section() {
+        // manifest 里那一侧是空数组 = 插件没声明这类依赖，不能把配置也一起否掉
+        // （老插件升级上来时，配置里那份 inject 还得继续生效）。
+        let empty = manifest(&[], &[]);
+        assert_eq!(
+            declared(
+                Some(&empty),
+                Dependency::Hard,
+                vec!["from.config".to_owned()]
+            ),
+            vec!["from.config".to_owned()]
+        );
+        assert_eq!(
+            declared(
+                Some(&empty),
+                Dependency::Soft,
+                vec!["from.config".to_owned()]
+            ),
+            vec!["from.config".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_plugin_without_a_manifest_keeps_reading_the_config_section() {
+        // ABI v3 的老插件没有 `plugin_manifest`：行为必须和以前一模一样。
+        assert_eq!(
+            declared(None, Dependency::Hard, vec!["from.config".to_owned()]),
+            vec!["from.config".to_owned()]
+        );
+        assert_eq!(
+            declared(None, Dependency::Soft, vec!["from.config".to_owned()]),
+            vec!["from.config".to_owned()]
+        );
+    }
+
+    #[test]
+    fn hard_and_soft_fall_back_independently() {
+        // 回落是**逐侧**判定，不是「manifest 里有东西就整个采信」：
+        // 插件只声明硬依赖时，软依赖那半边仍然该读配置（它没说过自己不软依赖谁）。
+        let only_hard = manifest(&["storage.mongo"], &[]);
+        assert_eq!(
+            declared(
+                Some(&only_hard),
+                Dependency::Hard,
+                vec!["旧的.inject".to_owned()]
+            ),
+            vec!["storage.mongo"]
+        );
+        assert_eq!(
+            declared(
+                Some(&only_hard),
+                Dependency::Soft,
+                vec!["配置里的.soft".to_owned()]
+            ),
+            vec!["配置里的.soft"]
+        );
+
+        // 反过来也一样：只声明软依赖时硬依赖读配置。
+        let only_soft = manifest(&[], &["media.ffmpeg"]);
+        assert_eq!(
+            declared(
+                Some(&only_soft),
+                Dependency::Hard,
+                vec!["配置里的.inject".to_owned()]
+            ),
+            vec!["配置里的.inject"]
+        );
+        assert_eq!(
+            declared(
+                Some(&only_soft),
+                Dependency::Soft,
+                vec!["旧的.soft".to_owned()]
+            ),
+            vec!["media.ffmpeg"]
+        );
     }
 }

@@ -163,6 +163,47 @@ fn loads_the_demo_plugin_and_its_vtable_calls_land() {
     );
 }
 
+/// ABI v4：探测阶段就要能读到插件自描述，且**不需要 `plugin_start`**。
+///
+/// 依赖声明靠它——内核在决定要不要激活之前就得知道插件要什么能力。
+#[test]
+fn probe_reads_the_v4_manifest() {
+    let path = build_fixture("fuyubot-plugin-demo");
+    let loader = PluginLoader::new(Context::new()).unwrap();
+
+    let probe = loader.probe(&path).expect("探测 demo 插件");
+    let manifest = probe
+        .manifest
+        .expect("ABI v4 的插件应当导出 plugin_manifest");
+    assert_eq!(manifest.name, "fuyubot.demo");
+    // demo 插件没有依赖：两个列表都该是空的，而不是解析失败的默认值被当成「没声明」。
+    assert!(manifest.inject.is_empty(), "{manifest:?}");
+    assert!(manifest.soft_inject.is_empty(), "{manifest:?}");
+    // 版本是真值，不是 ABI v4 早期那个硬编码的 `"0.0.0"`。
+    assert!(!manifest.version.is_empty(), "{manifest:?}");
+    assert_ne!(manifest.version, "0.0.0", "{manifest:?}");
+}
+
+/// 端到端：`plugin_manifest` 里的依赖与版本真的能穿过 dlopen/JSON/`Manifest` 三层。
+///
+/// 用独立夹具而不是 demo，是因为**版本号必须与 `fuyubot-abi` 不同**才证明得了
+/// `env!("CARGO_PKG_VERSION")` 求值在插件 crate 那一侧（同 workspace 同版本时，
+/// 「取错了 crate」和「取对了」的结果一模一样）。
+#[test]
+fn probe_reads_declared_dependencies_and_the_plugin_crate_version() {
+    let path = build_fixture("fuyubot-plugin-manifest-fixture");
+    let loader = PluginLoader::new(Context::new()).unwrap();
+
+    let probe = loader.probe(&path).expect("探测 manifest 夹具");
+    let manifest = probe.manifest.expect("夹具应当导出 plugin_manifest");
+
+    assert_eq!(manifest.name, "fuyubot.manifest-fixture");
+    // 夹具的 Cargo.toml 里写的是 2.3.4，workspace 是 0.1.x。
+    assert_eq!(manifest.version, "2.3.4");
+    assert_eq!(manifest.inject, ["demo.dep"]);
+    assert_eq!(manifest.soft_inject, ["demo.soft"]);
+}
+
 /// 中间件：往 payload 里塞一个标记，用来验证「改过的版本」能到插件手里。
 struct Tagger;
 
