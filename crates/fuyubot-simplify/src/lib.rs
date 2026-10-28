@@ -276,7 +276,7 @@ pub fn plain_text(text: &Text) -> Value {
 pub fn parse_text_request(text: &Text) -> Option<Value> {
     let parse_mode = text.parse_mode.to_td()?;
     Some(json!({
-        "@type": "parseTextEntities",
+        "@type": td_api::ParseTextEntities::METHOD,
         "text": text.text,
         "parse_mode": parse_mode,
     }))
@@ -2186,7 +2186,7 @@ impl Simplify {
         let payload = send_params(chat_id, params, &|text: &Text| self.formatted(text));
         Ok(self
             .host
-            .td_invoke_simplified("sendMessage", &payload.to_string())?)
+            .td_invoke_simplified(td_api::SendMessage::METHOD, &payload.to_string())?)
     }
 
     /// 只发请求，不等结果（`sendMessageAlbum`）——顺带先验项数。
@@ -2197,7 +2197,7 @@ impl Simplify {
         let payload = album_params(chat_id, params, &|text: &Text| self.formatted(text));
         Ok(self
             .host
-            .td_invoke_simplified("sendMessageAlbum", &payload.to_string())?)
+            .td_invoke_simplified(td_api::SendMessageAlbum::METHOD, &payload.to_string())?)
     }
 
     /// 等某个请求的响应：拿到就返回，`error` 变 [`SimplifyError::Tdlib`]，
@@ -2260,7 +2260,7 @@ impl Simplify {
         let params = json!({ "chat_id": chat_id, "message_ids": ids, "revoke": true });
         match self
             .host
-            .td_invoke_simplified("deleteMessages", &params.to_string())
+            .td_invoke_simplified(td_api::DeleteMessages::METHOD, &params.to_string())
         {
             Ok(_) => self.host.log(
                 fuyubot_abi::LogLevel::Warn,
@@ -2291,7 +2291,7 @@ impl Simplify {
         });
         let request_id = self
             .host
-            .td_invoke_simplified("editMessageText", &payload.to_string())?;
+            .td_invoke_simplified(td_api::EditMessageText::METHOD, &payload.to_string())?;
         self.await_response(
             request_id,
             Instant::now() + Duration::from_millis(params.timeout_ms),
@@ -2311,7 +2311,7 @@ impl Simplify {
         });
         let request_id = self
             .host
-            .td_invoke_simplified("editMessageCaption", &payload.to_string())?;
+            .td_invoke_simplified(td_api::EditMessageCaption::METHOD, &payload.to_string())?;
         self.await_response(
             request_id,
             Instant::now() + Duration::from_millis(params.timeout_ms),
@@ -2333,7 +2333,7 @@ impl Simplify {
         });
         let request_id = self
             .host
-            .td_invoke_simplified("editMessageMedia", &payload.to_string())?;
+            .td_invoke_simplified(td_api::EditMessageMedia::METHOD, &payload.to_string())?;
         self.await_response(
             request_id,
             Instant::now() + Duration::from_millis(params.timeout_ms),
@@ -2356,7 +2356,7 @@ impl Simplify {
         let payload = edit_markup_params(chat_id, message_id, reply_markup);
         let request_id = self
             .host
-            .td_invoke_simplified("editMessageReplyMarkup", &payload.to_string())?;
+            .td_invoke_simplified(td_api::EditMessageReplyMarkup::METHOD, &payload.to_string())?;
         self.await_response(
             request_id,
             Instant::now() + Duration::from_millis(timeout_ms),
@@ -2382,7 +2382,7 @@ impl Simplify {
         });
         let request_id = self
             .host
-            .td_invoke_simplified("deleteMessages", &params.to_string())?;
+            .td_invoke_simplified(td_api::DeleteMessages::METHOD, &params.to_string())?;
         self.await_response(
             request_id,
             Instant::now() + Duration::from_millis(timeout_ms),
@@ -2410,7 +2410,7 @@ impl Simplify {
         });
         let request_id = self
             .host
-            .td_invoke_simplified("answerCallbackQuery", &params.to_string())?;
+            .td_invoke_simplified(td_api::AnswerCallbackQuery::METHOD, &params.to_string())?;
         self.await_response(
             request_id,
             Instant::now() + Duration::from_millis(timeout_ms),
@@ -2657,7 +2657,7 @@ impl Simplify {
         let params = json!({ "file_id": file_id, "priority": priority, "offset": 0, "limit": 0 });
         let request_id = self
             .host
-            .td_invoke_simplified("downloadFile", &params.to_string())?;
+            .td_invoke_simplified(td_api::DownloadFile::METHOD, &params.to_string())?;
 
         // TDLib 的 updateFile 长这样：{"@type":"updateFile","file":{"id":..,"local":{..}}}
         // —— file id 在 `file.id`，不是顶层。

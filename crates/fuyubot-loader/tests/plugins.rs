@@ -282,6 +282,8 @@ fn plugin_receives_its_own_response() {
 fn a_panicking_plugin_does_not_take_down_the_host() {
     let path = build_fixture("fuyubot-plugin-demo");
     let loader = PluginLoader::new(Context::new()).unwrap();
+    // 宿主自己预置了内置工具（TDLib 函数表），所以「干净」= 回到加载前，而不是「空表」。
+    let tools_before = loader.runtime().tools().len();
 
     let error = loader
         .load_with_config(&path, r#"{"panic_on_start":true}"#)
@@ -292,7 +294,11 @@ fn a_panicking_plugin_does_not_take_down_the_host() {
     );
 
     // 失败的那次加载不能留下任何注册
-    assert!(loader.runtime().tools().is_empty(), "失败的加载回滚不干净");
+    assert_eq!(
+        loader.runtime().tools().len(),
+        tools_before,
+        "失败的加载回滚不干净"
+    );
     assert_eq!(
         loader
             .runtime()
@@ -312,6 +318,8 @@ fn a_panicking_plugin_does_not_take_down_the_host() {
 fn refuses_a_plugin_with_an_incompatible_abi() {
     let path = build_fixture("fuyubot-plugin-badabi");
     let loader = PluginLoader::new(Context::new()).unwrap();
+    // 宿主内置工具在加载前就在表里；这里要的是「失败没有新增注册」。
+    let tools_before = loader.runtime().tools().len();
 
     let error = loader.load(&path).unwrap_err();
     let text = error.to_string();
@@ -325,7 +333,7 @@ fn refuses_a_plugin_with_an_incompatible_abi() {
     assert!(text.contains("badabi") || text.contains("ABI"), "{text}");
 
     // 失败之后宿主必须干净：不能留下半个插件注册的东西。
-    assert!(loader.runtime().tools().is_empty());
+    assert_eq!(loader.runtime().tools().len(), tools_before);
     assert!(loader.runtime().events().subscriber_count("demo.event") == 0);
 }
 

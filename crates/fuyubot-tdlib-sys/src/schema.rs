@@ -148,6 +148,17 @@ impl TdApiSchema {
         tl_schema::to_json(&self.entries, source.as_deref())
     }
 
+    /// 仅函数表（`to_json()["functions"]` 那一段）。
+    ///
+    /// 宿主的内置工具 `fuyubot.td.functions` 就返回它（缺口 13③）：运行时因此能问
+    /// 「这版 TDLib 有哪些方法」，而不必把三千多条再拷一份。
+    pub fn functions_json(&self) -> Value {
+        self.to_json()
+            .get("functions")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()))
+    }
+
     // ── 校验 ──────────────────────────────────────────────────────
 
     /// 发请求前的本地校验：方法名存在、不是构造器、参数名都认得。
@@ -206,6 +217,22 @@ mod tests {
         assert_eq!(back.source(), Some(Path::new("sample.tl")));
         // 再转一次应当逐字节一致
         assert_eq!(back.to_json(), schema.to_json());
+    }
+
+    /// `functions_json` 必须与 `to_json()["functions"]` 逐字节一致（同一份实现）。
+    #[test]
+    fn functions_json_is_the_functions_bucket() {
+        let schema = sample();
+        let functions = schema.functions_json();
+        assert_eq!(functions, schema.to_json()["functions"]);
+        assert_eq!(functions.as_array().unwrap().len(), 2);
+        assert!(
+            functions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == "sendMessage")
+        );
     }
 
     #[test]

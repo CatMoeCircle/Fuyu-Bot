@@ -794,7 +794,7 @@ impl Simplify {
         let payload = rich_send_params(chat_id, params);
         let request_id = self
             .host()
-            .td_invoke_simplified("sendMessage", &payload.to_string())?;
+            .td_invoke_simplified(crate::td_api::SendMessage::METHOD, &payload.to_string())?;
         let deadline = Instant::now() + Duration::from_millis(params.timeout_ms);
         let pending = self.await_response(request_id, deadline, params.timeout_ms)?;
         self.await_outcome(
@@ -839,7 +839,7 @@ impl Simplify {
         let payload = rich_edit_params(chat_id, message_id, params);
         let request_id = self
             .host()
-            .td_invoke_simplified("editMessageText", &payload.to_string())?;
+            .td_invoke_simplified(crate::td_api::EditMessageText::METHOD, &payload.to_string())?;
         self.await_response(
             request_id,
             Instant::now() + Duration::from_millis(params.timeout_ms),

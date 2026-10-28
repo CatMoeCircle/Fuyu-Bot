@@ -2,6 +2,8 @@
 //!
 //! 只依赖 `fuyubot-core`。注册/注销通过 [`ToolRegistry::on_change`] 的监听器广播，
 //! 由调用方（宿主）决定要不要转成 `fuyubot-event` 的事件——本 crate 不认识事件系统。
+//! 宿主侧那条桥在 `fuyubot_loader::HostRuntime::new`（缺口 9）：通道名直接取
+//! [`ToolEvent::kind`]，两条通道分别是 `tool_registered` / `tool_unregistered`。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, c_char};

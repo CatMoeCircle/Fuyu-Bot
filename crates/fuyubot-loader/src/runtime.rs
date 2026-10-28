@@ -23,7 +23,7 @@ use fuyubot_middleware::{
     Stage as MwStage,
 };
 use fuyubot_service::{ServiceContextExt as _, ServiceHandle as SvcRegistration};
-use fuyubot_tdlib::TdClient;
+use fuyubot_tdlib::{TdClient, schema::TdApiSchema};
 use fuyubot_tool::{ToolDescriptor, ToolHandle as ToolRegistration, ToolHandlerFn, ToolRegistry};
 use serde_json::{Value, json};
 
@@ -43,6 +43,13 @@ const LOG_CAPACITY: usize = 256;
 /// 与 `[tdlib] log_verbosity` 一个思路——默认安静，要排查再调大。
 /// 插件那边只要把 `[plugins].log_level` 写成 `"debug"` / `"trace"` 就能开。
 pub const DEFAULT_LOG_VERBOSITY: LogLevel = LogLevel::Info;
+
+/// 内置工具名：编译期烘焙的 TDLib 函数表（`td_api.tl` 的 `---functions---` 段）。
+///
+/// 入参 `{"filter": "sendMessage"}`（filter 可选），输出 `{"count":…,"functions":[…]}`。
+/// 宿主侧（`HostRuntime::tools().call_tool`）直接拿到输出；**ABI 侧 `call_tool` 只回请求号**
+/// ——输出回投不在本版 ABI 里（见缺口 13 的边界），插件目前只能用 `list_tools` 发现它。
+pub const TD_FUNCTIONS_TOOL: &str = "fuyubot.td.functions";
 
 /// 已发出请求的留档上限。
 const REQUEST_LOG_CAPACITY: usize = 256;
@@ -187,6 +194,8 @@ pub struct HostRuntime {
     td: OnceLock<Arc<TdClient>>,
     /// 装四个机制拿到的守卫，必须留住，否则机制会从 Context 里消失。
     _guards: Vec<Effect>,
+    /// 宿主自己注册的工具（目前只有 TDLib 函数表）。句柄 drop 即注销，所以要活到进程结束。
+    _builtin_tools: Vec<ToolRegistration>,
     /// 所有跨 ABI 的注册；插件卸载时按 owner 一次性回滚，子作用域按 scope 细粒度回滚。
     registrations: Mutex<Vec<Registration>>,
     next_id: AtomicU64,
@@ -265,7 +274,7 @@ impl Drop for ScopeGuard {
 impl HostRuntime {
     /// 在给定的 [`Context`] 上装好四个机制，并生成 VTable。
     pub fn new(ctx: Context) -> Result<Arc<Self>, String> {
-        let mut guards = Vec::with_capacity(4);
+        let mut guards = Vec::with_capacity(5);
         guards.push(fuyubot_event::install(&ctx).map_err(|e| e.to_string())?);
         guards.push(fuyubot_service::install(&ctx).map_err(|e| e.to_string())?);
         guards.push(fuyubot_tool::install(&ctx).map_err(|e| e.to_string())?);
@@ -275,6 +284,49 @@ impl HostRuntime {
         let tools = ctx.get::<ToolRegistry>().map_err(|e| e.to_string())?;
         let middleware = ctx.get::<Pipeline>().map_err(|e| e.to_string())?;
 
+        // 先把编译期烘焙的 `td_api.tl` 元数据解析掉（缺口 13）。拖到第一次 `td_send`
+        // 才解析的话，**第一条**请求会凭空多出一次几十毫秒的 JSON 解析——那正是
+        // 「刚起来那几条更新」最容易被漏掉的窗口（`download_file` 的进度等待就被它踩中过）。
+        // 进程内只解析一次，之后每次校验都只是查一张内存里的表。
+        let _ = TdApiSchema::compiled();
+
+        // 工具注册 / 注销 → 事件总线（缺口 9）。
+        //
+        // 机制 crate 之间不许互相依赖（硬约束 12），`ToolRegistry` 只认自己的监听器，
+        // 所以这条桥只能由唯一同时认识两边的东西来搭——就是这里。通道名直接用
+        // `ToolEvent::kind()`（`tool_registered` / `tool_unregistered`），不再另起一套命名。
+        //
+        // 监听器在工具表的锁**外面**被调用，所以回调里再 `emit` 不会自锁；`emit` 的回调
+        // 也可能反过来查工具表，这条链是安全的。
+        let bus = Arc::clone(&events);
+        guards.push(
+            tools.on_change(move |event| bus.emit(event.kind(), &event.to_payload()).map(|_| ())),
+        );
+
+        // 内置工具 `fuyubot.td.functions`（缺口 13③）：把编译期烘焙的
+        // `td_api.tl` 函数表变成工具表里**第一个带真实处理器**的工具，而不是只躺在库里的
+        // 死数据（宿主 `call_tool` 能直接拿到结果；ABI 侧的输出回投是另一条 ABI 决定）。
+        // 它同时也给 schema 找到了生产消费者——`check_request` 那条在 `td_send` 里。
+        let mut descriptor = ToolDescriptor::new(
+            TD_FUNCTIONS_TOOL,
+            "列出这版 TDLib 的 `---functions---` 方法（含参数、返回类型与说明）",
+            json!({
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "string",
+                        "description": "只看名字里含这段文字的方法（忽略大小写）"
+                    }
+                },
+                "additionalProperties": false
+            }),
+            Some(td_functions_handler),
+        );
+        descriptor.idempotent = true;
+        let builtin = tools
+            .register_tool(descriptor)
+            .map_err(|e| format!("注册内置工具 {TD_FUNCTIONS_TOOL} 失败: {e}"))?;
+
         // 预置内置 scope service（owner = 0 宿主自己，永远不会被回滚）。
         let rt = Arc::new_cyclic(|weak| Self {
             ctx,
@@ -283,6 +335,7 @@ impl HostRuntime {
             middleware,
             td: OnceLock::new(),
             _guards: guards,
+            _builtin_tools: vec![builtin],
             registrations: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
             next_owner: AtomicU64::new(1),
@@ -1766,6 +1819,15 @@ impl HostRuntime {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
+        // 真 schema 的**生产消费者**（缺口 13①）：方法名在不在 `---functions---` 里、
+        // 参数名认不认得，发之前先校一遍。只警告不拦截——schema 只是同一版
+        // `td_api.tl` 的编译期快照，最终裁判仍是 TDLib；硬拒绝会让 schema 与真库
+        // 不同步时挡住合法请求（用户 2026 拍板：警告照发）。
+        if let Some(reason) = schema_rejection(&method, &request) {
+            self.warn(&format!(
+                "请求 {method} 没过 schema 校验（照发，真库会再判一次）: {reason}"
+            ));
+        }
         let owner = self.current_owner();
 
         let id = match self.td.get() {
@@ -1884,10 +1946,57 @@ fn report_json(report: &Report) -> String {
     json!({ "count": report.plugins.len(), "plugins": plugins }).to_string()
 }
 
+/// 发请求前的本地校验：方法名与参数名是否出现在**编译期烘焙**的 `td_api.tl` 里。
+///
+/// 返回第一处不认得的名字（给日志用）；`None` = 过了。抽成纯函数是为了能直接测
+/// 判据本身——宿主警告只走 stderr，没有可断言的环形缓冲。
+fn schema_rejection(method: &str, request: &Value) -> Option<String> {
+    TdApiSchema::compiled()
+        .check_request(method, request)
+        .err()
+        .map(|error| error.to_string())
+}
+
+/// 内置工具 `fuyubot.td.functions` 的处理器：返回函数表（可按名字子串过滤）。
+unsafe extern "C-unwind" fn td_functions_handler(
+    _user_data: *mut c_void,
+    input_json: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证入参是 NUL 结尾字符串、活到调用结束。
+    let input = unsafe { cstr(input_json) }.unwrap_or("{}");
+    let filter = serde_json::from_str::<Value>(input).ok().and_then(|value| {
+        value
+            .get("filter")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+    });
+    let entries = match (td_functions_json().as_array(), filter.as_deref()) {
+        (Some(entries), None) => entries.clone(),
+        (Some(entries), Some(needle)) => entries
+            .iter()
+            .filter(|entry| {
+                entry["name"]
+                    .as_str()
+                    .is_some_and(|name| name.to_ascii_lowercase().contains(needle))
+            })
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
+    let payload = json!({ "count": entries.len(), "functions": entries });
+    fuyubot_tool::reply(&payload.to_string())
+}
+
+/// 函数表只从 schema 取一次：三千多条带说明，每次调工具都重算太浪费。
+fn td_functions_json() -> &'static Value {
+    static CACHE: OnceLock<Value> = OnceLock::new();
+    CACHE.get_or_init(|| TdApiSchema::compiled().functions_json())
+}
+
 /// 把 ABI 的 JSON 描述转成 [`ToolDescriptor`]。
 ///
-/// 处理器一律是 `None`：本版 ABI 的 `register_tool` 不带函数指针，
-/// 插件只能登记「我是个什么工具」，没法让宿主回调进来执行它。
+/// 处理器由 `api_register_tool` 单独填（ABI v4 起 `register_tool` 带函数指针，
+/// 见 `api_register_tool`）；这里只负责元数据部分。
 fn descriptor_from_json(text: &str) -> Result<ToolDescriptor, String> {
     let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
     ToolDescriptor::from_json(&value).map_err(|e| e.to_string())
@@ -2123,6 +2232,133 @@ mod tests {
             !after_unregister.to_string_lossy().contains("cache.probe"),
             "注销后缓存必须失效：{}",
             after_unregister.to_string_lossy()
+        );
+    }
+
+    /// 工具注册 / 注销必须同时出现在事件总线上（缺口 9 的验收）。
+    ///
+    /// 以前只有 `ToolRegistry` 的本地监听器能看见，插件订阅 `tool_registered`
+    /// 永远收不到——`ToolEvent::kind()` 那套命名等于是死代码。
+    #[test]
+    fn tool_registration_is_broadcast_on_the_event_bus() {
+        let rt = runtime();
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let _subscription = rt.events().on("tool_registered", None, move |payload| {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(payload.clone());
+            Ok(())
+        });
+        let unregistered: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&unregistered);
+        let _subscription = rt.events().on("tool_unregistered", None, move |payload| {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(payload.clone());
+            Ok(())
+        });
+
+        let handle = rt
+            .tools()
+            .register_tool(fuyubot_tool::ToolDescriptor::new(
+                "bus.probe",
+                "总线探针",
+                serde_json::json!({"type": "object"}),
+                None,
+            ))
+            .unwrap();
+
+        {
+            let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(seen.len(), 1, "注册只该发一条：{seen:?}");
+            assert_eq!(seen[0]["event"], "tool_registered");
+            assert_eq!(seen[0]["name"], "bus.probe");
+        }
+
+        drop(handle);
+        let unregistered = unregistered.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(unregistered.len(), 1, "注销只该发一条：{unregistered:?}");
+        assert_eq!(unregistered[0]["event"], "tool_unregistered");
+        assert_eq!(unregistered[0]["name"], "bus.probe");
+    }
+
+    /// 缺口 13③：函数表是**能调**的工具，不是躺在库里的死数据。
+    #[test]
+    fn builtin_td_functions_tool_is_callable() {
+        let rt = runtime();
+        let all = rt
+            .tools()
+            .call_tool(TD_FUNCTIONS_TOOL, &json!({}))
+            .expect("内置工具必须能调");
+        let all = &all.output;
+        assert!(all["count"].as_u64().unwrap() > 100, "{all}");
+        assert_eq!(
+            all["functions"].as_array().unwrap().len(),
+            all["count"].as_u64().unwrap() as usize
+        );
+
+        // 过滤走名字子串，大小写不敏感。
+        let filtered = rt
+            .tools()
+            .call_tool(TD_FUNCTIONS_TOOL, &json!({ "filter": "SENDMESSAGEALBUM" }))
+            .expect("带过滤也能调")
+            .output;
+        assert_eq!(filtered["count"], 1, "{filtered}");
+        assert_eq!(filtered["functions"][0]["name"], "sendMessageAlbum");
+        assert!(
+            filtered["functions"][0]["params"]
+                .as_array()
+                .is_some_and(|params| !params.is_empty()),
+            "函数条目要带参数：{filtered}"
+        );
+
+        let none = rt
+            .tools()
+            .call_tool(TD_FUNCTIONS_TOOL, &json!({ "filter": "zzz-nothing" }))
+            .expect("空结果也是成功")
+            .output;
+        assert_eq!(none["count"], 0, "{none}");
+    }
+
+    /// 缺口 13①：真 schema 的判据本身——方法名、参数名、合法请求三条都钉住。
+    ///
+    /// 宿主警告只走 stderr，没有可断言的环形缓冲，所以测判据（`schema_rejection`）+
+    /// 「错拼请求仍然发得出去」这两半，合起来就是 td_send 的全部行为。
+    #[test]
+    fn td_send_flags_requests_the_real_schema_rejects() {
+        let typo = json!({"@type":"sendMesssage","chat_id":1,"text":"hi"});
+        let reason = schema_rejection("sendMesssage", &typo).expect("方法名拼错必须被认出来");
+        assert!(reason.contains("sendMesssage"), "{reason}");
+
+        let wrong_param = json!({"@type":"sendMessage","chat_id":1,"textt":"hi"});
+        let reason = schema_rejection("sendMessage", &wrong_param).expect("参数名拼错必须被认出来");
+        assert!(reason.contains("textt"), "{reason}");
+
+        // 合法请求不许误报——不然日志天天狼来了，没人会看。
+        assert_eq!(schema_rejection("getMe", &json!({"@type":"getMe"})), None);
+        assert_eq!(
+            schema_rejection(
+                "sendMessage",
+                &json!({"@type":"sendMessage","chat_id":1,"input_message_content":{}})
+            ),
+            None
+        );
+
+        // 只警告不拦截：错拼的请求照样拿到请求号、照样留档。
+        let rt = runtime();
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+        let id = api
+            .td_invoke(r#"{"@type":"sendMesssage","chat_id":1,"text":"hi"}"#)
+            .unwrap();
+        assert!(id.is_valid(), "照发，所以请求号必须有效");
+        assert!(
+            rt.sent_requests()
+                .iter()
+                .any(|request| request.id == id.id && request.method == "sendMesssage"),
+            "{:?}",
+            rt.sent_requests()
         );
     }
 

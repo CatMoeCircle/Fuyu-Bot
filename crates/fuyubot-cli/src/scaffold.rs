@@ -6,6 +6,7 @@
 //! 项目模板用 `include_str!` 嵌进二进制，所以 `fuyubot init` 在任何目录都能跑，
 //! 不需要用户装一份模板文件。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use fuyubot_loader::{DEFAULT_LOG_VERBOSITY, DLL_EXTENSION, LogLevel};
@@ -746,69 +747,149 @@ pub fn install_from(
 }
 
 /// 在目录里找那个唯一的插件动态库。
+///
+/// 查找顺序（缺口 19）：
+/// 1. `source/target/{release,debug}` —— 普通工程的产物（同一插件两边都有时取**较新**的，
+///    见 [`newest_by_stem`]：`target/release` 里躺着半年前的旧 ABI 产物是常事）；
+/// 2. `source` 本身 —— C/C++ 手编、或产物已经拷到工程目录；
+/// 3. 沿父链找**最近的** `target/{release,debug}` —— workspace 成员的产物在**仓库根**，
+///    工程自己那份 `target/` 根本不存在。
+///
+/// 第 3 步扫到的是整个 workspace 的公共产物目录（一屏都是别人的 dll），所以先按
+/// 工程目录名收窄（`weather-bot` / `weather_bot` 两种写法都认）；收窄不到才算没找到，
+/// 不会随手抓一个别人的插件装上去。
 pub fn find_artifact(source: &Path) -> Result<PathBuf, String> {
     if source.is_file() {
         return Ok(source.to_path_buf());
     }
-    let mut candidates = Vec::new();
-    for dir in [
-        source.join("target").join("release"),
-        source.join("target").join("debug"),
-        source.to_path_buf(),
-    ] {
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|e| e == DLL_EXTENSION) {
-                candidates.push(path);
-            }
-        }
-        if !candidates.is_empty() {
-            break;
-        }
+    // 相对路径要先落成绝对：父链是「按文件系统」走的，`crates/foo` 的父链在
+    // 不同工作目录下会指向不同的 `target/`。已经是绝对的路径原样保留（不做 `\\?\` 前缀）。
+    let source = if source.is_absolute() {
+        source.to_path_buf()
+    } else {
+        std::path::absolute(source).unwrap_or_else(|_| source.to_path_buf())
+    };
+    let expected = source.file_name().map(|name| {
+        // cargo 的目录名用 `-`，产物名用 `_`（`plugin-demo` → `plugin_demo`）。
+        name.to_string_lossy().replace('-', "_")
+    });
+
+    let own = newest_by_stem(target_dlls(&source));
+    if !own.is_empty() {
+        return pick_artifact(own, &source);
     }
-    match candidates.len() {
-        0 => Err(format!(
-            "{} 里没找到 .{DLL_EXTENSION}。\
-             本 CLI **不编译插件**（打包归作者自己的语言工具链）：先用 `cargo build`（Rust / \
-             Python / JS 插件的 cdylib 都是 Rust 编的）或 `cl /LD`（C/C++）编出来，\
-             再把产物或工程目录交给本命令。\
-             注意 workspace 成员的产物落在**仓库根**的 target/ 下，本命令只查工程自己的 target/。",
-            source.display()
-        )),
-        1 => Ok(candidates.remove(0)),
-        _ => Err(format!(
-            "{} 里有多个候选，指定其中一个：{}",
-            source.display(),
-            candidates
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+
+    let direct = dlls_in(&source);
+    if !direct.is_empty() {
+        return pick_artifact(direct, &source);
     }
+
+    for ancestor in source.ancestors().skip(1) {
+        let candidates = newest_by_stem(target_dlls(ancestor));
+        if candidates.is_empty() {
+            continue;
+        }
+        let narrowed: Vec<PathBuf> = match &expected {
+            Some(name) => candidates
+                .into_iter()
+                .filter(|path| artifact_stem_matches(path, name))
+                .collect(),
+            None => candidates,
+        };
+        if !narrowed.is_empty() {
+            return pick_artifact(narrowed, &source);
+        }
+        // 这个 target/ 里没有本工程的产物：可能是更大的 workspace，继续往上。
+    }
+
+    Err(format!(
+        "{} 里没找到 .{DLL_EXTENSION}（工程自己的 target/、工程目录、以及沿父链的 target/ 都查过了）。\
+         本 CLI **不编译插件**（打包归作者自己的语言工具链）：先用 `cargo build`（Rust / \
+         Python / JS 插件的 cdylib 都是 Rust 编的）或 `cl /LD`（C/C++）编出来，\
+         再把产物或工程目录交给本命令。\
+         workspace 成员的产物在仓库根的 target/ 下——按工程目录名匹配；\
+         目录名和 crate 名对不上时，直接把那个 .{DLL_EXTENSION} 的路径交给本命令。",
+        source.display()
+    ))
 }
 
-/// 插件自己的脚本（`.py` / `.js` / `.ts`）——和 cdylib 同目录同名的那个。
+/// 某个目录里所有看起来是插件动态库的文件（不递归）。
+fn dlls_in(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|e| e == DLL_EXTENSION))
+        .collect()
+}
+
+/// 一个工程根（或 workspace 根）下 `target/release` 与 `target/debug` 的产物合集。
+fn target_dlls(base: &Path) -> Vec<PathBuf> {
+    let mut found = dlls_in(&base.join("target").join("release"));
+    found.extend(dlls_in(&base.join("target").join("debug")));
+    found
+}
+
+/// 同名（主干相同，`lib` 前缀不计）的产物只留**最新**的那份。
 ///
-/// 宿主加载 cdylib 时把它的绝对路径当配置传进去（见 `run`），所以这里要能找对。
-/// cargo 在类 Unix 上会给 cdylib 加 `lib` 前缀，两种都试。
-///
-/// `.ts` 也在列：TypeScript 插件走 Node 自带的**类型剥离**直接跑（Node ≥ 23.6），
-/// 不需要先 `tsc`（见 `examples/ts-counter`）。Node 太老会由桥报「启动失败」，
-/// 不会变成「加载成功但什么都不干」。
-pub fn find_script(dll: &Path) -> Option<PathBuf> {
-    let dir = dll.parent()?;
-    let stem = dll.file_stem()?.to_string_lossy().into_owned();
-    let bare = stem.strip_prefix("lib").unwrap_or(&stem).to_owned();
-    for candidate in [stem.clone(), bare] {
-        for extension in ["py", "js", "ts"] {
-            let path = dir.join(format!("{candidate}.{extension}"));
-            if path.is_file() {
-                return Some(path);
+/// release / debug 是两次独立的构建，谁新谁代表「刚编的那一版」。以前固定先看 release，
+/// 结果把半年前的旧 ABI 产物装进了插件目录（真踩过：`target/release` 里的 demo 插件
+/// 还是 ABI v1，`plugin_init` 直接拒绝加载）。不同主干仍然算多个候选，交给调用方指定。
+fn newest_by_stem(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut by_stem: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for path in candidates {
+        let Some(stem) = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        let stem = stem.strip_prefix("lib").unwrap_or(&stem).to_owned();
+        match by_stem.get(&stem) {
+            Some(existing) if modified(existing) >= modified(&path) => {}
+            _ => {
+                by_stem.insert(stem, path);
             }
         }
     }
-    None
+    by_stem.into_values().collect()
+}
+
+/// 文件的修改时间；读不到就当最旧（永远不会赢过读得到的那个）。
+fn modified(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+/// 产物主干是否就是工程（`lib` 前缀与平台大小写都容忍）。
+fn artifact_stem_matches(path: &Path, expected: &str) -> bool {
+    let Some(stem) = path.file_stem().map(|stem| stem.to_string_lossy()) else {
+        return false;
+    };
+    let bare = stem.strip_prefix("lib").unwrap_or(&stem);
+    bare.eq_ignore_ascii_case(expected)
+}
+
+/// 零 / 一 / 多个候选的收尾：多个就让调用方自己指定，不猜。
+fn pick_artifact(mut candidates: Vec<PathBuf>, source: &Path) -> Result<PathBuf, String> {
+    match candidates.len() {
+        0 => Err(format!("{} 里没找到 .{DLL_EXTENSION}", source.display())),
+        1 => Ok(candidates.remove(0)),
+        _ => {
+            candidates.sort();
+            Err(format!(
+                "{} 里有多个候选，指定其中一个：{}",
+                source.display(),
+                candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+    }
 }
 
 /// 同伴文件可能待在哪些目录里。
@@ -1152,42 +1233,8 @@ mod tests {
         assert_eq!(config.bot.api_id, None);
     }
 
-    #[test]
-    fn script_is_found_next_to_the_library() {
-        let dir = temp("find-script");
-        let dll = dir.join(format!("libweather.{DLL_EXTENSION}"));
-        std::fs::write(&dll, b"x").unwrap();
-        assert_eq!(find_script(&dll), None);
-        std::fs::write(dir.join("weather.py"), b"print()").unwrap();
-        assert_eq!(
-            find_script(&dll).unwrap().file_name().unwrap(),
-            "weather.py",
-            "要去掉 cargo 加的 lib 前缀"
-        );
-    }
-
-    /// `.ts` 也在查找列表里（TypeScript 插件直接靠 Node 剥类型跑）。
-    /// 同一个名字同时存在时按 `py` → `js` → `ts` 的顺序取第一个。
-    #[test]
-    fn script_lookup_also_accepts_typescript() {
-        let dir = temp("find-script-ts");
-        let dll = dir.join(format!("counter.{DLL_EXTENSION}"));
-        std::fs::write(&dll, b"x").unwrap();
-        std::fs::write(dir.join("counter.ts"), b"export {}").unwrap();
-        assert_eq!(
-            find_script(&dll).unwrap().file_name().unwrap(),
-            "counter.ts"
-        );
-
-        // .js 优先于 .ts（两个都在时不该挑 TS）
-        std::fs::write(dir.join("counter.js"), b"// js").unwrap();
-        assert_eq!(
-            find_script(&dll).unwrap().file_name().unwrap(),
-            "counter.js"
-        );
-    }
-
     /// 装插件时**脚本要跟着走**（宿主按 cdylib 同目录找脚本），无关文件不搬。
+    /// 「去哪找脚本」的规则本身在 `fuyubot-loader::find_script`（缺口 28），这里只测拷贝。
     #[test]
     fn install_copies_the_library_and_its_companions() {
         let source = temp("install-src");
@@ -1242,6 +1289,59 @@ mod tests {
         let copied = install_from(&dll, &[project.clone()], &plugin_dir).unwrap();
         assert_eq!(copied.len(), 2, "{copied:?}");
         assert!(plugin_dir.join("weather.py").is_file());
+    }
+
+    /// workspace 成员的产物在**仓库根**的 `target/` 下，工程自己那份不存在（缺口 19）。
+    #[test]
+    fn workspace_member_artifact_is_found_in_the_repo_target() {
+        let repo = temp("find-artifact-workspace");
+        let member = repo.join("crates").join("weather-bot");
+        std::fs::create_dir_all(&member).unwrap();
+        let out = repo.join("target").join("debug");
+        std::fs::create_dir_all(&out).unwrap();
+        let wanted = out.join(format!("weather_bot.{DLL_EXTENSION}"));
+        std::fs::write(&wanted, b"lib").unwrap();
+        // 公共 target/ 里一定有别人的产物：不能随手抓一个装上去。
+        std::fs::write(out.join(format!("other_plugin.{DLL_EXTENSION}")), b"lib").unwrap();
+
+        assert_eq!(find_artifact(&member).unwrap(), wanted);
+    }
+
+    /// release / debug 各有一份时取**较新**的，而不是盲选 release。
+    ///
+    /// 真踩过：仓库根 `target/release` 里躺着一个 ABI v1 的 demo 插件（半年前编的），
+    /// 而刚 `cargo build` 出来的是 debug——按「先 release」装进去的那个，宿主直接拒绝加载。
+    #[test]
+    fn the_newer_of_release_and_debug_wins() {
+        let project = temp("find-artifact-newest");
+        let release = project.join("target").join("release");
+        let debug = project.join("target").join("debug");
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::create_dir_all(&debug).unwrap();
+        std::fs::write(release.join(format!("weather.{DLL_EXTENSION}")), b"old").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let fresh = debug.join(format!("weather.{DLL_EXTENSION}"));
+        std::fs::write(&fresh, b"new").unwrap();
+
+        assert_eq!(find_artifact(&project).unwrap(), fresh);
+    }
+
+    /// 仓库根的 target/ 里没有本工程的产物时如实报「没找到」，不猜别人的。
+    #[test]
+    fn a_workspace_target_without_this_crate_is_reported() {
+        let repo = temp("find-artifact-nomatch");
+        let member = repo.join("crates").join("ghost-plugin");
+        std::fs::create_dir_all(&member).unwrap();
+        let out = repo.join("target").join("debug");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join(format!("other_plugin.{DLL_EXTENSION}")), b"lib").unwrap();
+
+        let error = find_artifact(&member).unwrap_err();
+        assert!(error.contains("没找到"), "{error}");
+        assert!(
+            !error.contains("other_plugin"),
+            "不该把别人列成候选：{error}"
+        );
     }
 
     /// Linux / macOS 上 cargo 给 cdylib 加 `lib` 前缀，Windows 上不加。

@@ -10,6 +10,7 @@
 mod loader;
 mod pipeline;
 mod runtime;
+mod script;
 
 /// 插件作者写 cdylib 时直接对着 ABI crate 编程。
 pub use fuyubot_abi as abi;
@@ -19,5 +20,7 @@ pub use loader::{
 };
 pub use pipeline::{PipelineError, UpdateOutcome, UpdatePipeline};
 pub use runtime::{
-    DEFAULT_LOG_VERBOSITY, HostRuntime, LogLevel, RESPONSE_EVENT, SentRequest, UPDATE_EVENT,
+    DEFAULT_LOG_VERBOSITY, HostRuntime, LogLevel, RESPONSE_EVENT, SentRequest, TD_FUNCTIONS_TOOL,
+    UPDATE_EVENT,
 };
+pub use script::{SCRIPT_EXTENSIONS, find_script};

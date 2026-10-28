@@ -7,7 +7,7 @@
 //! 依赖是**持续跟踪**的：某个能力被注销了，依赖它的插件自动退回 Pending
 //! （它已生效的注册一并回滚）；能力回来时再自动重新激活。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -496,16 +496,22 @@ impl PluginManager {
     pub fn load_all(&mut self, plugins: Vec<Arc<dyn Plugin>>) -> Result<Vec<String>, KernelError> {
         // 环在注册前就报掉——不留半加载状态（Cordis 同样是启动期拒绝）。
         detect_cycle(&plugins)?;
+        // 重名也在**改表之前**整批验完。旧写法边验边 push：第 N 个撞名时前 N-1 个
+        // 已经进了表，却把 `Err` 交回给调用方——「失败 = 什么都没发生」不成立，
+        // 而且那半批会在之后的 `reconcile` 里真的被激活。
+        {
+            let fibers = self.lock_fibers();
+            let mut seen: HashSet<&str> = HashSet::with_capacity(plugins.len());
+            for plugin in &plugins {
+                let name = plugin.name();
+                if fibers.iter().any(|fiber| fiber.name() == name) || !seen.insert(name) {
+                    return Err(KernelError::DuplicatePlugin(name.to_owned()));
+                }
+            }
+        }
         {
             let mut fibers = self.lock_fibers();
-            let mut seen: HashMap<String, ()> = HashMap::with_capacity(plugins.len());
             for plugin in plugins {
-                let name = plugin.name().to_owned();
-                if fibers.iter().any(|fiber| fiber.name() == name)
-                    || seen.insert(name.clone(), ()).is_some()
-                {
-                    return Err(KernelError::DuplicatePlugin(name));
-                }
                 fibers.push(Fiber {
                     plugin,
                     state: State::Pending,
@@ -974,6 +980,10 @@ mod tests {
             fresh.load_all(vec![Named::new("A", &[], &log), Named::new("A", &[], &log)]),
             Err(KernelError::DuplicatePlugin(_))
         ));
+        // 失败就是什么都没发生：旧写法边验边 push，撞名时前一个已经入库并会被激活，
+        // 调用方却以为整批都没加载。
+        assert_eq!(fresh.len(), 0, "重名失败不能留下半批插件");
+        assert!(fresh.active().is_empty());
     }
 
     /// 环在启动前报错（`load_all` 入口的 `detect_cycle`），不再靠 budget 静默吸收。

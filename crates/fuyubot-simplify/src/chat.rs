@@ -351,7 +351,7 @@ impl Simplify {
     ///
     /// ⚠️ **阻塞**当前线程（TDLib 的应答要经接收循环），回调里请用 `*_then` 那一套。
     pub fn me(&self, timeout_ms: u64) -> Option<Value> {
-        self.ask("getMe", "{}", timeout_ms)
+        self.ask(crate::td_api::GetMe::METHOD, "{}", timeout_ms)
     }
 
     /// 自己的 user id；拿不到（`getMe` 超时 / 报错）返回 `None`。
@@ -383,7 +383,7 @@ impl Simplify {
         let params = chat_member_params(chat_id, user_id).to_string();
         let request = self
             .host()
-            .td_invoke_simplified("getChatMember", &params)
+            .td_invoke_simplified(crate::td_api::GetChatMember::METHOD, &params)
             .ok()?;
         let response = self.wait_response(request, timeout_ms)?;
         self.soften(&response, "getChatMember")
@@ -462,7 +462,7 @@ impl Simplify {
         let payload = forward_params(chat_id, from_chat_id, params).to_string();
         let request = self
             .host()
-            .td_invoke_simplified("forwardMessages", &payload)?;
+            .td_invoke_simplified(crate::td_api::ForwardMessages::METHOD, &payload)?;
         let response = self.await_response(
             request,
             Instant::now() + Duration::from_millis(params.timeout_ms),
@@ -509,13 +509,13 @@ impl Simplify {
     ) -> Result<()> {
         if self.is_bot(timeout_ms) {
             self.say(
-                "setMessageReactions",
+                crate::td_api::SetMessageReactions::METHOD,
                 &set_reactions_params(chat_id, message_id, std::slice::from_ref(reaction), is_big),
                 timeout_ms,
             )
         } else {
             self.say(
-                "addMessageReaction",
+                crate::td_api::AddMessageReaction::METHOD,
                 &reaction_params(chat_id, message_id, reaction, is_big, true),
                 timeout_ms,
             )
@@ -538,13 +538,13 @@ impl Simplify {
     ) -> Result<()> {
         if self.is_bot(timeout_ms) {
             self.say(
-                "setMessageReactions",
+                crate::td_api::SetMessageReactions::METHOD,
                 &set_reactions_params(chat_id, message_id, &[], false),
                 timeout_ms,
             )
         } else {
             self.say(
-                "removeMessageReaction",
+                crate::td_api::RemoveMessageReaction::METHOD,
                 &remove_reaction_params(chat_id, message_id, reaction),
                 timeout_ms,
             )
@@ -561,7 +561,7 @@ impl Simplify {
         timeout_ms: u64,
     ) -> Result<()> {
         self.say(
-            "addMessageReaction",
+            crate::td_api::AddMessageReaction::METHOD,
             &reaction_params(chat_id, message_id, reaction, is_big, true),
             timeout_ms,
         )
@@ -579,7 +579,7 @@ impl Simplify {
         timeout_ms: u64,
     ) -> Result<()> {
         self.say(
-            "setMessageReactions",
+            crate::td_api::SetMessageReactions::METHOD,
             &set_reactions_params(chat_id, message_id, reactions, is_big),
             timeout_ms,
         )
@@ -850,16 +850,16 @@ mod tests {
                 forward_params(7, 8, &ForwardParams::new([1, 2])),
             ),
             (
-                "addMessageReaction",
+                crate::td_api::AddMessageReaction::METHOD,
                 reaction_params(7, 9, &Reaction::emoji("👍"), false, true),
             ),
             (
-                "setMessageReactions",
+                crate::td_api::SetMessageReactions::METHOD,
                 set_reactions_params(7, 9, &reactions, true),
             ),
             // bot 的「清空」：空列表也是合法形状
             (
-                "setMessageReactions",
+                crate::td_api::SetMessageReactions::METHOD,
                 set_reactions_params(7, 9, &[], false),
             ),
             (

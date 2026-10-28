@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use fuyubot_core::{Kernel, Plugin as _};
-use fuyubot_loader::{DylibPlugin, PluginLoader, UpdatePipeline, plugin_files};
+use fuyubot_loader::{DylibPlugin, PluginLoader, UpdatePipeline, find_script, plugin_files};
 // 扩展 trait 要在作用域里才能对 `ConsolePrompter` 调 `ask`（固有方法不覆盖它）。
 use fuyubot_tdlib::Prompter as _;
 
@@ -514,7 +514,7 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         // 纯 Rust/C 插件是同步的，回放完就已经尘埃落定。按这个差别选等待窗口。
         let scripted = plugin_files(&plugin_dir)?
             .iter()
-            .any(|path| scaffold::find_script(path).is_some());
+            .any(|path| find_script(path).is_some());
         replay_updates(
             &pipeline,
             &replay,
@@ -1106,7 +1106,7 @@ fn load_plugins(
     // 探测只问名字、不 start（见 `PluginLoader::probe`）。
     let mut adapters: Vec<Arc<DylibPlugin>> = Vec::new();
     for path in plugin_files(plugin_dir)? {
-        let config = match scaffold::find_script(&path) {
+        let config = match find_script(&path) {
             Some(script) => serde_json::json!({ "script": script, "plugins_dir": absolute, "scripts_dir": scripts_dir, "spawn": spawn }),
             None => serde_json::json!({ "plugins_dir": absolute, "scripts_dir": scripts_dir, "spawn": spawn }),
         }
