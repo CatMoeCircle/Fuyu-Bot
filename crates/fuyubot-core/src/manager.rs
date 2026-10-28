@@ -8,7 +8,7 @@
 //! （它已生效的注册一并回滚）；能力回来时再自动重新激活。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use crate::context::Context;
@@ -358,29 +358,34 @@ pub struct PluginManager {
     fibers: Arc<Mutex<Vec<Fiber>>>,
     /// 生命周期监听器（缺口 12）。和 fibers 一样用 `Arc`：服务变更钩子也要能发事件。
     lifecycle: Arc<LifecycleHooks>,
+    /// 推进闸门：`apply` 期间服务注册触发的钩子不能递归推进（见 [`Progress`]）。
+    progress: Arc<Progress>,
 }
 
 impl PluginManager {
     pub fn new(ctx: Context) -> Self {
         let fibers = Arc::new(Mutex::new(Vec::new()));
         let lifecycle = Arc::new(LifecycleHooks::default());
+        let progress = Arc::new(Progress::default());
 
         // 能力一增删就重新求值：这是「依赖持续跟踪」的驱动源。
         // 持**弱**引用——钩子被 Context 拿着，这里再持强引用双方都放不了手。
         let weak = Arc::downgrade(&fibers);
         let ctx_for_hook = ctx.clone();
         let hooks = Arc::clone(&lifecycle);
+        let progress_for_hook = Arc::clone(&progress);
         ctx.on_service_change(move |_name, _change| {
             let Some(fibers) = weak.upgrade() else {
                 return;
             };
-            reconcile_if_free(&ctx_for_hook, &fibers, &hooks);
+            reconcile_if_free(&ctx_for_hook, &fibers, &hooks, &progress_for_hook);
         });
 
         Self {
             ctx,
             fibers,
             lifecycle,
+            progress,
         }
     }
 
@@ -623,7 +628,7 @@ impl PluginManager {
     ///
     /// 返回这次**新激活**的顺序。
     pub fn reconcile(&mut self) -> Vec<String> {
-        reconcile_loop(&self.ctx, &self.fibers, &self.lifecycle)
+        reconcile_loop(&self.ctx, &self.fibers, &self.lifecycle, &self.progress)
     }
 
     fn lock_fibers(&self) -> MutexGuard<'_, Vec<Fiber>> {
@@ -631,14 +636,52 @@ impl PluginManager {
     }
 }
 
-/// 钩子侧的入口：抢不到锁说明正有人在 reconcile（`apply` 里注册了服务就会这样），
-/// 那一层的 loop 会把剩下的推进完，这里不必逞强。
-fn reconcile_if_free(ctx: &Context, fibers: &Mutex<Vec<Fiber>>, lifecycle: &LifecycleHooks) {
+/// 钩子侧的入口：推进中只打个「又变了」的记号，**绝不递归推进**。
+///
+/// 递归是错误顺序的根源：`apply` 里注册服务时，正在激活的那个 fiber 还是 `Activating`，
+/// 它的 `start` 没跑完；这时让依赖方先激活，软依赖（「基础设施先起来」）就白声明了。
+/// 外层那一圈循环本来就会重扫状态，所以记号只是给诊断留的，不靠它驱赶。
+fn reconcile_if_free(
+    ctx: &Context,
+    fibers: &Mutex<Vec<Fiber>>,
+    lifecycle: &LifecycleHooks,
+    progress: &Progress,
+) {
+    if progress.running.load(Ordering::SeqCst) {
+        progress.needed.store(true, Ordering::SeqCst);
+        return;
+    }
     let Ok(guard) = fibers.try_lock() else {
+        progress.needed.store(true, Ordering::SeqCst);
         return;
     };
     drop(guard);
-    reconcile_loop(ctx, fibers, lifecycle);
+    reconcile_loop(ctx, fibers, lifecycle, progress);
+}
+
+/// 依赖推进的**重入闸门**。
+///
+/// `apply` 里注册服务会同步触发服务变更钩子，而钩子天生会想「再算一遍」。如果真让它递归
+/// 算：提供者的 `apply` 还没返回（状态 `Activating`，`start` 没跑完），依赖方就会被判定
+/// 「能力已到位」而先激活——**软依赖想要的「基础设施先起来」直接失效**，
+/// 硬依赖也会在提供者的 `start` 完成之前放人过去。
+///
+/// 所以钩子在推进中只置 `needed`，让外层那一圈循环接着算（它本来就会重扫状态）。
+#[derive(Default)]
+struct Progress {
+    /// 有一圈正在推进。
+    running: AtomicBool,
+    /// 推进期间又变了，外层跑完这圈要再算一次（诊断用，当前靠外层重扫即可覆盖）。
+    needed: AtomicBool,
+}
+
+/// `running` 的复位靠 Drop：推进中 panic 也不能把闸门永久焊死。
+struct RunningGuard<'a>(&'a Progress);
+
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::SeqCst);
+    }
 }
 
 /// 反复推进直到没有状态要变。返回**这次**新激活的顺序。
@@ -646,7 +689,16 @@ fn reconcile_loop(
     ctx: &Context,
     fibers: &Mutex<Vec<Fiber>>,
     lifecycle: &LifecycleHooks,
+    progress: &Progress,
 ) -> Vec<String> {
+    // 重入 = 有人在外面推进（正常不会走到：钩子已经挡住了），直接让外层继续。
+    if progress.running.swap(true, Ordering::SeqCst) {
+        progress.needed.store(true, Ordering::SeqCst);
+        return Vec::new();
+    }
+    let _running = RunningGuard(progress);
+    progress.needed.store(false, Ordering::SeqCst);
+
     let mut activated = Vec::new();
     // 保险丝：一轮最多推进一个 fiber。给足冗余再撒手，免得依赖图万一构了环
     // 把这里卡成死循环。
@@ -969,7 +1021,12 @@ mod tests {
         assert!(manager.active().is_empty());
 
         manager.load(DbProvider).unwrap();
-        assert_eq!(manager.active(), ["consumer", "db-provider"]);
+        // 顺序是**激活先后**（`active()` 按 seq）：提供者先起来，消费者后起来。
+        //
+        // 这里曾经断言的是 `["consumer", "db-provider"]`——那不是期望，是在钉一个真 bug：
+        // provider 的 `apply` 里注册服务会触发钩子，钩子递归推进，于是在 provider 的
+        // `start` 还没返回时就把 consumer 激活了（seq 反而更小）。修掉重入之后顺序才正确。
+        assert_eq!(manager.active(), ["db-provider", "consumer"]);
     }
 
     /// 服务被注销（不是插件被卸载）也要能把依赖方打回去：
