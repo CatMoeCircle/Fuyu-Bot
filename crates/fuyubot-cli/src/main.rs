@@ -27,10 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use fuyubot_core::Kernel;
-use fuyubot_loader::{
-    LoadedPlugin, OrderedLoad, PluginLoader, Probe, UpdatePipeline, plugin_files,
-};
+use fuyubot_core::{Kernel, Plugin as _};
+use fuyubot_loader::{DylibPlugin, PluginLoader, UpdatePipeline, plugin_files};
 // 扩展 trait 要在作用域里才能对 `ConsolePrompter` 调 `ask`（固有方法不覆盖它）。
 use fuyubot_tdlib::Prompter as _;
 
@@ -462,7 +460,7 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // ④ 插件全部加载完（**在发 `setTdlibParameters` 之前**）。
     // `spawn = true`：`run` 要的是真跑起来——装依赖、起进程、watch 一整套。
-    let mut loaded = load_plugins(&loader, &plugin_dir, true)?;
+    let mut loaded = load_plugins(&mut kernel, &loader, &plugin_dir, true)?;
 
     // ⑤⑥ 现在才驱动登录：等「等参数」状态 → 设置 → 等授权状态 →（要登录就登录）→ Ready。
     if let (Some(client), Some(parameters)) = (tdlib_client.as_ref(), parameters.as_ref()) {
@@ -636,13 +634,13 @@ fn plugin_list(args: PluginDirArgs) -> Result<(), Box<dyn std::error::Error>> {
         // owner 回滚，它一死，中间插件注册的清单 service 跟着注销——后面
         // `print_managed_scripts` 就什么都查不到。写在 `for` 的临时位置里
         // 正是踩过这个坑。
-        let loaded = load_plugins(&loader, &plugin_dir, false)?;
+        let loaded = load_plugins(&mut kernel, &loader, &plugin_dir, false)?;
         for plugin in &loaded {
             println!(
                 "{}\tABI {}\t{}",
-                plugin.name,
-                plugin.abi_version,
-                plugin.path.display()
+                plugin.name(),
+                plugin.abi_version(),
+                plugin.path().display()
             );
         }
 
@@ -1057,18 +1055,12 @@ fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     }
 }
 
-/// 逐个加载插件目录里的动态库。
-///
-/// 带脚本的插件（Python / JS）要把脚本的**绝对路径**当配置传进去——cdylib 自己
-/// 不知道自己在哪个目录，宿主才知道（见 `scaffold::find_script`）。
-///
-/// `spawn` 透传给插件（配置 JSON 的 `"spawn"` 字段）：`false` = 只发现不启动，
-/// `fuyubot plugin list` 用——列清单不该装依赖、起进程。`run` 传 `true`。
 fn load_plugins(
+    kernel: &mut Kernel,
     loader: &PluginLoader,
     plugin_dir: &Path,
     spawn: bool,
-) -> Result<Vec<LoadedPlugin>, Box<dyn std::error::Error>> {
+) -> Result<Vec<Arc<DylibPlugin>>, Box<dyn std::error::Error>> {
     // 插件自己算不出「插件目录」在哪（它跑在宿主进程里），只能由宿主告诉它。
     // 内置的 `/plugins` 命令就靠这个配置；绝对路径，免得随启动目录漂。
     // `canonicalize` 在 Windows 上带 `\\?\` 长路径前缀——去掉，配置与输出都干净。
@@ -1082,57 +1074,42 @@ fn load_plugins(
     // ——`--config` / `--plugin-dir` 指到别处、或不在项目根目录起进程时那样必错。
     let scripts_dir = absolute.join("scripts");
 
-    // 依赖声明写在插件自己的配置段里：`[plugin.<插件名>] inject = [...]`。
-    // 插件名是 dll 探测出来的那个，不是文件名。
-    let runtime = loader.runtime();
-    let deps_for = |name: &str| -> Vec<String> {
-        runtime
-            .plugin_config_value(name, "inject")
-            .and_then(|value| value.as_array().cloned())
-            .into_iter()
-            .flatten()
-            .filter_map(|item| item.as_str().map(str::to_owned))
-            .collect()
-    };
-
-    // 配置的形状取决于这个插件有没有脚本同伴，和原来那条规则一致。
-    let config_for = |probe: &Probe| {
-        match scaffold::find_script(&probe.path) {
+    // 先把目录扫成探针：插件名只有 dlopen 之后才知道，而依赖是按**名字**声明的。
+    // 探测只问名字、不 start（见 `PluginLoader::probe`）。
+    let mut adapters: Vec<Arc<DylibPlugin>> = Vec::new();
+    for path in plugin_files(plugin_dir)? {
+        let config = match scaffold::find_script(&path) {
             Some(script) => serde_json::json!({ "script": script, "plugins_dir": absolute, "scripts_dir": scripts_dir, "spawn": spawn }),
             None => serde_json::json!({ "plugins_dir": absolute, "scripts_dir": scripts_dir, "spawn": spawn }),
         }
-        .to_string()
-    };
-
-    let OrderedLoad { loaded, blocked } =
-        loader.load_dir_ordered(plugin_dir, deps_for, config_for)?;
-
-    let mut plugins = Vec::new();
-    for (path, outcome) in loaded {
-        match outcome {
-            Ok(plugin) => {
-                // 只有 `run`（spawn = true）要这行进度；`plugin list` 自己有格式化输出，
-                // 只发现模式下再打一遍「已加载」就是噪声。
-                if spawn {
-                    println!("已加载插件 {} ({})", plugin.name, path.display());
-                }
-                plugins.push(plugin);
-            }
-            Err(e) => eprintln!("跳过 {}: {e}", path.display()),
+        .to_string();
+        // 探测失败就跳过这一个，原因打出来——文件在那儿却悄悄消失是最难查的那类事。
+        match DylibPlugin::probe(loader, &path, config) {
+            Ok(adapter) => adapters.push(Arc::new(adapter)),
+            Err(error) => eprintln!("跳过 {}: {error}", path.display()),
         }
     }
 
-    // 依赖没齐的：`Pending`，不是失败。不说清楚，人就会以为它在正常跑。
-    for (probe, missing) in blocked {
-        let source = probe.path.display();
+    // 交给内核：依赖齐的当场激活，不齐的停在 Pending**等着**（不是失败），
+    // 能力出现/消失时内核自己的钩子会重新求值——这就是「依赖持续跟踪」。
+    let plugins: Vec<Arc<dyn fuyubot_core::Plugin>> = adapters
+        .iter()
+        .map(|adapter| Arc::clone(adapter) as Arc<dyn fuyubot_core::Plugin>)
+        .collect();
+    kernel.plugins().load_all(plugins)?;
+
+    // Pending 的要说清楚：不说的话，人就会以为它在正常跑。
+    for (name, missing) in kernel.plugins().pending() {
         eprintln!(
-            "插件 {} ({source}) 的依赖还没齐，先不启动：缺 {}",
-            probe.name,
+            "插件 {name} 的依赖还没齐，先不启动：缺 {}",
             missing.join(", ")
         );
     }
+    for (name, reason) in kernel.plugins().failed() {
+        eprintln!("插件 {name} 启动失败：{reason}");
+    }
 
-    Ok(plugins)
+    Ok(adapters)
 }
 
 /// 把一批更新灌进管线：不需要 Telegram 账号，也能验插件的判断与回投。

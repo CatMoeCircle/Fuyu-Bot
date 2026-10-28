@@ -373,3 +373,151 @@ fn load_dir_skips_non_plugins() {
         path.display()
     );
 }
+
+// ── P0：动态库插件接进内核 Fiber 状态机 ────────────────────────────────
+//
+// 这一组的要点不是「能加载」，而是「依赖语义只有内核那一份」：探测 → 造适配器 →
+// `PluginManager::load_all` → 内核自己决定谁起来、谁等着。下面每条都从**内核的
+// 视角**断言（`pending()` / `active()` / `is_running()`），不是从加载器的视角。
+
+/// `inject` 声明的依赖来自配置段 `[plugin.<名>].inject`。
+///
+/// ⚠️ 插件名是**点分**的（`fuyubot.demo` 在 TOML 里就是 `[plugin.fuyubot.demo]`），
+/// 宿主按点路径下钻，所以要拼成嵌套对象。写成字面键 `"fuyubot.demo"` 会查不到，
+/// 于是 `inject()` 返回空、插件**立刻激活**——症状是「明明声明了依赖却没等」。
+fn with_inject(loader: &PluginLoader, name: &str, deps: &[&str]) {
+    let mut section = serde_json::json!({ "inject": serde_json::json!(deps) });
+    for segment in name.split('.').rev() {
+        section = serde_json::json!({ segment: section });
+    }
+    loader
+        .runtime()
+        .install_config(None, serde_json::json!({ "plugin": section }));
+}
+
+/// 依赖不满足时**停在 Pending 等**，不是失败；依赖到位后自动激活。
+#[test]
+fn a_dylib_waits_in_pending_until_its_injection_appears() {
+    let demo = build_fixture("fuyubot-plugin-demo");
+    // ⚠️ loader 必须装在**内核自己的** Context 上。各自 `new()` 一张表的话，
+    // 能力注册到这边、内核的 fiber 看那边，`inject` 永远判不齐（踩过）。
+    let mut kernel = fuyubot_core::Kernel::new();
+    let ctx = kernel.context().clone();
+    let loader = PluginLoader::new(ctx.clone()).unwrap();
+
+    // demo 要一项一开始没人提供的能力。
+    with_inject(&loader, "fuyubot.demo", &["database"]);
+
+    let adapter = fuyubot_loader::DylibPlugin::probe(&loader, &demo, "").expect("探测成功");
+    let shared = std::sync::Arc::new(adapter);
+    kernel
+        .plugins()
+        .load_all(vec![
+            std::sync::Arc::clone(&shared) as std::sync::Arc<dyn fuyubot_core::Plugin>
+        ])
+        .expect("登记不该失败");
+
+    // 依赖没齐：登记了（is_loaded），但没起来。
+    assert!(kernel.plugins().is_loaded("fuyubot.demo"));
+    assert!(kernel.plugins().active().is_empty(), "缺依赖时不该激活");
+    let pending = kernel.plugins().pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].1, vec!["database".to_owned()], "该报出缺什么");
+    assert!(!shared.is_running(), "插件代码一次都不该跑到 start");
+
+    // 能力到位 → 内核的钩子自己把它拉起来，不需要谁再调一次加载。
+    let _capability = ctx.provide_named("database", 1_u8).expect("注册能力");
+    assert_eq!(kernel.plugins().active(), vec!["fuyubot.demo".to_owned()]);
+    assert!(shared.is_running(), "依赖齐了就该真的 start 过");
+}
+
+/// 能力消失 → 依赖方**自动退回 Pending 并回滚注册**；能力回来 → 自动重新激活。
+#[test]
+fn a_dylib_deactivates_and_reactivates_with_its_dependency() {
+    let demo = build_fixture("fuyubot-plugin-demo");
+    let mut kernel = fuyubot_core::Kernel::new();
+    let ctx = kernel.context().clone();
+    let loader = PluginLoader::new(ctx.clone()).unwrap();
+    with_inject(&loader, "fuyubot.demo", &["database"]);
+
+    let shared = std::sync::Arc::new(
+        fuyubot_loader::DylibPlugin::probe(&loader, &demo, "").expect("探测成功"),
+    );
+    kernel
+        .plugins()
+        .load_all(vec![
+            std::sync::Arc::clone(&shared) as std::sync::Arc<dyn fuyubot_core::Plugin>
+        ])
+        .expect("登记不该失败");
+
+    let capability = ctx.provide_named("database", 1_u8).expect("注册能力");
+    assert!(shared.is_running());
+    // demo 在 start 里注册过一个工具（见它的 plugin_start）。
+    assert!(
+        loader.runtime().tools().contains("demo.echo"),
+        "激活后它的注册该在宿主上"
+    );
+
+    // 能力消失：**Effect 回滚**跑起来 → plugin_stop + 注册整批撤销。
+    drop(capability);
+    assert!(kernel.plugins().active().is_empty(), "依赖没了就该退回去");
+    assert!(!shared.is_running(), "plugin_stop 该被调过");
+    assert_eq!(kernel.plugins().pending().len(), 1);
+    assert!(
+        !loader.runtime().tools().contains("demo.echo"),
+        "回滚要把它注册的工具也撤掉，否则是残留"
+    );
+
+    // 能力回来：同一个适配器重新 apply，不用重新探测、不用重新加载文件。
+    let _again = ctx.provide_named("database", 2_u8).expect("再注册一次");
+    assert_eq!(kernel.plugins().active(), vec!["fuyubot.demo".to_owned()]);
+    assert!(shared.is_running(), "该重新 start 过");
+    assert!(
+        loader.runtime().tools().contains("demo.echo"),
+        "重新激活要把注册再装回去"
+    );
+}
+
+/// `unload` 是「依赖方先撤」：撤掉被依赖的插件时，依赖它的先退回 Pending。
+#[test]
+fn unloading_a_provider_retracts_dependents_first() {
+    let demo = build_fixture("fuyubot-plugin-demo");
+    let mut kernel = fuyubot_core::Kernel::new();
+    let ctx = kernel.context().clone();
+    let loader = PluginLoader::new(ctx.clone()).unwrap();
+    with_inject(&loader, "fuyubot.demo", &["database"]);
+
+    let shared = std::sync::Arc::new(
+        fuyubot_loader::DylibPlugin::probe(&loader, &demo, "").expect("探测成功"),
+    );
+    kernel
+        .plugins()
+        .load_all(vec![
+            std::sync::Arc::clone(&shared) as std::sync::Arc<dyn fuyubot_core::Plugin>
+        ])
+        .expect("登记不该失败");
+
+    // 让能力由一个**内核插件**提供，这样卸载它才有「撤提供者」的含义。
+    struct Db;
+    impl fuyubot_core::Plugin for Db {
+        fn name(&self) -> &str {
+            "db"
+        }
+        fn apply(&self, ctx: &Context) -> Result<fuyubot_core::Effect, fuyubot_core::KernelError> {
+            ctx.provide_named("database", 1_u8)
+        }
+    }
+    kernel.plugins().load(Db).expect("加载提供者");
+    assert!(shared.is_running(), "能力齐了，demo 该起来");
+
+    kernel.plugins().unload("db").expect("卸载提供者");
+    assert!(
+        !shared.is_running(),
+        "提供者一走，依赖方要先撤（plugin_stop 必须被调到）"
+    );
+    assert!(
+        !loader.runtime().tools().contains("demo.echo"),
+        "依赖方要先撤掉自己的注册"
+    );
+    assert_eq!(kernel.plugins().pending().len(), 1);
+}

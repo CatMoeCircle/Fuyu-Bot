@@ -42,6 +42,10 @@ pub enum KernelError {
     PluginAlreadyLoaded(String),
     #[error("插件 {0} 没有加载")]
     PluginNotLoaded(String),
+    /// `apply` 失败。**和 `Pending` 不是一回事**：Pending 是「等着」，
+    /// 这是「试过了、起不来」。宿主层（比如 dylib 适配器）把外部错误翻成它。
+    #[error("插件 {plugin} 启动失败: {reason}")]
+    PluginApplyFailed { plugin: String, reason: String },
     #[error("插件集合里有重名的 {0}")]
     DuplicatePlugin(String),
     #[error("插件 {plugin} 依赖 {dependency}，但 {dependency} 既没加载也不在本次加载集合里")]

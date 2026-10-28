@@ -15,7 +15,7 @@ mod runtime;
 pub use fuyubot_abi as abi;
 
 pub use loader::{
-    DLL_EXTENSION, LoadError, LoadedPlugin, OrderedLoad, PluginLoader, Probe, plugin_files,
+    DLL_EXTENSION, DylibPlugin, LoadError, LoadedPlugin, PluginLoader, Probe, plugin_files,
 };
 pub use pipeline::{PipelineError, UpdateOutcome, UpdatePipeline};
 pub use runtime::{

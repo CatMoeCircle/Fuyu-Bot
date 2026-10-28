@@ -2,13 +2,13 @@
 
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use fuyubot_abi::{
     ABI_VERSION, PluginHandle, PluginInitFn, PluginStartFn, PluginStopFn, SYM_PLUGIN_INIT,
     SYM_PLUGIN_START, SYM_PLUGIN_STOP,
 };
-use fuyubot_core::Context;
+use fuyubot_core::{Context, Effect};
 use libloading::{Library, Symbol};
 
 use crate::pipeline::UpdatePipeline;
@@ -349,46 +349,34 @@ impl PluginLoader {
         Ok(results)
     }
 
-    /// 扫描目录，**按依赖顺序**逐个加载。
+    /// 扫描目录，为每个动态库造一个 [`DylibPlugin`]（**只探测，不启动**）。
     ///
-    /// - `deps_for(插件名)` 返回它要的能力列表（宿主从配置段里读，见
-    ///   `[plugin.<名>].inject`）；将来插件自描述 manifest 就位后可以直接取自那里。
-    /// - `config_for(&probe)` 产出喂给 `plugin_start` 的配置 JSON。
+    /// 依赖排序**不在这里做**：拿到适配器之后交给
+    /// [`PluginManager::load_all`](fuyubot_core::PluginManager::load_all)，
+    /// 由内核的 fiber 状态机决定谁先起来、谁先等着。这是本版唯一一套依赖语义。
     ///
-    /// 已经排好序的那些按序加载，依赖没齐的**不加载**（不报错），由
-    /// [`OrderedLoad::blocked`] 汇报——和内核侧 Pending 一个道理。
-    pub fn load_dir_ordered(
+    /// 探测失败的不进队列，但原因要留住——文件在那儿却悄悄消失是最难查的那类事。
+    pub fn scan_dir(
         &self,
         dir: impl AsRef<Path>,
-        deps_for: impl Fn(&str) -> Vec<String>,
         config_for: impl Fn(&Probe) -> String,
-    ) -> std::io::Result<OrderedLoad> {
-        let mut errored: Vec<(PathBuf, LoadError)> = Vec::new();
-        let mut good = Vec::new();
+    ) -> std::io::Result<Vec<Result<DylibPlugin, LoadError>>> {
+        let mut adapters = Vec::new();
         for path in plugin_files(dir)? {
-            // 探测失败就当它不在本次队列里，但原因要留住——文件在那儿却悄悄
-            // 消失是最难查的那类事。
+            // 先探一次拿到配置需要的元数据（脚本路径那类东西由调用方按 path 决定）。
             match self.probe(&path) {
-                Ok(probe) => good.push(probe),
-                Err(error) => errored.push((path, error)),
+                Ok(probe) => {
+                    let config = config_for(&probe);
+                    adapters.push(Ok(DylibPlugin::new(
+                        probe,
+                        config,
+                        Arc::clone(&self.runtime),
+                    )));
+                }
+                Err(error) => adapters.push(Err(error)),
             }
         }
-
-        let (sorted, blocked) = pick_ready(good, &deps_for, &|capability| {
-            self.runtime.has_service(capability)
-        });
-
-        let mut loaded = errored
-            .into_iter()
-            .map(|(path, error)| (path, Err(error)))
-            .collect::<Vec<_>>();
-        for probe in sorted {
-            let config = config_for(&probe);
-            let outcome = self.load_with_config(&probe.path, &config);
-            loaded.push((probe.path.clone(), outcome));
-        }
-
-        Ok(OrderedLoad { loaded, blocked })
+        Ok(adapters)
     }
 }
 
@@ -403,76 +391,6 @@ pub struct Probe {
     /// `plugin_init` 自己报出来的名字（插件名是点分的，和 dll 文件名常常不同）。
     pub name: String,
     pub abi_version: u32,
-}
-
-/// 一次按依赖顺序加载的结果。
-pub struct OrderedLoad {
-    /// 真正加载了的，按**实际加载顺序**（不是文件名顺序）。
-    pub loaded: Vec<(PathBuf, Result<LoadedPlugin, LoadError>)>,
-    /// 依赖没齐、被留在原地的：`(探测结果, 还缺哪些能力)`。
-    ///
-    /// 和 Cordis 的 PENDING 一样，这是**等着**而不是失败——日志要说清楚。
-    pub blocked: Vec<(Probe, Vec<String>)>,
-}
-
-/// 依依赖把探针排成加载队列，实在排不进去的留在原处。
-///
-/// 每一轮把「依赖已经全齐」的都挑走；一轮下来没有进展就撒手——
-/// 剩下的是互相等（成环），或在等一个根本不存在的东西。
-///
-/// 一个能力两种满足方式，和内核侧的口径一致：服务表里已经有这个名字，
-/// 或者排在前面的某个插件就叫这个名字。
-fn pick_ready(
-    probes: Vec<Probe>,
-    deps_for: &impl Fn(&str) -> Vec<String>,
-    already_present: &dyn Fn(&str) -> bool,
-) -> (Vec<Probe>, Vec<(Probe, Vec<String>)>) {
-    let mut remaining = probes;
-    let mut sorted: Vec<Probe> = Vec::new();
-
-    loop {
-        let mut taken: Vec<Probe> = Vec::new();
-        let mut rest: Vec<Probe> = Vec::new();
-
-        for probe in remaining {
-            let missing: Vec<String> = deps_for(&probe.name)
-                .into_iter()
-                .filter(|capability| {
-                    !(already_present(capability)
-                        || sorted.iter().any(|done| done.name == *capability))
-                })
-                .collect();
-
-            if missing.is_empty() {
-                taken.push(probe);
-            } else {
-                rest.push(probe);
-            }
-        }
-
-        if taken.is_empty() {
-            remaining = rest;
-            break;
-        }
-        sorted.extend(taken);
-        remaining = rest;
-    }
-
-    let blocked = remaining
-        .into_iter()
-        .map(|probe| {
-            let missing = deps_for(&probe.name)
-                .into_iter()
-                .filter(|capability| {
-                    !(already_present(capability)
-                        || sorted.iter().any(|done| done.name == *capability))
-                })
-                .collect();
-            (probe, missing)
-        })
-        .collect();
-
-    (sorted, blocked)
 }
 
 /// 目录下的候选插件文件（按扩展名筛），已排序。
@@ -502,88 +420,90 @@ fn plugin_name(handle: &PluginHandle, path: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-#[cfg(test)]
-mod order_tests {
-    use super::*;
-
-    fn probe(name: &str) -> Probe {
-        Probe {
-            path: PathBuf::from(format!("{name}.{DLL_EXTENSION}")),
-            name: name.to_owned(),
-            abi_version: ABI_VERSION,
+/// 从文件里把库打开、init、start 全走一遍，成功后交回活着的那些东西。
+///
+/// 和 [`PluginLoader::load_with_config`] 的分工：那边「加载完就把生命周期交出去」，
+/// 返回一个自己管收摊的 [`LoadedPlugin`]；这里把四件东西交回来，由
+/// [`DylibPlugin`] 决定什么时候、以什么顺序收。
+fn start_library(
+    runtime: &Arc<HostRuntime>,
+    path: &Path,
+    config: &str,
+) -> Result<(PluginHandle, Option<PluginStopFn>, Library, u64), LoadError> {
+    let config = CString::new(config).map_err(|_| LoadError::BadConfig)?;
+    // 规范化成绝对路径：`open_library` 只对绝对路径开 Windows 的
+    // `LOAD_WITH_ALTERED_SEARCH_PATH`，插件旁边的兄弟 DLL 靠这个才找得到（约束 30 / 坑 43）。
+    let location = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    // SAFETY: 加载动态库就等于执行其中的代码，只加载可信文件。
+    let lib = unsafe { fuyubot_tdlib::loader::open_library(&location) }.map_err(|source| {
+        LoadError::Library {
+            path: path.to_owned(),
+            source,
         }
-    }
+    })?;
 
-    fn names_of(probes: &[Probe]) -> Vec<&str> {
-        probes.iter().map(|p| p.name.as_str()).collect()
-    }
+    let (init, start, stop) = {
+        // SAFETY: 只从刚加载的库里取符号，名字与类型由 ABI 约定。
+        let init: Symbol<PluginInitFn> =
+            unsafe { lib.get(SYM_PLUGIN_INIT) }.map_err(|source| LoadError::MissingSymbol {
+                path: path.to_owned(),
+                symbol: "plugin_init",
+                source,
+            })?;
+        let init = *init;
+        let start = unsafe { lib.get::<PluginStartFn>(SYM_PLUGIN_START) }
+            .ok()
+            .map(|symbol| *symbol);
+        let stop = unsafe { lib.get::<PluginStopFn>(SYM_PLUGIN_STOP) }
+            .ok()
+            .map(|symbol| *symbol);
+        (init, start, stop)
+    };
 
-    /// 传入顺序（= 文件名字典序）不该影响加载顺序，依赖说的才算。
-    #[test]
-    fn dependencies_decide_the_order_not_the_file_names() {
-        let deps = |name: &str| match name {
-            "b" => vec!["a".to_owned()],
-            _ => Vec::new(),
-        };
+    // 从这里开始，任何提前返回都会让 `scope` 在 drop 时把这批注册整批回滚。
+    let scope = runtime.plugin_scope();
+    let owner = scope.owner();
 
-        // 故意把依赖者排在前面。
-        let (sorted, blocked) = pick_ready(vec![probe("b"), probe("a")], &deps, &|_| false);
-
-        assert!(blocked.is_empty(), "依赖都在同一批里，不该有被卡住的");
-        assert_eq!(names_of(&sorted), ["a", "b"]);
-    }
-
-    /// 已经有人提供的能力也算满足——这就是「依赖某个插件」和
-    /// 「依赖某项能力」能共用一套判定的地方。
-    #[test]
-    fn a_capability_already_in_the_service_table_counts_as_ready() {
-        let deps = |name: &str| match name {
-            "consumer" => vec!["database".to_owned()],
-            _ => Vec::new(),
-        };
-
-        let (sorted, blocked) = pick_ready(vec![probe("consumer")], &deps, &|capability| {
-            capability == "database"
+    // SAFETY: init 是本库的 plugin_init；vtable 由本运行时持有，地址稳定。
+    let handle = unsafe { init(runtime.vtable_ptr()) };
+    if !handle.is_valid() {
+        return Err(LoadError::InitFailed {
+            path: path.to_owned(),
         });
-
-        assert!(blocked.is_empty());
-        assert_eq!(names_of(&sorted), ["consumer"]);
     }
 
-    /// 成环 / 依赖一个不存在的东西：留下来排队并重报，而不是报错。
-    #[test]
-    fn cycles_and_absent_dependencies_are_blocked_not_loaded() {
-        let deps = |name: &str| match name {
-            "a" => vec!["b".to_owned()],
-            "b" => vec!["a".to_owned()],
-            _ => vec!["nowhere".to_owned()],
-        };
+    if handle.abi_version != ABI_VERSION {
+        // 版本不兼容时**不能**调 plugin_stop：那是对一个我们不认识的 ABI 下手。
+        return Err(LoadError::AbiMismatch {
+            path: path.to_owned(),
+            plugin: handle.abi_version,
+            host: ABI_VERSION,
+        });
+    }
 
-        let (sorted, blocked) =
-            pick_ready(vec![probe("a"), probe("b"), probe("c")], &deps, &|_| false);
+    // 名字必须在 start 之前登记：插件在 `start` 里就可能调 `set_config`，
+    // 宿主靠 owner → 名字的映射判定「这是谁的段」。
+    let name = plugin_name(&handle, path);
+    runtime.register_owner_name(owner, &name);
 
-        assert!(sorted.is_empty(), "互相等、或等不到的，都不该被加载");
-        assert_eq!(blocked.len(), 3);
-        for (probe, missing) in &blocked {
-            assert!(!missing.is_empty(), "{:?} 该报得出缺什么", probe.name);
+    if let Some(start) = start {
+        // SAFETY: handle 来自本插件的 init；config 在调用期间存活。
+        let code = unsafe { start(handle, config.as_ptr()) };
+        if code != 0 {
+            if let Some(stop) = stop {
+                // SAFETY: ABI 已经校验过，这里停掉是安全的。
+                unsafe { stop(handle) };
+            }
+            runtime.unregister_owner_name(owner);
+            return Err(LoadError::StartFailed {
+                path: path.to_owned(),
+                code,
+            });
         }
     }
 
-    /// 排在前面的插件本身就是一种能力：这正是「依赖某个具体插件」的写法。
-    #[test]
-    fn earlier_plugins_satisfy_later_ones_by_name() {
-        let deps = |name: &str| match name {
-            "c" => vec!["a".to_owned()],
-            "b" => vec!["a".to_owned()],
-            _ => Vec::new(),
-        };
-
-        let (sorted, blocked) =
-            pick_ready(vec![probe("c"), probe("b"), probe("a")], &deps, &|_| false);
-
-        assert!(blocked.is_empty());
-        assert_eq!(names_of(&sorted), ["a", "c", "b"], "同轮的保持原序");
-    }
+    scope.commit();
+    Ok((handle, stop, lib, owner))
 }
 
 /// 这个动态库是不是 Go 编出来的（Go 的库不能卸载，见 [`LoadedPlugin`]）。///
@@ -600,6 +520,183 @@ fn looks_like_go_binary(path: &Path) -> bool {
         return false;
     };
     bytes.windows(MAGIC.len()).any(|window| window == MAGIC)
+}
+
+/// 一个动态库插件在**内核 Fiber 状态机**里的形态。
+///
+/// 这是「把 dylib 接进 Cordis」的桥：Cordis 那边的插件是一个实现了
+/// [`fuyubot_core::Plugin`] 的 Rust 值，依赖用 `inject()` 声明、生命周期由
+/// [`PluginManager`](fuyubot_core::PluginManager) 的 Pending/Active 状态机驱赶；
+/// 而 dylib 那侧的「插件」是四个导出符号 + 一张 vtable。适配器把后者伪装成前者，
+/// 于是两边只剩**一套**依赖语义，不再各写一份。
+///
+/// 它**不**自己做依赖排序，也不自己判断能不能起来——那是 `PluginManager` 的活。
+/// 它只负责：`apply` = dlopen + `plugin_init` + `plugin_start`，
+/// 返回的 `Effect` = `plugin_stop` + 宿主侧注册整批回滚。
+///
+/// ⚠️ **卸载是软的（不 `dlclose`）**：`Effect` 跑完只停插件、撤注册，动态库本身
+/// 留在 `Slot::Stopped` 里，进程退出才释放。原因是安全边界——事件总线的订阅快照
+/// 持着指向插件代码的回调 `Arc`，`dlclose` 之后那条订阅万一被调到就是访问违例。
+/// Cordis 那边靠 GC 托管根本没有这个问题；我们只能选择不卸载。
+/// 代价是每个卸过的插件留几 MB 映射，换掉的是一整类崩溃。
+/// （Go 的 c-shared 本来就不能卸载，见约束 50——现在两种插件口径一致了。）
+pub struct DylibPlugin {
+    name: String,
+    path: PathBuf,
+    config: String,
+    /// 承载 `plugin_init` / `plugin_start` / `plugin_stop` 与全部 ABI 状态。
+    ///
+    /// `Mutex` 不是为了并发调用——ABI 回调是同步的——而是因为 `apply` 走
+    /// `&self`（[`fuyubot_core::Plugin`] 的签名），可变状态只能靠内部可变性。
+    ///
+    /// 外面再套一层 `Arc` 是为了 `Effect`：回滚闭包要求 `'static`，而它由内核
+    /// 在**卸载时**才跑，那时 `&self` 早就不在了。闭包自己持一份 `Arc` 才安全。
+    slot: Arc<Mutex<Slot>>,
+    runtime: Arc<HostRuntime>,
+    /// 探测阶段就知道的 ABI 版本（只为诊断；真加载时会再校验一次）。
+    abi_version: u32,
+}
+
+/// 把 dylib 插件伪装成内核插件。
+///
+/// `apply` 做完 `plugin_init` + `plugin_start`，把「怎么收摊」包成 [`Effect`]：
+/// 内核只在两处跑它——这个 fiber 退回 Pending（依赖消失），或整个卸载。
+/// 那正是 Cordis 的 `Effect` 语义，所以不需要 `dispose()`（它留给「服务注销之外
+/// 的清理」，dylib 插件没有这种东西）。
+impl fuyubot_core::Plugin for DylibPlugin {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 依赖来自配置段 `[plugin.<插件名>].inject`。
+    ///
+    /// 为什么不是插件自描述：ABI v3 没有 `plugin_manifest`（见 gaps 缺口 5 的
+    /// 「仍欠 ①」）。宿主读自己的配置表是现在唯一能落地的来源，等 ABI v4 有了
+    /// manifest 再换——换的时候只改这一个方法。
+    fn inject(&self) -> Vec<String> {
+        self.runtime
+            .plugin_config_value(&self.name, "inject")
+            .and_then(|value| value.as_array().cloned())
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn apply(&self, _ctx: &Context) -> Result<Effect, fuyubot_core::KernelError> {
+        let (handle, stop, lib, owner) = start_library(&self.runtime, &self.path, &self.config)
+            .map_err(|error| {
+                // 内核的 `KernelError` 不认 `LoadError`（那是本 crate 的类型，
+                // 且 core 不许依赖 loader）。带上原因文本，日志里还能看懂。
+                fuyubot_core::KernelError::PluginApplyFailed {
+                    plugin: self.name.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+
+        *self.lock() = Slot::Running {
+            handle,
+            stop,
+            owner,
+        };
+
+        // 闭包自己持一份 `Arc`：内核会在**卸载时**才跑它，`&self` 那时已经没了。
+        let slot = Arc::clone(&self.slot);
+        let runtime = Arc::clone(&self.runtime);
+        Ok(Effect::new(move || Self::teardown(&slot, &runtime, lib)))
+    }
+}
+
+/// 一次激活产出的全部「活的东西」。没激活时是 [`Slot::Idle`]。
+///
+/// ⚠️ 手写 `Send + Sync`：`PluginHandle` 里有 `*mut c_void` / `*const c_char`
+/// （插件自己的不透明数据），编译器不会自动判定它可跨线程。但 ABI 契约要求插件
+/// **必须**是线程安全的（回调会从接收循环线程进来，见约束 22 与 `Plugin: Send + Sync`），
+/// 所以这个断言与 `define_plugin!` 对插件的那个要求是同一个前提。
+unsafe impl Send for Slot {}
+unsafe impl Sync for Slot {}
+
+enum Slot {
+    Idle,
+    Running {
+        handle: PluginHandle,
+        /// `plugin_stop` 是可选导出（只做元数据登记的插件没有它）。
+        stop: Option<PluginStopFn>,
+        owner: u64,
+    },
+    /// 已经断了，动态库留着不让卸载（见 [`DylibPlugin`] 的文档）。
+    /// 装着那个 `Library` 只为让它活到进程结束，字段本身不读。
+    #[allow(dead_code)]
+    Stopped {
+        lib: Library,
+    },
+}
+
+impl DylibPlugin {
+    /// 包装一个已经探测过的动态库，但**不启动它**。
+    pub fn new(probe: Probe, config: impl Into<String>, runtime: Arc<HostRuntime>) -> Self {
+        Self {
+            name: probe.name,
+            path: probe.path,
+            config: config.into(),
+            slot: Arc::new(Mutex::new(Slot::Idle)),
+            runtime,
+            abi_version: probe.abi_version,
+        }
+    }
+
+    /// 探测 + 包装一步到位。
+    pub fn probe(
+        loader: &PluginLoader,
+        path: impl AsRef<Path>,
+        config: impl Into<String>,
+    ) -> Result<Self, LoadError> {
+        let probe = loader.probe(path)?;
+        Ok(Self::new(probe, config, Arc::clone(loader.runtime())))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn abi_version(&self) -> u32 {
+        self.abi_version
+    }
+
+    /// 现在是不是活着（`plugin_start` 成功过且没被停）。
+    pub fn is_running(&self) -> bool {
+        matches!(*self.lock(), Slot::Running { .. })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Slot> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 停掉并撤掉它注册的一切，把库留在 [`Slot::Stopped`] 里。
+    ///
+    /// `lib` 是这次激活打开的动态库。它**不会被 drop**——收进 `Stopped` 让它活到
+    /// 进程结束，这就是「软卸载」的全部实现（理由见类型文档）。
+    ///
+    /// 收成**自由函数**而不是 `&self` 上的方法：回滚闭包要 `'static`，只拿得到
+    /// `Arc<Mutex<Slot>>` 与 `Arc<HostRuntime>`，拿不到 `&self`。
+    fn teardown(slot: &Arc<Mutex<Slot>>, runtime: &HostRuntime, lib: Library) {
+        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::mem::replace(&mut *guard, Slot::Stopped { lib });
+        if let Slot::Running {
+            handle,
+            stop,
+            owner,
+        } = previous
+        {
+            // 先让插件自己收摊，再撤宿主这侧的注册。
+            if let Some(stop) = stop {
+                // SAFETY: handle 来自本插件的 plugin_init，ABI 版本已校验。
+                unsafe { stop(handle) };
+            }
+            runtime.rollback_owner(owner);
+            runtime.unregister_owner_name(owner);
+        }
+    }
 }
 
 #[cfg(test)]
