@@ -8,6 +8,8 @@
 //! ```text
 //! fuyubot init                              生成 fuyubot.toml + plugins/
 //! fuyubot run [--background]                起框架、加载插件（后台运行 = 日志进 logs/fuyubot.log）
+//! fuyubot login                             只登录：建 client → 走完授权 → 打印账户 → 退出（不加载插件）
+//! fuyubot logout [--yes]                    清掉本地 TDLib 会话目录（默认只打印将要删什么）
 //! fuyubot status                            看这个目录上的实例在不在跑
 //! fuyubot config                            打印**生效的**配置值（含默认值）
 //! fuyubot stop                              停掉它
@@ -20,6 +22,7 @@
 //! 已按新规格拆掉。
 
 mod instance;
+mod logout;
 mod scaffold;
 
 use std::path::{Path, PathBuf};
@@ -46,6 +49,15 @@ enum Command {
     Init(InitArgs),
     /// 起框架、加载插件
     Run(RunArgs),
+    /// 只登录，不起框架：建 TDLib 客户端 → 走完授权 → 打印账户 → 退出。
+    ///
+    /// **不加载插件、不开接收循环**（缺口 22）。登录完 session 落在 `data/`，
+    /// 之后 `fuyubot run`（含 `--background`）起来就直接进 `Ready`。
+    Login(LoginArgs),
+    /// 清掉本地 TDLib 会话目录（= 退出登录；下次要重新登录）。
+    ///
+    /// 默认**只打印将要删除什么**，加 `--yes` 才真删。实例在跑时拒绝。
+    Logout(LogoutArgs),
     /// 看这个目录上的实例在不在跑（读 `.fuyubot/`）
     Status(StatusArgs),
     /// 停掉这个目录上跑着的实例
@@ -76,6 +88,12 @@ struct RunArgs {
     /// 配置文件
     #[arg(long, default_value = scaffold::CONFIG_FILE)]
     config: PathBuf,
+    /// 覆盖配置里的 `api_id`（**不是**秘密，可以写在命令行 / 脚本里）。
+    ///
+    /// 优先级：**本参数 → 环境变量 `TG_API_ID` → 配置 `[telegram].api_id` → 交互提问**。
+    /// `api_hash` 是凭据，**没有**对应参数（硬约束 41）：只走 `TG_API_HASH` 或交互输入。
+    #[arg(long, value_name = "ID")]
+    api_id: Option<i64>,
     /// 覆盖配置里的插件目录
     #[arg(long)]
     plugin_dir: Option<PathBuf>,
@@ -102,6 +120,32 @@ struct RunArgs {
     /// （脚本插件 2000，原生插件 150）。插件要发慢速网络请求时把它调大。
     #[arg(long, value_name = "MS")]
     replay_wait: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+struct LoginArgs {
+    /// 配置文件
+    #[arg(long, default_value = scaffold::CONFIG_FILE)]
+    config: PathBuf,
+    /// 覆盖配置里的 `api_id`（**不是**秘密）。
+    ///
+    /// 优先级：**本参数 → 环境变量 `TG_API_ID` → 配置 → 交互提问**。
+    /// `api_hash` 没有对应参数（硬约束 41）：只走 `TG_API_HASH` 或交互输入。
+    #[arg(long, value_name = "ID")]
+    api_id: Option<i64>,
+}
+
+#[derive(Args, Debug)]
+struct LogoutArgs {
+    /// 配置文件（会话目录就是它旁边的 `[telegram].data_dir`，默认 `<项目根>/data`）
+    #[arg(long, default_value = scaffold::CONFIG_FILE)]
+    config: PathBuf,
+    /// 真的删除。**不加只打印「将要删除什么」**（默认是预览，不是删除）。
+    ///
+    /// 三道守卫与这个开关无关：实例在跑 → 一律拒绝；目录不在项目根内 → 额外醒目警告；
+    /// 目录里没有 TDLib 的会话标记（`td.binlog`）→ 一律拒绝（那多半不是 TDLib 数据目录）。
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -174,6 +218,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Run(args) if args.background => run_background(args)?,
         Command::Run(args) => run(args)?,
+        Command::Login(args) => login(args)?,
+        Command::Logout(args) => logout::run(&args)?,
         Command::Status(args) => status(&args)?,
         Command::Stop(args) => stop(&args)?,
         Command::Config(args) => config_list(&args)?,
@@ -228,9 +274,11 @@ fn stop(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// ⚠️ 子进程的 stdin 是 `null`：**后台跑不能交互**。要登录（没有 session、也没有
 /// `TG_BOT_TOKEN`）就会直接失败——父进程把日志尾巴打出来指路，而不是挂在那里等人输入。
 fn run_background(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // 参数错误要**在前台**报出来：子进程的报错只会留在日志里。
+    let cli_api_id = checked_cli_api_id(args.api_id)?;
     let root = parent_or_dot(&args.config);
     // 先在本进程里把项目建好：两个进程同时 init 会撞车（一个成功一个报「已经存在」）。
-    ensure_project(&root, &args.config)?;
+    ensure_project(&root, &args.config, cli_api_id)?;
 
     let log = instance::log_path(&root);
     if let Some(parent) = log.parent() {
@@ -254,6 +302,10 @@ fn run_background(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.no_login {
         command.arg("--no-login");
+    }
+    // `--api-id` 是**非秘密**的覆盖，后台子进程必须拿到同一份（否则前后台用两个 api_id）。
+    if let Some(api_id) = args.api_id {
+        command.arg("--api-id").arg(api_id.to_string());
     }
     if let Some(replay) = &args.replay {
         command.arg("--replay").arg(replay);
@@ -324,6 +376,47 @@ fn existing_root(config: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// 实例在跑就**拒绝**（`login` / `logout` 共用）。
+///
+/// 判据就是 [`instance::probe`] 的那把锁（不是「PID 还活着吗」）：拿不到锁 = 真有进程
+/// 持有这个目录的实例。为什么这两条命令要挡：TDLib 的 sqlite + binlog 同一时刻只能
+/// 一个进程打开，`login` 再开一次、`logout` 直接把目录删掉，都会把跑着的实例拆坏。
+///
+/// 回报的是「已经存在的实例」而不是「没实例」——`Stale`（锁文件在、没人持有）是安全的，
+/// 那是上次没收摊，`run` 自己会接管。
+fn refuse_while_running(root: &Path) -> Result<(), String> {
+    match instance::probe(root) {
+        instance::State::Running(Some(info)) => Err(format!(
+            "{} 上还有实例在跑（{}，pid {}，已运行 {}）——先 `fuyubot stop` 再来；\
+             运行中动 TDLib 的会话目录会把它的数据库拆坏",
+            root.display(),
+            info.name,
+            info.pid,
+            instance::uptime_text(info.started, instance::unix_now())
+        )),
+        instance::State::Running(None) => Err(format!(
+            "{} 上还有一个实例正在启动（状态还没发布）——等它起来后 `fuyubot stop` 再来",
+            root.display()
+        )),
+        instance::State::Absent | instance::State::Stale(_) => Ok(()),
+    }
+}
+
+/// 把 `--config` 归一成**真正要读**的那份文件。
+///
+/// 默认名字（`fuyubot.toml`）是相对的、还要支持「从子目录往上找」，所以得用
+/// [`scaffold::find_config`] 找出来的那份；`--config` 明确写了别的名字就是显式意图，
+/// 原样用（文件不在 = 一份默认值，见 [`scaffold::load_config`]）。
+///
+/// `run` / `login` / `logout` 都走这一条：三条路读的配置必须是同一份，
+/// 否则 `data_dir` 一差，登录与运行就会各写一个 TDLib 数据库。
+fn resolved_config_path(configured: &Path, root: &Path) -> PathBuf {
+    match scaffold::find_config(root) {
+        Some(found) if configured == Path::new(scaffold::CONFIG_FILE) => found,
+        _ => configured.to_path_buf(),
+    }
+}
+
 /// 从 `start` 往上找带 `fuyubot.toml` 的目录。
 fn project_root(start: &Path) -> Option<PathBuf> {
     scaffold::find_config(start).and_then(|path| path.parent().map(Path::to_path_buf))
@@ -346,7 +439,77 @@ fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(run_async(args))
 }
 
+/// `fuyubot login`：**只**把登录走完（缺口 22 的「独立登录命令」）。
+///
+/// 与 `run` 的差别只有两处：**不加载插件、不开接收循环**。其余（配置解析、自动 init、
+/// 凭据来源、`resolve_parameters`、`drive_login`、账户打印）全部复用 `run` 的那一套——
+/// 两条路各写一份的话，`data_dir` 或凭据优先级一旦漂移，就会出现「`run` 能登、`login`
+/// 登不上」这种最难查的分叉。
+///
+/// 为什么需要它：`run --background` 没有 stdin，登录不了；容器 / CI 想先登录一次、
+/// 之后只跑实例，也得有个只做登录的命令。登录完 session 落在 `data/`，
+/// 之后 `fuyubot run --background` 起来就直接进 `Ready`（`drive_login` 会打那条判据）。
+///
+/// 实例在跑时拒绝并**拿锁**：登录可能要等验证码 / 扫码好几分钟，这期间
+/// `fuyubot run` 不该挤进来抢同一个 TDLib 数据库（判据与 `logout` 共用）。
+fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(login_async(args))
+}
+
+async fn login_async(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // 先验 `--api-id`（显式写错就立刻报）：别先建了项目再因为参数错而半途退出。
+    let cli_api_id = checked_cli_api_id(args.api_id)?;
+    let root = parent_or_dot(&args.config);
+    // 配置与 `run` 同源：自动 init 会让「第一次就 `login`」也能直接工作。
+    ensure_project(&root, &args.config, cli_api_id)?;
+    let config_path = resolved_config_path(&args.config, &root);
+    let root = parent_or_dot(&config_path);
+    let config = scaffold::load_config(&config_path)?;
+
+    refuse_while_running(&root)?;
+    // 锁一直拿到本命令退出：登录期间 `fuyubot run` 会被这把锁挡在外面。
+    let instance_lock = instance::InstanceLock::acquire(&root)?;
+
+    let mut kernel = Kernel::new();
+    kernel.start().await?;
+    let loader = PluginLoader::new(kernel.context().clone())?;
+    let pipeline = Arc::new(loader.pipeline());
+
+    // ⚠️ 这里**不** `load_plugins`、也**不** `spawn_dispatch`：登录只需要一个能收发
+    // TDLib 更新的客户端，插件与分发都是 `run` 的事（不然登个录还要装/起一遍插件）。
+    let Some(client) = attach_tdlib(
+        &pipeline,
+        config.tdlib.path.as_deref(),
+        config.tdlib.log_verbosity(),
+    ) else {
+        kernel.stop().await?;
+        return Err("TDLib 没就绪，登录没法进行——上面的报错说明了缺什么\
+                    （TDLIB_TDJSON_PATH、exe 同级 tdjson，或 [tdlib].path）"
+            .into());
+    };
+
+    let parameters = resolve_parameters(&config, &config_path, &root, cli_api_id)?;
+    let account = config.telegram.account_type()?;
+    println!(
+        "只登录：不加载插件、不开接收循环；登完就退出\
+         （之后 `fuyubot run` 会直接用这份 session）"
+    );
+    drive_login(&client, &parameters, account, &pipeline)?;
+    println!(
+        "登录完成：session 在 {}——`fuyubot run`（含 `--background`）起来会直接进 Ready",
+        parameters.data_dir.display()
+    );
+
+    // 收摊：没有插件要卸载、没有接收循环要停；客户端 drop 时 TDLib 自己关掉会话。
+    drop(instance_lock);
+    kernel.stop().await?;
+    Ok(())
+}
+
 async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // 参数错误要**在动任何文件之前**报出来（自动 init 会建项目目录）。
+    let cli_api_id = checked_cli_api_id(args.api_id)?;
     // 启动时刻：写进状态文件给 `status` 算「已运行多久」。
     let started_at = instance::unix_now();
     // 项目根目录：`fuyubot.toml` 所在目录（找不到就是当前目录）。
@@ -357,13 +520,10 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // ⚠️ **`--replay` 不自动 init**：回放是「离线验插件」的开发路径，不该因为跑一次就在
     //    当前目录里留下 `fuyubot.toml`（踩过一次：在仓库根跑回放，仓库里凭空多了个配置文件）。
     if args.replay.is_none() {
-        ensure_project(&root, &args.config)?;
+        ensure_project(&root, &args.config, cli_api_id)?;
     }
 
-    let config_path = match scaffold::find_config(&root) {
-        Some(found) if args.config == Path::new(scaffold::CONFIG_FILE) => found,
-        _ => args.config.clone(),
-    };
+    let config_path = resolved_config_path(&args.config, &root);
     let root = parent_or_dot(&config_path);
     let config = scaffold::load_config(&config_path)?;
     let plugin_dir = args
@@ -454,7 +614,12 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     //    `authorizationStateWaitTdlibParameters`，**已有的 session 也不会被打开**
     //    （数据库目录正是在 `setTdlibParameters` 里给的）。它只适合「只想把插件跑起来」。
     let parameters = match (tdlib_client.as_ref(), args.no_login) {
-        (Some(_), false) => Some(resolve_parameters(&config, &config_path, &root)?),
+        (Some(_), false) => Some(resolve_parameters(
+            &config,
+            &config_path,
+            &root,
+            cli_api_id,
+        )?),
         _ => None,
     };
 
@@ -742,13 +907,20 @@ fn plugin_uninstall(args: UninstallArgs) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// `run` 的自动初始化：缺配置文件就照模板写一份，插件目录不在就建。
+/// `run` / `login` 的自动初始化：缺配置文件就照模板写一份，插件目录不在就建。
 ///
 /// **刻意不复用 `init()`**：那个命令在文件已存在时报错（对显式 `init` 是对的），
 /// 而 `run` 要的是幂等——「有就直接跑，没有就建好再跑」，这样用户少一步。
 ///
 /// 只处理**默认文件名**：`--config` 指了别的名字就是显式意图，不替用户凭空造一个。
-fn ensure_project(root: &Path, configured: &Path) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `api_id_override` 是命令行的 `--api-id`（非秘密）：模板里顺手写上，省一次手填。
+/// 优先级与 [`resolve_parameters`] 一致：`--api-id` → `TG_API_ID` → 0（让 `run` 再问）。
+fn ensure_project(
+    root: &Path,
+    configured: &Path,
+    api_id_override: Option<i64>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if configured.is_file() {
         return Ok(());
     }
@@ -762,9 +934,12 @@ fn ensure_project(root: &Path, configured: &Path) -> Result<(), Box<dyn std::err
     }
     // `TG_API_ID` 不是秘密，顺手带进模板省得用户手填；名字允许用 FUYUBOT_NAME 覆盖。
     let name = std::env::var("FUYUBOT_NAME").unwrap_or_else(|_| "fuyubot".to_owned());
-    let api_id = std::env::var("TG_API_ID")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
+    let api_id = api_id_override
+        .or_else(|| {
+            std::env::var("TG_API_ID")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+        })
         .unwrap_or(0);
     scaffold::init(root, &name, api_id)?;
     println!(
@@ -835,37 +1010,100 @@ impl fuyubot_tdlib::Prompter for ConsolePrompter {
     }
 }
 
+/// api_id 是从哪一路来的（只用来打一句「凭据已就位」与写单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiIdSource {
+    /// 命令行 `--api-id`（缺口 24）。
+    Cli,
+    /// 环境变量 `TG_API_ID`。
+    Env,
+    /// 配置文件 `[telegram].api_id`（旧位置 `[bot].api_id` 也算）。
+    Config,
+    /// 都没有，得交互式问。
+    Asked,
+}
+
+impl ApiIdSource {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Cli => "命令行 --api-id",
+            Self::Env => "环境变量 TG_API_ID",
+            Self::Config => "配置 [telegram].api_id",
+            Self::Asked => "交互输入",
+        }
+    }
+}
+
+/// 按优先级挑 api_id：**命令行 → 环境变量 → 配置 → 问用户**（返回值 `0` = 得问）。
+///
+/// 纯函数：环境变量由调用方读好传进来。单测**不许**去改进程环境——`cargo test` 的
+/// 多个测试线程共享同一个环境，`set_var` 会让别的测试随机变红。
+///
+/// `0` 一律当「没给」：模板里 `api_id = 0` 是占位，CI 里 `TG_API_ID=` 也常留空。
+fn pick_api_id(cli: Option<i64>, env: Option<i64>, configured: i64) -> (i64, ApiIdSource) {
+    let usable = |id: i64| id != 0;
+    if let Some(id) = cli.filter(|id| usable(*id)) {
+        return (id, ApiIdSource::Cli);
+    }
+    if let Some(id) = env.filter(|id| usable(*id)) {
+        return (id, ApiIdSource::Env);
+    }
+    if usable(configured) {
+        return (configured, ApiIdSource::Config);
+    }
+    (0, ApiIdSource::Asked)
+}
+
+/// 校验命令行的 `--api-id`：**显式写错就报错**，不静默退回配置。
+///
+/// `0` / 负数当成「填错了」而不是「没写」——用户既然写了参数，得到一个 0 只会更困惑
+/// （`0` 在模板里是占位，在真实调用里必然失败）。
+fn checked_cli_api_id(cli: Option<i64>) -> Result<Option<i64>, String> {
+    match cli {
+        Some(id) if id <= 0 => Err(format!(
+            "`--api-id {id}` 不合法：api_id 是正整数（到 https://my.telegram.org 申请一个）"
+        )),
+        other => Ok(other),
+    }
+}
+
 /// 把登录要用的 TDLib 参数凑齐：**缺什么就交互式问用户**，问到的**回写配置**。
 ///
-/// 优先级：环境变量 → 配置 → **交互式提问**（`run` 自己问，
-/// 不让用户先去翻文档找配置项）。
+/// 优先级（缺口 24 定的）：
+/// - `api_id`：**命令行 `--api-id` → 环境变量 `TG_API_ID` → 配置 → 交互式提问**
+///   （`login` / `run` 自己问，不让用户先去翻文档找配置项）；
+/// - `api_hash`：环境变量 `TG_API_HASH` → 配置里已保存的 → 交互式提问。
+///   **没有**对应命令行参数（硬约束 41）。
 /// - `api_id` **不是**凭据（约束 41 只禁 Bot Token / 手机号 / 密码），环境变量与配置都认；
 /// - `api_hash` 是凭据，但**每次冷启动都要随 `setTdlibParameters` 发给 TDLib**
 ///   （session 还有效也照样要发），不记住就得每次手输——所以环境变量与
 ///   配置里已保存的都认，**交互问出来的回写** `[telegram].api_hash` 明文一行。
 ///
-/// ⚠️ 回写只发生在「这次真的问过」时：环境变量/配置来的值不动文件，
+/// ⚠️ 回写只发生在「这次真的问过」时：命令行 / 环境变量 / 配置来的值不动文件，
 /// 「我没让它改配置它却改了」比多问一次更让人困惑。
 fn resolve_parameters(
     config: &scaffold::Config,
     config_path: &Path,
     root: &Path,
+    cli_api_id: Option<i64>,
 ) -> Result<fuyubot_tdlib::TdlibParameters, Box<dyn std::error::Error>> {
     let mut prompter = ConsolePrompter::default();
     // 这两个只有**交互问出来**才有值——它们是回写的唯一依据。
     let mut asked_id: Option<i64> = None;
     let mut asked_hash: Option<String> = None;
 
+    let cli_api_id = checked_cli_api_id(cli_api_id)?;
     let id_from_env = std::env::var("TG_API_ID")
         .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|id| *id != 0);
-    let configured_id = id_from_env.unwrap_or_else(|| config.telegram.api_id(&config.bot));
-    let api_id = if configured_id != 0 {
-        configured_id
+        .and_then(|value| value.parse::<i64>().ok());
+    let (picked_id, id_source) =
+        pick_api_id(cli_api_id, id_from_env, config.telegram.api_id(&config.bot));
+    let api_id = if picked_id != 0 {
+        picked_id
     } else {
         let answer = prompter.ask(
-            "api_id（到 https://my.telegram.org 申请；它不是秘密，也可以填进 [telegram].api_id）",
+            "api_id（到 https://my.telegram.org 申请；它不是秘密，也可以填进 [telegram].api_id \
+             或命令行 --api-id）",
         )?;
         let parsed = answer.parse::<i64>().map_err(|_| {
             format!("api_id 得是数字，给的是「{answer}」——到 https://my.telegram.org 申请一个")
@@ -901,11 +1139,6 @@ fn resolve_parameters(
     // **配置与凭据都齐了就直接进下一步**：一次都没问过就说清凭据是从哪来的，
     // 免得用户以为「没提问 = 凭据没被用上」。
     if !prompter.asked {
-        let id_src = if id_from_env.is_some() {
-            "环境变量 TG_API_ID"
-        } else {
-            "配置 [telegram].api_id"
-        };
         let hash_src = if hash_from_env.is_some() {
             "环境变量 TG_API_HASH"
         } else if saved_hash.is_some() {
@@ -913,7 +1146,10 @@ fn resolve_parameters(
         } else {
             "交互输入"
         };
-        println!("api_id 与 api_hash 都已就位（{id_src} + {hash_src}），跳过初始化与提问");
+        println!(
+            "api_id 与 api_hash 都已就位（{} + {hash_src}），跳过初始化与提问",
+            id_source.describe()
+        );
     }
 
     // 交互问出来的才落盘：下次冷启动不用再输一遍（**每次**都要随 `setTdlibParameters`
@@ -988,7 +1224,7 @@ fn drive_login(
         Duration::from_secs(15),
         pipeline,
     ) {
-        Ok(me) => println!("开始运行，账户：{}", describe_account(&me)),
+        Ok(me) => println!("已登录，账户：{}", describe_account(&me)),
         Err(error) => eprintln!("已登录，但 getMe 没拿到（{error}）——不影响运行"),
     }
     Ok(())
@@ -1412,6 +1648,89 @@ mod tests {
         assert!(Cli::try_parse_from(["fuyubot", "new-plugin", "demo"]).is_err());
         // 插件也不归运行时 CLI 编（变更 5）：`build-plugin` 已经拆掉了。
         assert!(Cli::try_parse_from(["fuyubot", "build-plugin"]).is_err());
+    }
+
+    /// 缺口 22 的两个新子命令 + 缺口 24 的 `--api-id`：解析结果要是我们想的那样。
+    ///
+    /// 同时钉住「**没有**凭据参数」这条硬约束 41：`--api-hash` / `--token` 必须解析失败
+    /// （谁想加它们，这条会先红）。
+    #[test]
+    fn login_logout_and_api_id_parse() {
+        // login：默认配置文件 + 可选 --api-id（非秘密，可以写在命令行）。
+        let cli = Cli::try_parse_from(["fuyubot", "login"]).unwrap();
+        match cli.command {
+            Command::Login(args) => {
+                assert_eq!(args.config, PathBuf::from(scaffold::CONFIG_FILE));
+                assert_eq!(args.api_id, None);
+            }
+            other => panic!("解析成了 {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["fuyubot", "login", "--api-id", "42"]).unwrap();
+        match cli.command {
+            Command::Login(args) => assert_eq!(args.api_id, Some(42)),
+            other => panic!("解析成了 {other:?}"),
+        }
+
+        // logout：默认是**预览**，`--yes` 才是真删。
+        let cli = Cli::try_parse_from(["fuyubot", "logout"]).unwrap();
+        match cli.command {
+            Command::Logout(args) => assert!(!args.yes, "默认绝不能是删除"),
+            other => panic!("解析成了 {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["fuyubot", "logout", "--yes"]).unwrap();
+        match cli.command {
+            Command::Logout(args) => assert!(args.yes),
+            other => panic!("解析成了 {other:?}"),
+        }
+
+        // run 也认 --api-id（缺口 24），并且和别的开关能一起给。
+        let cli = Cli::try_parse_from(["fuyubot", "run", "--api-id", "7", "--no-login"]).unwrap();
+        match cli.command {
+            Command::Run(args) => {
+                assert_eq!(args.api_id, Some(7));
+                assert!(args.no_login);
+            }
+            other => panic!("解析成了 {other:?}"),
+        }
+
+        // 硬约束 41：凭据**没有**命令行参数。
+        assert!(
+            Cli::try_parse_from(["fuyubot", "login", "--api-hash", "x"]).is_err(),
+            "api_hash 是凭据，不许有命令行参数"
+        );
+        assert!(
+            Cli::try_parse_from(["fuyubot", "run", "--token", "x"]).is_err(),
+            "Bot Token 是凭据，不许有命令行参数"
+        );
+        assert!(
+            Cli::try_parse_from(["fuyubot", "logout", "--api-id", "1"]).is_err(),
+            "logout 不需要 api_id"
+        );
+    }
+
+    /// 缺口 24 的优先级：**命令行 → 环境变量 → 配置 → 交互提问**。
+    ///
+    /// 这里测纯函数而不是 `resolve_parameters`：后者要读进程环境，而 `cargo test`
+    /// 的测试线程共享环境，`set_var` 会让同批别的测试随机变红。
+    #[test]
+    fn api_id_priority_is_cli_then_env_then_config_then_ask() {
+        assert_eq!(pick_api_id(Some(7), Some(8), 9), (7, ApiIdSource::Cli));
+        assert_eq!(pick_api_id(None, Some(8), 9), (8, ApiIdSource::Env));
+        assert_eq!(pick_api_id(None, None, 9), (9, ApiIdSource::Config));
+        // 哪一路都没有（配置里是模板占位 0）：返回 0 = 得问用户。
+        assert_eq!(pick_api_id(None, None, 0), (0, ApiIdSource::Asked));
+        // 命令行给了就用它，哪怕环境变量 / 配置里也有别的值。
+        assert_eq!(pick_api_id(Some(7), None, 0), (7, ApiIdSource::Cli));
+        assert_eq!(pick_api_id(Some(7), Some(8), 0), (7, ApiIdSource::Cli));
+        // `0` 一律当「没给」：`TG_API_ID=` 留空、模板里的 `api_id = 0` 都是常见写法。
+        assert_eq!(pick_api_id(None, Some(0), 9), (9, ApiIdSource::Config));
+        assert_eq!(pick_api_id(Some(0), None, 9), (9, ApiIdSource::Config));
+
+        // 显式写错的 --api-id 要报错，不能静默退回配置（那会让人以为参数生效了）。
+        assert!(checked_cli_api_id(Some(0)).is_err());
+        assert!(checked_cli_api_id(Some(-5)).is_err());
+        assert!(checked_cli_api_id(None).unwrap().is_none());
+        assert_eq!(checked_cli_api_id(Some(42)).unwrap(), Some(42));
     }
 
     /// `status` / `stop` 只认**已存在**的项目：从深层目录也能向上找到根（变更 6）。
