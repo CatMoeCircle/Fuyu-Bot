@@ -14,8 +14,12 @@ account_type = "bot"
 api_id = __API_ID__
 # TDLib 的数据目录：database 与 files **都**指它（相对项目根目录）。
 data_dir = "data"
-# ⚠️ api_hash 是**凭据**，不许写进这个文件（硬约束 41）——只走环境变量 `TG_API_HASH`，
-#    或 `fuyubot run` 的交互式输入。配置里写了也会被忽略（serde 里根本没这个字段）。
+# ⚠️ api_hash 是**凭据**。每次冷启动都要随 `setTdlibParameters` 发给 TDLib（session
+#    有效也一样），所以 `fuyubot run` 交互问过一次后会把它**明文写回下面这一行**——
+#    这份文件从此就带着你的应用密钥，别提交到版本库、别整份发给别人。
+#    不想落盘就设环境变量 `TG_API_HASH`（环境变量优先，且不会被写回）。
+api_hash = ""
+# Bot Token / 手机号 / 两步验证密码**从不**写进这个文件：session 有效后它们用不上。
 
 [plugins]
 # 插件目录：`fuyubot run` 从这里加载所有动态库。

@@ -189,6 +189,144 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
     toml::from_str(&text).map_err(|e| format!("{} 不是合法配置: {e}", path.display()))
 }
 
+// ── 凭据（api_id / api_hash）的落盘 ────────────────────────────────
+//
+// `run` 每次冷启动都要把 api_id 与 api_hash 随 `setTdlibParameters` 发给 TDLib（session
+// 还有效也照样要发），所以「交互问一次就记住」是刚需——否则每次启动都得手输两遍。
+// 记住的位置就是 `fuyubot.toml` 的 `[telegram]` 段（约束 41）。
+
+/// 读配置文件里已保存的 `[telegram].api_hash`。
+///
+/// ⚠️ **故意不进 [`Config`]**：`Config::to_json()` 的整棵树会交给宿主运行时，而插件经
+/// ABI 的 `get_config` 能读**任意**段——把凭据放进那棵树等于发给每个插件。所以这个键
+/// 只由 CLI 自己按文件读。代价是插件 `set_config` 的全量重写会冲掉它，那一侧在
+/// `fuyubot-loader` 的 `persist_toml` 里补回来。
+pub fn load_api_hash(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let saved: SavedCredentials = toml::from_str(&text).ok()?;
+    saved
+        .telegram
+        .and_then(|section| section.api_hash)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// 只解析凭据那两个键的小结构（[`load_api_hash`] 用）。
+#[derive(serde::Deserialize)]
+struct SavedCredentials {
+    telegram: Option<SavedTelegram>,
+}
+
+#[derive(serde::Deserialize)]
+struct SavedTelegram {
+    api_hash: Option<String>,
+}
+
+/// 把**交互问出来**的凭据写回配置文件，下次不用再问。
+///
+/// 只写传进来的那几个：`None` = 这次没问过（值来自环境变量或配置），**不动文件**——
+/// 「我没让它改配置它却改了」比多问一次更让人困惑。返回**有没有真的改文件**。
+///
+/// ⚠️ 只做**文本级替换**，不用 `toml::to_string` 全量重写：后者会把文件里所有注释
+/// （含每个 `[plugin.*]` 段的说明）冲掉，代价远大于收益。这里是「键在就改值、
+/// 不在就插一行、段不在就补一段」。
+///
+/// 写盘失败返回 `Err`：**调用方只许警告，不许因此起不来**。
+pub fn remember_credentials(
+    path: &Path,
+    api_id: Option<i64>,
+    api_hash: Option<&str>,
+) -> Result<bool, String> {
+    if api_id.is_none() && api_hash.is_none() {
+        return Ok(false);
+    }
+    let original =
+        std::fs::read_to_string(path).map_err(|e| format!("读不了 {}: {e}", path.display()))?;
+    let mut lines: Vec<String> = original.lines().map(str::to_owned).collect();
+    let mut changed = false;
+    if let Some(id) = api_id {
+        changed |= set_toml_key(&mut lines, "telegram", "api_id", &id.to_string());
+    }
+    if let Some(hash) = api_hash {
+        changed |= set_toml_key(&mut lines, "telegram", "api_hash", &quote_toml_string(hash));
+    }
+    if !changed {
+        return Ok(false);
+    }
+    // ⚠️ `lines()` 会把 `\r\n` 的 `\r` 也吃掉：Windows 上（或 git 开了 autocrlf）用户的
+    // 配置是 CRLF，照 `join("\n")` 写回去等于把整个文件静默转成 LF——diff 里全是红。
+    let eol = if original.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut text = lines.join(eol);
+    // `lines()` 把末尾换行吃掉了，写回去要补上——否则下一次回写会把最后两行粘成一行。
+    if original.ends_with('\n') {
+        text.push_str(eol);
+    }
+    write(path, &text)?;
+    Ok(true)
+}
+
+/// 在 `[section]` 段里把 `key` 设成 `value`（原地改 `lines`），返回有没有改动。
+///
+/// 段里可能有提到同名键的**注释行**（模板里就有），匹配时跳过以 `#` 开头的行；
+/// `api_id_extra` 这种前缀相同的键也要放过（看 `key` 后面是不是紧跟 `=`）。
+fn set_toml_key(lines: &mut Vec<String>, section: &str, key: &str, value: &str) -> bool {
+    let header = format!("[{section}]");
+    let start = match lines.iter().position(|line| line.trim() == header) {
+        Some(index) => index + 1,
+        // 连这一段都没有：补一段到文件末尾。
+        None => {
+            while lines.last().is_some_and(|line| line.trim().is_empty()) {
+                lines.pop();
+            }
+            lines.push(String::new());
+            lines.push(header);
+            lines.push(format!("{key} = {value}"));
+            return true;
+        }
+    };
+    // 段的边界：下一个顶层 `[…]` 行，或文件末尾。
+    let end = lines[start..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .map_or(lines.len(), |offset| start + offset);
+
+    for index in start..end {
+        let trimmed = lines[index].trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix(key) else {
+            continue;
+        };
+        if !rest.trim_start().starts_with('=') {
+            continue;
+        }
+        let rendered = format!("{key} = {value}");
+        if lines[index] == rendered {
+            return false;
+        }
+        lines[index] = rendered;
+        return true;
+    }
+
+    // 键不在段里：插到段末尾（跳过尾部空行）。
+    let mut insert_at = end;
+    while insert_at > start && lines[insert_at - 1].trim().is_empty() {
+        insert_at -= 1;
+    }
+    lines.insert(insert_at, format!("{key} = {value}"));
+    true
+}
+
+/// 包成 TOML 基本字符串（只转义 `\` 与 `"`）。
+fn quote_toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// 从 `start` 往上找 `fuyubot.toml`。
 ///
 /// ⚠️ **相对路径必须先变绝对**：`Path::new(".").parent()` 是 `Some("")`，`""` 又已经没有父目录，
@@ -216,7 +354,8 @@ pub fn find_config(start: &Path) -> Option<PathBuf> {
 
 /// `fuyubot config` 的几行输出：**生效值**（缺省已填好），外加这份文件到底在哪。
 ///
-/// 纯函数，不碰环境。文件不存在时如实说「全是默认值」——`run` 本来就是按默认值起的。
+/// 纯函数，不碰进程环境（唯一例外是读 `config_path` 里那个凭据键）。文件不存在时如实说
+/// 「全是默认值」——`run` 本来就是按默认值起的。
 pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<String> {
     let missing = if config_path.is_file() {
         ""
@@ -247,6 +386,14 @@ pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<Str
             "[telegram]  api_id       = {}",
             config.telegram.api_id(&config.bot)
         ),
+        // 凭据**不回显**：只说有没有存（它现在是明文躺在文件里的，终端再打一遍没意义）。
+        format!(
+            "[telegram]  api_hash     = {}",
+            match load_api_hash(config_path) {
+                Some(_) => "已保存在本文件（不回显）".to_owned(),
+                None => "未保存（TG_API_HASH 环境变量，或 run 交互输入后自动写回）".to_owned(),
+            }
+        ),
         format!(
             "[telegram]  data_dir     = {}",
             config.telegram.data_dir(root).display()
@@ -268,8 +415,9 @@ pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<Str
             "[tdlib]     log_verbosity= {}",
             config.tdlib.log_verbosity()
         ),
-        "凭据        api_hash / token / 手机号不读配置（TG_API_HASH 等环境变量或交互输入）"
-            .to_owned(),
+        // Bot Token / 手机号 / 两步验证密码**仍然不落盘**：session 有效后它们用不上，
+        // 落了只是多一份明文。api_hash 是例外（每次冷启动都要发，见上面那行的注释）。
+        "凭据        Bot Token / 手机号 / 密码不落盘（TG_BOT_TOKEN 或交互输入）".to_owned(),
     ];
     // 插件各自的配置段：把 `plugin` 表按「点路径」展平成 `[plugin.fuyubot.manage]` 这样一行一个。
     // 插件名是点分的，`[plugin.fuyubot.manage]` 解析成嵌套表 `{ fuyubot: { manage: … } }`；
@@ -313,7 +461,9 @@ fn flatten_plugin_sections(value: &toml::Value, prefix: &str, out: &mut Vec<Stri
 
 /// 生成 `fuyubot.toml` 与插件目录。
 ///
-/// ⚠️ 只写 `api_id`：`api_hash` 是凭据，**不许**落进配置文件（硬约束 41）。
+/// ⚠️ 这里**只写 `api_id`**：`api_hash` 在模板里是个空占位（`" "` 都不写，就是 `""`），
+/// 真值由 `run` 交互问过之后用 [`remember_credentials`] 写回——`init` 手上没有它，
+/// 也不该替用户去环境变量里捞。
 pub fn init(root: &Path, name: &str, api_id: i64) -> Result<PathBuf, String> {
     let config = root.join(CONFIG_FILE);
     if config.exists() {
@@ -852,23 +1002,148 @@ mod tests {
         );
     }
 
+    /// `init` 手上没有 api_hash，所以它只留下**空占位**——真值由 `run` 问过之后回写。
     #[test]
-    fn init_never_writes_the_api_hash_into_the_config() {
-        // 硬约束 41：api_hash 是凭据，不许落盘。
+    fn init_leaves_the_api_hash_empty() {
         let root = temp("init-no-secret");
         let path = init(&root, "mybot", 12345).unwrap();
+        // 空串当「没存」：不能让「api_hash = ""」被当成有效凭据发给 TDLib。
+        assert_eq!(load_api_hash(&path), None);
         let text = std::fs::read_to_string(&path).unwrap();
-        // 只查**键**：注释里提到 `api_hash` 是故意的（要提醒用户别往这儿写）。
-        assert!(
-            !text
-                .lines()
-                .any(|line| line.trim_start().starts_with("api_hash")),
-            "配置里出现了 api_hash 键：\n{text}"
-        );
         assert!(
             !text.contains("__API_HASH__"),
             "模板占位符没被换掉：\n{text}"
         );
+    }
+
+    /// 回写凭据：**值要能读回来，注释一个字都不能丢**。
+    ///
+    /// 全量 `toml::to_string` 重写也能写对值，但会把用户手写的注释冲掉——那才是这份
+    /// 配置里最值钱的部分（每个插件段都靠注释说明键是什么意思）。
+    #[test]
+    fn remembering_credentials_keeps_the_comments() {
+        let root = temp("remember");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(
+            &path,
+            "# 顶上的注释\n\
+             [bot]\n\
+             name = \"mybot\"\n\
+             \n\
+             [telegram]\n\
+             # 这段的注释\n\
+             account_type = \"bot\"\n\
+             # api_hash 是凭据，别外传\n\
+             api_id = 0\n\
+             data_dir = \"data\"\n\
+             \n\
+             [plugins]\n\
+             dir = \"plugins\"\n",
+        )
+        .unwrap();
+
+        assert!(remember_credentials(&path, Some(246810), Some("deadbeef")).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        // 注释全在（含那条提到 api_hash 的）。
+        assert!(text.contains("# 顶上的注释"), "{text}");
+        assert!(text.contains("# 这段的注释"), "{text}");
+        assert!(text.contains("# api_hash 是凭据，别外传"), "{text}");
+        // 值改的是原来那一行，不是追加第二行。
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim_start().starts_with("api_id"))
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("api_id = 246810"), "{text}");
+        assert!(text.contains("api_hash = \"deadbeef\""), "{text}");
+        // 其它段没被动过。
+        assert!(text.contains("dir = \"plugins\""), "{text}");
+
+        // 读回来：api_id 走配置树，api_hash 走凭据入口。
+        let config = load_config(&path).unwrap();
+        assert_eq!(config.telegram.api_id(&config.bot), 246810);
+        assert_eq!(load_api_hash(&path).as_deref(), Some("deadbeef"));
+
+        // 同样的值再写一次 = 没改动（不该把文件重写一遍）。
+        assert!(!remember_credentials(&path, Some(246810), Some("deadbeef")).unwrap());
+        // 什么都没问 = 什么都不动。
+        assert!(!remember_credentials(&path, None, None).unwrap());
+    }
+
+    /// 行尾是 CRLF 的文件回写之后**还得是 CRLF**：`lines()` 会吞掉 `\r`，照 `join("\n")`
+    /// 写回去等于把整份配置静默转成 LF（git 开了 autocrlf 的 Windows 用户会看到满屏 diff）。
+    #[test]
+    fn remembering_keeps_crlf_line_endings() {
+        let root = temp("remember-crlf");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(&path, "[telegram]\r\napi_id = 0\r\n").unwrap();
+
+        assert!(remember_credentials(&path, Some(42), Some("h")).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\r\n"), "CRLF 被改成了 LF：{text:?}");
+        assert!(!text.replace("\r\n", "").contains('\n'), "{text:?}");
+        assert!(text.contains("api_id = 42"), "{text}");
+        assert_eq!(load_api_hash(&path).as_deref(), Some("h"));
+    }
+
+    /// 只回写**问过**的那一个：api_id 来自配置时不该顺手把 hash 写进去，反之亦然。
+    #[test]
+    fn remembering_writes_only_what_was_asked() {
+        let root = temp("remember-partial");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(&path, "[telegram]\napi_id = 0\n").unwrap();
+
+        assert!(remember_credentials(&path, None, Some("only-hash")).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("api_id = 0"), "api_id 没问过就不该动：{text}");
+        assert_eq!(load_api_hash(&path).as_deref(), Some("only-hash"));
+
+        assert!(remember_credentials(&path, Some(111), None).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("api_id = 111"), "{text}");
+        // hash 那行还在（这次没问，也不能顺手删）。
+        assert_eq!(load_api_hash(&path).as_deref(), Some("only-hash"));
+    }
+
+    /// `[telegram]` 段整个不在（比如一份只写了插件段的配置）：补一段，不报错。
+    #[test]
+    fn remembering_appends_a_missing_telegram_section() {
+        let root = temp("remember-no-section");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(&path, "[plugins]\ndir = \"plugins\"\n").unwrap();
+
+        assert!(remember_credentials(&path, Some(7), Some("h")).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[telegram]"), "{text}");
+        assert_eq!(
+            load_config(&path).unwrap().telegram.api_id(&Bot::default()),
+            7
+        );
+        assert_eq!(load_api_hash(&path).as_deref(), Some("h"));
+        assert!(
+            text.contains("dir = \"plugins\""),
+            "原来那段不能被吃掉：{text}"
+        );
+    }
+
+    /// 凭据**不进配置树**：那棵树会整棵交给宿主运行时，插件 `get_config` 能读任意段。
+    #[test]
+    fn the_saved_api_hash_stays_out_of_the_config_tree() {
+        let root = temp("remember-not-in-tree");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(&path, "[telegram]\napi_id = 1\n").unwrap();
+        remember_credentials(&path, None, Some("secret")).unwrap();
+
+        let json = load_config(&path).unwrap().to_json().unwrap();
+        assert!(
+            json.pointer("/telegram/api_hash").is_none(),
+            "凭据不能出现在给插件的配置树里：{json}"
+        );
+        // 空值也不算「保存过」——否则 `api_hash = ""` 会被当成凭据发给 TDLib。
+        std::fs::write(&path, "[telegram]\napi_hash = \"\"\n").unwrap();
+        assert_eq!(load_api_hash(&path), None);
     }
 
     #[test]

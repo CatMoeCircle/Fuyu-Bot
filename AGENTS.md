@@ -42,7 +42,7 @@ TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` �
 
 ```powershell
 cargo build --workspace --offline     # 0 退出、0 warning
-cargo test  --workspace --offline     # 223 passed / 0 failed / 9 ignored
+cargo test  --workspace --offline     # 269 passed / 0 failed / 10 ignored
 cargo tree  --workspace --offline     # 无环
 cargo fmt --all --check               # 0 diff
 
@@ -127,7 +127,11 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 38. **`run --replay` 不接 TDLib**：回放必须离线可跑。
 39. CLI 的模板与 SDK 只有一份来源（`include_str!`），不许复制第二份。
 40. **`clap` 只允许出现在两个 CLI crate 里**，库 crate 不许依赖它。
-41. **凭据一律不落盘**：只走 `TG_API_ID` / `TG_API_HASH` / `TG_BOT_TOKEN` 或交互输入。
+41. **Bot Token / 手机号 / 两步验证密码一律不落盘**：只走 `TG_BOT_TOKEN` 或交互输入。
+    `api_id` / `api_hash` 是**例外**：它们**每次冷启动**都要随 `setTdlibParameters` 发出去
+    （session 有效也一样），不记住就得每次手输——`run` 交互问过之后**明文写回**
+    `fuyubot.toml` 的 `[telegram]` 段（`api_hash` 不进 `Config` 树，插件 `get_config` 读不到；
+    插件 `set_config` 的全量重写由 `persist_toml` 补回）。写回只发生在「这次真问过」时。
 42. **TDLib 字段路径先问真库**（如 `file.id`；`user` 没有 `is_bot` / `username`）。
 43. **TDLib 方法名 ≠ Bot API**：发送一律 `sendMessage` + `input_message_content`；参数名以 `td_api.tl` 为准，并留一条 `check_request` 测试。
 44. **`fuyubot-sdk check` 静态读导出表**，绝不 dlopen；ABI 版本只能运行时判定。

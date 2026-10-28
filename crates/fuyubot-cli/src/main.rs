@@ -67,7 +67,8 @@ struct InitArgs {
     #[arg(long, default_value = "fuyubot")]
     name: String,
     /// TDLib api_id（到 https://my.telegram.org 申请）。**不是**秘密，可以写进配置。
-    /// api_hash 是凭据，**不给这个命令传**——用环境变量 `TG_API_HASH`。
+    /// api_hash 这个命令**不收**：`fuyubot run` 首次会问，问完写回配置
+    /// （或事先设环境变量 `TG_API_HASH`，那就一次都不用输）。
     #[arg(long, default_value_t = 0)]
     api_id: i64,
 }
@@ -92,6 +93,8 @@ struct RunArgs {
     ///
     /// ⚠️ 后台跑**没有 stdin**：要交互式登录的场合（还没有 session、也没有 `TG_BOT_TOKEN`）
     /// 会直接失败并留在日志里——先用前台 `fuyubot run` 登一次，session 会落在 `data/`。
+    /// 首次还要问 api_id / api_hash，同样问不了；问过一次它们会写回 `fuyubot.toml`
+    /// （或事先设 `TG_API_ID` / `TG_API_HASH`），之后就不用再问。
     #[arg(long)]
     background: bool,
     /// 把一批更新的 JSON 灌进管线后退出：**不接 TDLib、不用账号**，纯离线验插件
@@ -453,7 +456,7 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     //    `authorizationStateWaitTdlibParameters`，**已有的 session 也不会被打开**
     //    （数据库目录正是在 `setTdlibParameters` 里给的）。它只适合「只想把插件跑起来」。
     let parameters = match (tdlib_client.as_ref(), args.no_login) {
-        (Some(_), false) => Some(resolve_parameters(&config, &root)?),
+        (Some(_), false) => Some(resolve_parameters(&config, &config_path, &root)?),
         _ => None,
     };
 
@@ -806,18 +809,26 @@ impl fuyubot_tdlib::Prompter for ConsolePrompter {
     }
 }
 
-/// 把登录要用的 TDLib 参数凑齐：**缺什么就交互式问用户**。
+/// 把登录要用的 TDLib 参数凑齐：**缺什么就交互式问用户**，问到的**回写配置**。
 ///
 /// 优先级：环境变量 → 配置 → **交互式提问**（`run` 自己问，
 /// 不让用户先去翻文档找配置项）。
-/// - `api_id` **不是**凭据（约束 41 只禁 api_hash / token / 手机号 / 密码），所以环境变量与
-///   配置都认；
-/// - `api_hash` 是凭据，**只**认环境变量 `TG_API_HASH` 或交互式输入——配置里连字段都没有。
+/// - `api_id` **不是**凭据（约束 41 只禁 Bot Token / 手机号 / 密码），环境变量与配置都认；
+/// - `api_hash` 是凭据，但**每次冷启动都要随 `setTdlibParameters` 发给 TDLib**
+///   （session 还有效也照样要发），不记住就得每次手输——所以环境变量与
+///   配置里已保存的都认，**交互问出来的回写** `[telegram].api_hash` 明文一行。
+///
+/// ⚠️ 回写只发生在「这次真的问过」时：环境变量/配置来的值不动文件，
+/// 「我没让它改配置它却改了」比多问一次更让人困惑。
 fn resolve_parameters(
     config: &scaffold::Config,
+    config_path: &Path,
     root: &Path,
 ) -> Result<fuyubot_tdlib::TdlibParameters, Box<dyn std::error::Error>> {
     let mut prompter = ConsolePrompter::default();
+    // 这两个只有**交互问出来**才有值——它们是回写的唯一依据。
+    let mut asked_id: Option<i64> = None;
+    let mut asked_hash: Option<String> = None;
 
     let id_from_env = std::env::var("TG_API_ID")
         .ok()
@@ -830,9 +841,11 @@ fn resolve_parameters(
         let answer = prompter.ask(
             "api_id（到 https://my.telegram.org 申请；它不是秘密，也可以填进 [telegram].api_id）",
         )?;
-        answer.parse::<i64>().map_err(|_| {
+        let parsed = answer.parse::<i64>().map_err(|_| {
             format!("api_id 得是数字，给的是「{answer}」——到 https://my.telegram.org 申请一个")
-        })?
+        })?;
+        asked_id = Some(parsed);
+        parsed
     };
     let api_id = i32::try_from(api_id)
         .map_err(|_| format!("api_id {api_id} 超出 32 位范围，检查一下是不是填错了"))?;
@@ -840,18 +853,22 @@ fn resolve_parameters(
     let hash_from_env = std::env::var("TG_API_HASH")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let api_hash = match &hash_from_env {
-        Some(value) => value.clone(),
-        None => {
-            println!("没找到环境变量 TG_API_HASH。");
-            prompter.ask("api_hash（从 https://my.telegram.org 拿，输入不回显）")?
+    let saved_hash = scaffold::load_api_hash(config_path);
+    let api_hash = match (&hash_from_env, &saved_hash) {
+        (Some(value), _) => value.clone(),
+        (None, Some(saved)) => saved.clone(),
+        (None, None) => {
+            println!("没找到环境变量 TG_API_HASH，配置里也没存过。");
+            let answer = prompter.ask("api_hash（从 https://my.telegram.org 拿，输入不回显）")?;
+            asked_hash = Some(answer.clone());
+            answer
         }
     };
     // 空值必须在**发请求之前**挡住：TDLib 会回 `Valid api_hash must be provided`，
     // 而状态机对这条错误会一直重试到预算耗尽（实测空转满 600s 才超时）。
     if api_hash.trim().is_empty() {
         return Err("api_hash 是空的——到 https://my.telegram.org 拿一个；\
-                    它只走环境变量 TG_API_HASH 或交互式输入，不落配置（硬约束 41）"
+                    它走环境变量 TG_API_HASH、配置里已保存的值，或交互式输入"
             .into());
     }
 
@@ -865,10 +882,30 @@ fn resolve_parameters(
         };
         let hash_src = if hash_from_env.is_some() {
             "环境变量 TG_API_HASH"
+        } else if saved_hash.is_some() {
+            "配置 [telegram].api_hash（上次输入时保存的）"
         } else {
-            "配置/交互输入"
+            "交互输入"
         };
         println!("api_id 与 api_hash 都已就位（{id_src} + {hash_src}），跳过初始化与提问");
+    }
+
+    // 交互问出来的才落盘：下次冷启动不用再输一遍（**每次**都要随 `setTdlibParameters`
+    // 发这两个值，session 有效也一样）。写盘失败只警告——记住失败不该让机器人起不来。
+    if asked_id.is_some() || asked_hash.is_some() {
+        match scaffold::remember_credentials(config_path, asked_id, asked_hash.as_deref()) {
+            Ok(true) => {
+                println!("已写回 {}（下次不用再输这两项）", config_path.display());
+                if asked_hash.is_some() {
+                    println!(
+                        "⚠️ api_hash 是凭据，现在以**明文**放在上面的文件里——\
+                         别把它提交到版本库、也别整份发给别人"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("写回 api_id / api_hash 失败（不影响本次运行）：{e}"),
+        }
     }
 
     let data_dir = config.telegram.data_dir(root);
