@@ -637,6 +637,13 @@ mod tests {
     ) -> RequestId {
         RequestId::INVALID
     }
+    unsafe extern "C" fn noop_call_tool_result(
+        _: *mut core::ffi::c_void,
+        _: *const core::ffi::c_char,
+        _: *const core::ffi::c_char,
+    ) -> *const core::ffi::c_char {
+        core::ptr::null()
+    }
     unsafe extern "C" fn noop_list(_: *mut core::ffi::c_void) -> *const core::ffi::c_char {
         core::ptr::null()
     }
@@ -707,6 +714,7 @@ mod tests {
             emit: Some(noop_emit),
             register_tool: Some(noop_register_tool),
             call_tool: Some(noop_call_tool),
+            call_tool_result: Some(noop_call_tool_result),
             list_tools: Some(noop_list),
             list_plugins: Some(noop_list),
             provide_service: Some(noop_provide),

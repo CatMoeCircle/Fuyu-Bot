@@ -392,6 +392,7 @@ impl HostRuntime {
                 emit: Some(api_emit),
                 register_tool: Some(api_register_tool),
                 call_tool: Some(api_call_tool),
+                call_tool_result: Some(api_call_tool_result),
                 list_tools: Some(api_list_tools),
                 list_plugins: Some(api_list_plugins),
                 provide_service: Some(api_provide_service),
@@ -1565,6 +1566,34 @@ unsafe extern "C" fn api_call_tool(
     }
 }
 
+/// 同步工具调用：直接返回结果 JSON（失败是 `{"error": …}`）。
+///
+/// 与 `api_call_tool` 的区别：那个只回请求号，**没有结果回投通道**；这个当场执行并把
+/// `ToolRegistry::call_tool` 的 `output` 交给调用方。这样脚本桥 / 原生插件都能真的拿到
+/// 工具结果，而不是一个永远等不到事件的 id。
+unsafe extern "C" fn api_call_tool_result(
+    host: *mut c_void,
+    name: *const c_char,
+    input_json: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 host 来自本运行时。
+    let Some(rt) = (unsafe { runtime(host) }) else {
+        return core::ptr::null();
+    };
+    // SAFETY: 同上。
+    let Some(name) = (unsafe { cstr(name) }) else {
+        return core::ptr::null();
+    };
+    let input = parse_json(input_json).unwrap_or(Value::Null);
+    match rt.tools.call_tool(name, &input) {
+        Ok(call) => host_string(&call.output.to_string()),
+        Err(error) => {
+            rt.warn(&format!("调用工具 {name} 失败: {error}"));
+            host_string(&json!({ "error": error.to_string() }).to_string())
+        }
+    }
+}
+
 unsafe extern "C" fn api_list_tools(host: *mut c_void) -> *const c_char {
     // SAFETY: ABI 契约保证 host 来自本运行时。
     let Some(rt) = (unsafe { runtime(host) }) else {
@@ -2139,7 +2168,9 @@ mod tests {
         assert!(vtable.emit.is_some());
         assert!(vtable.register_tool.is_some());
         assert!(vtable.call_tool.is_some());
+        assert!(vtable.call_tool_result.is_some());
         assert!(vtable.list_tools.is_some());
+        assert!(vtable.list_plugins.is_some());
         assert!(vtable.provide_service.is_some());
         assert!(vtable.get_service.is_some());
         assert!(vtable.td_invoke.is_some());
@@ -3338,6 +3369,32 @@ mod tests {
         };
         assert!(request_id.is_valid(), "call_tool 应该发出请求");
         assert_eq!(counter.load(Ordering::SeqCst), 1, "handler 必须被调到一次");
+
+        // 同步结果：同一个工具，`call_tool_result` 当场把 output 交回来。
+        let raw = unsafe {
+            (rt.vtable.call_tool_result.unwrap())(
+                rt.vtable.host_ctx,
+                c"v4.echo".as_ptr(),
+                c"{\"x\":1}".as_ptr(),
+            )
+        };
+        assert!(!raw.is_null(), "结果不能是 NULL");
+        let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy();
+        let value: Value = serde_json::from_str(&text).expect("结果是 JSON");
+        assert_eq!(value["echo"]["x"], 1, "{value}");
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "同步调用也要走 handler");
+
+        // 不存在的工具：返回 `{"error": …}`，不是 NULL。
+        let raw = unsafe {
+            (rt.vtable.call_tool_result.unwrap())(
+                rt.vtable.host_ctx,
+                c"no.such.tool".as_ptr(),
+                c"{}".as_ptr(),
+            )
+        };
+        let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy();
+        let value: Value = serde_json::from_str(&text).expect("错误也是 JSON");
+        assert!(value["error"].as_str().is_some(), "{value}");
     }
 
     /// `list_plugins` 返回宿主那份报告（与 `fuyubot.host.plugins` service 同源）。

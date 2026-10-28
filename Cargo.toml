@@ -6,7 +6,7 @@ default-members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -14,17 +14,17 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/CatMoeCircle/Fuyu-Bot"
 
 [workspace.dependencies]
-fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.0" }
-fuyubot-cli = { path = "crates/fuyubot-cli", version = "0.1.0" }
-fuyubot-core = { path = "crates/fuyubot-core", version = "0.1.0" }
-fuyubot-event = { path = "crates/fuyubot-event", version = "0.1.0" }
-fuyubot-loader = { path = "crates/fuyubot-loader", version = "0.1.0" }
-fuyubot-middleware = { path = "crates/fuyubot-middleware", version = "0.1.0" }
-fuyubot-service = { path = "crates/fuyubot-service", version = "0.1.0" }
-fuyubot-simplify = { path = "crates/fuyubot-simplify", version = "0.1.0" }
-fuyubot-tdlib = { path = "crates/fuyubot-tdlib", version = "0.1.0" }
-fuyubot-tdlib-sys = { path = "crates/fuyubot-tdlib-sys", version = "0.1.0" }
-fuyubot-tool = { path = "crates/fuyubot-tool", version = "0.1.0" }
+fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.1" }
+fuyubot-cli = { path = "crates/fuyubot-cli", version = "0.1.1" }
+fuyubot-core = { path = "crates/fuyubot-core", version = "0.1.1" }
+fuyubot-event = { path = "crates/fuyubot-event", version = "0.1.1" }
+fuyubot-loader = { path = "crates/fuyubot-loader", version = "0.1.1" }
+fuyubot-middleware = { path = "crates/fuyubot-middleware", version = "0.1.1" }
+fuyubot-service = { path = "crates/fuyubot-service", version = "0.1.1" }
+fuyubot-simplify = { path = "crates/fuyubot-simplify", version = "0.1.1" }
+fuyubot-tdlib = { path = "crates/fuyubot-tdlib", version = "0.1.1" }
+fuyubot-tdlib-sys = { path = "crates/fuyubot-tdlib-sys", version = "0.1.1" }
+fuyubot-tool = { path = "crates/fuyubot-tool", version = "0.1.1" }
 
 cbindgen = "0.29.4"
 clap = { version = "4.6.7", features = ["derive"] }

@@ -3,7 +3,7 @@
 ## 这是什么
 
 基于 TDLib 的 Telegram bot / user 框架：**一个宿主进程 + N 个动态库插件**。
-插件是 cdylib（`.dll` / `.so` / `.dylib`），只认四个导出符号与一张 `HostApiVTable`（ABI 版本 3）。
+插件是 cdylib（`.dll` / `.so` / `.dylib`），只认四个导出符号与一张 `HostApiVTable`（ABI 版本 4）。
 TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` 在**编译期**转成 Rust 类型与可校验元数据。
 
 三个仓库（本仓只放运行时）：
@@ -22,7 +22,7 @@ TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` �
 | --- | --- |
 | `fuyubot-cli` | 二进制 `fuyubot`：`init` / `run` / `status` / `stop` / `config` / `plugin`（clap） |
 | `fuyubot-core` | Cordis 内核：`Context`（按**名字**寻址的服务表）/ `Effect` / `Plugin`（含 `inject`）/ `PluginManager`（Fiber 生命周期与依赖跟踪）。不认识 Telegram |
-| `fuyubot-abi` | C ABI：`HostApiVTable`（20 字段）、`PluginHandle`、`define_plugin!`、cbindgen 头文件 |
+| `fuyubot-abi` | C ABI：`HostApiVTable`（2 个 u32 + 20 个函数指针）、`PluginHandle`、`define_plugin!`、cbindgen 头文件 |
 | `fuyubot-tdlib-sys` | 绑定层：`td_api.tl` → 类型 + 元数据 + FFI 声明（无 tokio / 无网络） |
 | `fuyubot-tdlib` | `loader`（四级定位）+ `client`（`td_receive` 循环、`ReceiveLoop`）+ `authorize`（授权状态机） |
 | `fuyubot-event` / `service` / `tool` / `middleware` | 四个机制 crate，只依赖 `core`，彼此不依赖 |
@@ -153,7 +153,7 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     内容是 exe + tdjson + `plugins/`；内置插件**不单独打包**，中间 tar.gz 只留在 Actions artifacts。
 50. **Go 的 c-shared 插件不能卸载**：识别 `Go buildinf` 魔数并故意不卸载；同进程重复加载不可靠。
 51. **三仓发布顺序**：本仓先发 `fuyubot-abi` / `fuyubot-tdlib-sys` → SDK 发 `fuyubot-plugin-api` → `fuyubot-sdk-script`；不要把 patch 写进 SDK 的 `Cargo.toml`。
-52. **插件配置段是 `[plugin.<插件名>]`**（ABI v3）：插件名点分 → TOML 嵌套表，宿主把插件名当**点路径**在 `plugin` 表里下钻（`fuyubot.manage` → `plugin.fuyubot.manage`）。`get_config(section, key)` 读**任意**段（自己 + 别人）；`set_config(key, value)` **没有 section 参数**，只写调用者自己那段（靠 `owner_names` 映射判定，插件无法伪造）。`set_config` 落盘是 `toml::to_string_pretty` **全量重写**（注释会丢），写盘失败要还原内存。脚本插件侧同步入口是 `plugin_config()` / `pluginConfig()`（中间插件在 spawn 前把自己的段塞进 `config` 的 `plugin_config` 键）。
+52. **插件配置段是 `[plugin.<插件名>]`**（ABI v4）：插件名点分 → TOML 嵌套表，宿主把插件名当**点路径**在 `plugin` 表里下钻（`fuyubot.manage` → `plugin.fuyubot.manage`）。`get_config(section, key)` 读**任意**段（自己 + 别人）；`set_config(key, value)` **没有 section 参数**，只写调用者自己那段（靠 `owner_names` 映射判定，插件无法伪造）。`set_config` 落盘是 `toml::to_string_pretty` **全量重写**（注释会丢），写盘失败要还原内存。脚本插件侧同步入口是 `plugin_config()` / `pluginConfig()`（中间插件在 spawn 前把自己的段塞进 `config` 的 `plugin_config` 键）。
 
 ## 文档
 

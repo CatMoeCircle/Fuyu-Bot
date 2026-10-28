@@ -396,9 +396,21 @@ pub struct HostApiVTable {
     /// 每项：`{"name":"…","state":"active|pending|failed","missing":[…],"reason":"…"}`
     /// 返回宿主线程局部缓冲里的字符串（读完即弃）。没插件就是空数组 `[]`。
     pub list_plugins: Option<unsafe extern "C" fn(host: *mut c_void) -> *const c_char>,
+    /// **同步**调用工具，直接返回结果 JSON（缺口 13③ / 工具结果回投）。
+    ///
+    /// 与 [`Self::call_tool`] 的区别：那个只回请求号、结果没有回投通道；这个当场执行并
+    /// 返回结果。失败时返回 `{"error": "…"}`，成功时是工具 `output` 的原样 JSON。
+    /// 返回宿主线程局部缓冲里的字符串（读完即弃）。
+    pub call_tool_result: Option<
+        unsafe extern "C" fn(
+            host: *mut c_void,
+            name: *const c_char,
+            input_json: *const c_char,
+        ) -> *const c_char,
+    >,
 }
 
-/// VTable 就是「两个 u32 + 19 个指针」；布局一改，这里立刻编译不过。
+/// VTable 就是「两个 u32 + 20 个指针」；布局一改，这里立刻编译不过。
 const _: () = {
     use core::mem::{offset_of, size_of};
 
@@ -406,7 +418,7 @@ const _: () = {
     assert!(offset_of!(HostApiVTable, size) == 4);
     assert!(offset_of!(HostApiVTable, host_ctx) == 8);
     assert!(size_of::<Option<unsafe extern "C" fn()>>() == size_of::<*const c_void>());
-    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 19 * size_of::<*const c_void>());
+    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 20 * size_of::<*const c_void>());
 
     // 句柄要能按值跨 ABI：必须恰好一个 u64。
     assert!(size_of::<SubscriptionHandle>() == size_of::<u64>());
@@ -476,6 +488,8 @@ pub struct HostApi {
         *mut c_void,
     ) -> ToolHandle,
     call_tool: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> RequestId,
+    call_tool_result:
+        unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> *const c_char,
     list_tools: unsafe extern "C" fn(*mut c_void) -> *const c_char,
     list_plugins: unsafe extern "C" fn(*mut c_void) -> *const c_char,
     provide_service:
@@ -554,6 +568,7 @@ impl HostApi {
             emit: required!(emit),
             register_tool: required!(register_tool),
             call_tool: required!(call_tool),
+            call_tool_result: required!(call_tool_result),
             list_tools: required!(list_tools),
             list_plugins: required!(list_plugins),
             provide_service: required!(provide_service),
@@ -656,6 +671,25 @@ impl HostApi {
         let input = CString::new(input_json).map_err(|_| AbiError::BadString)?;
         // SAFETY: 同 log。
         Ok(unsafe { (self.call_tool)(self.host_ctx, name.as_ptr(), input.as_ptr()) })
+    }
+
+    /// **同步**调用工具并拿到结果（缺口 13③：工具结果回投）。
+    ///
+    /// 与 [`call_tool`](Self::call_tool) 的区别：那个只回请求号、结果没有回投通道；
+    /// 这个当场执行并返回结果。失败时返回 `{"error": "…"}`。
+    /// 返回的字符串是宿主线程局部缓冲，读完即弃。
+    pub fn call_tool_result(&self, name: &str, input_json: &str) -> Result<String, AbiError> {
+        let name = CString::new(name).map_err(|_| AbiError::BadString)?;
+        let input = CString::new(input_json).map_err(|_| AbiError::BadString)?;
+        // SAFETY: 同 log；宿主保证返回的指针在读完之前有效。
+        let raw = unsafe { (self.call_tool_result)(self.host_ctx, name.as_ptr(), input.as_ptr()) };
+        if raw.is_null() {
+            return Ok(String::new());
+        }
+        // SAFETY: 同上。
+        Ok(unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned())
     }
 
     /// 全部工具的元数据 JSON 数组。宿主临时的字符串，读完即弃。
@@ -1174,6 +1208,13 @@ mod tests {
     ) -> RequestId {
         RequestId::INVALID
     }
+    unsafe extern "C" fn noop_call_tool_result(
+        _: *mut c_void,
+        _: *const c_char,
+        _: *const c_char,
+    ) -> *const c_char {
+        core::ptr::null()
+    }
     unsafe extern "C" fn noop_list_tools(_: *mut c_void) -> *const c_char {
         core::ptr::null()
     }
@@ -1237,6 +1278,7 @@ mod tests {
             emit: Some(noop_emit),
             register_tool: Some(noop_register_tool),
             call_tool: Some(noop_call_tool),
+            call_tool_result: Some(noop_call_tool_result),
             list_tools: Some(noop_list_tools),
             list_plugins: Some(noop_list_plugins),
             provide_service: Some(noop_provide),
