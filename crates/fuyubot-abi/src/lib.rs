@@ -1110,11 +1110,15 @@ macro_rules! define_plugin {
             $crate::ABI_VERSION
         }
 
-        /// 自描述元数据（名字 + 依赖），宿主在 `plugin_init` 之前读。
+        /// 自描述元数据（名字 / 版本 / 依赖），宿主在 `plugin_init` 之前读。
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn plugin_manifest() -> *const ::core::ffi::c_char {
             $crate::__macro_support::manifest_json(
                 $name,
+                // 求值的是**调用方 crate**（插件 crate）的版本，不是 `fuyubot-abi` 的：
+                // `macro_rules!` 在调用点展开，`env!` 读的是「当前这次编译」的
+                // `CARGO_PKG_VERSION`，而 `$crate` 只影响路径解析、不改变求值点。
+                ::core::env!("CARGO_PKG_VERSION"),
                 <$ty as $crate::Plugin>::inject(),
                 <$ty as $crate::Plugin>::soft_inject(),
             )
@@ -1128,31 +1132,66 @@ macro_rules! define_plugin {
 /// 一个稳定的路径（约束 37：内部走 `$crate::__macro_support::…`，不额外要求插件
 /// 依赖别的 crate）。
 pub mod __macro_support {
-    /// 把名字与依赖列表拼成 `plugin_manifest` 的 JSON。
+    /// 把名字、版本与依赖列表拼成 `plugin_manifest` 的 JSON。
     ///
     /// 手写 JSON 拼接（不引 serde）：`fuyubot-abi` 是最底层的 crate，
-    /// 依赖越少越好（约束 2/3）。名字是代码里的字面量、依赖是 `&'static str`，
-    /// 不含需要转义的字符——如果将来插件名允许引号，这里要换。
+    /// 依赖越少越好（约束 2/3）。**所有字符串都过 `quote()`**——插件名与依赖名
+    /// 通常是 `a.b.c` 这种，但没人禁止它们带引号、反斜杠或中文。
+    ///
+    /// 非 ASCII（中文等）**原样输出**：JSON 的编码规定就是 UTF-8，宿主侧
+    /// `CStr::to_string_lossy` + `serde_json::from_str` 直接能读；转成 `\uXXXX`
+    /// 反而要为 > 0xFFFF 的字符拼代理对，白添错误面。
     pub fn manifest_json(
         name: &str,
+        version: &str,
         inject: Vec<String>,
         soft_inject: Vec<String>,
     ) -> *const core::ffi::c_char {
-        fn join(items: &[String]) -> String {
+        /// 加引号并转义：`"`、`\` 与全部 < 0x20 的控制字符。
+        ///
+        /// 控制字符统一写成 `\u00XX`（含 NUL）——这样拼出来的串里绝不会出现裸 NUL，
+        /// [`std::ffi::CString::new`] 也就不会因为插件名里塞了个 `\0` 而返回 null。
+        fn quote(text: &str) -> String {
+            use core::fmt::Write;
+
+            let mut out = String::with_capacity(text.len() + 2);
+            out.push('"');
+            for ch in text.chars() {
+                match ch {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    ch if (ch as u32) < 0x20 => {
+                        // `Write for String` 的 Err 是 `Infallible`，写不进去才是怪事。
+                        let _ = write!(out, "\\u{:04x}", ch as u32);
+                    }
+                    ch => out.push(ch),
+                }
+            }
+            out.push('"');
+            out
+        }
+
+        fn list(items: &[String]) -> String {
             items
                 .iter()
-                .map(|s| format!("\"{s}\""))
+                .map(|item| quote(item))
                 .collect::<Vec<_>>()
                 .join(",")
         }
+
         let json = format!(
-            "{{\"name\":\"{name}\",\"version\":\"0.0.0\",\"inject\":[{}],\"soft_inject\":[{}]}}",
-            join(&inject),
-            join(&soft_inject)
+            "{{\"name\":{},\"version\":{},\"inject\":[{}],\"soft_inject\":[{}]}}",
+            quote(name),
+            quote(version),
+            list(&inject),
+            list(&soft_inject)
         );
         // 返回的是 `CString::into_raw`——契约是「调用方读完用 `plugin_free_string` 释放」。
-        // 这里用 `into_raw` 是因为 `manifest_json` 每次调用都生成新串，
-        // 让调用方负责释放比「线程局部缓冲」更简单（manifest 只在加载时调一次）。
+        // 每次调用都生成新串：manifest 只在加载时读一次，让调用方负责释放比
+        // 「线程局部缓冲」更简单，也不给宿主留悬垂指针的机会。
         match std::ffi::CString::new(json) {
             Ok(c) => c.into_raw(),
             Err(_) => core::ptr::null(),
@@ -1314,6 +1353,16 @@ mod tests {
         fn stop(&mut self) {
             self.host.log(LogLevel::Info, "plugin stopping");
         }
+
+        /// 故意放一条中文：`manifest_json` 对非 ASCII 不做 `\u` 转义，
+        /// 这条同时钉住「UTF-8 原样进 JSON」这件事。
+        fn inject() -> Vec<String> {
+            vec!["dep.alpha".to_owned(), "依赖.中文".to_owned()]
+        }
+
+        fn soft_inject() -> Vec<String> {
+            vec!["soft.beta".to_owned()]
+        }
     }
 
     define_plugin!(TestPlugin, "test.plugin");
@@ -1398,6 +1447,84 @@ mod tests {
         // SAFETY: 同一个 handle，stop 收走并释放状态。
         unsafe { plugin_stop(handle) };
         assert_eq!(LOG_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    /// ABI v4 的自描述：名字、版本、两组依赖都要在 JSON 里，且能被宿主原样解析回来。
+    ///
+    /// 顺手走一遍 `plugin_free_string` 归还——那是 manifest 的所有权契约，
+    /// 宿主（`fuyubot-loader` 的 `read_manifest`）就是按这个还的。
+    #[test]
+    fn macro_manifest_publishes_name_version_and_dependencies() {
+        // SAFETY: 宏生成的是静态导出，随时可调；返回的指针归调用方。
+        let raw = unsafe { plugin_manifest() };
+        assert!(!raw.is_null(), "manifest 不该为空");
+        // SAFETY: 契约保证是 NUL 结尾的 JSON。
+        let text = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("manifest 必须是合法 JSON");
+        assert_eq!(value["name"], "test.plugin");
+        // 版本取自**这个 crate** 的 `CARGO_PKG_VERSION`（宏在调用点展开）。
+        // 注意这里证明不了「取的是插件 crate 的版本」——本 crate 既是插件又是 abi；
+        // 那条跨 crate 的证据在 loader 的 fixture 测试里。
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            value["inject"],
+            serde_json::json!(["dep.alpha", "依赖.中文"])
+        );
+        assert_eq!(value["soft_inject"], serde_json::json!(["soft.beta"]));
+
+        // SAFETY: 指针来自 `CString::into_raw`，只还一次。
+        unsafe { plugin_free_string(raw as *mut c_char) };
+    }
+
+    /// 拼 JSON 时每个字符串都要转义：插件名与依赖名没人保证是 `a.b.c`。
+    #[test]
+    fn manifest_json_escapes_every_string_it_embeds() {
+        let name = "we\"ird\\name\n中\\文";
+        let inject = vec!["a\"b".to_owned(), "c\\d".to_owned()];
+        let soft = vec!["e\tf".to_owned()];
+
+        let raw = __macro_support::manifest_json(name, "1.2.3-rc.1", inject.clone(), soft.clone());
+        assert!(!raw.is_null());
+        // SAFETY: 同上，契约是 NUL 结尾。
+        let text = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        // 转义的第一步：拼出来的串里不能有裸换行 / 裸制表符，否则 JSON 直接废。
+        assert!(!text.contains('\n'), "{text}");
+        assert!(!text.contains('\t'), "{text}");
+
+        let value: serde_json::Value = serde_json::from_str(&text).expect("转义后必须是合法 JSON");
+        assert_eq!(value["name"], name);
+        assert_eq!(value["version"], "1.2.3-rc.1");
+        assert_eq!(value["inject"], serde_json::json!(inject));
+        assert_eq!(value["soft_inject"], serde_json::json!(soft));
+
+        // SAFETY: 指针来自 manifest_json 内部的 `CString::into_raw`。
+        unsafe { plugin_free_string(raw as *mut c_char) };
+    }
+
+    /// 头文件是 C/C++ 作者唯一的契约来源：v4 的三个新导出必须在里面，
+    /// 否则他们根本不知道要写。本机没有 C 编译器时（缺口 20），这条是唯一把关。
+    #[test]
+    fn the_header_declares_the_v4_exports() {
+        for symbol in [
+            "plugin_init",
+            "plugin_start",
+            "plugin_stop",
+            "plugin_free_string",
+            "plugin_manifest",
+            "fuyubot_abi_version",
+            "plugin_free_handle",
+        ] {
+            assert!(PLUGIN_HEADER.contains(symbol), "头文件缺 {symbol}");
+        }
+        assert!(PLUGIN_HEADER.contains("FUYUBOT_EXPORT"));
+        // 内存所有权那段必须提到 manifest，否则「谁来 free」这件事没有落点。
+        assert!(PLUGIN_HEADER.contains("plugin_manifest` 的返回值也归插件所有"));
     }
 
     #[test]

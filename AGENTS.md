@@ -154,6 +154,10 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 50. **Go 的 c-shared 插件不能卸载**：识别 `Go buildinf` 魔数并故意不卸载；同进程重复加载不可靠。
 51. **三仓发布顺序**：本仓先发 `fuyubot-abi` / `fuyubot-tdlib-sys` → SDK 发 `fuyubot-plugin-api` → `fuyubot-sdk-script`；不要把 patch 写进 SDK 的 `Cargo.toml`。
 52. **插件配置段是 `[plugin.<插件名>]`**（ABI v4）：插件名点分 → TOML 嵌套表，宿主把插件名当**点路径**在 `plugin` 表里下钻（`fuyubot.manage` → `plugin.fuyubot.manage`）。`get_config(section, key)` 读**任意**段（自己 + 别人）；`set_config(key, value)` **没有 section 参数**，只写调用者自己那段（靠 `owner_names` 映射判定，插件无法伪造）。`set_config` 落盘是 `toml::to_string_pretty` **全量重写**（注释会丢），写盘失败要还原内存。脚本插件侧同步入口是 `plugin_config()` / `pluginConfig()`（中间插件在 spawn 前把自己的段塞进 `config` 的 `plugin_config` 键）。
+53. **依赖声明以 `plugin_manifest` 为准**：`DylibPlugin::inject()` / `soft_inject()` 先读 manifest（probe 阶段 `read_manifest` 拿到，`plugin_free_string` 归还），为空才退回 `[plugin.<名>].inject` / `.soft_inject`。别把配置当唯一来源——那会让「换台机器忘了抄」变成静默的加载顺序错误。
+54. **`reconcile` 不许在 `apply` 期间递归推进**：`apply` 里注册服务会同步触发服务变更钩子；若钩子就地递归，提供者还在 `Activating`（`start` 没跑完）依赖方就被激活，软依赖「基础设施先起来」直接作废、硬依赖也会提前放人。钩子只置 `Progress::needed` 并返回，由外层 `reconcile_loop` 接着推进（`Progress::running` 是闸门，`RunningGuard` 保证 panic 也不焊死）。
+55. **新增插件导出符号要三处同步**：`fuyubot-abi` 的 `SYM_*` 常量、`build.rs` 的 `TRAILER`（手写声明）、SDK 的 `sdk check` 的 `ABI_SYMBOLS`。约束 18 只管**类型**（`export.include`），不管函数声明——ABI v4 的 `plugin_manifest` / `fuyubot_abi_version` / `plugin_free_handle` 就漏在头文件外过一轮，C 作者据此**根本不知道要写**。`TRAILER` 里用到 ABI 类型的声明必须留在 trailer（`after_includes` 在所有类型定义之前，放那儿 `-fsyntax-only` 直接报错，约束 33）。
+56. **`plugin_manifest` 的 `version` 取 `env!("CARGO_PKG_VERSION")`**（宏在调用点展开，所以是**插件 crate** 的版本，不是 abi 的）：它是真值，不是 `"0.0.0"` 占位。所有字符串过 `quote()` 转义（`"` / `\` / `< 0x20` → `\u00XX`），非 ASCII 原样写 UTF-8。宿主侧 `declared()` 的优先级是「manifest 该侧非空 → 用它，否则回退 `[plugin.<名>].inject`」，**覆盖而非合并、且逐侧判定**——所以插件一旦声明 `inject`，配置里那份就静默失效。
 
 ## 文档
 

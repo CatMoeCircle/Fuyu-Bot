@@ -11,7 +11,7 @@ const HEADER: &str = r#"/**
  * 本文件由 cbindgen 从 fuyubot-abi/src/lib.rs 生成，**不要手改**：
  * 改 ABI 请改 Rust 定义，然后重新构建（build.rs 会重新生成）。
  *
- * ## 内存所有权（只有三条，全部是硬规矩）
+ * ## 内存所有权（只有五条，全部是硬规矩）
  *
  * 1. **谁分配谁释放。** 插件通过 `plugin_init` 返回的 `name`、以及插件自己
  *    分配的任何字符串，都由插件持有；宿主绝不会 free 它们。插件若要给出一个
@@ -25,6 +25,22 @@ const HEADER: &str = r#"/**
  *    `ServiceVTable` 指针：在服务被注销之前一直有效，可以放心留着
  *    （但它指向的内存属于提供方，不要写）。
  * 4. **`ServiceMethodFn` 的返回值由提供方持有。** 调用方读完即弃。
+ * 5. **`plugin_manifest` 的返回值也归插件所有。** 它每次调用都新分配一条
+ *    NUL 结尾的 JSON，宿主读完必须调插件的 `plugin_free_string` 归还；
+ *    不还就是每次加载漏一小段。返回 NULL 表示「我没有元数据」——不导出这个
+ *    符号也行，那是 ABI v3 的插件，宿主会退回读配置段。
+ *
+ * ## `plugin_manifest`（ABI v4）
+ *
+ * 形状：`{"name":"…","version":"…","inject":[…],"soft_inject":[…]}`
+ *
+ * 宿主在 `plugin_init` **之前**读它，所以它不能依赖任何初始化过的状态。
+ * `inject` 里的能力缺了插件不会被激活（硬依赖），`soft_inject` 只影响激活
+ * 顺序（软依赖，缺了照常加载）。字符串按 JSON 规则转义：`"`、`\` 与小于
+ * 0x20 的控制字符（写成 `\u00XX`），非 ASCII 就是 UTF-8 原文。
+ *
+ * `version` 是**插件 crate 的版本**，与 `PluginHandle::abi_version`（ABI 世代）
+ * 不是一回事，两者不要混用来判兼容。
  *
  * ## 版本协商
  *
@@ -55,7 +71,7 @@ const HEADER: &str = r#"/**
 const AFTER_INCLUDES: &str = r#"/**
  * 插件导出符号用的可见性宏。
  *
- * 生成动态库时必须让这 4 个符号可见：Windows 上靠 `__declspec(dllexport)`，
+ * 生成动态库时必须让这 7 个符号可见：Windows 上靠 `__declspec(dllexport)`，
  * 类 Unix 系统默认全导出（这里留空）。宿主（比如 C++ 写的）要包含本头文件时，
  * 先自己定义 `FUYUBOT_EXPORT` 成 `__declspec(dllimport)` 之类即可。
  */
@@ -76,17 +92,31 @@ const AFTER_INCLUDES: &str = r#"/**
  */"#;
 
 /// 文件末尾：插件必须导出的符号（这里所有类型都已经声明好了）。
+///
+/// 顺序与 `abi` 里的 `SYM_*` 常量一致：v3 的四件套在前，v4 新增的三个紧随其后。
 const TRAILER: &str = r#"/**
  * 插件必须导出的符号（C++ 下请放在 `extern "C"` 块里）。
  *
  * 名字与 arity 是 ABI 定死的，宿主按这些名字 dlsym。
- * `plugin_start` / `plugin_stop` 可以省略（只做元数据登记的插件不写），
- * `plugin_init` 和 `plugin_free_string` 必须有。
+ *
+ * 必需与可选的边界：
+ * - `plugin_init` **必需**，缺了宿主根本不加载；
+ * - `plugin_start` / `plugin_stop` 可省略（只做元数据登记的插件不写）；
+ * - `plugin_manifest`（ABI v4）可省略，但**省略就意味着依赖只能靠宿主配置**
+ *   `[plugin.<名>].inject`。想被宿主按依赖排序就必须导出它；
+ * - `fuyubot_abi_version`（ABI v4）可省略，只服务 `fuyubot-sdk check` 的静态检查；
+ * - `plugin_free_handle`（ABI v4）可省略，ABI 版本不匹配时宿主用它释放
+ *   `plugin_init` 分配的状态（那种时候调 `plugin_stop` 不安全）；
+ * - `plugin_free_string` 只要插件往外交付过字符串（含 `plugin_manifest`）
+ *   就必须**真的能释放**——空实现会让每次加载漏一段。
  */
 FUYUBOT_EXPORT PluginHandle plugin_init(const HostApiVTable *host);
 FUYUBOT_EXPORT int32_t plugin_start(PluginHandle handle, const char *config_json);
 FUYUBOT_EXPORT void plugin_stop(PluginHandle handle);
-FUYUBOT_EXPORT void plugin_free_string(char *ptr);"#;
+FUYUBOT_EXPORT void plugin_free_string(char *ptr);
+FUYUBOT_EXPORT const char *plugin_manifest(void);
+FUYUBOT_EXPORT uint32_t fuyubot_abi_version(void);
+FUYUBOT_EXPORT void plugin_free_handle(PluginHandle handle);"#;
 
 fn main() {
     let mut config = cbindgen::Config::default();
