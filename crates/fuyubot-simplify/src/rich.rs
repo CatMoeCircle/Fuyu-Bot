@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    Media, ReplyButton, Result, Simplify, SimplifyError, Text, content_json, plain_text,
+    Media, ReplyButton, Result, Simplify, SimplifyError, Text, Topic, content_json, plain_text,
     put_common, reply_markup,
 };
 
@@ -698,7 +698,8 @@ pub fn rich_content_json(message: &RichMessage, clear_draft: bool) -> Value {
 pub struct RichMessageParams {
     pub message: RichMessage,
     pub reply_to_message_id: Option<i64>,
-    pub topic_id: Option<i64>,
+    /// 发到哪个话题（见 [`Topic`]）。
+    pub topic_id: Option<Topic>,
     pub reply_markup: Vec<Vec<ReplyButton>>,
     /// 发的时候顺手删掉草稿（TDLib 的 `clear_draft`）。
     pub clear_draft: bool,
@@ -3514,14 +3515,15 @@ mod tests {
     fn send_and_edit_params_use_tdlib_field_names() {
         let params = RichMessageParams {
             reply_to_message_id: Some(9),
-            topic_id: Some(3),
+            topic_id: Some(Topic::forum(3)),
             reply_markup: vec![vec![ReplyButton::callback("好", "ok")]],
             ..RichMessageParams::markdown("正文")
         };
         let send = rich_send_params(7, &params);
         // 真签名是 topic_id / reply_to / input_message_content（不是 Bot API 那套）
         assert_eq!(send["chat_id"], 7);
-        assert_eq!(send["topic_id"]["@type"], "messageTopicThread");
+        assert_eq!(send["topic_id"]["@type"], "messageTopicForum");
+        assert_eq!(send["topic_id"]["forum_topic_id"], 3);
         assert_eq!(send["reply_to"]["@type"], "inputMessageReplyToMessage");
         assert_eq!(
             send["input_message_content"]["@type"],

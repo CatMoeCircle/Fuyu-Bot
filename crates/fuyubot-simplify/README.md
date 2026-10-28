@@ -1,12 +1,23 @@
 # fuyubot-simplify
 
-TDLib 便捷封装：把「发消息 / 相册 / 富消息 / 编辑消息 / 删除消息 / 等更新 / 内联键盘 / 批量解析 / 下载进度」包成人话 API——**一个方法一个参数结构体 + 短字段名**（`SendMessageParams { text, media, reply_to_message_id, topic_id, reply_markup, link_preview, timeout_ms }`），调用方不拼 TDLib 的嵌套 JSON，请求经 `td_invoke*` 发出、返回的仍是 TDLib 原始 JSON。
+TDLib 便捷封装：把「发消息 / 相册 / 富消息 / 编辑消息 / 删除消息 / 转发 / 管理权 / 表情反应 / 连接状态 / 等更新 / 内联键盘 / 批量解析 / 下载进度」包成人话 API——**一个方法一个参数结构体 + 短字段名**（`SendMessageParams { text, media, reply_to_message_id, topic_id, reply_markup, link_preview, timeout_ms }`），调用方不拼 TDLib 的嵌套 JSON，请求经 `td_invoke*` 发出、返回的仍是 TDLib 原始 JSON。
 
 **每个方法都等到结果才返回**，不交回请求号：
 
 - 发送类（`send_message` / `send_message_album` / `send_rich_message`）：等响应拿临时消息 → 等 `updateMessageSendSucceeded`（成功，给最终 `Message`）或 `updateMessageSendFailed`（→ `SimplifyError::SendFailed`）；超时先撤回未发出的消息再 `Timeout`。相册是 **N 条**结局，全成才算成。
 - 其余（`edit_*` / `delete_message` / `answer_callback_query`）：结果是**响应**——`Message` / `ok` 是成功，`@type == "error"` → `SimplifyError::Tdlib`。
 - ⚠️ 这些方法是**阻塞**的，而插件回调就在接收循环线程上——回调里请用 `*_then`（结果走闭包，并返回线程句柄，**`stop()` 里要 join**，否则卸载后线程还在跑库里的代码）。
+
+## 身份、管理权、转发、反应、连接状态
+
+这几样在 TDLib 里都「没有直觉上那个方法」，所以单独封一层：
+
+话题（`topic_id`）不是裸 id，是 [`Topic`]：`Topic::forum(1)`（论坛群组 / 与 bot 的私聊，TDLib 的 `messageTopicForum`）、`Topic::thread(2)`（**非论坛**群组的评论串，`messageTopicThread`）、`Topic::direct_messages(..)` / `Topic::saved_messages(..)`。四者构造器与 id 类型都不同，所以**没有** `From<i64>`——逼调用方说清是哪一种。
+
+- **管理权**：`user` 上连 `is_bot` 都没有（身份在 `user.type`），管理权在 `getChatMember` 的 `ChatMember.status` 里。`is_chat_admin(chat_id, user_id, right, timeout_ms)` / `am_i_chat_admin(chat_id, right, timeout_ms)` 直接返回 **`bool`**：`right: Option<AdminRight>` 为 `None` 只看身份（群主 / 管理员），`Some(…)` 还要求 `chatAdministratorRights` 里那一项为真（群主**拥有一切**，唯一的例外是 `IsAnonymous`——它在 creator 自己的 `is_anonymous` 上，不在 `rights` 里）。查不到（超时 / TDLib 报错 / 不是群聊）一律 `false`：不确定时说「没有」比说「有」安全。手上已经有 `ChatMember` / `updateChatMember` 时直接调纯函数 `is_admin_status(status, right)`，省一次往返。
+- **转发**：`forward_messages(chat_id, from_chat_id, &ForwardParams { … })` 走 `forwardMessages`（一次一组，不是 Bot API 的 `forwardMessage`），`message_ids` 会**排序去重**（TDLib 要求严格递增、最多 100 条），返回的是还没发完的临时消息——这里只等**响应**，不等发送结局。
+- **表情反应**：bot 与用户号**不是同一个方法**——用户用 `addMessageReaction`（追加一个），bot 只能用 `setMessageReactions`（整组覆盖，空列表 = 清空）。`react` / `unreact` 先 `getMe` 看 `user.type.@type == "userTypeBot"` 再挑对的那个；已经知道自己是哪种就直接调 `add_reaction` / `set_reactions`，省掉 `getMe` 那一趟。
+- **连接状态**：TDLib 没有 `getConnectionState`，连接状态只以 `updateConnectionState` 的形式出现。`track_connection_state()` 订阅并**记住最新那条**（守卫 drop 即退订），之后 `is_ready()` / `connection()` / `state()` 随时可读、不发请求。订阅之前推过的更新补不回来（状态更新不重放），所以在插件 `start` 里尽早调。注意这是**连接**状态，不是**授权**状态——`connectionStateReady` 也可能还没登录。
 
 `formattedText` 那条链路上的带标记文本（Markdown / HTML）**不自己解析**——经同步的 `td_execute` 直接问 TDLib 的 `parseTextEntities`。
 

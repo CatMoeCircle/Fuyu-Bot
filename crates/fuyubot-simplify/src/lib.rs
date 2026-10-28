@@ -54,6 +54,25 @@
 //!   **只在下一次宿主调用之前有效**，要拿数据就立刻读（或用 `*_json` / `wait_response`，
 //!   它们已经替你拷好了）。
 //!
+//! ## 身份、管理权、转发、反应、连接状态
+//!
+//! 这几样在 TDLib 里都「没有直觉上那个方法」，所以单独封一层：
+//!
+//! - **管理权**：`user` 上连 `is_bot` 都没有（身份在 `user.type`），管理权在
+//!   `getChatMember` 的 `ChatMember.status` 里。[`Simplify::is_chat_admin`] /
+//!   [`Simplify::am_i_chat_admin`] 直接返回 **`bool`**：`right: Option<AdminRight>`
+//!   为 `None` 只看身份，`Some(…)` 还要求 `chatAdministratorRights` 里那一项为真；
+//!   查不到（超时 / TDLib 报错 / 不是群聊）一律 `false`。
+//! - **转发**：[`Simplify::forward_messages`] 走 `forwardMessages`（一次一组，
+//!   不是 Bot API 的 `forwardMessage`），`message_ids` 会被排序去重。
+//! - **表情反应**：bot 与用户号**不是同一个方法**——用户用 `addMessageReaction`
+//!   （追加一个），bot 只能用 `setMessageReactions`（整组覆盖，空列表 = 清空）。
+//!   [`Simplify::react`] / [`Simplify::unreact`] 先看 `getMe` 再挑，不用调用方操心。
+//! - **连接状态**：TDLib 没有 `getConnectionState`，连接状态只以
+//!   `updateConnectionState` 的形式出现。[`Simplify::track_connection_state`]
+//!   订阅并记住最新那条（守卫 drop 即退订），之后 [`ConnectionTracker::is_ready`]
+//!   随时可读、不发请求。
+//!
 //! ## 类型提示
 //!
 //! TDLib 的请求/更新类型（编译期从 `td_api.tl` 生成）经 [`td_api`] 重导：
@@ -73,8 +92,17 @@ use serde_json::{Map, Value, json};
 /// 这里重导 `td_api`，让只依赖本 crate 的调用方也有类型提示。
 pub use fuyubot_tdlib_sys::td_api;
 
+mod chat;
+mod connection;
 mod rich;
 
+pub use chat::{
+    AdminRight, ForwardParams, MAX_FORWARD_MESSAGES, Reaction, chat_member_params, forward_params,
+    is_admin_status, reaction_params, remove_reaction_params, set_reactions_params,
+};
+pub use connection::{
+    CONNECTION_UPDATE, ConnectionState, ConnectionTracker, track_connection_state,
+};
 pub use rich::{
     RichButton, RichButtonAction, RichButtonAlign, RichButtonStyle, RichMedia, RichMessage,
     RichMessageParams, RichSource, markdown, rich_content_json, rich_edit_params, rich_send_params,
@@ -90,6 +118,10 @@ pub enum SimplifyError {
     BadString,
     #[error("相册只能放 2–10 项，收到 {0} 项")]
     AlbumSize(usize),
+    #[error("转发列表是空的")]
+    EmptyForward,
+    #[error("一次最多转发 {MAX_FORWARD_MESSAGES} 条，收到 {0} 条")]
+    TooManyForward(usize),
     #[error("富消息不能为空（blocks 或源文本至少要有内容）")]
     EmptyRichMessage,
     #[error("块 / 按钮行只能挂在 Blocks 源上：md / html 源由服务端解析，本地插不进块")]
@@ -1360,6 +1392,72 @@ fn base64(data: &str) -> String {
     out
 }
 
+// ── 话题 ──────────────────────────────────────────────────────────
+
+/// 消息落在哪个「话题」：TDLib 的 `MessageTopic`（四个构造器，各有各的 id 类型）。
+///
+/// 这四个**不是一回事**，选错了 TDLib 会拒绝：
+///
+/// | 变体 | 用在哪 | TDLib 构造器 |
+/// | --- | --- | --- |
+/// | [`Forum`](Self::Forum) | **论坛**群组（以及与 bot 的私聊）里的话题 | `messageTopicForum { forum_topic_id: int32 }` |
+/// | [`Thread`](Self::Thread) | **非论坛**群组的评论串 | `messageTopicThread { message_thread_id: int53 }` |
+/// | [`DirectMessages`](Self::DirectMessages) | 频道的「私信话题」 | `messageTopicDirectMessages` |
+/// | [`SavedMessages`](Self::SavedMessages) | 收藏夹里的话题 | `messageTopicSavedMessages` |
+///
+/// ⚠️ 这里刻意**不给** `From<i64>`：论坛话题是 `int32`、评论串是 `int53`，
+/// 一个裸数字说不清是哪一种——把它隐式转成其中任何一个，都会在另一种群里静默发错。
+/// （这里以前就是固定按 `messageTopicThread` 拼的：非论坛群以外全错。）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Topic {
+    /// 论坛群组 / 与 bot 的私聊里的话题（`forum_topic_id`）。
+    Forum(i32),
+    /// **非论坛**群组的评论串（`message_thread_id`）。
+    Thread(i64),
+    /// 频道私信话题（`direct_messages_chat_topic_id`）。
+    DirectMessages(i64),
+    /// 收藏夹话题（`saved_messages_topic_id`）。
+    SavedMessages(i64),
+}
+
+impl Topic {
+    /// 论坛群组（或与 bot 的私聊）里的话题。
+    pub fn forum(forum_topic_id: i32) -> Self {
+        Self::Forum(forum_topic_id)
+    }
+
+    /// **非论坛**群组里的评论串。
+    pub fn thread(message_thread_id: i64) -> Self {
+        Self::Thread(message_thread_id)
+    }
+
+    /// 频道的私信话题。
+    pub fn direct_messages(direct_messages_chat_topic_id: i64) -> Self {
+        Self::DirectMessages(direct_messages_chat_topic_id)
+    }
+
+    /// 收藏夹里的话题。
+    pub fn saved_messages(saved_messages_topic_id: i64) -> Self {
+        Self::SavedMessages(saved_messages_topic_id)
+    }
+
+    /// TDLib 的 `MessageTopic`。
+    pub fn to_json(&self) -> Value {
+        match self {
+            Self::Forum(id) => json!({ "@type": "messageTopicForum", "forum_topic_id": id }),
+            Self::Thread(id) => json!({ "@type": "messageTopicThread", "message_thread_id": id }),
+            Self::DirectMessages(id) => json!({
+                "@type": "messageTopicDirectMessages",
+                "direct_messages_chat_topic_id": id,
+            }),
+            Self::SavedMessages(id) => json!({
+                "@type": "messageTopicSavedMessages",
+                "saved_messages_topic_id": id,
+            }),
+        }
+    }
+}
+
 // ── 参数结构体（一个方法一个，字段用短名字） ──────────────────────
 
 /// `sendMessage` 的参数。
@@ -1373,8 +1471,9 @@ pub struct SendMessageParams {
     pub media: Option<Media>,
     /// 回复哪条消息（TDLib 的 `reply_to`）。
     pub reply_to_message_id: Option<i64>,
-    /// 哪个话题/楼层（TDLib 的 `topic_id`，不是 Bot API 的 `message_thread_id`）。
-    pub topic_id: Option<i64>,
+    /// 发到哪个话题（TDLib 的 `topic_id`）。**不是** Bot API 的 `message_thread_id`——
+    /// 论坛话题是 [`Topic::forum`]，非论坛群组的评论串才是 [`Topic::thread`]。
+    pub topic_id: Option<Topic>,
     /// 内联键盘（空数组 = 不带）。
     pub reply_markup: Vec<Vec<ReplyButton>>,
     /// 链接预览：`Some(false)` = 关掉；`Some(true)` / `None` = 交给 TDLib 默认（显示）。
@@ -1424,7 +1523,8 @@ pub struct SendAlbumParams {
     /// 整组共用一段标题。
     pub caption: Option<Text>,
     pub reply_to_message_id: Option<i64>,
-    pub topic_id: Option<i64>,
+    /// 发到哪个话题（见 [`Topic`]）。
+    pub topic_id: Option<Topic>,
     /// 整组**共用**的等待预算（[`Simplify::send_message_album_wait_success`] 用）：
     /// 先等 `Messages` 响应、再等 N 条 `updateMessageSendSucceeded`，全程只有这一个预算，
     /// 不是每条各等一次。
@@ -1508,12 +1608,15 @@ impl Default for EditMediaParams {
 ///
 /// 参数名以真 `td_api.tl` 为准（`sendMessage chat_id topic_id reply_to options
 /// reply_markup input_message_content`）：
-/// - 话题是 **`topic_id`**（`messageTopicThread`）；
+/// - 话题是 **`topic_id`**，但它是个 `MessageTopic`——**四个构造器选哪个由
+///   [`Topic`] 决定**（论坛话题是 `messageTopicForum`，不是 `messageTopicThread`）；
 /// - 回复是 **`reply_to`**（`inputMessageReplyToMessage`）；
 /// - **没有顶层 `caption`**，它在内容类型里（见 [`content_json`]）。
 ///
 /// 这一版修掉的是一次真缺陷：上面几条以前全按 **Bot API** 的样子拼
 /// （`message_thread_id` / `reply_to_message_id` / 顶层 `caption`），TDLib 一个都不认。
+/// 后来又发现 `topic_id` 固定拼 `messageTopicThread` 也是错的——那是**非论坛**群组的
+/// 评论串，论坛话题得用 `messageTopicForum`，所以改成了 [`Topic`]。
 /// `every_request_simplify_builds_passes_the_real_schema` 会挡住再犯。
 pub fn send_params(
     chat_id: i64,
@@ -1564,12 +1667,9 @@ fn media_with_caption(media: &Media, text: Option<&Text>) -> Media {
 }
 
 /// `topic_id` / `reply_to` 两个共用的可选参数。
-fn put_common(payload: &mut Map<String, Value>, topic_id: &Option<i64>, reply_to: &Option<i64>) {
-    if let Some(thread) = topic_id {
-        payload.insert(
-            "topic_id".to_owned(),
-            json!({ "@type": "messageTopicThread", "message_thread_id": thread }),
-        );
+fn put_common(payload: &mut Map<String, Value>, topic_id: &Option<Topic>, reply_to: &Option<i64>) {
+    if let Some(topic) = topic_id {
+        payload.insert("topic_id".to_owned(), topic.to_json());
     }
     if let Some(message) = reply_to {
         payload.insert(
@@ -2858,7 +2958,7 @@ mod tests {
                 text: Some(Text::plain("hi")),
                 media: None,
                 reply_to_message_id: Some(9),
-                topic_id: Some(3),
+                topic_id: Some(Topic::forum(3)),
                 reply_markup: vec![vec![
                     ReplyButton::callback("ok", "x")
                         .emoji(4242)
@@ -2872,8 +2972,9 @@ mod tests {
 
         let params = rt.sent_requests()[0].params.clone();
         // 真 `sendMessage` 是 `chat_id topic_id reply_to options reply_markup input_message_content`
-        assert_eq!(params["topic_id"]["@type"], "messageTopicThread");
-        assert_eq!(params["topic_id"]["message_thread_id"], 3);
+        // 论坛话题是 messageTopicForum（不是 messageTopicThread——那是非论坛群组的评论串）
+        assert_eq!(params["topic_id"]["@type"], "messageTopicForum");
+        assert_eq!(params["topic_id"]["forum_topic_id"], 3);
         assert_eq!(params["reply_to"]["@type"], "inputMessageReplyToMessage");
         assert_eq!(params["reply_to"]["message_id"], 9);
         assert!(
@@ -3256,7 +3357,8 @@ mod tests {
                 medias: vec![Media::photo("/tmp/a.jpg"), Media::photo("/tmp/b.jpg")],
                 caption: Some(Text::plain("一组图")),
                 reply_to_message_id: Some(9),
-                topic_id: Some(3),
+                // 非论坛群组的评论串走 messageTopicThread（与上面的 forum 分支互补）
+                topic_id: Some(Topic::thread(3)),
                 timeout_ms: 0,
             }
         );
@@ -3302,6 +3404,7 @@ mod tests {
         // 相册：input_message_contents 是数组，共用一段标题
         let album = &sent[3].params;
         assert_eq!(album["topic_id"]["@type"], "messageTopicThread");
+        assert_eq!(album["topic_id"]["message_thread_id"], 3);
         assert_eq!(album["reply_to"]["message_id"], 9);
         let contents = album["input_message_contents"].as_array().unwrap();
         assert_eq!(contents.len(), 2);
@@ -4016,7 +4119,7 @@ mod tests {
                 text: Some(Text::markdown_v2("*hi*")),
                 media: None,
                 reply_to_message_id: Some(9),
-                topic_id: Some(3),
+                topic_id: Some(Topic::forum(3)),
                 reply_markup: markup.clone(),
                 link_preview: Some(false),
                 timeout_ms: 0,
@@ -4103,13 +4206,13 @@ mod tests {
             7,
             &quick!(SendMessageParams::media(Media::location(1.5, 2.5)))
         );
-        simplify.send_message_album(
+        let _ = simplify.send_message_album(
             7,
             &SendAlbumParams {
                 medias: vec![Media::photo("/tmp/a.jpg"), Media::photo("/tmp/b.jpg")],
                 caption: Some(Text::plain("一组")),
                 reply_to_message_id: Some(9),
-                topic_id: Some(3),
+                topic_id: Some(Topic::forum(3)),
                 timeout_ms: 0,
             },
         );
@@ -4120,7 +4223,7 @@ mod tests {
             7,
             &RichMessageParams {
                 reply_to_message_id: Some(9),
-                topic_id: Some(3),
+                topic_id: Some(Topic::forum(3)),
                 reply_markup: markup.clone(),
                 clear_draft: true,
                 timeout_ms: 0,
@@ -4197,6 +4300,36 @@ mod tests {
         fire!(simplify, edit_message_reply_markup, 7, 9, &[], 0);
         fire!(simplify, delete_message, 7, [9, 10], true, 0);
         fire!(simplify, answer_callback_query, 555, Some("好的"), true, 0);
+        // 管理权 / 转发 / 表情反应：离线同样拿不到响应，但请求已经留档
+        fire!(
+            simplify,
+            is_chat_admin,
+            7,
+            42,
+            Some(AdminRight::DeleteMessages),
+            0
+        );
+        fire!(simplify, am_i_chat_admin, 7, None, 0);
+        fire!(
+            simplify,
+            forward_messages,
+            7,
+            8,
+            &quick!(ForwardParams::new([2, 1]).topic_id(Topic::forum(3)))
+        );
+        fire!(simplify, react, 7, 9, &Reaction::emoji("👍"), false, 0);
+        fire!(simplify, unreact, 7, 9, &Reaction::custom_emoji(5), 0);
+        // bot 那条路（setMessageReactions）离线走不到（要先 getMe 才判定），
+        // 它的形状由 chat::tests::new_request_shapes_pass_the_real_schema 单独守着。
+        fire!(
+            simplify,
+            set_reactions,
+            7,
+            9,
+            &[Reaction::emoji("👍"), Reaction::custom_emoji(1)],
+            false,
+            0
+        );
         // 不等响应：超时也照样说明请求发出去了
         let _ = simplify.download_file(99, 1, 10);
 
