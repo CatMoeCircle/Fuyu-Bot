@@ -209,6 +209,12 @@ pub struct HostRuntime {
     /// 子作用域表：中间插件为每个脚本建一个，卸载单个脚本只撤销它自己的。
     scopes: Mutex<HashMap<u64, ScopeInfo>>,
     next_scope: AtomicU64,
+    /// owner → 这个插件的 **Context 子作用域**（服务可见性）。
+    ///
+    /// 与上面那个 `scopes` 是两件事：`scopes` 管「哪些注册归这个插件」（回滚粒度
+    /// 与 `scope` 细分），这张表管「它注册的服务给谁看、它能看见谁的服务」。
+    /// 插件在 `begin_plugin` 时拿到自己的 child，`rollback_owner` 时连同注册一起丢弃。
+    plugin_contexts: Mutex<HashMap<u64, Context>>,
     /// 内置「插件清单」service 的 vtable（`context` 指向本实例）。按值存，地址稳定。
     plugins_vtable: ServiceVTable,
     waiters: Mutex<HashMap<u64, Arc<Waiter>>>,
@@ -352,6 +358,7 @@ impl HostRuntime {
             next_id: AtomicU64::new(1),
             next_owner: AtomicU64::new(1),
             scopes: Mutex::new(HashMap::new()),
+            plugin_contexts: Mutex::new(HashMap::new()),
             next_scope: AtomicU64::new(1),
             waiters: Mutex::new(HashMap::new()),
             next_waiter: AtomicU64::new(1),
@@ -406,6 +413,7 @@ impl HostRuntime {
                 log: Some(api_log),
                 get_config: Some(api_get_config),
                 set_config: Some(api_set_config),
+                provide_service_shared: Some(api_provide_service_shared),
             },
         });
         rt.provide_scope_service();
@@ -829,6 +837,13 @@ impl HostRuntime {
 
     fn begin_plugin(&self) -> u64 {
         let id = self.next_owner.fetch_add(1, Ordering::Relaxed);
+        // 每个插件一份 Context 子作用域：它注册的服务默认只自己（和自己的子作用域）看得见，
+        // 查找仍沿父链走到根，所以宿主那四个机制照样能用。要跨插件共享走
+        // `provide_service_shared`（直接写根）。
+        self.plugin_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, self.ctx.child());
         // 插件加载作用域：scope = 0（插件根作用域），压到本线程栈顶。
         SCOPE_STACK.with(|stack| stack.borrow_mut().push((id, 0)));
         id
@@ -853,6 +868,26 @@ impl HostRuntime {
         }
         // 这个 owner 建的子作用域一并失效并从表里摘掉，否则作用域表只增不减。
         self.scopes().retain(|_, info| info.owner != owner);
+        // Context 子作用域也是：插件没了，它那层服务表就没人该看见了。
+        // （注册本身已经在上面的倒序撤销里撤掉了，这里只是把表项丢掉。）
+        self.plugin_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&owner);
+    }
+
+    /// 当前调用者该往哪张服务表写、从哪张查。
+    ///
+    /// 有 owner 且登记过 child → 用它（插件的私有作用域）；否则退回根
+    /// （宿主自己调的，或者 `plugin_init` 之前的早期调用）。
+    fn caller_context(&self) -> Context {
+        let owner = self.current_owner();
+        self.plugin_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&owner)
+            .cloned()
+            .unwrap_or_else(|| self.ctx.clone())
     }
 
     /// 摘走满足 `predicate` 的全部注册（**保持注册顺序**），剩下的写回表。
@@ -1617,6 +1652,36 @@ unsafe extern "C" fn api_list_plugins(host: *mut c_void) -> *const c_char {
     host_string(&rt.plugin_report())
 }
 
+/// 注册到**进程级**：所有插件可见。与 [`api_provide_service`] 的唯一区别就是落点。
+unsafe extern "C" fn api_provide_service_shared(
+    host: *mut c_void,
+    name: *const c_char,
+    vtable: *const ServiceVTable,
+) -> ServiceHandle {
+    // SAFETY: ABI 契约保证 host 来自本运行时。
+    let Some(rt) = (unsafe { runtime(host) }) else {
+        return ServiceHandle::INVALID;
+    };
+    if vtable.is_null() {
+        rt.warn("provide_service_shared 收到了空 vtable");
+        return ServiceHandle::INVALID;
+    }
+    // SAFETY: 同上。
+    let Some(name) = (unsafe { cstr(name) }) else {
+        return ServiceHandle::INVALID;
+    };
+    // 故意写根：这就是「共享」的全部含义。同名会和别人撞，所以调用方得是真的想共享。
+    match rt.ctx.provide_service(name, AbiService(vtable)) {
+        Ok(handle) => ServiceHandle {
+            id: rt.remember(RegistrationKind::Service(handle)),
+        },
+        Err(e) => {
+            rt.warn(&format!("注册共享服务 {name} 失败: {e}"));
+            ServiceHandle::INVALID
+        }
+    }
+}
+
 unsafe extern "C" fn api_provide_service(
     host: *mut c_void,
     name: *const c_char,
@@ -1634,7 +1699,10 @@ unsafe extern "C" fn api_provide_service(
     let Some(name) = (unsafe { cstr(name) }) else {
         return ServiceHandle::INVALID;
     };
-    match rt.ctx.provide_service(name, AbiService(vtable)) {
+    match rt
+        .caller_context()
+        .provide_service(name, AbiService(vtable))
+    {
         Ok(handle) => ServiceHandle {
             id: rt.remember(RegistrationKind::Service(handle)),
         },
@@ -1657,7 +1725,7 @@ unsafe extern "C" fn api_get_service(
     let Some(name) = (unsafe { cstr(name) }) else {
         return core::ptr::null();
     };
-    match rt.ctx.resolve::<AbiService>(name) {
+    match rt.caller_context().resolve::<AbiService>(name) {
         Ok(service) => service.0,
         Err(_) => core::ptr::null(),
     }
@@ -2019,7 +2087,9 @@ impl PluginScope<'_> {
     /// 保留这次加载产生的注册。
     pub(crate) fn commit(mut self) {
         self.finished = true;
-        self.runtime.end_plugin();
+        // **不要**在这里 `end_plugin()`：`self` 紧接着就被 Drop，那边统一收尾。
+        // 早先两处都弹一次，栈就被弹穿了（单层加载时 pop 空栈看不出来，
+        // 中间插件嵌套加载脚本时会把外层的作用域弹掉）。
     }
 }
 
@@ -3333,6 +3403,94 @@ mod tests {
             assert!(error.contains("nope"), "{error}");
         }
         // vtable 是局部变量，活到本函数末尾——比所有调用都久。
+    }
+
+    /// 作用域的两种落点：`provide_service` 写调用者自己的 child，`provide_service_shared` 写根。
+    ///
+    /// 验四件事：两个插件注册同名服务**不冲突**；私有服务落在 child 里、根上看不见；
+    /// 共享服务落在根上；child 沿父链能看见共享的那份。
+    ///
+    /// 只验落点，不验 `get_service` 的端到端可见性——那条路是
+    /// `caller_context().resolve()`，与 `provide` 同源同表；可见性本身由
+    /// `Context` 的作用域单测（`child` / `resolve` / `names`）保证。
+    #[test]
+    fn plugin_services_are_private_until_shared() {
+        unsafe extern "C" fn echo(_ctx: *mut c_void, input: *const c_char) -> *const c_char {
+            input
+        }
+        let method = CString::new("echo").unwrap();
+        let name = CString::new("demo.svc").unwrap();
+        let methods = [ServiceMethod {
+            name: method.as_ptr(),
+            func: Some(echo),
+        }];
+        // 用 `version` 区分两份 vtable，指针比较才有意义。
+        let service = |tag: u32| ServiceVTable {
+            name: name.as_ptr(),
+            version: tag,
+            size: core::mem::size_of::<ServiceVTable>() as u32,
+            context: core::ptr::null_mut(),
+            methods: methods.as_ptr(),
+            method_count: methods.len(),
+        };
+        let service_a = service(1);
+        let service_b = service(2);
+        let shared = service(3);
+
+        let rt = HostRuntime::new(Context::new()).unwrap();
+        let host = rt.vtable.host_ctx;
+        let provide = rt.vtable.provide_service.unwrap();
+        let provide_shared = rt.vtable.provide_service_shared.unwrap();
+
+        let scope_a = rt.plugin_scope();
+        assert_eq!(
+            SCOPE_STACK.with(|s| s.borrow().len()),
+            2,
+            "begin_plugin 应当往底(0,0)之上压一层"
+        );
+        // SAFETY: host 来自本运行时；几个 vtable 都活到函数末尾。
+        let handle_a = unsafe { provide(host, name.as_ptr(), &service_a) };
+        assert_ne!(handle_a.id, 0, "插件 A 注册私有服务应当成功");
+
+        // 第二个插件注册**同名**服务：落点不同，所以不该冲突。
+        // 下划线前缀不是「不用」——是刻意持有到函数末尾，提前 drop 会把栈弹掉。
+        let _scope_b = rt.plugin_scope();
+        // SAFETY: 同上。
+        let handle_b = unsafe { provide(host, name.as_ptr(), &service_b) };
+        assert_ne!(
+            handle_b.id, 0,
+            "两个插件注册同名服务不该冲突——它们落在各自的作用域里"
+        );
+
+        // 私有：落在插件自己的 child 上，**根上看不见**。
+        let child = rt
+            .plugin_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&scope_a.owner())
+            .cloned()
+            .expect("begin_plugin 应当给这个 owner 建 child");
+        assert!(
+            child.resolve::<AbiService>("demo.svc").is_ok(),
+            "私有服务应当落在插件自己的 child 里"
+        );
+        assert!(
+            rt.ctx.resolve::<AbiService>("demo.svc").is_err(),
+            "私有服务不该漏到根上——这正是「默认私有」的全部含义"
+        );
+
+        // 共享：显式写根，child 沿父链也看得见。
+        // SAFETY: host 来自本运行时；vtable 活到函数末尾。
+        let handle_shared = unsafe { provide_shared(host, c"demo.shared".as_ptr(), &shared) };
+        assert_ne!(handle_shared.id, 0, "共享注册应当成功");
+        assert!(
+            rt.ctx.resolve::<AbiService>("demo.shared").is_ok(),
+            "共享服务应当在根上"
+        );
+        assert!(
+            child.resolve::<AbiService>("demo.shared").is_ok(),
+            "child 沿父链也该看见共享服务"
+        );
     }
 
     /// ABI v4 核心：`register_tool` 带 handler 之后 `call_tool` 真的调到它。

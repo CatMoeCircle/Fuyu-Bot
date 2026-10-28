@@ -654,6 +654,14 @@ mod tests {
     ) -> ServiceHandle {
         ServiceHandle::INVALID
     }
+    /// `provide_service_shared` 的桩：测试里两者行为一样，区别只在宿主的落点。
+    unsafe extern "C" fn noop_provide_shared(
+        _: *mut core::ffi::c_void,
+        _: *const core::ffi::c_char,
+        _: *const ServiceVTable,
+    ) -> ServiceHandle {
+        ServiceHandle::INVALID
+    }
     unsafe extern "C" fn noop_get(
         _: *mut core::ffi::c_void,
         _: *const core::ffi::c_char,
@@ -728,6 +736,7 @@ mod tests {
             log: Some(noop_log),
             get_config: Some(noop_get_config),
             set_config: Some(noop_set_config),
+            provide_service_shared: Some(noop_provide_shared),
         }
     }
 

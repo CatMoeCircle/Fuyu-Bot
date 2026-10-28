@@ -99,8 +99,11 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     `isolate(name)` 把某个名字从当前作用域及以下的父链查找里摘掉。
     两个刻意的区分：`names()` 报的是「**能看见**什么」（含父级、去掉被隔离的），
     `len()` / `is_empty()` 报的是「**这一层**存了几个」。
-    ⚠️ 目前 `PluginManager` 传给插件 `apply` 的仍是**共享的根**，所以插件之间还没有
-    各自的作用域；`isolate` 现在服务于测试替身与宿主自己的代码。
+    ✅ **2026 起 dylib 插件有各自的作用域**：`HostRuntime` 在 `begin_plugin` 时给每个 owner 建一份
+    `ctx.child()`（存 `plugin_contexts`）；插件的 `provide_service` 落自己那层、要跨插件共享得用
+    `provide_service_shared` 显式写根、`get_service` 从自己那层沿父链查，`rollback_owner` 连 child
+    一起丢弃。⚠️ 但 `PluginManager` 传给**内置 Rust 插件** `apply` 的仍是共享的根（它们本来就是宿主
+    的一部分，不是外部插件）；`isolate` 仍然只服务测试替身与宿主自己的代码。
 11. **`Effect` 是 `#[must_use]`**：`let _ =` 会立刻回滚；要么存起来，要么显式 drop / rollback。
 12. **四个机制 crate 只依赖 `core`，彼此不许依赖**；组合由宿主层做。
 13. **与 Context 集成 = `install(ctx)` + 扩展 trait**；服务缺失时报错要带「该怎么 install」。

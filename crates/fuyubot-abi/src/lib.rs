@@ -408,6 +408,20 @@ pub struct HostApiVTable {
             input_json: *const c_char,
         ) -> *const c_char,
     >,
+    /// 注册一个服务到**进程级**：所有插件都能看见。
+    ///
+    /// [`Self::provide_service`] 注册到**调用者自己的作用域**（默认私有，兄弟插件看不见）。
+    /// 分成两个字段而不是加一个 bool 参数：作用域的边界是安全属性，不该藏在一个
+    /// 布尔里——写 `_shared` 的那一行必须是显眼的。
+    ///
+    /// 追加在尾部：老插件（`size` 更小）会被 `VTableTooSmall` 明确拒绝，而不是读到错位的指针。
+    pub provide_service_shared: Option<
+        unsafe extern "C" fn(
+            host: *mut c_void,
+            name: *const c_char,
+            vtable: *const ServiceVTable,
+        ) -> ServiceHandle,
+    >,
 }
 
 /// VTable 就是「两个 u32 + 20 个指针」；布局一改，这里立刻编译不过。
@@ -418,7 +432,9 @@ const _: () = {
     assert!(offset_of!(HostApiVTable, size) == 4);
     assert!(offset_of!(HostApiVTable, host_ctx) == 8);
     assert!(size_of::<Option<unsafe extern "C" fn()>>() == size_of::<*const c_void>());
-    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 20 * size_of::<*const c_void>());
+    // 21 = 2 个 u32 之后的函数指针个数。**加 VTable 字段必须同步改这个数**：
+    // 它是「结构没被悄悄改动」的唯一守卫，比 offset 断言更能发现加/删字段。
+    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 21 * size_of::<*const c_void>());
 
     // 句柄要能按值跨 ABI：必须恰好一个 u64。
     assert!(size_of::<SubscriptionHandle>() == size_of::<u64>());
@@ -493,6 +509,9 @@ pub struct HostApi {
     list_tools: unsafe extern "C" fn(*mut c_void) -> *const c_char,
     list_plugins: unsafe extern "C" fn(*mut c_void) -> *const c_char,
     provide_service:
+        unsafe extern "C" fn(*mut c_void, *const c_char, *const ServiceVTable) -> ServiceHandle,
+    /// 同上，但落到进程级（所有插件可见）。
+    provide_service_shared:
         unsafe extern "C" fn(*mut c_void, *const c_char, *const ServiceVTable) -> ServiceHandle,
     get_service: unsafe extern "C" fn(*mut c_void, *const c_char) -> *const ServiceVTable,
     td_invoke: unsafe extern "C" fn(*mut c_void, *const c_char) -> RequestId,
@@ -572,6 +591,7 @@ impl HostApi {
             list_tools: required!(list_tools),
             list_plugins: required!(list_plugins),
             provide_service: required!(provide_service),
+            provide_service_shared: required!(provide_service_shared),
             get_service: required!(get_service),
             td_invoke: required!(td_invoke),
             td_invoke_simplified: required!(td_invoke_simplified),
@@ -707,6 +727,11 @@ impl HostApi {
         unsafe { cstr_to_string(raw) }
     }
 
+    /// 注册一个服务，**落在调用者自己的作用域里**（默认私有）。
+    ///
+    /// 兄弟插件看不见它（查找只沿父链向上，兄弟之间没有边），但根上的公共服务
+    /// （宿主那四个机制）照样看得见。要跨插件共享用 [`Self::provide_service_shared`]。
+    ///
     /// # Safety
     /// `vtable` 必须在注销之前一直有效（生命周期由调用方保证）。
     pub unsafe fn provide_service(
@@ -719,6 +744,22 @@ impl HostApi {
         };
         // SAFETY: 调用方保证 vtable 存活。
         unsafe { (self.provide_service)(self.host_ctx, name.as_ptr(), vtable) }
+    }
+
+    /// 注册到**进程级**：所有插件都能看见。宿主自己那四个机制就是这个层级。
+    ///
+    /// ⚠️ 同名会和别人撞（宿主直接报 `ServiceNameExists`），所以只在真的要共享时用。
+    /// 分成两个方法而不是加一个 `bool`：作用域边界是安全属性，`_shared` 必须显眼。
+    pub fn provide_service_shared(
+        &self,
+        name: &str,
+        vtable: *const ServiceVTable,
+    ) -> ServiceHandle {
+        let Ok(name) = CString::new(name) else {
+            return ServiceHandle::INVALID;
+        };
+        // SAFETY: 同上。
+        unsafe { (self.provide_service_shared)(self.host_ctx, name.as_ptr(), vtable) }
     }
 
     pub fn get_service(&self, name: &str) -> *const ServiceVTable {
@@ -1268,6 +1309,14 @@ mod tests {
     ) -> ServiceHandle {
         ServiceHandle::INVALID
     }
+    /// `provide_service_shared` 的桩：测试里两者行为一样，区别只在宿主的落点。
+    unsafe extern "C" fn noop_provide_shared(
+        _: *mut c_void,
+        _: *const c_char,
+        _: *const ServiceVTable,
+    ) -> ServiceHandle {
+        ServiceHandle::INVALID
+    }
     unsafe extern "C" fn noop_get(_: *mut c_void, _: *const c_char) -> *const ServiceVTable {
         core::ptr::null()
     }
@@ -1331,6 +1380,7 @@ mod tests {
             log: Some(test_log),
             get_config: Some(noop_get_config),
             set_config: Some(noop_set_config),
+            provide_service_shared: Some(noop_provide_shared),
         }
     }
 
