@@ -137,6 +137,33 @@ pub fn resolve_repo(configured: Option<&str>) -> Option<String> {
         })
 }
 
+/// 从 `SHA256SUMS` 文本里取某个资产的摘要（64 位小写 hex）。
+///
+/// 发布侧用 GNU coreutils 的 `sha256sum` 生成，格式是 `<hex>  <名字>`；二进制模式会写成
+/// `<hex> *<名字>`。这里只认最后一段路径（容忍 `./` 前缀与 CRLF），找不到、或那行摘要
+/// 明显不是 SHA256（长度/字符不对）就返回 `None`——调用方据此决定「跳过校验」还是失败。
+pub fn digest_for(text: &str, asset: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(digest) = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+        let name = name.trim_start_matches('*');
+        let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+        if name != asset {
+            continue;
+        }
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        return Some(digest.to_ascii_lowercase());
+    }
+    None
+}
+
 /// 在所有缓存根里找 `relative` 那一份（顺序即优先级，见 [`cache_roots`]）。
 pub fn find_cached(relative: &Path) -> Option<PathBuf> {
     cache_roots()
@@ -237,6 +264,14 @@ fn store_out_dir_fallback(dest: &Path, bytes: &[u8]) -> Result<PathBuf, String> 
     }
 }
 
+/// 单次下载允许的最大字节数。
+///
+/// ureq 3 的 `read_to_vec()` **默认上限是 10MB**——而静态链接 OpenSSL 的 tdjson 资产
+/// 有 12–30MB，于是 1.8.69 的动态库在旧代码里永远下不下来（错误信息是
+/// 「the response body is larger than request limit: 10485760」，完全不像「资产太大」）。
+/// 这里显式放宽；`td_api.tl`（1–2MB）也走同一函数，没有副作用。
+pub const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
+
 /// 构建期的 HTTP GET。
 ///
 /// **不按 `vendored` 门控**：`td_api.tl` 是必需输入，无论开不开 vendored 都要下载它。
@@ -246,11 +281,12 @@ fn store_out_dir_fallback(dest: &Path, bytes: &[u8]) -> Result<PathBuf, String> 
 /// 而 `http_get` 一个测试都没有——把 `ureq` 拖进测试编译只会把它的传递依赖
 /// （ring 的 C 代码）也拉进来，纯属浪费。
 ///
-/// 两条刻意的取舍：
+/// 刻意的取舍：
 /// - **瞬时失败重试**：`td_api.tl` 下不来 = 构建失败，一次网络抖动不该毁掉整次构建。
 /// - **不设超时**：ureq 的默认全是 `None`（即不超时），这正是慢速链路下拖 12MB 动态库资产
 ///   所需要的；给它加超时会把「慢但能成」变成失败。也别为了「可控」随手 `timeout_global`。
 /// - **4xx 不重试**：仓库名 / tag / 资产名写错是确定性的，重试只是浪费时间。
+/// - **放宽 body 上限**：见 [`MAX_DOWNLOAD_BYTES`]——默认 10MB 会静默下不了现在的资产。
 #[cfg(not(test))]
 pub fn http_get(url: &str) -> Result<Vec<u8>, String> {
     const ATTEMPTS: u32 = 3;
@@ -260,10 +296,16 @@ pub fn http_get(url: &str) -> Result<Vec<u8>, String> {
             Err(ureq::Error::StatusCode(code)) if (400..500).contains(&code) => {
                 return Err(format!("HTTP {code}"));
             }
-            Ok(response) => match response.into_body().read_to_vec() {
-                Ok(bytes) => return Ok(bytes),
-                Err(error) => last = error.to_string(),
-            },
+            Ok(response) => {
+                let body = response
+                    .into_body()
+                    .into_with_config()
+                    .limit(MAX_DOWNLOAD_BYTES);
+                match body.read_to_vec() {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(error) => last = error.to_string(),
+                }
+            }
             Err(error) => last = error.to_string(),
         }
         if attempt < ATTEMPTS {
@@ -325,6 +367,39 @@ mod tests {
             release_url("fuyubot/fuyubot", "1.8.66", "TDLib-windows-x86_64"),
             "https://github.com/fuyubot/fuyubot/releases/download/TDLib-v1.8.66/TDLib-windows-x86_64"
         );
+    }
+
+    /// 发布侧的 `SHA256SUMS` 是 GNU `sha256sum` 的格式：两种分隔、`./` 前缀、CRLF
+    /// 都要认；摘要不合法的那行不能当成命中（否则等于放行）。
+    #[test]
+    fn sha256sums_lookup_handles_the_formats_we_publish() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let c = "c".repeat(64);
+        let text = format!(
+            "{a}  TDLib-linux-x86_64\r\n\
+             {b} *./TDLib-windows-x86_64\n\
+             # 注释行不算\n\
+             not-a-digest  TDLib-macos-aarch64\n\
+             {c}  td_api.tl\n"
+        );
+
+        assert_eq!(
+            digest_for(&text, "TDLib-linux-x86_64").as_deref(),
+            Some(a.as_str())
+        );
+        assert_eq!(
+            digest_for(&text, "TDLib-windows-x86_64").as_deref(),
+            Some(b.as_str()),
+            "二进制模式的 ` *` 与 `./` 前缀都要剥掉"
+        );
+        assert_eq!(digest_for(&text, "td_api.tl").as_deref(), Some(c.as_str()));
+        assert_eq!(
+            digest_for(&text, "TDLib-macos-aarch64"),
+            None,
+            "摘要不是 64 位 hex 时不能当成命中"
+        );
+        assert_eq!(digest_for(&text, "TDLib-linux-aarch64"), None);
     }
 
     /// 两份 `[package.metadata.fuyubot]` 必须一致（schema 与动态库各读各的 Cargo.toml）。

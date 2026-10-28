@@ -44,6 +44,12 @@ const LOG_CAPACITY: usize = 256;
 /// 插件那边只要把 `[plugins].log_level` 写成 `"debug"` / `"trace"` 就能开。
 pub const DEFAULT_LOG_VERBOSITY: LogLevel = LogLevel::Info;
 
+/// 宿主自己注册的工具在 `list_tools` 的 `owner` 字段里的取值。
+///
+/// 用 `host` 而不是某个插件名：宿主的内置工具不属于任何插件，插件名一律是点分的
+/// （`fuyubot.demo`），两者不会混。
+pub const HOST_TOOL_OWNER: &str = "host";
+
 /// 内置工具名：编译期烘焙的 TDLib 函数表（`td_api.tl` 的 `---functions---` 段）。
 ///
 /// 入参 `{"filter": "sendMessage"}`（filter 可选），输出 `{"count":…,"functions":[…]}`。
@@ -214,8 +220,11 @@ pub struct HostRuntime {
     /// 默认 [`DEFAULT_LOG_VERBOSITY`]。没有它的时候 `api_log` 对每条日志都
     /// `eprintln!`——插件刷 Debug 就是实打实的 stderr 系统调用。
     log_verbosity: AtomicU32,
-    /// `list_tools` 的序列化缓存：`(工具表版本号, JSON)`。版本号没变就复用。
-    tool_list_cache: Mutex<Option<(u64, Arc<CString>)>>,
+    /// `list_tools` 的序列化缓存：`(工具表版本号, owner 表版本号, JSON)`。两个都没变就复用。
+    ///
+    /// 为什么还要 owner 版本号：`owner` 是**算出来**的（工具注册完之后 `remember` 才记下
+    /// 归属），只盯工具表版本号的话，可能把「暂时按宿主算」的那一版缓存住。
+    tool_list_cache: Mutex<Option<(u64, u64, Arc<CString>)>>,
     /// 请求 id → 发起它的 owner。响应回来时按它决定投递给谁（有容量上限）。
     request_owners: Mutex<RequestOwners>,
     /// 没接 TDLib 时用的合成请求号。
@@ -227,8 +236,11 @@ pub struct HostRuntime {
     vtable: HostApiVTable,
     /// 全局配置（路径 + JSON 树）。`get_config` / `set_config` 读写它。
     config: Mutex<ConfigState>,
-    /// 插件 owner id → 插件名（`set_config` 按它判定「这是谁的段」）。
+    /// 插件 owner id → 插件名（`set_config` 按它判定「这是谁的段」；`list_tools` 的
+    /// `owner` 字段也从这里取）。
     owner_names: Mutex<HashMap<u64, String>>,
+    /// `owner_names` / 归属表的版本号：每次登记或摘掉名字、每次 `remember` 都 +1。
+    owner_revision: AtomicU64,
     /// **活的**插件报告来源（装了内核的 [`PluginReporter`] 之后才有）。
     ///
     /// 为什么是「来源」而不是「快照」：`HostRuntime` 只持有 `Context`，**刻意不持有
@@ -368,6 +380,7 @@ impl HostRuntime {
             },
             config: Mutex::new(ConfigState::default()),
             owner_names: Mutex::new(HashMap::new()),
+            owner_revision: AtomicU64::new(0),
             plugin_report: Mutex::new(None),
             // `host_ctx` 指向这个 `Arc` 内部；地址稳定，插件活着期间一直有效。
             vtable: HostApiVTable {
@@ -445,6 +458,7 @@ impl HostRuntime {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(owner, name.to_owned());
+        self.owner_revision.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 卸载插件时摘掉它的 owner 映射（owner id 会复用吗？不会——`next_owner` 只增不减，
@@ -454,6 +468,7 @@ impl HostRuntime {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&owner);
+        self.owner_revision.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 读配置：`section` 为空 = 读顶层；否则把 `section` 当**点路径**在 `plugin` 表里下钻
@@ -636,27 +651,75 @@ impl HostRuntime {
         self.log_verbosity.store(level as u32, Ordering::Relaxed);
     }
 
-    /// `list_tools` 的 JSON，按工具表版本号缓存。
+    /// `list_tools` 的 JSON，按工具表 / owner 表版本号缓存。
+    ///
+    /// 每条工具多一个 `owner` 字段（缺口 31）：注册它的**插件名**，宿主内置工具是
+    /// [`HOST_TOOL_OWNER`]。ABI 不用改——JSON 加字段向后兼容；插件靠它回答
+    /// 「这个工具到底是谁的」。
     ///
     /// 工具表变更不频繁，而列工具是热路径：没缓存时每调一次都要 `BTreeMap` 全表克隆
     /// → 逐条 `to_json` → 序列化 → 再拷进线程局部缓冲。版本号没变就直接复用上次的
     /// `CString`（用 `Arc` 存，所以缓存被替换后插件手里那个旧指针**依然有效**）。
     fn tools_json(&self) -> Arc<CString> {
         let revision = self.tools.revision();
+        let owner_revision = self.owner_revision.load(Ordering::Relaxed);
         let mut cache = self
             .tool_list_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         match cache.as_ref() {
-            Some((cached_revision, json)) if *cached_revision == revision => Arc::clone(json),
+            Some((cached_revision, cached_owner_revision, json))
+                if *cached_revision == revision && *cached_owner_revision == owner_revision =>
+            {
+                Arc::clone(json)
+            }
             _ => {
-                let json = Arc::new(
-                    CString::new(self.tools.list_tools_json().to_string()).unwrap_or_default(),
-                );
-                *cache = Some((revision, Arc::clone(&json)));
+                let mut list = self.tools.list_tools_json();
+                let owners = self.tool_owners();
+                if let Some(items) = list.as_array_mut() {
+                    for item in items {
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let owner = owners
+                            .get(&name)
+                            .map(String::as_str)
+                            .unwrap_or(HOST_TOOL_OWNER);
+                        item["owner"] = Value::String(owner.to_owned());
+                    }
+                }
+                let json = Arc::new(CString::new(list.to_string()).unwrap_or_default());
+                *cache = Some((revision, owner_revision, Arc::clone(&json)));
                 json
             }
         }
+    }
+
+    /// 工具名 → 注册它的插件名（宿主自己 = [`HOST_TOOL_OWNER`]）。
+    ///
+    /// 从**注册表**算，而不是另存一张影子表：影子表要在「注销 / 回滚 / 加载失败」三处
+    /// 同步，漏一处就会报错主人。注册表是唯一真实来源——工具不在表里，owner 也不存在。
+    fn tool_owners(&self) -> HashMap<String, String> {
+        // 先拷名字再拿注册表锁：两把锁不嵌套，免得以后有人反向加锁。
+        let names = self
+            .owner_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut owners = HashMap::new();
+        for registration in self.registrations().iter() {
+            let RegistrationKind::Tool(handle) = &registration.kind else {
+                continue;
+            };
+            let owner = names
+                .get(&registration.owner)
+                .cloned()
+                .unwrap_or_else(|| HOST_TOOL_OWNER.to_owned());
+            owners.insert(handle.name().to_owned(), owner);
+        }
+        owners
     }
 
     /// 插件经 VTable 打进来的日志（最多 [`LOG_CAPACITY`] 行，最新的在末尾）。
@@ -802,12 +865,17 @@ impl HostRuntime {
         // 那个脚本在宿主侧的注册就落到那个 scope。
         let (owner, scope) =
             SCOPE_STACK.with(|stack| stack.borrow().last().copied().unwrap_or((0, 0)));
+        // 只有工具注册才改变 `list_tools` 的归属——订阅 / 服务 / 中间件不用让缓存失效。
+        let is_tool = matches!(&kind, RegistrationKind::Tool(_));
         self.registrations().push(Registration {
             id,
             owner,
             scope,
             kind,
         });
+        if is_tool {
+            self.owner_revision.fetch_add(1, Ordering::Relaxed);
+        }
         id
     }
 
@@ -2319,6 +2387,47 @@ mod tests {
             .expect("空结果也是成功")
             .output;
         assert_eq!(none["count"], 0, "{none}");
+    }
+
+    /// 缺口 31：`list_tools` 要说清每个工具是**谁**注册的。
+    ///
+    /// 宿主内置工具报 [`HOST_TOOL_OWNER`]；插件注册的报插件名；回滚后工具与归属
+    /// 一起消失（归属是从注册表算的，不是另一张会留残影的表）。
+    #[test]
+    fn list_tools_reports_who_registered_each_tool() {
+        let rt = runtime();
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+
+        let scope = rt.plugin_scope();
+        let owner = scope.owner();
+        rt.register_owner_name(owner, "demo.owner");
+        let tool = api.register_tool_meta(
+            r#"{"name":"owned.tool","description":"归属测试","input_schema":{"type":"object"}}"#,
+        );
+        assert!(tool.is_valid());
+
+        let listed: Value =
+            serde_json::from_str(&rt.tools_json().to_string_lossy()).expect("list_tools 是 JSON");
+        let find = |name: &str| {
+            listed
+                .as_array()
+                .expect("工具表是数组")
+                .iter()
+                .find(|item| item["name"] == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("list_tools 里没有 {name}：{listed}"))
+        };
+        assert_eq!(find("owned.tool")["owner"], "demo.owner");
+        assert_eq!(find(TD_FUNCTIONS_TOOL)["owner"], HOST_TOOL_OWNER);
+
+        drop(scope);
+        rt.unregister_owner_name(owner);
+        let after = rt.tools_json().to_string_lossy().into_owned();
+        assert!(
+            !after.contains("owned.tool"),
+            "回滚后不该留下归属残影：{after}"
+        );
     }
 
     /// 缺口 13①：真 schema 的判据本身——方法名、参数名、合法请求三条都钉住。

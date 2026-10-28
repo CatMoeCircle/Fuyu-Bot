@@ -426,6 +426,11 @@ jobs:
             exit 1
           fi
           test -f dist/td_api.tl
+          # 校验表：构建期下载用 `SHA256SUMS` 校验资产（缺口 14），所以它必须由 CI 产出。
+          # 顺序固定（TDLib-* 在前、td_api.tl 在后），表里只放这次真的会上传的文件。
+          (cd dist && sha256sum TDLib-* td_api.tl > SHA256SUMS)
+          echo "==> SHA256SUMS"
+          cat dist/SHA256SUMS
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
@@ -434,6 +439,7 @@ jobs:
           path: |
             dist/TDLib-*
             dist/td_api.tl
+            dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 90
 
@@ -487,6 +493,8 @@ jobs:
             echo
             echo "Also attached: \`td_api.tl\`（构建期转换用，loader 不下载它）。"
             echo
+            echo "\`SHA256SUMS\` covers every attached package + \`td_api.tl\`; build scripts verify downloads against it."
+            echo
             echo "## Schema / bindings"
             echo
             echo "\`td_api.tl\` on this release is the schema \`fuyubot-tdlib\` converts at **build time**"
@@ -502,6 +510,7 @@ jobs:
           # Upload the plain, uncompressed schema first so it is easy to find on the Release page.
           UPLOAD=()
           [[ -f dist/td_api.tl ]] && UPLOAD+=("dist/td_api.tl")
+          [[ -f dist/SHA256SUMS ]] && UPLOAD+=("dist/SHA256SUMS")
           for f in dist/TDLib-*; do
             [[ -f "$f" ]] && UPLOAD+=("$f")
           done
@@ -575,7 +584,7 @@ jobs:
             echo "| Matrix builds | \`${BUILD}\` |"
             echo "| Assemble | \`${ASSEMBLE}\` |"
             echo
-            echo "Release assets: \`td_api.tl\` + per-platform \`TDLib-*\` packages."
+            echo "Release assets: \`td_api.tl\` + per-platform \`TDLib-*\` packages + \`SHA256SUMS\`."
             echo
             echo "### Matrix"
             echo

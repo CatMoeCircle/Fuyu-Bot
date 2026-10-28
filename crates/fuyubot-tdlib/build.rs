@@ -245,24 +245,9 @@ fn fetch_cached(
     println!("cargo:warning=下载 TDLib {version} 的 {asset}：{url}");
     let bytes = build_support::http_get(&url).map_err(|e| format!("下载 {url} 失败: {e}"))?;
 
-    // `.sha256` 侧车文件 404 是正常的（资产可以没有校验文件），拿到什么算什么。
-    match build_support::http_get(&format!("{url}.sha256")) {
-        Ok(digest) => {
-            let text = String::from_utf8_lossy(&digest);
-            let expected = text
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            let actual = vendored::sha256_hex(&bytes);
-            if expected != actual {
-                return Err(format!(
-                    "{asset} 的 SHA256 不匹配：期望 {expected}，实际 {actual}"
-                ));
-            }
-        }
-        Err(e) => println!("cargo:warning=没拿到 {url}.sha256（{e}），跳过校验"),
-    }
+    // 校验走 Release 的汇总表 `SHA256SUMS`；旧的 `<资产>.sha256` 侧车从来没被发布过
+    // （所以它那条校验一直在空跑，见缺口 14）。
+    verify_against_checksums(repo, version, asset, &bytes)?;
 
     let payload = if unpack {
         vendored::extract_library(&bytes, os)?
@@ -270,4 +255,47 @@ fn fetch_cached(
         bytes
     };
     build_support::store_download(relative, &payload)
+}
+
+/// 用 Release 里的 `SHA256SUMS` 校验刚下到的资产（缺口 14）。
+///
+/// 旧实现试的是 `<资产>.sha256` 侧车文件，而发布侧**从来没发过**它（只发汇总表），
+/// 于是那条校验每次都「404 → 警告 → 跳过」，等于空跑。现在读汇总表：
+///
+/// - 表里有这个资产 → 比对，**不匹配直接失败**（下坏了 / 被换了都不该继续构建）；
+/// - 表里没有这个资产 → 警告并跳过（发布侧漏了一项，但不该让构建挂掉）；
+/// - 表本身拿不到（老 Release 没发过，例如 1.8.69）→ 警告并跳过。
+///
+/// 「拿不到就跳过」是刻意保留的：校验是加分项，不该变成新的单点故障；但每次跳过都会
+/// 打一条 warning，别让它再悄悄退化成空跑。CI 侧已生成 `SHA256SUMS`（build-tdlib.yml）。
+#[cfg(feature = "vendored")]
+fn verify_against_checksums(
+    repo: &str,
+    version: &str,
+    asset: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let url = build_support::release_url(repo, version, "SHA256SUMS");
+    let text = match build_support::http_get(&url) {
+        Ok(raw) => String::from_utf8_lossy(&raw).into_owned(),
+        Err(error) => {
+            println!(
+                "cargo:warning=没拿到 {url}（{error}），跳过 {asset} 的校验\
+                 （这个 Release 没发 SHA256SUMS？）"
+            );
+            return Ok(());
+        }
+    };
+    let Some(expected) = build_support::digest_for(&text, asset) else {
+        println!("cargo:warning={url} 里没有 {asset}，跳过校验");
+        return Ok(());
+    };
+    let actual = vendored::sha256_hex(bytes);
+    if expected != actual {
+        return Err(format!(
+            "{asset} 的 SHA256 不匹配：期望 {expected}，实际 {actual}"
+        ));
+    }
+    println!("cargo:warning={asset} 的 SHA256 已校验（{expected}）");
+    Ok(())
 }

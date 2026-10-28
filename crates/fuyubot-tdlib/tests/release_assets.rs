@@ -104,4 +104,20 @@ fn the_release_workflow_publishes_exactly_the_asset_names_we_download() {
         !workflow.contains(".zip"),
         "workflow 里还在产出 .zip——loader 吃不了它（会被当成裸库静默写出）"
     );
+
+    // 缺口 14：校验表必须由 CI **生成并上传**，否则 `fetch_cached` 的 SHA256SUMS
+    // 校验永远走「拿不到 → 跳过」，等于空跑（以前是 `.sha256` 侧车，从没发布过）。
+    assert!(
+        workflow.contains("sha256sum TDLib-* td_api.tl > SHA256SUMS"),
+        "workflow 没生成 dist/SHA256SUMS（下载校验会退化成空跑）"
+    );
+    assert!(
+        workflow.contains("UPLOAD+=(\"dist/SHA256SUMS\")"),
+        "Release 上传列表里没有 SHA256SUMS——生成了也不会发出去"
+    );
+    assert!(
+        workflow.matches("SHA256SUMS").count() >= 4,
+        "SHA256SUMS 要在生成 / artifact / 上传 / 说明里都出现，当前只有 {} 处",
+        workflow.matches("SHA256SUMS").count()
+    );
 }
