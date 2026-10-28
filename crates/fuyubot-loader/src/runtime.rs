@@ -16,7 +16,7 @@ use fuyubot_abi::{
     MiddlewareHandle, RequestId, ServiceHandle, ServiceMethod, ServiceVTable, SubscriptionHandle,
     ToolHandle, WaitHandle,
 };
-use fuyubot_core::{Context, Effect, PluginReporter, Report};
+use fuyubot_core::{Context, Effect, PluginManager, PluginReporter, Report};
 use fuyubot_event::{EventBus, Filter, SubscriptionHandle as EventSubscription};
 use fuyubot_middleware::{
     Middleware, MiddlewareContext, MiddlewareHandle as MwRegistration, Next, Pipeline,
@@ -602,6 +602,27 @@ impl HostRuntime {
     /// 状态变化后主动刷，实际没人刷得到；这个交出去的是计算能力，问一次算一次。
     pub fn install_plugin_reporter(&self, reporter: PluginReporter) {
         *self.plugin_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(reporter);
+    }
+
+    /// 把内核的插件生命周期事件桥到事件总线（缺口 12 的宿主消费者）。
+    ///
+    /// 通道名直接用 `LifecycleEvent::kind()`（`plugin_loaded` / `plugin_activated` /
+    /// `plugin_deactivated` / `plugin_failed` / `plugin_unloaded`），负载是
+    /// `{"event": …, "name": …}`，失败时多一个 `reason`。
+    ///
+    /// 返回的 [`Effect`] 要留住（drop 即退订）。和 [`install_plugin_reporter`] 一样，
+    /// 这只是把内核的能力接出来——`HostRuntime` 仍然**不持有** `PluginManager`。
+    ///
+    /// [`install_plugin_reporter`]: Self::install_plugin_reporter
+    pub fn install_lifecycle_bridge(&self, manager: &PluginManager) -> Effect {
+        let bus = Arc::clone(&self.events);
+        manager.on_lifecycle(move |event| {
+            let mut payload = json!({ "event": event.kind(), "name": event.name() });
+            if let Some(reason) = event.reason() {
+                payload["reason"] = Value::String(reason.to_owned());
+            }
+            let _ = bus.emit(event.kind(), &payload);
+        })
     }
 
     /// 此刻的插件报告（JSON）。没装来源就是空表。
@@ -2349,6 +2370,56 @@ mod tests {
         assert_eq!(unregistered.len(), 1, "注销只该发一条：{unregistered:?}");
         assert_eq!(unregistered[0]["event"], "tool_unregistered");
         assert_eq!(unregistered[0]["name"], "bus.probe");
+    }
+
+    /// 缺口 12 的宿主侧消费者：内核生命周期事件必须出现在事件总线上。
+    #[test]
+    fn lifecycle_events_reach_the_event_bus() {
+        struct Probe;
+        impl fuyubot_core::Plugin for Probe {
+            fn name(&self) -> &str {
+                "lifecycle.probe"
+            }
+            fn apply(
+                &self,
+                _ctx: &Context,
+            ) -> std::result::Result<Effect, fuyubot_core::KernelError> {
+                Ok(Effect::none())
+            }
+        }
+
+        let ctx = Context::new();
+        let rt = HostRuntime::new(ctx.clone()).unwrap();
+        let mut manager = PluginManager::new(ctx.clone());
+        let _bridge = rt.install_lifecycle_bridge(&manager);
+
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let _sub = rt.events().on("plugin_activated", None, move |payload| {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(payload.clone());
+            Ok(())
+        });
+        let unloaded: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&unloaded);
+        let _sub = rt.events().on("plugin_unloaded", None, move |payload| {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(payload.clone());
+            Ok(())
+        });
+
+        manager.load(Probe).unwrap();
+        manager.unload("lifecycle.probe").unwrap();
+
+        let activated = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(activated.len(), 1, "{activated:?}");
+        assert_eq!(activated[0]["event"], "plugin_activated");
+        assert_eq!(activated[0]["name"], "lifecycle.probe");
+        let unloaded = unloaded.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(unloaded.len(), 1, "{unloaded:?}");
+        assert_eq!(unloaded[0]["name"], "lifecycle.probe");
     }
 
     /// 缺口 13③：函数表是**能调**的工具，不是躺在库里的死数据。
