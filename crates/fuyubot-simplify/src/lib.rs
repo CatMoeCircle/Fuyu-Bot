@@ -169,13 +169,16 @@ fn send_failed_of(update: &Value) -> Option<SimplifyError> {
     if update.get("@type").and_then(Value::as_str) != Some("updateMessageSendFailed") {
         return None;
     }
+    // 真 `td_api.tl`：`updateMessageSendFailed ... error:error`——错误码和消息
+    // 在嵌套的 `error` 对象里（`error code:int32 message:string`），不在顶层。
+    let error = update.get("error");
     Some(SimplifyError::SendFailed {
-        code: update
-            .get("error_code")
+        code: error
+            .and_then(|error| error.get("code"))
             .and_then(Value::as_i64)
             .unwrap_or(0) as i32,
-        message: update
-            .get("error_message")
+        message: error
+            .and_then(|error| error.get("message"))
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
@@ -307,6 +310,50 @@ pub fn is_formatted_text(response: Option<&Value>) -> bool {
         return false;
     };
     value.get("@type").and_then(Value::as_str) == Some("formattedText")
+}
+
+/// `parseTextEntities` 的响应 → `(最终值, 要打的警告)`。
+///
+/// 警告单独返回是为了能单测：`Simplify::formatted` 负责 `log`，这里只负责
+/// 「这个响应意味着什么」。三种情况分开说：
+///
+/// - `formattedText`：直接用它，不警告；
+/// - `@type == "error"`：TDLib 明确拒绝了这次解析，把 code / message 打出来；
+/// - 其它（没接 TDLib / 读不懂）：退回纯文本，按「没接 TDLib」警告。
+fn formatted_with_warn(text: &Text, response: Option<&Value>) -> (Value, Option<String>) {
+    let Some(value) = response else {
+        return (
+            plain_text(text),
+            Some(format!(
+                "宿主没接 TDLib，Markdown 按纯文本发：{}",
+                text.text
+            )),
+        );
+    };
+    if is_formatted_text(Some(value)) {
+        return (value.clone(), None);
+    }
+    if value.get("@type").and_then(Value::as_str) == Some("error") {
+        let code = value.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let message = value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return (
+            plain_text(text),
+            Some(format!(
+                "Markdown 解析失败（TDLib {code}）：{message}，按纯文本发：{}",
+                text.text
+            )),
+        );
+    }
+    (
+        plain_text(text),
+        Some(format!(
+            "parseTextEntities 回了非预期响应，Markdown 按纯文本发：{}",
+            text.text
+        )),
+    )
 }
 
 // ── 媒体 ──────────────────────────────────────────────────────────
@@ -2101,8 +2148,10 @@ impl Simplify {
     /// TDLib 允许同步跑它。这一点很关键——等响应那套会卡住投递线程，
     /// 而插件通常正是在更新回调里发消息。
     ///
-    /// 拿不到结果（没接 TDLib、TDLib 报错、`Plain` 模式）就退回纯文本，不报错——
-    /// 一条 Markdown 写错的消息不该整条发不出去。
+    /// 拿不到结果就退回纯文本，不报错——一条 Markdown 写错的消息不该整条发不出去。
+    /// 但**两种失败分开警告**：没接 TDLib 说「没接 TDLib」；`parseTextEntities`
+    /// 报错（比如 `file_xxx.mp4` 里未闭合的 `_` 触发 `Can't parse entities`）则把
+    /// TDLib 的 code / message 原样打出来，别让真实错误被一句笼统的「解析失败」吞掉。
     pub fn formatted(&self, text: &Text) -> Value {
         let Some(request) = parse_text_request(text) else {
             return plain_text(text); // Plain：没有对应的 TextParseMode，别白跑一趟
@@ -2111,16 +2160,11 @@ impl Simplify {
             .host
             .td_execute(&request.to_string())
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
-        if !is_formatted_text(response.as_ref()) {
-            self.host.log(
-                fuyubot_abi::LogLevel::Warn,
-                &format!(
-                    "宿主没接 TDLib（或解析失败），Markdown 按纯文本发：{}",
-                    text.text
-                ),
-            );
+        let (value, warn) = formatted_with_warn(text, response.as_ref());
+        if let Some(warn) = warn {
+            self.host.log(fuyubot_abi::LogLevel::Warn, &warn);
         }
-        formatted_from(text, response.as_ref())
+        value
     }
 
     /// 发消息并**等到发送结局**：成功返回最终的 `Message`，失败 / 超时返回错误。
@@ -2129,8 +2173,8 @@ impl Simplify {
     ///
     /// 1. `sendMessage` 的**响应**先回来，里面是还**没发出去**的临时消息；
     /// 2. 随后那条临时消息各来一条结局更新——`updateMessageSendSucceeded`
-    ///    （`message` 是最终消息）或 `updateMessageSendFailed`（`error_code` /
-    ///    `error_message`）。按临时消息的 `old_message_id` 精确对号，
+    ///    （`message` 是最终消息）或 `updateMessageSendFailed`（错误在嵌套的
+    ///    `error` 对象里）。按临时消息的 `old_message_id` 精确对号，
     ///    同一会话里别人发的结局不会串进来。
     ///
     /// ⚠️ **阻塞**当前线程：在更新回调里调它就是自己卡自己（回调跑在接收循环
@@ -3315,6 +3359,44 @@ mod tests {
         );
     }
 
+    /// 退回纯文本时的警告要**说清楚原因**：没接 TDLib 与 TDLib 拒绝解析是两件事，
+    /// 后者必须把真实的 code / message 打出来（不能一句「宿主没接 TDLib」吞掉）。
+    #[test]
+    fn the_fallback_warning_names_the_real_parse_error() {
+        let text = Text::markdown("建 D:\\GitHub\\FuyuBot\\cache\\file_1.mp4 失败");
+
+        // 解析成功：直接用它，不警告。
+        let parsed = json!({ "@type": "formattedText", "text": "ok", "entities": [] });
+        let (value, warn) = formatted_with_warn(&text, Some(&parsed));
+        assert_eq!(value, parsed);
+        assert!(warn.is_none());
+
+        // TDLib 拒绝解析（`@type == "error"`）：警告要带上真实的 code 和 message。
+        let error = json!({
+            "@type": "error",
+            "code": 400,
+            "message": "Can't parse entities: Can't find end of the entity starting at byte offset 109",
+        });
+        let (value, warn) = formatted_with_warn(&text, Some(&error));
+        assert_eq!(value["text"], text.text, "失败也退回原文，一个字符不丢");
+        let warn = warn.unwrap_or_default();
+        assert!(warn.contains("400"), "要带 TDLib 错误码：{warn}");
+        assert!(
+            warn.contains("Can't find end of the entity"),
+            "要带真实消息：{warn}"
+        );
+        assert!(
+            !warn.contains("没接 TDLib"),
+            "解析失败不是没接 TDLib：{warn}"
+        );
+
+        // 没接 TDLib：单独的说法，不掺解析失败。
+        let (value, warn) = formatted_with_warn(&text, None);
+        assert_eq!(value["text"], text.text);
+        let warn = warn.unwrap_or_default();
+        assert!(warn.contains("宿主没接 TDLib"), "{warn}");
+    }
+
     /// 编辑 / 相册 / 删除：方法名与参数名按真 `td_api.tl` 拼。
     #[test]
     fn edit_album_and_delete_build_the_real_requests() {
@@ -3518,13 +3600,12 @@ mod tests {
         })
     }
 
-    /// 一条「发送失败」的更新。
+    /// 一条「发送失败」的更新（`error` 按真 schema 嵌套，`error code:int32 message:string`）。
     fn send_failed(old_message_id: i64, code: i32, message: &str) -> Value {
         json!({
             "@type": "updateMessageSendFailed",
             "old_message_id": old_message_id,
-            "error_code": code,
-            "error_message": message,
+            "error": { "code": code, "message": message },
             "message": { "@type": "message", "id": old_message_id, "chat_id": 7 },
         })
     }
