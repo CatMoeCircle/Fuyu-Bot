@@ -123,6 +123,9 @@ impl UpdatePipeline {
                 Err(e) => eprintln!("[fuyubot-pipeline] 丢掉一条处理不了的更新: {e}"),
             },
             Routed::Response(response) => {
+                if self.runtime.trace_updates() {
+                    eprintln!("[response] {}", response.payload);
+                }
                 if let Err(e) = self.deliver_response(&response.payload) {
                     eprintln!("[fuyubot-pipeline] 投递响应失败（继续）: {e}");
                 }
@@ -143,6 +146,12 @@ impl UpdatePipeline {
     pub fn process_value(&self, payload: Value) -> Result<UpdateOutcome, PipelineError> {
         if !payload.is_object() {
             return Err(PipelineError::NotObject);
+        }
+
+        // `--trace-updates`：在**任何中间件改动之前**打原始 JSON，这就是 TDLib 发来的现场。
+        // 放这里而不是 `dispatch`，是为了让 `--replay` 的离线路径也打得出来。
+        if self.runtime.trace_updates() {
+            eprintln!("[update] {}", payload);
         }
 
         let mut warnings = Vec::new();

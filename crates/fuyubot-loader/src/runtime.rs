@@ -240,6 +240,9 @@ pub struct HostRuntime {
     /// 默认 [`DEFAULT_LOG_VERBOSITY`]。没有它的时候 `api_log` 对每条日志都
     /// `eprintln!`——插件刷 Debug 就是实打实的 stderr 系统调用。
     log_verbosity: AtomicU32,
+    /// 原始更新 / 响应的追踪开关（`--trace-updates`）：开了之后管线把 TDLib
+    /// 发来的每一条原始 JSON 打到 stderr（含消息内容，只给调试用）。
+    trace_updates: AtomicBool,
     /// `list_tools` 的序列化缓存：`(工具表版本号, owner 表版本号, JSON)`。两个都没变就复用。
     ///
     /// 为什么还要 owner 版本号：`owner` 是**算出来**的（工具注册完之后 `remember` 才记下
@@ -382,6 +385,7 @@ impl HostRuntime {
             next_waiter: AtomicU64::new(1),
             log_lines: Mutex::new(VecDeque::new()),
             log_verbosity: AtomicU32::new(DEFAULT_LOG_VERBOSITY as u32),
+            trace_updates: AtomicBool::new(false),
             tool_list_cache: Mutex::new(None),
             request_owners: Mutex::new(RequestOwners::default()),
             next_synthetic_request: AtomicU64::new(SYNTHETIC_REQUEST_BASE),
@@ -701,6 +705,15 @@ impl HostRuntime {
     /// 只是省掉格式化与系统调用，**不改变**插件侧的行为：插件照样能调 `log`。
     pub fn set_log_verbosity(&self, level: LogLevel) {
         self.log_verbosity.store(level as u32, Ordering::Relaxed);
+    }
+
+    /// 打开 / 关闭原始更新追踪（`--trace-updates`）。
+    pub fn set_trace_updates(&self, enabled: bool) {
+        self.trace_updates.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn trace_updates(&self) -> bool {
+        self.trace_updates.load(Ordering::Relaxed)
     }
 
     /// `list_tools` 的 JSON，按工具表 / owner 表版本号缓存。
@@ -2578,6 +2591,17 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("info-after-lowering"))
         );
+    }
+
+    /// 原始更新追踪开关（`--trace-updates`）：默认关，开了就开，可以再关掉。
+    #[test]
+    fn trace_updates_toggles() {
+        let rt = runtime();
+        assert!(!rt.trace_updates(), "默认不该开着");
+        rt.set_trace_updates(true);
+        assert!(rt.trace_updates());
+        rt.set_trace_updates(false);
+        assert!(!rt.trace_updates());
     }
 
     /// `list_tools` 的缓存：工具表没变就复用，注册 / 注销后必须失效。

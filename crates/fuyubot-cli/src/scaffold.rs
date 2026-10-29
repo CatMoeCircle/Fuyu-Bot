@@ -133,16 +133,23 @@ impl Plugins {
         else {
             return Ok(DEFAULT_LOG_VERBOSITY);
         };
-        match raw.to_ascii_lowercase().as_str() {
-            "error" => Ok(LogLevel::Error),
-            "warn" | "warning" => Ok(LogLevel::Warn),
-            "info" => Ok(LogLevel::Info),
-            "debug" => Ok(LogLevel::Debug),
-            "trace" => Ok(LogLevel::Trace),
-            _ => Err(format!(
-                "[plugins].log_level = \"{raw}\" 认不出来，只能写 error / warn / info / debug / trace"
-            )),
-        }
+        parse_log_level(raw)
+    }
+}
+
+/// 把用户写的级别名解析成 [`LogLevel`]；写错就报错指路。
+///
+/// `[plugins].log_level` 与 `run --log-level` 共用同一份解析，两边写法必须一致。
+pub fn parse_log_level(raw: &str) -> Result<LogLevel, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "error" => Ok(LogLevel::Error),
+        "warn" | "warning" => Ok(LogLevel::Warn),
+        "info" => Ok(LogLevel::Info),
+        "debug" => Ok(LogLevel::Debug),
+        "trace" => Ok(LogLevel::Trace),
+        _ => Err(format!(
+            "log_level = \"{raw}\" 认不出来，只能写 error / warn / info / debug / trace"
+        )),
     }
 }
 

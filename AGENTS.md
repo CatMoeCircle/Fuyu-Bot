@@ -47,6 +47,7 @@ cargo tree  --workspace --offline     # 无环
 cargo fmt --all --check               # 0 diff
 
 cargo bot                             # = fuyubot run（当前目录）
+cargo dev                             # 开发跑 = cargo bot + 完整日志（--log-level trace + --trace-updates）
 cargo package-bot                     # release：fuyubot.exe + 三个内置插件（tdjson 由 build.rs 放到 exe 同级）
 ```
 

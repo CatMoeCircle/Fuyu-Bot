@@ -120,6 +120,18 @@ struct RunArgs {
     /// （脚本插件 2000，原生插件 150）。插件要发慢速网络请求时把它调大。
     #[arg(long, value_name = "MS")]
     replay_wait: Option<u64>,
+    /// 覆盖 `[plugins].log_level`：error / warn / info / debug / trace。
+    ///
+    /// 调试时不用改配置就能把插件日志打到最细（trace = 全打）。
+    /// 与配置共用同一份解析，写错会当场报错指路。
+    #[arg(long, value_name = "LEVEL")]
+    log_level: Option<String>,
+    /// 调试用：把 TDLib 发来的**每一条**原始更新 / 响应 JSON 打到 stderr。
+    ///
+    /// 里面含消息内容，别在正式环境开；要查「某个错误为什么没有 code」这类问题时
+    /// 它就是现场——`cargo dev` 已经默认带上这个开关。
+    #[arg(long)]
+    trace_updates: bool,
 }
 
 #[derive(Args, Debug)]
@@ -576,11 +588,18 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .runtime()
         .install_config(Some(config_path.clone()), config_json);
 
-    // 插件日志门槛：`[plugins].log_level`。**必须在插件加载之前**——
+    // 插件日志门槛：`[plugins].log_level`，`--log-level` 覆盖它。**必须在插件加载之前**——
     // 插件 `init` / `start` 里打的日志也受它管。
-    pipeline
-        .runtime()
-        .set_log_verbosity(config.plugins.log_level()?);
+    let plugin_log_level = match &args.log_level {
+        Some(raw) => scaffold::parse_log_level(raw)?,
+        None => config.plugins.log_level()?,
+    };
+    pipeline.runtime().set_log_verbosity(plugin_log_level);
+    println!("插件日志级别：{}", plugin_log_level as i32);
+    if args.trace_updates {
+        pipeline.runtime().set_trace_updates(true);
+        println!("--trace-updates：每一条原始更新 / 响应都会打到 stderr");
+    }
 
     // ── 启动顺序 ────────────────────────────────────────────────
     //
@@ -1628,6 +1647,20 @@ mod tests {
             Command::Run(args) => assert_eq!(args.replay.as_deref(), Some(Path::new("u.json"))),
             other => panic!("解析成了 {other:?}"),
         }
+
+        // 开发跑的两个开关：`--log-level` 覆盖配置门槛，`--trace-updates` 打原始更新。
+        let cli =
+            Cli::try_parse_from(["fuyubot", "run", "--log-level", "trace", "--trace-updates"])
+                .unwrap();
+        match cli.command {
+            Command::Run(args) => {
+                assert_eq!(args.log_level.as_deref(), Some("trace"));
+                assert!(args.trace_updates);
+            }
+            other => panic!("解析成了 {other:?}"),
+        }
+        // 级别名写错（如 `verbose`）交给 `parse_log_level` 报错，不在 clap 这里。
+        assert!(Cli::try_parse_from(["fuyubot", "run", "--log-level", "verbose"]).is_ok());
 
         // 后台运行：只是 `run` 的一个开关（`status` / `stop` 面对的是同一个实例）。
         let cli = Cli::try_parse_from(["fuyubot", "run", "--background"]).unwrap();

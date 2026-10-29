@@ -7,6 +7,11 @@
 # 要传参数就直接跟在后面，例如 `cargo bot --config demo/fuyubot.toml --no-login`。
 bot = "run -p fuyubot-cli -- run"
 
+# 开发跑：**完整日志**（`--log-level trace` 全打插件日志 + `--trace-updates`
+# 逐条打印 TDLib 原始更新/响应），其余与 `cargo bot` 一样。
+# 查「错误为什么没有 code / 消息」这类问题时用它，现场就在 stderr 里。
+dev = "run -p fuyubot-cli -- run --log-level trace --trace-updates"
+
 # 本地打包：release 构建 `fuyubot` + **三个内置插件**（/start、/help、/plugins）。
 # 产物都落在 `target/release/`：`fuyubot.exe`、`fuyubot_plugin_{start,help,manage}.{dll,so,dylib}`。
 # tdjson.dll（+ 兄弟 DLL）由 build.rs 一并放到 exe 旁边（loader 优先级 2 认「可执行文件目录」），

@@ -77,3 +77,4 @@ fuyubot_plugin.h
 .DS_Store
 Thumbs.db
 *.swp
+/cache
