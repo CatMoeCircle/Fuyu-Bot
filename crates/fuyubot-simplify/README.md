@@ -1,9 +1,11 @@
 # fuyubot-simplify
 
+TDLib 便捷封装：把「发消息 / 相册 / 富消息 / 编辑消息 / 删除消息 / 转发 / 管理权 / 表情反应 / 连接状态 / 等更新 / 内联键盘 / 批量解析 / 下载进度」包成人话 API——**一个方法一个参数结构体 + 短字段名**（`SendMessageParams { text, media, reply_to_message_id, topic_id, reply_markup, link_preview, timeout_ms }`），调用方不拼 TDLib 的嵌套 JSON，请求经 `td_invoke*` 发出、返回的仍是 TDLib 原始 JSON。
+
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
+
 > ⚠️ **新代码优先 `fuyubot_abi::ResponseRouter`**（`invoke_simplified(..).await` / `wait_for_update(..).await`）。
 > 本 crate 的方法是**同步阻塞**的，只适合同步上下文；事件回调里请用 `*_then`。
-
-TDLib 便捷封装：把「发消息 / 相册 / 富消息 / 编辑消息 / 删除消息 / 转发 / 管理权 / 表情反应 / 连接状态 / 等更新 / 内联键盘 / 批量解析 / 下载进度」包成人话 API——**一个方法一个参数结构体 + 短字段名**（`SendMessageParams { text, media, reply_to_message_id, topic_id, reply_markup, link_preview, timeout_ms }`），调用方不拼 TDLib 的嵌套 JSON，请求经 `td_invoke*` 发出、返回的仍是 TDLib 原始 JSON。
 
 **每个方法都等到结果才返回**，不交回请求号：
 
