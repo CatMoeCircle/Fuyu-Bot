@@ -84,12 +84,12 @@ fn the_release_workflow_publishes_exactly_the_asset_names_we_download() {
 
     // 每个平台的**打包 + 校验**两步都要用 `dist/${{ matrix.asset }}` 当路径——
     // 只有真的用它当文件名，上面那条「matrix 里有名字」才等于「发布出来的就是这个名字」。
-    // 3 个平台 × (打包 1 + 校验 1) = 6。加了平台就同步
-    // `src/loader/vendored.rs` 的 `ASSET_*` 与这里的数字。
+    // 4 个平台（linux / macos / windows / android）× (打包 1 + 校验 1) = 8。
+    // 加了平台就同步 `src/loader/vendored.rs` 的 `ASSET_*` 与这里的数字。
     let uses = compact.matches("dist/${{matrix.asset}}").count();
     assert_eq!(
-        uses, 6,
-        "linux / macos / windows 的打包与校验都应当走 `dist/${{{{ matrix.asset }}}}`（3×2=6），实际找到 {uses} 处"
+        uses, 8,
+        "linux / macos / windows / android 的打包与校验都应当走 `dist/${{{{ matrix.asset }}}}`（4×2=8），实际找到 {uses} 处"
     );
 
     // tag 也必须一致：loader 拼的是 `TDLib-v<版本>`（连字符，无空格，不做百分号编码）。

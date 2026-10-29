@@ -21,6 +21,11 @@ pub const ASSET_LINUX_AARCH64: &str = "TDLib-linux-aarch64";
 pub const ASSET_MACOS_AARCH64: &str = "TDLib-macos-aarch64";
 pub const ASSET_WINDOWS_X86_64: &str = "TDLib-windows-x86_64";
 pub const ASSET_WINDOWS_AARCH64: &str = "TDLib-windows-aarch64";
+/// Android（NDK 交叉编译的 tdjson）。命名与桌面同款 `TDLib-<os>-<arch>`，
+/// 所以 loader 的下载 / 校验逻辑与桌面完全一致——交叉编译（`--target aarch64-linux-android
+/// --features vendored`）时 `build.rs` 会按这个名字取到 tdjson。
+pub const ASSET_ANDROID_AARCH64: &str = "TDLib-android-aarch64";
+pub const ASSET_ANDROID_X86_64: &str = "TDLib-android-x86_64";
 
 /// `(os, arch, 资产名)`——**加/减平台只动这一张表**：
 /// [`asset_name`] 与报错里的「支持哪些」都从它来，不会各自漂。
@@ -32,19 +37,22 @@ pub const ASSET_WINDOWS_AARCH64: &str = "TDLib-windows-aarch64";
 /// 目前**故意不覆盖** `macos/x86_64`（Intel Mac）：CI 没有那个 runner，
 /// 加了表反而会在构建期变成一个含糊的 404。真要支持得先给 CI 加平台。
 ///
-/// 同理**故意不覆盖** `android/*`：Android 的 tdjson 由 `.github/workflows/build-tdlib.yml`
-/// 的 `build-android` job 以 `tdjson-android-<abi>` 的形式产出（workflow artifact），
-/// 再由 `build-framework-android` job 塞进 `.tdlib-cache/<版本>/android-<arch>/` 供
-/// `build.rs` 拷到可执行文件同级——**不走 Releases 的自动下载**（那张表一旦加进来，
-/// 就等于承诺 `TDLib-android-*` 一定躺在 Release 上，而现在 Android 是临时产物）。
-/// 所以 Android **有** [`library_filename`]（加载要用），但 `asset_name` 是 `None`：
-/// 在 Android 上开 `--features vendored` 会在构建期明确报「没有对应的 Releases 资产」。
+/// `android/*` 现在**也覆盖**（见 `ASSET_ANDROID_*`）：`TDLib-android-aarch64` /
+/// `TDLib-android-x86_64` 是 loader 的正式发布资产，走 Releases 自动下载——
+/// 交叉编译（如 `cargo build --target aarch64-linux-android --features vendored`）
+/// 时 `build.rs` 会按这个名字取到 tdjson。
+/// 同时 CI 仍把它以 `tdjson-android-<abi>` 的 workflow artifact 形式保留一份
+/// （`build-tdlib.yml` 的 `build-android` job），作为 `release-bot.yml` 的
+/// `build-framework-android` job 的**兜底**来源——优先从 Release 取，取不到再退回 artifact。
+/// 所以 Android **有** [`library_filename`]（加载要用）也**有** [`asset_name`]（下载要用）。
 pub const ASSETS: &[(&str, &str, &str)] = &[
     ("linux", "x86_64", ASSET_LINUX_X86_64),
     ("linux", "aarch64", ASSET_LINUX_AARCH64),
     ("macos", "aarch64", ASSET_MACOS_AARCH64),
     ("windows", "x86_64", ASSET_WINDOWS_X86_64),
     ("windows", "aarch64", ASSET_WINDOWS_AARCH64),
+    ("android", "aarch64", ASSET_ANDROID_AARCH64),
+    ("android", "x86_64", ASSET_ANDROID_X86_64),
 ];
 
 /// 平台动态库文件名；不支持的平台返回 `None`。
@@ -267,7 +275,7 @@ mod tests {
         }
         assert_eq!(
             ASSETS.len(),
-            5,
+            7,
             "表里有几行就要和 CI 的 matrix 一样多（守卫测试会逐行比对）"
         );
 
@@ -300,9 +308,16 @@ mod tests {
         // Android：库名与 Linux 相同（ELF），但 `std::env::consts::OS` 是 `"android"`，
         // 不单列一条就会在优先级 4 变成「未知平台」。
         assert_eq!(library_filename("android"), Some("libtdjson.so"));
-        // 而**故意没有** Releases 资产：Android 的 tdjson 由 CI 的 workflow artifact 喂给
-        // 框架构建 job（见 ASSETS 的注释），所以 `--features vendored` 在 Android 上会明确报错。
-        assert_eq!(asset_name("android", "aarch64"), None);
+        // Android 现在也是正式的 Releases 资产（loader 下载 / 框架交叉编译都走它），
+        // CI 同时保留 `tdjson-android-<abi>` 的 workflow artifact 作为兜底（见 ASSETS 注释）。
+        assert_eq!(
+            asset_name("android", "aarch64"),
+            Some("TDLib-android-aarch64")
+        );
+        assert_eq!(
+            asset_name("android", "x86_64"),
+            Some("TDLib-android-x86_64")
+        );
         assert_eq!(library_filename("freebsd"), None);
     }
 

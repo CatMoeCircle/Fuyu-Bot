@@ -9,9 +9,10 @@ name: Build TDLib
 #
 # 两种产物：
 #   - 桌面：`TDLib-<os>-<arch>`，是 **loader 的发布资产**（tag `TDLib-v<版本>`），走 `assemble` + Release。
-#   - Android：`tdjson-android-<abi>`，**不是** loader 资产（loader 只认 windows/macos/linux），
-#     作为 workflow artifact 交给 `release-bot.yml` 的 `build-android`
-#     （先看 Release 上的 `TDLib-android-<arch>`，没有就退回这里最近一次成功的 artifact）。
+#   - Android：`TDLib-android-<arch>`，**也是** loader 的发布资产（与桌面同款命名 / 下载逻辑），
+#     走 `assemble` + Release；同时 CI 仍以 `tdjson-android-<abi>` 的 workflow artifact 形式
+#     保留一份，交给 `release-bot.yml` 的 `build-android` 作兜底
+#     （优先从 Release 取 `TDLib-android-<arch>`，取不到再退回 artifact）。
 #
 # `desktop` 表里每行都有 `enabled` 开关，**默认全为 `true`**（行为与以前一致）；
 # 只想建某几个平台时，把其余行改成 `false` 即可。**别删行**——
@@ -34,7 +35,7 @@ on:
         required: true
         type: string
       publish_release:
-        description: "Publish/update the GitHub Release (requires all 5 desktop platforms enabled; turn OFF for Android-only builds)"
+        description: "Publish/update the GitHub Release (requires all 5 desktop platforms enabled; Android assets are published too when enabled). Turn OFF for a partial/test build."
         required: true
         type: boolean
         default: true
@@ -121,13 +122,15 @@ jobs:
               {"platform": "windows", "arch": "x86_64", "runner": "windows-latest", "asset": "TDLib-windows-x86_64", "enabled": True},
               {"platform": "windows", "arch": "arm64", "runner": "windows-11-vs2026-arm", "asset": "TDLib-windows-aarch64", "enabled": True},
           ]
-          # Android：**不是** loader 的发布资产（loader 只认 windows/macos/linux），
-          # 所以键名叫 `artifact` 而不是 `asset`——资产名故意不带 `TDLib-` 前缀，
-          # 不进 Release、不参与 SHA256SUMS，只作为 workflow artifact 上传。
-          # `arch` 仍是 cargo 口径（aarch64 / x86_64），`abi` 是 NDK 的 ABI 名。
+          # Android：**现在也是** loader 的发布资产（键名 `asset`，名字 `TDLib-android-<arch>`），
+          # 走 Releases 自动下载（交叉编译 + 框架构建都从 Release 取它）。
+          # 同时保留 `artifact` 键（名字 `tdjson-android-<abi>`）：CI 仍把这个资产以
+          # workflow artifact 形式上传一份，作为 `release-bot.yml` 的 `build-android` 兜底来源
+          # （优先从 Release 取 `TDLib-android-<arch>`，取不到再退回 artifact）。
+          # `arch` 是 cargo 口径（aarch64 / x86_64），`abi` 是 NDK 的 ABI 名（给 build 脚本用）。
           android = [
-              {"platform": "android", "arch": "aarch64", "abi": "arm64-v8a", "target": "aarch64-linux-android", "runner": "ubuntu-22.04", "artifact": "tdjson-android-arm64-v8a", "enabled": True},
-              {"platform": "android", "arch": "x86_64", "abi": "x86_64", "target": "x86_64-linux-android", "runner": "ubuntu-22.04", "artifact": "tdjson-android-x86_64", "enabled": True},
+              {"platform": "android", "arch": "aarch64", "abi": "arm64-v8a", "target": "aarch64-linux-android", "runner": "ubuntu-22.04", "artifact": "tdjson-android-arm64-v8a", "asset": "TDLib-android-aarch64", "enabled": True},
+              {"platform": "android", "arch": "x86_64", "abi": "x86_64", "target": "x86_64-linux-android", "runner": "ubuntu-22.04", "artifact": "tdjson-android-x86_64", "asset": "TDLib-android-x86_64", "enabled": True},
           ]
 
           def enabled(rows):
@@ -494,8 +497,9 @@ jobs:
             windows "$ARCH" "${{ matrix.asset }}"
 
       # ---------------- Android ----------------
-      # 产物是 `tdjson-android-<abi>`（**不是** loader 的发布资产：loader 只认
-      # windows/macos/linux），只作为 workflow artifact 交给 release-bot 的 Android 构建。
+      # 产物是 `TDLib-android-<arch>`（**是** loader 的发布资产，与桌面同款），走 Release；
+      # 同时整个 `dist/` 也作为 `tdjson-android-<abi>` workflow artifact 上传，
+      # 交给 `release-bot.yml` 的 `build-android` 作兜底。
       - name: Build TDLib tdjson (Android)
         if: matrix.platform == 'android'
         shell: bash
@@ -514,16 +518,16 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${{ needs.resolve-tdlib.outputs.tdlib_version }}"
-          # 用 `matrix.artifact`（不是 `matrix.asset`）：Android 不是 loader 资产，
-          # 这样 release_assets.rs 的双向比对也不会把它算进去。
+          # 用 `matrix.asset`（= `TDLib-android-<arch>`）：Android 现在是 loader 的发布资产，
+          # release_assets.rs 的双向比对应把它算进去（与桌面一致）。
           .github/scripts/package-tdlib.sh \
             "$GITHUB_WORKSPACE/out/tdjson" \
-            "$GITHUB_WORKSPACE/dist/${{ matrix.artifact }}" \
+            "$GITHUB_WORKSPACE/dist/${{ matrix.asset }}" \
             android \
             "${{ matrix.arch }}" \
             "$VERSION" \
             "$TDLIB_COMMIT" \
-            "${{ matrix.artifact }}"
+            "${{ matrix.asset }}"
 
       - name: Verify TDLib (Android)
         if: matrix.platform == 'android'
@@ -531,10 +535,10 @@ jobs:
         run: |
           set -euo pipefail
           .github/scripts/verify-tdlib.sh \
-            "$GITHUB_WORKSPACE/dist/${{ matrix.artifact }}" \
+            "$GITHUB_WORKSPACE/dist/${{ matrix.asset }}" \
             android \
             "${{ matrix.arch }}" \
-            "${{ matrix.artifact }}"
+            "${{ matrix.asset }}"
 
       - name: Upload TDLib artifact
         if: matrix.platform != 'android'
@@ -555,7 +559,7 @@ jobs:
           retention-days: 30
 
   # ⚠️ 框架本体（含 Android 可执行文件）**不在这里**：本 workflow 只负责产 TDLib
-  #    （`TDLib-*` 给 loader，`tdjson-android-<abi>` 给 Android 框架构建用）。
+  #    （`TDLib-*` 给 loader——现在含 Android；`tdjson-android-<abi>` 是给 Android 框架构建的兜底 artifact）。
   #    `fuyubot` 二进制的构建全部在 `release-bot.yml`（那边才有"产品"的概念：
   #    版本号、plugins/、zip、Release）。Android 的框架 job 也在那边。
 
@@ -599,8 +603,8 @@ jobs:
           ls -lah dist
           COUNT="$(find dist -type f -name 'TDLib-*' | wc -l)"
           echo "==> found $COUNT package(s)"
-          # 只数**桌面**包：`build_count` 现在是「桌面 + Android」的总数，
-          # 而 Android 的产物不叫 TDLib-*、也不进 Release。
+          # 数**桌面包**（下界校验）：`build_count` 现在是「桌面 + Android」的总数，
+          # 而 Android 的产物现在**也**叫 TDLib-*、也进 Release，所以这里只拿桌面数当下界。
           EXPECTED="${{ needs.resolve-tdlib.outputs.desktop_count }}"
           if [[ "$COUNT" -lt "$EXPECTED" ]]; then
             echo "error: expected $EXPECTED selected platform packages, found $COUNT" >&2
@@ -631,8 +635,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.resolve-tdlib.outputs.tdlib_version }}
           COMMIT: ${{ needs.resolve-tdlib.outputs.tdlib_commit }}
-          # 发布说明里的表只列桌面（Android 的 tdjson 不进 Release，也不是 loader 资产）
+          # 发布说明里的表列桌面 + Android（现在都是 loader 发布资产）
           DESKTOP_PLAN: ${{ needs.resolve-tdlib.outputs.desktop_plan }}
+          ANDROID_PLAN: ${{ needs.resolve-tdlib.outputs.android_plan }}
         shell: bash
         run: |
           set -euo pipefail
@@ -661,14 +666,18 @@ jobs:
             echo
             echo "| Platform | Arch | Archive | Directory inside archive | Dynamic library |"
             echo "|----------|------|---------|--------------------------|-----------------|"
-            python3 - "$DESKTOP_PLAN" <<'PY' >> "$NOTES"
+            python3 - "$DESKTOP_PLAN" "$ANDROID_PLAN" <<'PY' >> "$NOTES"
           import json, sys
-          matrix = json.loads(sys.argv[1])
-          libraries = {"linux": "libtdjson.so", "macos": "libtdjson.dylib", "windows": "tdjson.dll"}
+          desktop, android = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+          libraries = {"linux": "libtdjson.so", "macos": "libtdjson.dylib", "windows": "tdjson.dll", "android": "libtdjson.so"}
           # 资产名与归档内容由 matrix.asset 决定（= loader 的 ASSET_*，不带扩展名）。
-          for item in matrix["include"]:
-              platform, arch, asset = item["platform"], item["arch"], item["asset"]
-              print(f"| {platform} | {arch} | `{asset}` | `{asset}/` | `{libraries[platform]}` |")
+          # 桌面 + Android 都是 loader 发布资产；跳过停用的行。
+          for plan in (desktop, android):
+              for item in plan["include"]:
+                  if not item.get("enabled", True):
+                      continue
+                  platform, arch, asset = item["platform"], item["arch"], item["asset"]
+                  print(f"| {platform} | {arch} | `{asset}` | `{asset}/` | `{libraries[platform]}` |")
           PY
             echo
             echo "Each package contains only \`tdjson\` (+ \`VERSION.json\` / README)."
@@ -770,11 +779,11 @@ jobs:
             echo "| Matrix builds（含 Android） | \`${BUILD}\` |"
             echo "| Assemble | \`${ASSEMBLE}\` |"
             echo
-            echo "Release assets: \`td_api.tl\` + per-platform \`TDLib-*\` packages + \`SHA256SUMS\`."
+            echo "Release assets: \`td_api.tl\` + per-platform \`TDLib-*\` packages (now incl. Android) + \`SHA256SUMS\`."
             echo
-            echo "本 workflow **只产 TDLib**：桌面 \`TDLib-*\`（loader 的发布资产）与 \`tdjson-android-<abi>\`"
-            echo "（Android 用，只是 workflow artifact）。\`fuyubot\` 二进制与 \`plugins/\` 的构建在 \`release-bot.yml\`。"
-            echo "loader 的 \`ASSETS\` 表仍只覆盖 windows / macos / linux。"
+            echo "本 workflow **只产 TDLib**：桌面 / Android 的 \`TDLib-*\`（都是 loader 的发布资产，走 Release），"
+            echo "外加 \`tdjson-android-<abi>\` 的 workflow artifact 给框架构建兜底。\`fuyubot\` 二进制与 \`plugins/\` 的构建在 \`release-bot.yml\`。"
+            echo "loader 的 \`ASSETS\` 表现在覆盖 windows / macos / linux / **android**。"
             echo
             echo "### Desktop matrix"
             echo
