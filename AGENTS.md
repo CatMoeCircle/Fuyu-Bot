@@ -28,7 +28,7 @@ TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` �
 | `fuyubot-event` / `service` / `tool` / `middleware` | 四个机制 crate，只依赖 `core`，彼此不依赖 |
 | `fuyubot-loader` | 唯一宿主层：VTable 桥、更新管线、插件加载、注册回滚 |
 | `fuyubot-simplify` | TDLib 便捷封装（发消息 / 编辑 / Markdown → entities / 命令解析）；`ops` 模块是它的 JSON 操作表，宿主 ABI v5 的 `simplify_invoke*` 就跑它 |
-| `fuyubot-plugin-*` | demo / badabi 测试插件 + 三个内置插件（`/start`、`/help`、`/plugins`） |
+| `plugins/` · `examples/` · `tests/` | 按角色分目录：`plugins/` = 三个内置插件（`/start`、`/help`、`/plugins`）；`examples/fuyubot-plugin-demo` = 最小示例（也是加载器夹具）；`tests/` = ABI / 清单 / 作用域夹具（`badabi`、`manifest-fixture`、`scope-fixture`） |
 
 数据流：插件的 `on/invoke/emit/middleware` → `HostApiVTable` → `HostRuntime`（事件总线 / 服务 / 工具 / 管线 / TdClient）
 → 更新走六阶段 + 双通道（`"update"` 与具体 `@type`），响应按 `@request_id` 回到发起插件。

@@ -1,8 +1,15 @@
-# examples：回放用的更新 JSON
+# examples：示例插件与回放数据
 
-这个目录只剩**回放数据**。五种语言的示例插件工程搬到了
+五种语言的示例插件工程在
 [FuyuBot-SDK 的 `examples/`](https://github.com/CatMoeCircle/FuyuBot-SDK/tree/main/examples)
-（它们依赖 SDK crate，跟运行时仓库分开）。
+（它们依赖 SDK crate，跟运行时仓库分开）。本目录只放运行时仓库自己的示例：
+
+| 路径 | 内容 |
+|---|---|
+| `fuyubot-plugin-demo/` | 最小 Rust 插件示例（`define_plugin!` 的直接抄写模板），同时是 `fuyubot-loader` 端到端测试的夹具 |
+| `replay/` | 回放用的更新 JSON，见下表 |
+
+## 回放数据
 
 | 文件 | 内容 | 打给谁 |
 |---|---|---|

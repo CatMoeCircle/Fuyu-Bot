@@ -1,8 +1,14 @@
 [workspace]
-# 只有运行时本体 + 内置插件 + ABI 契约。插件 SDK 在另一个仓库（FuyuBot-SDK），
-# 文档站在第三个仓库（FuyuBot-Docs）；这里不再编 `fuyubot-sdk`，也不再带示例插件。
-members = ["crates/*"]
-default-members = ["crates/*"]
+# 只有运行时本体 + ABI 契约 + 插件。插件 SDK 在另一个仓库（FuyuBot-SDK），
+# 文档站在第三个仓库（FuyuBot-Docs）；这里不再编 `fuyubot-sdk`。
+# 按角色分目录，别再把插件和库混在一起：
+#   crates/    运行时库（含发 crates.io 的 abi / tdlib-sys）
+#   plugins/   内置插件（随发布包分发）
+#   examples/  示例插件；replay/ 是回放数据不是 crate，所以示例 crate 单独点名
+#   tests/     测试夹具插件（集成测试用 `cargo build -p` 编它们）
+members = ["crates/*", "plugins/*", "examples/fuyubot-plugin-demo", "tests/*"]
+# 裸 `cargo build` / `cargo test` 只编运行时与内置插件；示例与夹具按需 `-p`。
+default-members = ["crates/*", "plugins/*"]
 resolver = "3"
 
 [workspace.package]

@@ -55,8 +55,10 @@ logs/
 # 只挡仓库根那一份：`crates/fuyubot-cli/templates/fuyubot.toml` 是模板，**要入库**。
 /fuyubot.toml
 
-# ── 装好的插件目录（`fuyubot plugin add` 往里拷产物）───────────────────
-/plugins/
+# ── 本机实例的插件安装目录（`fuyubot plugin add` 往里拷产物）──────────
+# 仓根的 `fuyubot.toml` 把 `[plugins] dir` 指到 `dist/plugins`：
+# `plugins/` 现在是**插件 crate 源码**目录，不能再拿来放编译产物。
+/dist/
 
 # ── 生成的绑定与编译产物 ──────────────────────────────────────────────
 # `fuyubot_plugin.h` 是**产物不是源码**（AGENTS.md 约束 35）：谁要落盘就
