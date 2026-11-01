@@ -485,6 +485,26 @@ fn parent_or_dot(path: &Path) -> PathBuf {
         .to_path_buf()
 }
 
+/// 把进程的工作目录切到项目根（`fuyubot.toml` 所在目录）。
+///
+/// 插件是**同进程**的动态库，它们算相对路径时只有 `current_dir()` 可用——宿主是在项目根、
+/// 还是随便哪个目录被敲起来的，本来不该决定插件把缓存写到哪。`run` 在加载插件之前切一次，
+/// 「相对路径」从此一律指项目根：插件配置里写 `cache` / `Cache` 就落在配置文件旁边，
+/// 和 `[telegram].data_dir`（`root.join(...)`）是同一个基准。
+///
+/// ⚠️ 调用方必须**先**把手上的相对路径归一成绝对路径（`--config` / `--plugin-dir` /
+/// `--replay`）：切完目录，同一个相对字符串就不再指向同一处了。
+///
+/// 回放（`--replay`）也走这条：它同样加载插件，缓存落点该和真机一致。
+fn enter_project_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::current_dir().ok().as_deref() == Some(root) {
+        return Ok(());
+    }
+    std::env::set_current_dir(root).map_err(|e| format!("切不到项目根 {}: {e}", root.display()))?;
+    cli!(info, "工作目录切到项目根：{}", root.display());
+    Ok(())
+}
+
 // ── run / plugin list ──────────────────────────────────────────────
 
 /// 读面板写的日志级别请求；没有 / 不认识就保持 `current`。
@@ -605,12 +625,23 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config_path = resolved_config_path(&args.config, &root);
+    // 从这一刻起手上的路径都得是绝对的：下面要切工作目录，相对字符串切完就指到别处去了。
+    let config_path = std::path::absolute(&config_path)?;
     let root = parent_or_dot(&config_path);
     let config = scaffold::load_config(&config_path)?;
-    let plugin_dir = args
-        .plugin_dir
-        .clone()
-        .unwrap_or_else(|| config.plugin_dir(&root));
+    // `--plugin-dir` 是「相对用户敲命令的地方」的路径，切目录之前先归一；
+    // 没给就用配置里的（`root` 已经绝对的，`root.join(dir)` 自然也是）。
+    let plugin_dir = match args.plugin_dir.clone() {
+        Some(dir) => std::path::absolute(dir)?,
+        None => config.plugin_dir(&root),
+    };
+    // `--replay` 同理：回放文件是用户眼里的相对路径，切目录后就不再是那个意思了。
+    let replay = args.replay.clone().map(std::path::absolute).transpose()?;
+    // 插件是**同进程**的 dll，它们算相对路径用的是 `current_dir()`。宿主从哪个目录被敲起来
+    // 是用户的自由，不该决定缓存落在哪儿——所以在加载插件之前把 CWD 钉到项目根
+    // （配置文件所在目录）：插件配置里写成 `cache` / `Cache` 的相对路径就稳稳落在
+    // `fuyubot.toml` 旁边，跟 `[telegram].data_dir` 的语义一致。
+    enter_project_root(&root)?;
     // 插件目录不在就建一个空的：`plugin_files` 对**不存在的目录**是 io 错误，
     // 而 `run` 不该因为「还没装过插件」就死在一个 `Os { code: 3 }` 上
     // （`init` 只在缺配置时才会建 `plugins/`，配置已存在而目录被删掉就轮到这条兜底）。
@@ -852,7 +883,7 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_authorization = (*authorization.lock().unwrap_or_else(|e| e.into_inner())).clone();
     let mut last_account = current_account(loader.runtime());
 
-    if let Some(replay) = args.replay {
+    if let Some(replay) = replay {
         // 脚本插件在**另一个进程**里跑，反应要经管道回来，还可能捎带网络请求；
         // 纯 Rust/C 插件是同步的，回放完就已经尘埃落定。按这个差别选等待窗口。
         let scripted = plugin_files(&plugin_dir)?
