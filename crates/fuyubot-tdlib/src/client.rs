@@ -340,6 +340,53 @@ impl TdClient {
         serde_json::from_str(&text).map_err(|_| TdlibError::BadResponse(text.into_owned()))
     }
 
+    /// 优雅关闭：先发 `{"@type":"close"}`，再同步等到 `authorizationStateClosed`。
+    ///
+    /// TDLib 收到 `close` 之后会关掉数据库、把待写的东西刷盘，全部完成后才发
+    /// `updateAuthorizationState`（`authorizationStateClosed`）；**等到它**再 drop，
+    /// 才是「干净地退出」而不是「把句柄一毁」。
+    ///
+    /// ⚠️ **必须在 [`ReceiveLoop`] 停掉之后调用**：这里自己 `receive`，循环还在跑的话
+    /// 两边会抢更新——Closed 被循环拿走，这里就只能等到超时。
+    ///
+    /// 返回 `true` = 看到关闭完成；`false` = 发送失败、TDLib 明确报错，或 `timeout`
+    /// 内没等到。`false` 不需要特殊处理：调用方照常 drop，`Drop` 仍会
+    /// `td_json_client_destroy`，只是没有「刷盘完成」的保证。
+    pub fn close_and_wait(&self, timeout: Duration) -> bool {
+        let close_id = match self.send(serde_json::json!({ "@type": "close" })) {
+            Ok(id) => id,
+            Err(_) => return false,
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            // 单次最多 1s：既有机会在 TDLib 安静时醒来看截止时间，也不会睡过整个预算。
+            let wait = (deadline - now).min(Duration::from_secs(1));
+            let Some(routed) = self.receive(wait) else {
+                continue;
+            };
+            match routed {
+                // TDLib 拒绝了关闭（比如客户端已经关掉了）：别再空等。
+                Routed::Response(response) if response.id == close_id => {
+                    if response.is_error() {
+                        return false;
+                    }
+                }
+                Routed::Update(update)
+                    if update.kind == "updateAuthorizationState"
+                        && update.payload["authorization_state"]["@type"]
+                            == "authorizationStateClosed" =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// 拉一次更新并分流；`None` 表示超时（TDLib 那边没数据）。
     pub fn receive(&self, timeout: Duration) -> Option<Routed> {
         // SAFETY: raw 有效；timeout 是秒。
@@ -456,6 +503,7 @@ impl Drop for TdClient {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::VecDeque;
     use std::ffi::c_char;
     use std::sync::Mutex as StdMutex;
 
@@ -582,6 +630,91 @@ mod tests {
             set_log_verbosity: noop_set_log_verbosity,
         };
         (Arc::new(TdClient::from_parts(api, raw)), sent)
+    }
+
+    /// 假接收端：`replies` 里排好的 JSON 按顺序交出去，空了就返回空指针（= 超时）。
+    struct Feed {
+        sent: Arc<StdMutex<Vec<String>>>,
+        replies: StdMutex<VecDeque<String>>,
+    }
+
+    unsafe extern "C" fn feed_send(ctx: *mut c_void, request: *const c_char) {
+        // SAFETY: ctx 是 &Feed，由测试保证活到 drop 之后。
+        let feed = unsafe { &*(ctx as *const Feed) };
+        let text = unsafe { CStr::from_ptr(request) }
+            .to_string_lossy()
+            .into_owned();
+        feed.sent.lock().unwrap().push(text);
+    }
+
+    unsafe extern "C" fn feed_receive(ctx: *mut c_void, _: f64) -> *const c_char {
+        // SAFETY: ctx 是 &Feed，由测试保证活到 drop 之后。
+        let feed = unsafe { &*(ctx as *const Feed) };
+        let next = feed.replies.lock().unwrap().pop_front();
+        match next {
+            // 故意泄漏：`receive` 只保证返回指针在下一次调用前有效，测试里不再回收。
+            Some(text) => CString::new(text).unwrap().into_raw() as *const c_char,
+            None => std::ptr::null(),
+        }
+    }
+
+    /// 造一个按脚本回更新的假客户端（`Feed` 同样泄漏到测试进程结束）。
+    fn scripted_client(replies: Vec<Value>) -> (TdClient, Arc<StdMutex<Vec<String>>>) {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let feed = Box::new(Feed {
+            sent: Arc::clone(&sent),
+            replies: StdMutex::new(replies.into_iter().map(|value| value.to_string()).collect()),
+        });
+        let api = TdApi {
+            create: noop_create,
+            destroy: noop_destroy,
+            send: feed_send,
+            receive: feed_receive,
+            execute: noop_execute,
+            set_log_verbosity: noop_set_log_verbosity,
+        };
+        (
+            TdClient::from_parts(api, Box::into_raw(feed) as *mut c_void),
+            sent,
+        )
+    }
+
+    fn auth_state(state: &str) -> Value {
+        json!({
+            "@type": "updateAuthorizationState",
+            "authorization_state": { "@type": state },
+        })
+    }
+
+    /// 关闭 = 先发 `close`，再等 `authorizationStateClosed`；中间态不算数。
+    #[test]
+    fn close_and_wait_sends_close_and_waits_for_the_closed_state() {
+        let (client, sent) = scripted_client(vec![
+            auth_state("authorizationStateClosing"),
+            auth_state("authorizationStateClosed"),
+        ]);
+
+        assert!(client.close_and_wait(Duration::from_secs(2)));
+
+        let captured = sent.lock().unwrap();
+        assert_eq!(captured.len(), 1, "只该发一条 close：{captured:?}");
+        let parsed: Value = serde_json::from_str(&captured[0]).unwrap();
+        assert_eq!(parsed["@type"], json!("close"));
+    }
+
+    /// 等不到 Closed 也不能卡死：返回 `false`，让调用方照常 drop。
+    #[test]
+    fn close_and_wait_gives_up_after_the_budget() {
+        let (client, sent) = scripted_client(vec![]);
+
+        let started = Instant::now();
+        assert!(!client.close_and_wait(Duration::from_millis(30)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(25),
+            "明显没等预算就返回了：{:?}",
+            started.elapsed()
+        );
+        assert_eq!(sent.lock().unwrap().len(), 1, "取消关闭也要先发过 close");
     }
 
     /// 等到至少 `expected` 条请求在途，返回 `(id, 方法名)` 列表（按 id 升序）。
