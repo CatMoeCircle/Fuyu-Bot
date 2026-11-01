@@ -2347,12 +2347,13 @@ mod tests {
 
     /// `status` / `stop` 只认**已存在**的项目：从深层目录也能向上找到根（变更 6）。
     ///
-    /// ⚠️ 「找不到就报错」那条分支在仓库里测不出来：测试临时目录在 `target/test-tmp/` 下，
-    /// 往上一定能撞见仓库根那份 `fuyubot.toml`。所以这里只测找得到的那一半；
-    /// 报错那半是**手工**验的：`status --config nope\fuyubot.toml` →
+    /// 「找不到就报错」那条分支是**手工**验的：`status --config nope\fuyubot.toml` →
     /// `Error: "nope 及其上级目录里没有 fuyubot.toml——先 `fuyubot init` 建一个"`、退出码 1。
+    ///
+    /// 相对路径用「CWD → 临时目录」的真实相对路径来测，不依赖仓库根恰好有一份
+    /// `fuyubot.toml`（那份被挪进 `.fuyubot/` 之后，旧写法会红）。
     #[test]
-    fn status_walks_up_to_the_project_root() {
+    fn status_walks_up_and_resolves_relative_paths() {
         let root = test_support::temp("status-root");
         scaffold::init(&root, "mybot", 1).unwrap();
         let nested = root.join("plugins").join("somewhere");
@@ -2362,13 +2363,34 @@ mod tests {
             root
         );
 
-        // 相对路径也得能往上走：默认的 `--config fuyubot.toml` 就是相对路径，
-        // 而 `Path::new(".").parent()` 是 `Some("")`、`""` 没有父目录——不把起点变绝对，
-        // 在子目录里跑 `status` / `config` 会谎报「这里没有配置」。
-        // 测试 CWD 是 crate 根，往上两级就是仓库根那份 `fuyubot.toml`。
-        let found = scaffold::find_config(Path::new(scaffold::CONFIG_FILE))
-            .expect("相对路径必须能向上找到仓库根的 fuyubot.toml");
+        // 默认的 `--config fuyubot.toml` 是相对路径：`find_config` 必须先把起点变绝对，
+        // 否则从子目录往上走时会因为 `""` 没有父目录而谎报「这里没有配置」。
+        let relative = relative_to(&std::env::current_dir().unwrap(), &nested);
+        let found = scaffold::find_config(&relative).expect("相对路径必须能向上找到 fuyubot.toml");
         assert!(found.is_absolute() && found.is_file(), "{found:?}");
+        assert_eq!(
+            std::fs::canonicalize(found.parent().unwrap()).unwrap(),
+            std::fs::canonicalize(&root).unwrap()
+        );
+    }
+
+    /// `target` 相对 `base` 的路径（两边都按 `Path::components` 比较）。
+    fn relative_to(base: &Path, target: &Path) -> PathBuf {
+        let base: Vec<_> = base.components().collect();
+        let target: Vec<_> = target.components().collect();
+        let common = base
+            .iter()
+            .zip(&target)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let mut relative = PathBuf::new();
+        for _ in common..base.len() {
+            relative.push("..");
+        }
+        for component in &target[common..] {
+            relative.push(component.as_os_str());
+        }
+        relative
     }
 
     /// `config` 打的是**生效值**：默认值要出现、写错的 `account_type` 要报出来、
