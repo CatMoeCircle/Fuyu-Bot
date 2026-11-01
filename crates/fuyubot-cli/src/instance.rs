@@ -1,4 +1,4 @@
-//! 实例锁与状态：`<项目根>/.fuyubot/` 下的两个文件。
+//! 实例锁、状态与运行期控制：`<项目根>/.fuyubot/` 下的几个文件。
 //!
 //! 一个目录一个 Bot、一个进程一个 Bot（`docs/decisions.md` 核心原则 1），所以 `fuyubot run`
 //! 起来时**独占** `.fuyubot/lock`：
@@ -12,6 +12,8 @@
 //!   `lock` 只需要「能不能锁上」这一个比特，内容另放一处反而更干净。
 //! - 状态**在启动完成之后才发布**：`run --background` 的父进程等的就是它（拿上锁只说明进程
 //!   活着，那时候插件还没加载、登录还没走）。
+//! - 运行期控制各占一个文件：`stop` 是优雅停止请求，`log-level` 是面板在日志页调的插件
+//!   日志门槛。两者都只表达「这一次运行」：新实例拿锁时会把它们清掉，不会带到下一轮。
 //!
 //! `--replay` 不占锁、也不发布状态：回放是离线验插件的开发路径，不该和跑着的实例互斥。
 
@@ -38,6 +40,14 @@ fn status_path(root: &Path) -> PathBuf {
 /// 只有进程自己收摊这条路真的通。标记里带 PID，免得「上一次留下的标记」误伤新实例。
 fn stop_path(root: &Path) -> PathBuf {
     root.join(STATE_DIR).join("stop")
+}
+
+/// 运行期调日志级别的控制文件：面板写它，运行中的实例在主循环里读。
+///
+/// 它**不是**配置：只表达「这一次运行」想要的门槛。`InstanceLock::acquire` 会在新实例
+/// 启动时删掉它，避免上一轮临时开的 `trace` 悄悄带到下一次启动。
+fn log_level_path(root: &Path) -> PathBuf {
+    root.join(STATE_DIR).join("log-level")
 }
 
 /// 后台运行的日志文件路径。
@@ -257,6 +267,30 @@ pub fn request_stop(root: &Path, pid: u32) -> Result<(), String> {
     std::fs::write(&path, format!("{pid}\n")).map_err(|e| format!("写不了 {}: {e}", path.display()))
 }
 
+/// 运行中实例请求的日志级别（`.fuyubot/log-level`）。
+///
+/// 没有文件 / 空文件都算「没请求」。内容由写入方保证是白名单里的名字；
+/// 运行中的实例还会再解析一次，写坏了也只是不生效，不会把实例带崩。
+pub fn requested_log_level(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(log_level_path(root)).ok()?;
+    let level = text.trim();
+    (!level.is_empty()).then(|| level.to_owned())
+}
+
+/// 请运行中的实例把插件日志门槛切到 `level`（`error` / `warn` / `info` / `debug` / `trace`）。
+///
+/// 只在实例运行中调用才有意义：它自己每 500ms 在主循环里读一次这个文件。
+pub fn request_log_level(root: &Path, level: &str) -> Result<(), String> {
+    // 写进控制文件之前先验一遍：与其让实例每 500ms 读到一个不认识的名字，
+    // 不如在这里把错误指回调用方（面板能把这句话原样显示出来）。
+    crate::scaffold::parse_log_level(level)?;
+    let path = log_level_path(root);
+    std::fs::create_dir_all(root.join(STATE_DIR))
+        .map_err(|e| format!("建不了 {}: {e}", root.join(STATE_DIR).display()))?;
+    std::fs::write(&path, format!("{level}\n"))
+        .map_err(|e| format!("写不了 {}: {e}", path.display()))
+}
+
 // ── 实例锁 ─────────────────────────────────────────────────────────
 
 /// 本进程拿下的实例锁。**drop 即释放**（进程死了操作系统也会放）。
@@ -290,6 +324,8 @@ impl InstanceLock {
             Ok(()) => {
                 let _ = std::fs::remove_file(status_path(root));
                 let _ = std::fs::remove_file(stop_path(root));
+                // 上一轮临时调的日志级别不能带到这一轮：它只是运行期控制，不是配置。
+                let _ = std::fs::remove_file(log_level_path(root));
                 Ok(Self {
                     _file: file,
                     root: root.to_path_buf(),

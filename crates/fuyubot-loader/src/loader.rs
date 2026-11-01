@@ -15,7 +15,7 @@ use fuyubot_core::{Context, Effect};
 use libloading::{Library, Symbol};
 
 use crate::pipeline::UpdatePipeline;
-use crate::runtime::HostRuntime;
+use crate::runtime::{HostRuntime, PluginHost};
 
 /// 动态库后缀（按平台）。
 pub const DLL_EXTENSION: &str = if cfg!(target_os = "windows") {
@@ -74,6 +74,10 @@ pub struct LoadedPlugin {
     stop: Option<PluginStopFn>,
     /// 这次加载在宿主侧注册的所有东西的归属 id。
     owner: u64,
+    /// 这个插件那份 `host_ctx`（含 vtable 副本）：插件在任意线程调宿主时都靠它认归属。
+    /// `Option` 只为 Go 的 c-shared 库：它不能卸载，插件里残留的 goroutine 可能还会
+    /// 调宿主，所以那份上下文要跟着库一起泄漏到进程结束。
+    _host: Option<Box<PluginHost>>,
     /// 保证动态库活到最后：插件代码在 drop 之前一直可用。
     _lib: Option<Library>,
     /// 这个库是不是 Go 的 c-shared（`crosscall2` 是 Go 运行时符号）。
@@ -102,6 +106,9 @@ impl LoadedPlugin {
 
 impl Drop for LoadedPlugin {
     fn drop(&mut self) {
+        // `plugin_stop` 里的日志 / `set_config` 仍要认得出是哪个插件：加载作用域
+        // 早在 `load` 返回时就弹掉了，这里临时把 owner 压回栈顶。
+        let _owner = self._runtime.enter_owner(self.owner);
         if let Some(stop) = self.stop.take() {
             // SAFETY: handle 来自本插件的 plugin_init，且 ABI 版本已经校验过。
             unsafe { stop(self.handle) };
@@ -111,9 +118,13 @@ impl Drop for LoadedPlugin {
         // owner → 名字的映射也一并摘掉（插件卸载后不能再以它之名写配置）。
         self._runtime.unregister_owner_name(self.owner);
         // 动态库这时才真正卸载；Go 的 c-shared 除外——卸载它会让进程崩（见类型文档）。
+        // 上下文也要一起留给它：goroutine 可能还活着，`host_ctx` 不能悬空。
         if self.go_runtime {
             if let Some(lib) = self._lib.take() {
                 std::mem::forget(lib);
+            }
+            if let Some(host) = self._host.take() {
+                std::mem::forget(host);
             }
         }
     }
@@ -213,10 +224,16 @@ impl PluginLoader {
         // 从这里开始，任何提前返回都会让 `scope` 在 drop 时把这批注册整批回滚。
         let scope = self.runtime.plugin_scope();
         let owner = scope.owner();
+        // init 期间也要认得出是谁：manifest 的名字先登记，init 返回后再用 handle 的名字覆盖。
+        self.runtime
+            .register_owner_name(owner, &declared_name(&lib, path));
 
-        // SAFETY: init 是本库的 plugin_init；vtable 由本运行时持有，地址稳定。
-        let handle = unsafe { init(self.runtime.vtable_ptr()) };
+        // 每份插件自己的 `host_ctx` + vtable 副本：插件在自己起的线程里调宿主也认得出是谁。
+        let host = self.runtime.plugin_host(owner);
+        // SAFETY: init 是本库的 plugin_init；vtable 在 Box 里，地址稳定。
+        let handle = unsafe { init(host.vtable_ptr()) };
         if !handle.is_valid() {
+            self.runtime.unregister_owner_name(owner);
             return Err(LoadError::InitFailed {
                 path: path.to_owned(),
             });
@@ -232,6 +249,7 @@ impl PluginLoader {
                 // SAFETY: handle 来自同一轮 init；该符号只读 handle 里的 context。
                 unsafe { free(handle) };
             }
+            self.runtime.unregister_owner_name(owner);
             return Err(LoadError::AbiMismatch {
                 path: path.to_owned(),
                 plugin: handle.abi_version,
@@ -272,6 +290,7 @@ impl PluginLoader {
             handle,
             stop,
             owner,
+            _host: Some(host),
             _lib: Some(lib),
             go_runtime,
             _runtime: Arc::clone(&self.runtime),
@@ -306,6 +325,10 @@ impl PluginLoader {
         // 探测期内不能让宿主任就把东西注册了：这个 scope **不 commit**，
         // drop 时整批回滚（见 `HostRuntime::plugin_scope`）。
         let scope = self.runtime.plugin_scope();
+        let owner = scope.owner();
+        // init 期间也要认得出是谁（探测也会跑一遍插件代码，日志同样要带来源）。
+        self.runtime
+            .register_owner_name(owner, &declared_name(&lib, path));
 
         let init: Symbol<PluginInitFn> =
             unsafe { lib.get(SYM_PLUGIN_INIT) }.map_err(|source| LoadError::MissingSymbol {
@@ -321,15 +344,20 @@ impl PluginLoader {
             .ok()
             .map(|symbol| *symbol);
 
-        // SAFETY: init / stop 来自本库；vtable 由本运行时持有，地址稳定。
-        let handle = unsafe { init(self.runtime.vtable_ptr()) };
+        // 探测也会跑一遍插件代码（日志要带来源），所以同样给它一份自己的上下文。
+        let host = self.runtime.plugin_host(owner);
+        // SAFETY: init / stop 来自本库；vtable 在 Box 里，地址稳定。
+        let handle = unsafe { init(host.vtable_ptr()) };
         if !handle.is_valid() {
+            self.runtime.unregister_owner_name(owner);
             return Err(LoadError::InitFailed {
                 path: path.to_owned(),
             });
         }
 
         let name = plugin_name(&handle, path);
+        // 用 handle 里的名字覆盖探测前登记的 manifest 名（两者通常一致）。
+        self.runtime.register_owner_name(owner, &name);
 
         // 礼貌地把 init 期间分配的东西还给插件：一次探测不该在插件侧漏状态。
         if handle.abi_version == ABI_VERSION {
@@ -343,6 +371,7 @@ impl PluginLoader {
             // SAFETY: 同上，只读 handle 里的 context。
             unsafe { free(handle) };
         }
+        self.runtime.unregister_owner_name(owner);
         // scope 在这里自然 drop：init 注册过的一切整批撤销。
 
         // 显式收掉它：`init` 期间注册过的一切在这一刻整批撤销——
@@ -528,6 +557,24 @@ unsafe fn read_manifest(lib: &Library) -> Option<Manifest> {
     })
 }
 
+/// init 之前能确定的名字：`plugin_manifest` 优先，没有就用文件 stem。
+///
+/// 为什么要提前拿：`plugin_init` / `plugin_stop` 里插件也可能打日志，而日志来源
+/// 靠 owner → 名字的映射；等 init 返回再登记的话，启动期的日志只能标成 `plugin`，
+/// `--log-plugin` 也就过滤不到它们。
+fn declared_name(lib: &Library, path: &Path) -> String {
+    // SAFETY: 只调用插件的 `plugin_manifest` 导出，契约与 `probe` 里那次相同。
+    unsafe { read_manifest(lib) }
+        .map(|manifest| manifest.name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("plugin")
+                .to_owned()
+        })
+}
+
 /// 从文件里把库打开、init、start 全走一遍，成功后交回活着的那些东西。
 ///
 /// 和 [`PluginLoader::load_with_config`] 的分工：那边「加载完就把生命周期交出去」，
@@ -537,7 +584,16 @@ fn start_library(
     runtime: &Arc<HostRuntime>,
     path: &Path,
     config: &str,
-) -> Result<(PluginHandle, Option<PluginStopFn>, Library, u64), LoadError> {
+) -> Result<
+    (
+        PluginHandle,
+        Option<PluginStopFn>,
+        Library,
+        u64,
+        Box<PluginHost>,
+    ),
+    LoadError,
+> {
     let config = CString::new(config).map_err(|_| LoadError::BadConfig)?;
     // 规范化成绝对路径：`open_library` 只对绝对路径开 Windows 的
     // `LOAD_WITH_ALTERED_SEARCH_PATH`，插件旁边的兄弟 DLL 靠这个才找得到（约束 30 / 坑 43）。
@@ -571,10 +627,15 @@ fn start_library(
     // 从这里开始，任何提前返回都会让 `scope` 在 drop 时把这批注册整批回滚。
     let scope = runtime.plugin_scope();
     let owner = scope.owner();
+    // init 期间也要认得出是谁（日志来源 / `set_config`）。
+    runtime.register_owner_name(owner, &declared_name(&lib, path));
 
-    // SAFETY: init 是本库的 plugin_init；vtable 由本运行时持有，地址稳定。
-    let handle = unsafe { init(runtime.vtable_ptr()) };
+    // 每份插件自己的 `host_ctx` + vtable 副本：插件在自己起的线程里调宿主也认得出是谁。
+    let host = runtime.plugin_host(owner);
+    // SAFETY: init 是本库的 plugin_init；vtable 在 Box 里，地址稳定。
+    let handle = unsafe { init(host.vtable_ptr()) };
     if !handle.is_valid() {
+        runtime.unregister_owner_name(owner);
         return Err(LoadError::InitFailed {
             path: path.to_owned(),
         });
@@ -582,6 +643,7 @@ fn start_library(
 
     if handle.abi_version != ABI_VERSION {
         // 版本不兼容时**不能**调 plugin_stop：那是对一个我们不认识的 ABI 下手。
+        runtime.unregister_owner_name(owner);
         return Err(LoadError::AbiMismatch {
             path: path.to_owned(),
             plugin: handle.abi_version,
@@ -611,7 +673,7 @@ fn start_library(
     }
 
     scope.commit();
-    Ok((handle, stop, lib, owner))
+    Ok((handle, stop, lib, owner, host))
 }
 
 /// 这个动态库是不是 Go 编出来的（Go 的库不能卸载，见 [`LoadedPlugin`]）。///
@@ -739,8 +801,8 @@ impl fuyubot_core::Plugin for DylibPlugin {
     }
 
     fn apply(&self, _ctx: &Context) -> Result<Effect, fuyubot_core::KernelError> {
-        let (handle, stop, lib, owner) = start_library(&self.runtime, &self.path, &self.config)
-            .map_err(|error| {
+        let (handle, stop, lib, owner, host) =
+            start_library(&self.runtime, &self.path, &self.config).map_err(|error| {
                 // 内核的 `KernelError` 不认 `LoadError`（那是本 crate 的类型，
                 // 且 core 不许依赖 loader）。带上原因文本，日志里还能看懂。
                 fuyubot_core::KernelError::PluginApplyFailed {
@@ -766,6 +828,7 @@ impl fuyubot_core::Plugin for DylibPlugin {
             handle,
             stop,
             owner,
+            _host: host,
         };
 
         // 闭包自己持一份 `Arc`：内核会在**卸载时**才跑它，`&self` 那时已经没了。
@@ -791,12 +854,15 @@ enum Slot {
         /// `plugin_stop` 是可选导出（只做元数据登记的插件没有它）。
         stop: Option<PluginStopFn>,
         owner: u64,
+        /// 这个插件那份 `host_ctx`（含 vtable 副本）；`plugin_stop` 期间还活着。
+        _host: Box<PluginHost>,
     },
     /// 已经断了，动态库留着不让卸载（见 [`DylibPlugin`] 的文档）。
-    /// 装着那个 `Library` 只为让它活到进程结束，字段本身不读。
+    /// 装着 `Library` 与那份 `host_ctx` 只为让它们活到进程结束，字段本身不读。
     #[allow(dead_code)]
     Stopped {
         lib: Library,
+        host: Box<PluginHost>,
     },
 }
 
@@ -855,20 +921,32 @@ impl DylibPlugin {
     /// `Arc<Mutex<Slot>>` 与 `Arc<HostRuntime>`，拿不到 `&self`。
     fn teardown(slot: &Arc<Mutex<Slot>>, runtime: &HostRuntime, lib: Library) {
         let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = std::mem::replace(&mut *guard, Slot::Stopped { lib });
-        if let Slot::Running {
-            handle,
-            stop,
-            owner,
-        } = previous
-        {
-            // 先让插件自己收摊，再撤宿主这侧的注册。
-            if let Some(stop) = stop {
-                // SAFETY: handle 来自本插件的 plugin_init，ABI 版本已校验。
-                unsafe { stop(handle) };
+        // 先取出运行中的那套，收摊后再把库与 `host_ctx` 一起塞进 `Stopped`：
+        // 两者都要活到进程结束（插件代码一直映射着，残留线程仍可能调宿主）。
+        let previous = std::mem::replace(&mut *guard, Slot::Idle);
+        match previous {
+            Slot::Running {
+                handle,
+                stop,
+                owner,
+                _host: host,
+            } => {
+                // `plugin_stop` 里的日志 / `set_config` 仍要认得出是哪个插件。
+                let _owner = runtime.enter_owner(owner);
+                // 先让插件自己收摊，再撤宿主这侧的注册。
+                if let Some(stop) = stop {
+                    // SAFETY: handle 来自本插件的 plugin_init，ABI 版本已校验。
+                    unsafe { stop(handle) };
+                }
+                runtime.rollback_owner(owner);
+                runtime.unregister_owner_name(owner);
+                *guard = Slot::Stopped { lib, host };
             }
-            runtime.rollback_owner(owner);
-            runtime.unregister_owner_name(owner);
+            // 理论上到不了：teardown 只由 Running 状态的 Effect 调。真到了也别把库丢了。
+            other => {
+                *guard = other;
+                std::mem::forget(lib);
+            }
         }
     }
 }

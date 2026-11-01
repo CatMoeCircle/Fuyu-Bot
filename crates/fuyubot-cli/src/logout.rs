@@ -203,28 +203,35 @@ fn summarize_entries(entries: &[String]) -> String {
 
 /// 打印「将要删除什么」。**预览与真删前都打**——真删时它就是回执。
 fn print_plan(session: &Session, root: &Path) {
-    println!("将要删除 TDLib 本地会话（logout）：");
-    println!("  目录  {}", session.dir.display());
-    println!(
+    cli!(info, "将要删除 TDLib 本地会话（logout）：");
+    cli!(info, "  目录  {}", session.dir.display());
+    cli!(
+        info,
         "  内容  {} 个文件，{}",
         session.files,
         human_bytes(session.bytes)
     );
-    println!("  条目  {}", summarize_entries(&session.entries));
+    cli!(info, "  条目  {}", summarize_entries(&session.entries));
     if !session.inside_root {
-        println!();
-        println!(
+        cli!(
+            warn,
             "⚠️ 这个目录**不在项目根内**（{}）：[telegram].data_dir 指到了项目外面，",
             root.display()
         );
-        println!(
+        cli!(
+            warn,
             "   删的是上面那个绝对路径。确认它真是 TDLib 的会话目录（有 {}）再加 --yes。",
             SESSION_MARKER
         );
     }
-    println!();
-    println!("删掉之后 session 就没了，下次 `fuyubot run` / `fuyubot login` 要重新登录");
-    println!("（Bot Token / 手机号 / 密码从来不落盘，这里只有 TDLib 的数据库与 binlog）");
+    cli!(
+        info,
+        "删掉之后 session 就没了，下次 `fuyubot run` / `fuyubot login` 要重新登录"
+    );
+    cli!(
+        info,
+        "（Bot Token / 手机号 / 密码从来不落盘，这里只有 TDLib 的数据库与 binlog）"
+    );
 }
 
 /// `fuyubot logout` 的本体。
@@ -239,14 +246,16 @@ pub fn run(args: &super::LogoutArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     match inspect(&root, &data_dir)? {
         Verdict::Missing => {
-            println!(
+            cli!(
+                info,
                 "没有会话目录（{} 不存在）：没在这里登录过，或者已经清过了",
                 data_dir.display()
             );
-            println!("没有东西可删。");
+            cli!(info, "没有东西可删。");
         }
         Verdict::Empty => {
-            println!(
+            cli!(
+                info,
                 "{} 是空目录（没有 TDLib 的会话标记 {}）：没有会话可删",
                 data_dir.display(),
                 SESSION_MARKER
@@ -267,8 +276,8 @@ pub fn run(args: &super::LogoutArgs) -> Result<(), Box<dyn std::error::Error>> {
         Verdict::Session(session) => {
             print_plan(&session, &root);
             if !args.yes {
-                println!();
-                println!(
+                cli!(
+                    info,
                     "没有 --yes：上面这些**一个都没删**（这只是预览）。\
                      确认要清掉会话就加 --yes 再跑一次。"
                 );
@@ -284,8 +293,8 @@ pub fn run(args: &super::LogoutArgs) -> Result<(), Box<dyn std::error::Error>> {
                     session.dir.display()
                 )
             })?;
-            println!();
-            println!(
+            cli!(
+                info,
                 "已删除 {}（{} 个文件，{}）——下次 `fuyubot run` / `fuyubot login` 会重新要求登录",
                 session.dir.display(),
                 session.files,

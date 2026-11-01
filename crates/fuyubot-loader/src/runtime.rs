@@ -3,7 +3,7 @@
 //! 这里就是「宿主层做桥」那句话的落点：四个机制 crate 彼此不依赖，
 //! 把它们组合起来的地方只能有一个，那就是这里。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -240,6 +240,12 @@ pub struct HostRuntime {
     /// 默认 [`DEFAULT_LOG_VERBOSITY`]。没有它的时候 `api_log` 对每条日志都
     /// `eprintln!`——插件刷 Debug 就是实打实的 stderr 系统调用。
     log_verbosity: AtomicU32,
+    /// 插件日志的来源白名单：`None` = 全收，`Some(set)` = 只收这些插件。
+    ///
+    /// 由 CLI 的 `--log-plugin` 设置（`None` / 空表都表示不过滤）。只作用于
+    /// **插件经 VTable 打进来的**日志：宿主与管线日志不走 [`api_log`]，所以
+    /// 过滤某个插件时框架自己的告警仍然看得见。
+    log_plugins: Mutex<Option<HashSet<String>>>,
     /// 原始更新 / 响应的追踪开关（`--trace-updates`）：开了之后管线把 TDLib
     /// 发来的每一条原始 JSON 打到 stderr（含消息内容，只给调试用）。
     trace_updates: AtomicBool,
@@ -410,6 +416,7 @@ impl HostRuntime {
                 method_count: PLUGIN_METHODS.0.len(),
             },
             config: Mutex::new(ConfigState::default()),
+            log_plugins: Mutex::new(None),
             owner_names: Mutex::new(HashMap::new()),
             owner_revision: AtomicU64::new(0),
             plugin_report: Mutex::new(None),
@@ -506,6 +513,16 @@ impl HostRuntime {
         self.owner_revision.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// owner id → 插件名。查不到（极早期 / 已经注销）返回 `None`，日志来源标成
+    /// `plugin`，不冒充宿主。
+    fn owner_name(&self, owner: u64) -> Option<String> {
+        self.owner_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&owner)
+            .cloned()
+    }
+
     /// 读配置：`section` 为空 = 读顶层；否则把 `section` 当**点路径**在 `plugin` 表里下钻
     /// （插件名是点分的，如 `fuyubot.manage` → `plugin.fuyubot.manage`）。
     /// `key` 为空 = 整段/整个顶层。命中返回 `Some(JSON)`，否则 `None`。
@@ -582,13 +599,30 @@ impl HostRuntime {
         Ok(())
     }
 
-    /// 交给插件的 VTable 指针。
+    /// 全局 VTable 指针（测试 / 宿主内部用；**正式加载插件用 [`Self::plugin_host`]**）。
     pub fn vtable_ptr(&self) -> *const HostApiVTable {
         &self.vtable
     }
 
     pub fn vtable(&self) -> &HostApiVTable {
         &self.vtable
+    }
+
+    /// 造一份「指向本运行时 + 这个插件」的 [`PluginHost`]，把其中的 vtable 交给 `plugin_init`。
+    ///
+    /// 每个插件一份（地址稳定）：插件可能在**自己起的线程**、或阻塞式
+    /// `wait_for_update` 循环里调 `host.log`，那些线程上没有宿主的作用域栈——归属
+    /// 只能从它传回来的 `host_ctx` 里认。
+    pub(crate) fn plugin_host(&self, owner: u64) -> Box<PluginHost> {
+        let mut host = Box::new(PluginHost {
+            magic: PLUGIN_HOST_MAGIC,
+            runtime: self as *const HostRuntime,
+            owner,
+            vtable: self.vtable,
+        });
+        let ptr = host.as_mut() as *mut PluginHost as *mut c_void;
+        host.vtable.host_ctx = ptr;
+        host
     }
 
     pub fn context(&self) -> &Context {
@@ -705,6 +739,44 @@ impl HostRuntime {
     /// 只是省掉格式化与系统调用，**不改变**插件侧的行为：插件照样能调 `log`。
     pub fn set_log_verbosity(&self, level: LogLevel) {
         self.log_verbosity.store(level as u32, Ordering::Relaxed);
+    }
+
+    /// 只看这些插件打出来的日志（`--log-plugin`，可重复）。
+    ///
+    /// 传空表 = 取消过滤。名字按**原样**比较（插件名是 manifest 里的标识，大小写敏感）；
+    /// 也接受逗号分隔的写法（`--log-plugin a,b`）。只影响插件经 VTable 打进来的日志，
+    /// 宿主 / 管线日志不受影响。
+    pub fn set_log_plugins(&self, names: Vec<String>) {
+        let filter: HashSet<String> = names
+            .iter()
+            .flat_map(|raw| raw.split(','))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let mut slot = self.log_plugins.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = if filter.is_empty() {
+            None
+        } else {
+            Some(filter)
+        };
+    }
+
+    /// 当前来源白名单（`None` = 不过滤）。给测试与诊断用。
+    pub fn log_plugins(&self) -> Option<Vec<String>> {
+        let slot = self.log_plugins.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref().map(|names| {
+            let mut names: Vec<String> = names.iter().cloned().collect();
+            names.sort();
+            names
+        })
+    }
+
+    /// 这条插件日志该不该留下。没有白名单时全收；没有登记名字的 owner 也放行
+    /// （`plugin_init` 阶段，宁可多打一行，也别把启动期的错误吞掉）。
+    fn plugin_log_enabled(&self, name: &str) -> bool {
+        let slot = self.log_plugins.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref().is_none_or(|names| names.contains(name))
     }
 
     /// 打开 / 关闭原始更新追踪（`--trace-updates`）。
@@ -901,6 +973,14 @@ impl HostRuntime {
         id
     }
 
+    /// 把某个 owner 临时压回作用域栈顶。卸载时跑 `plugin_stop` 用：那时加载作用域
+    /// 已经弹掉了，不压回去的话插件在 `stop` 里打的日志会退化成 `plugin`、
+    /// `set_config` 也会被当成宿主写的。
+    pub(crate) fn enter_owner(&self, owner: u64) -> OwnerGuard<'_> {
+        SCOPE_STACK.with(|stack| stack.borrow_mut().push((owner, 0)));
+        OwnerGuard { _runtime: self }
+    }
+
     fn end_plugin(&self) {
         SCOPE_STACK.with(|stack| {
             stack.borrow_mut().pop();
@@ -999,13 +1079,13 @@ impl HostRuntime {
 
     /// 宿主侧的告警输出。`pub(crate)`：`loader` 的探测阶段也要报「自报名对不上」这类事。
     pub(crate) fn warn(&self, message: &str) {
-        self.info(message);
+        tracing::warn!(target: "fuyubot::host", "{message}");
     }
 
-    /// 宿主侧的一般信息。与 [`Self::warn`] 走同一条通道（`eprintln` + 统一前缀），
-    /// 区别只在调用点的语义：这条不是「出事了」，是「记一笔」。
+    /// 宿主侧的一般信息。与 [`Self::warn`] 走同一条通道（`tracing` 的 `fuyubot::host`
+    /// target），区别只在级别：这条不是「出事了」，是「记一笔」。
     pub(crate) fn info(&self, message: &str) {
-        eprintln!("[fuyubot-host] {message}");
+        tracing::info!(target: "fuyubot::host", "{message}");
     }
 
     fn registrations(&self) -> MutexGuard<'_, Vec<Registration>> {
@@ -1092,15 +1172,59 @@ unsafe impl Sync for HostRuntime {}
 
 // ── 边界小工具 ─────────────────────────────────────────────────────
 
+/// 每个插件一份的宿主上下文（`host_ctx` 指向它，而不是全局运行时）。
+///
+/// 为什么需要它：日志来源原来只靠**线程局部**的作用域栈；插件在自己起的线程、
+/// 或阻塞式 `wait_for_update` 循环里调 `host.log` 时栈是空的，只能标成 `plugin`。
+/// 把归属烧进 `host_ctx` 之后，插件从**任何线程**调进来都认得出是谁。
+#[repr(C)]
+pub(crate) struct PluginHost {
+    /// 与「运行时指针」区分用的魔数。
+    magic: u64,
+    /// 真正的运行时（`Arc<HostRuntime>` 内层地址，插件活着期间一直有效）。
+    runtime: *const HostRuntime,
+    /// 这个插件在宿主侧的归属 id。
+    owner: u64,
+    /// 交给 `plugin_init` 的 vtable 副本；在 `Box` 里地址固定，`host_ctx` 指回自己。
+    vtable: HostApiVTable,
+}
+
+impl PluginHost {
+    pub(crate) fn vtable_ptr(&self) -> *const HostApiVTable {
+        &self.vtable
+    }
+}
+
+/// 一个不可能与堆指针撞上的魔数（内存里是 `FUYUPLUG`）。
+const PLUGIN_HOST_MAGIC: u64 = 0x4755_4C50_5559_5546;
+
+/// 把 `host_ctx` 认成插件上下文；不是（老调用 / 测试用的全局 vtable）返回 `None`。
+///
 /// # Safety
-/// `host` 必须来自 [`HostRuntime::vtable_ptr`]，且运行时仍然活着。
+/// `host` 必须来自 [`HostRuntime::vtable_ptr`] 或 [`HostRuntime::plugin_host`]，
+/// 且宿主仍然活着（读前 8 字节判魔数，两边的内存都由宿主持有）。
+unsafe fn plugin_host<'a>(host: *mut c_void) -> Option<&'a PluginHost> {
+    if host.is_null() {
+        return None;
+    }
+    // SAFETY: 由调用方保证；两个来源的首地址都是对齐且已初始化的。
+    let candidate = unsafe { &*(host as *const PluginHost) };
+    (candidate.magic == PLUGIN_HOST_MAGIC).then_some(candidate)
+}
+
+/// # Safety
+/// `host` 必须来自 [`HostRuntime::vtable_ptr`] / [`HostRuntime::plugin_host`]，
+/// 且运行时仍然活着。
 unsafe fn runtime<'a>(host: *mut c_void) -> Option<&'a HostRuntime> {
     if host.is_null() {
-        None
-    } else {
-        // SAFETY: 由调用方保证。
-        Some(unsafe { &*(host as *const HostRuntime) })
+        return None;
     }
+    if let Some(ctx) = unsafe { plugin_host(host) } {
+        // SAFETY: `PluginHost` 里的运行时指针由宿主写死，插件活着期间有效。
+        return Some(unsafe { &*ctx.runtime });
+    }
+    // SAFETY: 由调用方保证（全局 vtable 的 `host_ctx` 就是运行时地址）。
+    Some(unsafe { &*(host as *const HostRuntime) })
 }
 
 /// 把 `host_ctx` 换成一份**自己持有**的 [`Arc`]，好交给跨线程的工作函数。
@@ -1115,11 +1239,19 @@ unsafe fn runtime_arc(host: *mut c_void) -> Option<Arc<HostRuntime>> {
     if host.is_null() {
         return None;
     }
-    // SAFETY: `host_ctx` 是 `HostRuntime::new` 里 `Arc::new_cyclic` 给的地址
-    // （见那里的 `weak.as_ptr()`），也就是 Arc 内层的地址，所以按 Arc 加计数是合法的。
-    unsafe { Arc::increment_strong_count(host as *const HostRuntime) };
+    // 插件上下文里包着真正的运行时地址；全局 vtable 的 `host_ctx` 本身就是它。
+    let ptr = match unsafe { plugin_host(host) } {
+        Some(ctx) => ctx.runtime,
+        None => host as *const HostRuntime,
+    };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` 是 `HostRuntime::new` 里 `Arc::new_cyclic` 给的地址
+    // （`weak.as_ptr()`），也就是 Arc 内层的地址，所以按 Arc 加计数是合法的。
+    unsafe { Arc::increment_strong_count(ptr) };
     // SAFETY: 同上；刚刚加过一次计数，这份 Arc 由本函数返回给调用方持有。
-    Some(unsafe { Arc::from_raw(host as *const HostRuntime) })
+    Some(unsafe { Arc::from_raw(ptr) })
 }
 
 /// # Safety
@@ -1517,14 +1649,39 @@ unsafe extern "C" fn api_log(host: *mut c_void, level: u32, message: *const c_ch
     if level as u32 > rt.log_verbosity() {
         return;
     }
+    // 来源：优先 `host_ctx` 里烧好的归属——插件自己起的线程、阻塞式 `wait_for_update`
+    // 循环、以及「A 调 B 的 service」这几种情况都没有/只有调用方的作用域栈，
+    // 真正说话的是持有这份 vtable 的插件。没有插件上下文时（测试用的全局 vtable）
+    // 才退回线程作用域栈。
+    let owner = match unsafe { plugin_host(host) } {
+        Some(ctx) => ctx.owner,
+        None => rt.current_owner(),
+    };
+    // 名字还没登记（理论上只会在 init 极早期）时标成 `plugin`，不冒充宿主。
+    let plugin = rt.owner_name(owner);
+    if let Some(name) = plugin.as_deref() {
+        if !rt.plugin_log_enabled(name) {
+            return;
+        }
+    }
+    let source = plugin.as_deref().unwrap_or("plugin");
     {
         let mut lines = rt.log_lines.lock().unwrap_or_else(|e| e.into_inner());
         if lines.len() >= LOG_CAPACITY {
             lines.pop_front();
         }
-        lines.push_back(format!("{level:?} {text}"));
+        // 环形缓冲也带来源：`--replay` 打出来的是「谁说的」，而不只是「说了什么」。
+        lines.push_back(format!("{source} {level:?} {text}"));
     }
-    eprintln!("[plugin/{level:?}] {text}");
+    // 动态级别没法走 `event!(level, …)`（callsite 要求常量级别），所以逐级 match；
+    // 每个分支各有一个静态 callsite，开销与直接写 `info!` 一样。
+    match level {
+        LogLevel::Error => tracing::error!(target: "fuyubot::plugin", plugin = %source, "{text}"),
+        LogLevel::Warn => tracing::warn!(target: "fuyubot::plugin", plugin = %source, "{text}"),
+        LogLevel::Info => tracing::info!(target: "fuyubot::plugin", plugin = %source, "{text}"),
+        LogLevel::Debug => tracing::debug!(target: "fuyubot::plugin", plugin = %source, "{text}"),
+        LogLevel::Trace => tracing::trace!(target: "fuyubot::plugin", plugin = %source, "{text}"),
+    }
 }
 
 unsafe extern "C" fn api_on(
@@ -2262,6 +2419,19 @@ impl HostRuntime {
     }
 }
 
+/// [`HostRuntime::enter_owner`] 的守卫：drop 时弹回作用域栈。
+pub(crate) struct OwnerGuard<'a> {
+    _runtime: &'a HostRuntime,
+}
+
+impl Drop for OwnerGuard<'_> {
+    fn drop(&mut self) {
+        SCOPE_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
 /// 一次插件加载的作用域：正常结束时保留注册，失败或提前返回时整批回滚。
 pub(crate) struct PluginScope<'a> {
     runtime: &'a HostRuntime,
@@ -2419,6 +2589,36 @@ mod tests {
 
     fn runtime() -> Arc<HostRuntime> {
         HostRuntime::new(Context::new()).expect("运行时应该建得起来")
+    }
+
+    /// 插件自己起的线程上没有宿主的作用域栈——归属必须从 `host_ctx` 里认出来，
+    /// 不能退化成 `plugin`（这正是「脚本 / 异步插件日志没有名字」的根因）。
+    #[test]
+    fn a_foreign_thread_still_logs_under_the_plugin_name() {
+        let rt = runtime();
+        let owner = rt.begin_plugin();
+        rt.register_owner_name(owner, "demo.threaded");
+        let host = rt.plugin_host(owner);
+        let ptr = host.vtable_ptr() as usize;
+
+        std::thread::spawn(move || {
+            let api = unsafe { HostApi::from_raw(ptr as *const HostApiVTable) }
+                .expect("插件上下文里的 vtable 应该自洽");
+            api.log(LogLevel::Info, "from a plugin thread");
+        })
+        .join()
+        .unwrap();
+
+        rt.end_plugin();
+        let lines = rt.log_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("demo.threaded") && line.contains("from a plugin thread")),
+            "外来线程的日志要带插件名：{lines:?}"
+        );
+        rt.unregister_owner_name(owner);
+        drop(host);
     }
 
     /// VTable 必须每个字段都填满，且版本/尺寸自洽。
@@ -2590,6 +2790,51 @@ mod tests {
             !rt.log_lines()
                 .iter()
                 .any(|line| line.contains("info-after-lowering"))
+        );
+    }
+
+    /// 来源过滤：只留白名单里的插件；空表恢复全收；环形缓冲带来源。
+    #[test]
+    fn log_plugin_filter_keeps_only_selected_sources() {
+        let rt = runtime();
+        let scope = rt.plugin_scope();
+        rt.register_owner_name(scope.owner(), "fuyubot.demo");
+        // SAFETY: vtable 活着；scope 已把 owner 压到栈顶，api.log 会记到它名下。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+
+        rt.set_log_plugins(vec!["fuyubot.demo".to_owned()]);
+        assert_eq!(rt.log_plugins(), Some(vec!["fuyubot.demo".to_owned()]));
+        api.log(LogLevel::Info, "kept");
+        rt.set_log_plugins(vec!["other".to_owned()]);
+        api.log(LogLevel::Info, "dropped");
+
+        let lines = rt.log_lines();
+        assert!(lines.iter().any(|line| line.contains("kept")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|line| line.contains("dropped")),
+            "白名单外的插件日志不该进环形缓冲：{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("fuyubot.demo") && line.contains("kept")),
+            "环形缓冲要带来源：{lines:?}"
+        );
+
+        // 逗号写法也行（`--log-plugin a,b`）；空白会被吃掉。
+        rt.set_log_plugins(vec![" fuyubot.demo , other ".to_owned()]);
+        assert_eq!(
+            rt.log_plugins(),
+            Some(vec!["fuyubot.demo".to_owned(), "other".to_owned()])
+        );
+
+        // 空表 = 取消过滤（不是「谁都不留」）。
+        rt.set_log_plugins(Vec::new());
+        assert_eq!(rt.log_plugins(), None);
+        api.log(LogLevel::Info, "back");
+        assert!(
+            rt.log_lines().iter().any(|line| line.contains("back")),
+            "清空白名单后应恢复全收"
         );
     }
 

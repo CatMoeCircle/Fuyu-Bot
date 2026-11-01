@@ -21,7 +21,17 @@
 //! 编好之后 `fuyubot plugin install <产物>` 只是**复制**进插件目录。以前的 `build-plugin`
 //! 已按新规格拆掉。
 
+/// CLI 输出统一走 `tracing`：命令结果与运行期诊断同一条通道、同一份格式。
+///
+/// 目标固定为 `fuyubot::cli`，控制台来源列显示 `cli`；消息本身不带级别以外的前缀。
+macro_rules! cli {
+    ($level:ident, $($arg:tt)*) => {
+        tracing::$level!(target: "fuyubot::cli", $($arg)*)
+    };
+}
+
 mod instance;
+mod logging;
 mod logout;
 mod scaffold;
 
@@ -31,7 +41,9 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use fuyubot_core::{Kernel, Plugin as _};
-use fuyubot_loader::{DylibPlugin, PluginLoader, UpdatePipeline, find_script, plugin_files};
+use fuyubot_loader::{
+    DylibPlugin, LogLevel, PluginLoader, UpdatePipeline, find_script, plugin_files,
+};
 // 扩展 trait 要在作用域里才能对 `ConsolePrompter` 调 `ask`（固有方法不覆盖它）。
 use fuyubot_tdlib::Prompter as _;
 
@@ -126,6 +138,12 @@ struct RunArgs {
     /// 与配置共用同一份解析，写错会当场报错指路。
     #[arg(long, value_name = "LEVEL")]
     log_level: Option<String>,
+    /// 只看这些插件打出来的日志（可重复；宿主 / 管线日志不受影响）。
+    ///
+    /// 名字以 manifest 里的插件名为准（如 `fuyubot.start`），也可以写逗号分隔的多个。
+    /// 不传 = 全收。
+    #[arg(long = "log-plugin", value_name = "NAME")]
+    log_plugin: Vec<String>,
     /// 调试用：把 TDLib 发来的**每一条**原始更新 / 响应 JSON 打到 stderr。
     ///
     /// 里面含消息内容，别在正式环境开；要查「某个错误为什么没有 code」这类问题时
@@ -219,14 +237,26 @@ struct UninstallArgs {
     plugin_dir: Option<PathBuf>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+fn main() {
+    // **所有**输出都走 `tracing`：命令结果、运行期诊断、致命错误同一条通道（见 `logging.rs`）。
+    logging::init();
+    if let Err(error) = dispatch(Cli::parse()) {
+        tracing::error!(target: "fuyubot::cli", "{error}");
+        std::process::exit(1);
+    }
+}
+
+/// 按子命令分派；`Err` = 这条命令失败，由 [`main`] 记一条 error 日志后以 1 退出。
+fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Init(args) => {
             let config = scaffold::init(&args.dir, &args.name, args.api_id)?;
-            println!("已生成 {}", config.display());
-            println!("插件目录：{}", args.dir.join("plugins").display());
-            println!("下一步：fuyubot-sdk init demo --lang rust（插件脚手架由开发 CLI 生成）");
+            cli!(info, "已生成 {}", config.display());
+            cli!(info, "插件目录：{}", args.dir.join("plugins").display());
+            cli!(
+                info,
+                "下一步：fuyubot-sdk init demo --lang rust（插件脚手架由开发 CLI 生成）"
+            );
         }
         Command::Run(args) if args.background => run_background(args)?,
         Command::Run(args) => run(args)?,
@@ -248,9 +278,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn status(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let root = existing_root(&args.config)?;
     for line in instance::status_lines(&root) {
-        println!("{line}");
+        cli!(info, "{line}");
     }
-    println!("  日志       {}", instance::log_path(&root).display());
+    cli!(info, "  日志       {}", instance::log_path(&root).display());
     Ok(())
 }
 
@@ -266,7 +296,7 @@ fn config_list(args: &ConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
     let path = scaffold::find_config(&start).unwrap_or_else(|| args.config.clone());
     let config = scaffold::load_config(&path)?;
     for line in scaffold::config_lines(&path, &parent_or_dot(&path), &config) {
-        println!("{line}");
+        cli!(info, "{line}");
     }
     Ok(())
 }
@@ -274,7 +304,7 @@ fn config_list(args: &ConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// `fuyubot stop`。
 fn stop(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let root = existing_root(&args.config)?;
-    println!("{}", instance::stop(&root)?);
+    cli!(info, "{}", instance::stop(&root)?);
     Ok(())
 }
 
@@ -325,6 +355,10 @@ fn run_background(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(wait) = args.replay_wait {
         command.arg("--replay-wait").arg(wait.to_string());
     }
+    // 日志过滤也要跟着走：后台进程是另一个进程，不传就等于把过滤丢了。
+    for name in &args.log_plugin {
+        command.arg("--log-plugin").arg(name);
+    }
     command
         .stdin(std::process::Stdio::null())
         .stdout(append()?)
@@ -359,13 +393,13 @@ fn run_background(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             instance::read_status(&root),
             Some(instance::Info { pid: published, .. }) if published == pid
         ) {
-            println!("已在后台运行：pid {pid}，日志 {}", log.display());
-            println!("`fuyubot status` 看状态，`fuyubot stop` 停掉它");
+            cli!(info, "已在后台运行：pid {pid}，日志 {}", log.display());
+            cli!(info, "`fuyubot status` 看状态，`fuyubot stop` 停掉它");
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            println!("后台进程（pid {pid}）还在启动中（登录可能要一会儿）");
-            println!("日志：{}；状态：`fuyubot status`", log.display());
+            cli!(info, "后台进程（pid {pid}）还在启动中（登录可能要一会儿）");
+            cli!(info, "日志：{}；状态：`fuyubot status`", log.display());
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -446,7 +480,19 @@ fn parent_or_dot(path: &Path) -> PathBuf {
 
 // ── run / plugin list ──────────────────────────────────────────────
 
+/// 读面板写的日志级别请求；没有 / 不认识就保持 `current`。
+///
+/// 抽成纯函数是为了能单独测：主循环本身要真 TDLib，测试里跑不起来。
+/// 控制文件由 `instance::request_log_level` 校验后写入，外部写坏也只是「不生效」。
+fn desired_log_level(root: &Path, current: LogLevel) -> LogLevel {
+    instance::requested_log_level(root)
+        .and_then(|raw| scaffold::parse_log_level(&raw).ok())
+        .unwrap_or(current)
+}
+
 fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // 在起 tokio 之前装：`now_local()` 在 Unix 多线程下拿不到时区，只能退回 UTC。
+    logging::init();
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run_async(args))
 }
@@ -465,6 +511,7 @@ fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// 实例在跑时拒绝并**拿锁**：登录可能要等验证码 / 扫码好几分钟，这期间
 /// `fuyubot run` 不该挤进来抢同一个 TDLib 数据库（判据与 `logout` 共用）。
 fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
+    logging::init();
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(login_async(args))
 }
@@ -503,12 +550,14 @@ async fn login_async(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let parameters = resolve_parameters(&config, &config_path, &root, cli_api_id)?;
     let account = config.telegram.account_type()?;
-    println!(
+    cli!(
+        info,
         "只登录：不加载插件、不开接收循环；登完就退出\
          （之后 `fuyubot run` 会直接用这份 session）"
     );
     drive_login(&client, &parameters, account, &pipeline)?;
-    println!(
+    cli!(
+        info,
         "登录完成：session 在 {}——`fuyubot run`（含 `--background`）起来会直接进 Ready",
         parameters.data_dir.display()
     );
@@ -522,6 +571,8 @@ async fn login_async(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> 
 async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // 参数错误要**在动任何文件之前**报出来（自动 init 会建项目目录）。
     let cli_api_id = checked_cli_api_id(args.api_id)?;
+    // 直接调 `run_async` 的路径（测试 / 将来的嵌入方）也要有订阅者；重复调用只保留第一个。
+    logging::init();
     // 启动时刻：写进状态文件给 `status` 算「已运行多久」。
     let started_at = instance::unix_now();
     // 项目根目录：`fuyubot.toml` 所在目录（找不到就是当前目录）。
@@ -553,10 +604,10 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         match scaffold::install_builtins(&plugin_dir) {
             Ok(staged) => {
                 for path in &staged {
-                    println!("已安装内置插件 {}", path.display());
+                    cli!(info, "已安装内置插件 {}", path.display());
                 }
             }
-            Err(error) => eprintln!("装内置插件失败（继续）: {error}"),
+            Err(error) => cli!(warn, "装内置插件失败（继续）: {error}"),
         }
     }
 
@@ -590,15 +641,28 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // 插件日志门槛：`[plugins].log_level`，`--log-level` 覆盖它。**必须在插件加载之前**——
     // 插件 `init` / `start` 里打的日志也受它管。
-    let plugin_log_level = match &args.log_level {
+    let mut log_level = match &args.log_level {
         Some(raw) => scaffold::parse_log_level(raw)?,
         None => config.plugins.log_level()?,
     };
-    pipeline.runtime().set_log_verbosity(plugin_log_level);
-    println!("插件日志级别：{}", plugin_log_level as i32);
+    pipeline.runtime().set_log_verbosity(log_level);
+    // 来源过滤：`--log-plugin fuyubot.start` 只留这个插件打出来的日志。
+    // 只挡插件日志，宿主 / 管线的告警照旧——过滤时最该看见的恰恰是「框架说哪里不对」。
+    pipeline.runtime().set_log_plugins(args.log_plugin.clone());
+    cli!(
+        info,
+        "插件日志级别：{}",
+        scaffold::log_level_name(log_level)
+    );
+    if !args.log_plugin.is_empty() {
+        cli!(info, "只看插件日志：{}", args.log_plugin.join(", "));
+    }
     if args.trace_updates {
         pipeline.runtime().set_trace_updates(true);
-        println!("--trace-updates：每一条原始更新 / 响应都会打到 stderr");
+        cli!(
+            info,
+            "--trace-updates：每一条原始更新 / 响应都会打到 stderr"
+        );
     }
 
     // ── 启动顺序 ────────────────────────────────────────────────
@@ -620,9 +684,9 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let replaying = args.replay.is_some();
     let tdlib_client = if args.no_tdlib || replaying {
         if replaying {
-            println!("--replay：本次不接 TDLib（回放是离线的，请求只留档）");
+            cli!(info, "--replay：本次不接 TDLib（回放是离线的，请求只留档）");
         } else {
-            println!("--no-tdlib：跳过 TDLib，插件照常加载");
+            cli!(info, "--no-tdlib：跳过 TDLib，插件照常加载");
         }
         None
     } else {
@@ -669,7 +733,8 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // 插件速览：`status` 是**另一个进程**，只能从这份文件读，所以要写下来。
     // （插件自己那条路走 `fuyubot.host.plugins` 服务，`load_plugins` 里已经装了活来源。）
     let detail = instance::PluginDetail::from_report(&kernel.report());
-    println!(
+    cli!(
+        info,
         "{bot_name}（fuyubot {}）已启动：插件 {} 个，工具 {} 个",
         env!("CARGO_PKG_VERSION"),
         detail.active.len(),
@@ -748,7 +813,10 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             })
     };
 
-    println!("开始接收 TDLib 更新（Ctrl-C 退出，或在别处 `fuyubot stop`）");
+    cli!(
+        info,
+        "开始接收 TDLib 更新（Ctrl-C 退出，或在别处 `fuyubot stop`）"
+    );
     //
     // ⚠️ Ctrl-C 目前仍是**硬杀**（进程被直接终止，插件的 `stop` 走不到）：要捕获它得开
     //    tokio 的 `signal` feature，那会带进 mio + signal-hook-registry + errno——AGENTS 的
@@ -756,6 +824,19 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     //    要优雅退出就走 `fuyubot stop`（它写停止标记，我们在下面这一圈里看到就自己收摊）。
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // 运行期调日志级别：面板在日志页写 `.fuyubot/log-level`，这里每圈读一次。
+        // 只有**变了**才 set + 打一行；文件不存在 / 内容写坏都保持当前级别。
+        let desired = desired_log_level(&root, log_level);
+        if desired != log_level {
+            pipeline.runtime().set_log_verbosity(desired);
+            log_level = desired;
+            cli!(
+                info,
+                "插件日志级别已切换为 {}",
+                scaffold::log_level_name(desired)
+            );
+        }
 
         // 插件在运行期会自行上下线（依赖消失就退回 Pending，回来再自动激活），
         // 而 `fuyubot status` 是**另一个进程**、只能读这份文件。所以这一圈顺带把
@@ -777,7 +858,7 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .is_some_and(instance::InstanceLock::stop_requested)
         {
-            println!("收到停止请求：停接收循环、卸载插件");
+            cli!(info, "收到停止请求：停接收循环、卸载插件");
             receive.stop();
             receive.join().await;
             loaded.clear();
@@ -795,7 +876,8 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         // 东西——**这条必须在停循环之前判**：`join()` 会按值消费 `receive`，从这里 `continue`
         // 就会跳过下面那次重新赋值，编译器直接报 use-after-move（也确实会漏掉循环）。
         let Some(parameters) = parameters.as_ref() else {
-            eprintln!(
+            cli!(
+                warn,
                 "⚠️ 授权状态变成 {state}，但本次是 --no-login（没发过 setTdlibParameters），\
                  没有可用的重登参数——只能继续等"
             );
@@ -803,13 +885,16 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         };
         let account = config.telegram.account_type()?;
 
-        eprintln!("⚠️ 授权状态变成 {state}：账号可能被下线或封禁 —— 停掉接收循环，退回登录流程");
+        cli!(
+            warn,
+            "⚠️ 授权状态变成 {state}：账号可能被下线或封禁 —— 停掉接收循环，退回登录流程"
+        );
         receive.stop();
         receive.join().await;
         drive_login(client, parameters, account, &pipeline)?;
         // 登录完再开分发。**插件不重新加载**：它们还订阅着，重载会重复注册。
         receive = pipeline.spawn_dispatch(client);
-        println!("已重新进入运行状态");
+        cli!(info, "已重新进入运行状态");
     }
 }
 
@@ -835,7 +920,8 @@ fn plugin_list(args: PluginDirArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         let files = plugin_files(&plugin_dir).unwrap_or_default();
         if files.is_empty() {
-            println!(
+            cli!(
+                warn,
                 "{} 里没有插件（.{}）",
                 plugin_dir.display(),
                 fuyubot_loader::DLL_EXTENSION
@@ -852,7 +938,8 @@ fn plugin_list(args: PluginDirArgs) -> Result<(), Box<dyn std::error::Error>> {
         // 正是踩过这个坑。
         let loaded = load_plugins(&mut kernel, &loader, &plugin_dir, false)?;
         for plugin in &loaded {
-            println!(
+            cli!(
+                info,
                 "{}\tABI {}\t{}",
                 plugin.name(),
                 plugin.abi_version(),
@@ -890,15 +977,15 @@ fn print_managed_scripts(loader: &PluginLoader) {
                         lines.push(format!("  {name}\t{lang}\t{}", entry.display()));
                     }
                 }
-                Err(e) => eprintln!("{service} 返回的不是合法 JSON: {e}"),
+                Err(e) => cli!(warn, "{service} 返回的不是合法 JSON: {e}"),
             },
-            Err(e) => eprintln!("查不了 {service}: {e}"),
+            Err(e) => cli!(warn, "查不了 {service}: {e}"),
         }
     }
     if !lines.is_empty() {
-        println!("脚本插件（{} 个，由中间插件托管）：", lines.len());
+        cli!(info, "脚本插件（{} 个，由中间插件托管）：", lines.len());
         for line in lines {
-            println!("{line}");
+            cli!(info, "{line}");
         }
     }
 }
@@ -909,7 +996,7 @@ fn plugin_install(args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
     let plugin_dir = args.plugin_dir.unwrap_or_else(|| config.plugin_dir(&root));
 
     for path in scaffold::install(&args.path, &plugin_dir)? {
-        println!("已安装 {}", path.display());
+        cli!(info, "已安装 {}", path.display());
     }
     Ok(())
 }
@@ -925,7 +1012,7 @@ fn plugin_uninstall(args: UninstallArgs) -> Result<(), Box<dyn std::error::Error
     let plugin_dir = args.plugin_dir.unwrap_or_else(|| config.plugin_dir(&root));
 
     for path in scaffold::uninstall(&args.name, &plugin_dir)? {
-        println!("已卸载 {}", path.display());
+        cli!(info, "已卸载 {}", path.display());
     }
     Ok(())
 }
@@ -965,7 +1052,8 @@ fn ensure_project(
         })
         .unwrap_or(0);
     scaffold::init(root, &name, api_id)?;
-    println!(
+    cli!(
+        info,
         "没有配置，已按默认模板生成 {}（等价于先跑一次 `fuyubot init`）",
         root.join(scaffold::CONFIG_FILE).display()
     );
@@ -996,7 +1084,7 @@ impl fuyubot_tdlib::Prompter for ConsolePrompter {
         if question.starts_with("Bot Token") {
             if let Ok(token) = std::env::var("TG_BOT_TOKEN") {
                 if !token.trim().is_empty() {
-                    println!("{question}：用环境变量 TG_BOT_TOKEN（不回显）");
+                    cli!(info, "{question}：用环境变量 TG_BOT_TOKEN（不回显）");
                     return Ok(token);
                 }
             }
@@ -1016,9 +1104,9 @@ impl fuyubot_tdlib::Prompter for ConsolePrompter {
     fn choose_login_method(
         &mut self,
     ) -> Result<fuyubot_tdlib::LoginMethod, fuyubot_tdlib::LoginError> {
-        println!("这个账号是 user 类型，选登录方式：");
-        println!("  1) 手机号（收验证码）");
-        println!("  2) 二维码（手机 Telegram 扫码）");
+        cli!(info, "这个账号是 user 类型，选登录方式：");
+        cli!(info, "  1) 手机号（收验证码）");
+        cli!(info, "  2) 二维码（手机 Telegram 扫码）");
         match self.ask("输入 1 或 2")?.trim() {
             "1" => Ok(fuyubot_tdlib::LoginMethod::PhoneNumber),
             "2" => Ok(fuyubot_tdlib::LoginMethod::QrCode),
@@ -1029,7 +1117,7 @@ impl fuyubot_tdlib::Prompter for ConsolePrompter {
     }
 
     fn notify(&mut self, message: &str) {
-        println!("{message}");
+        cli!(info, "{message}");
     }
 }
 
@@ -1145,7 +1233,7 @@ fn resolve_parameters(
         (Some(value), _) => value.clone(),
         (None, Some(saved)) => saved.clone(),
         (None, None) => {
-            println!("没找到环境变量 TG_API_HASH，配置里也没存过。");
+            cli!(info, "没找到环境变量 TG_API_HASH，配置里也没存过。");
             let answer = prompter.ask("api_hash（从 https://my.telegram.org 拿，输入不回显）")?;
             asked_hash = Some(answer.clone());
             answer
@@ -1169,7 +1257,8 @@ fn resolve_parameters(
         } else {
             "交互输入"
         };
-        println!(
+        cli!(
+            info,
             "api_id 与 api_hash 都已就位（{} + {hash_src}），跳过初始化与提问",
             id_source.describe()
         );
@@ -1180,16 +1269,21 @@ fn resolve_parameters(
     if asked_id.is_some() || asked_hash.is_some() {
         match scaffold::remember_credentials(config_path, asked_id, asked_hash.as_deref()) {
             Ok(true) => {
-                println!("已写回 {}（下次不用再输这两项）", config_path.display());
+                cli!(
+                    info,
+                    "已写回 {}（下次不用再输这两项）",
+                    config_path.display()
+                );
                 if asked_hash.is_some() {
-                    println!(
+                    cli!(
+                        warn,
                         "⚠️ api_hash 是凭据，现在以**明文**放在上面的文件里——\
                          别把它提交到版本库、也别整份发给别人"
                     );
                 }
             }
             Ok(false) => {}
-            Err(e) => eprintln!("写回 api_id / api_hash 失败（不影响本次运行）：{e}"),
+            Err(e) => cli!(warn, "写回 api_id / api_hash 失败（不影响本次运行）：{e}"),
         }
     }
 
@@ -1235,7 +1329,8 @@ fn drive_login(
     // 登录期判据（变更 3-b）：一次都没问过就进了 Ready，说明 `data_dir` 里的 session
     // 还有效——要明说，否则用户会以为自己刚输入的凭据生效了（其实根本没用到）。
     if !prompter.asked {
-        println!(
+        cli!(
+            info,
             "已有有效 session，TDLib 直接进了 authorizationStateReady（本次没有走任何登录交互）"
         );
     }
@@ -1373,7 +1468,7 @@ fn load_plugins(
         // 探测失败就跳过这一个，原因打出来——文件在那儿却悄悄消失是最难查的那类事。
         match DylibPlugin::probe(loader, &path, config) {
             Ok(adapter) => adapters.push(Arc::new(adapter)),
-            Err(error) => eprintln!("跳过 {}: {error}", path.display()),
+            Err(error) => cli!(warn, "跳过 {}: {error}", path.display()),
         }
     }
 
@@ -1391,13 +1486,14 @@ fn load_plugins(
 
     // Pending 的要说清楚：不说的话，人就会以为它在正常跑。
     for (name, missing) in kernel.plugins().pending() {
-        eprintln!(
+        cli!(
+            warn,
             "插件 {name} 的依赖还没齐，先不启动：缺 {}",
             missing.join(", ")
         );
     }
     for (name, reason) in kernel.plugins().failed() {
-        eprintln!("插件 {name} 启动失败：{reason}");
+        cli!(error, "插件 {name} 启动失败：{reason}");
     }
 
     Ok(adapters)
@@ -1425,7 +1521,7 @@ fn replay_updates(
     for update in &updates {
         let update_type = update.get("@type").and_then(|v| v.as_str()).unwrap_or("?");
         let outcome = pipeline.process_value(update.clone())?;
-        println!("回放 {update_type} → {outcome:?}");
+        cli!(info, "回放 {update_type} → {outcome:?}");
     }
 
     // 脚本插件是**另一个进程**：事件要经管道过去、反应要经管道回来，还可能捎带
@@ -1435,13 +1531,19 @@ fn replay_updates(
         quiet_override.unwrap_or(if scripted { 2000 } else { 150 }),
     );
 
-    println!("插件打出来的日志：");
+    cli!(info, "插件打出来的日志：");
     for line in runtime.log_lines() {
-        println!("  {line}");
+        cli!(info, "  {line}");
     }
-    println!("插件发出去的请求：");
+    cli!(info, "插件发出去的请求：");
     for request in runtime.sent_requests() {
-        println!("  #{} {} {}", request.id, request.method, request.params);
+        cli!(
+            info,
+            "  #{} {} {}",
+            request.id,
+            request.method,
+            request.params
+        );
     }
     Ok(())
 }
@@ -1490,7 +1592,8 @@ fn attach_tdlib(
         Some(path) => {
             let path = PathBuf::from(path);
             if !path.exists() {
-                eprintln!(
+                cli!(
+                    warn,
                     "配置里的 tdlib.path 不存在：{}，回退到自动查找",
                     path.display()
                 );
@@ -1507,18 +1610,19 @@ fn attach_tdlib(
 
     match resolved {
         Ok(resolved) => {
-            println!(
+            cli!(
+                info,
                 "TDLib {} 命中「{}」：{}",
                 fuyubot_tdlib::TDLIB_VERSION,
                 resolved.source,
                 resolved.target.display()
             );
             for note in &resolved.notes {
-                println!("  {note}");
+                cli!(info, "  {note}");
             }
         }
         Err(e) => {
-            eprintln!("TDLib 未就绪（不接更新）：{e}");
+            cli!(warn, "TDLib 未就绪（不接更新）：{e}");
             return None;
         }
     }
@@ -1526,7 +1630,7 @@ fn attach_tdlib(
     let client = match fuyubot_tdlib::TdClient::new() {
         Ok(client) => Arc::new(client),
         Err(e) => {
-            eprintln!("创建 TDLib 客户端失败（不接更新）：{e}");
+            cli!(warn, "创建 TDLib 客户端失败（不接更新）：{e}");
             return None;
         }
     };
@@ -1535,12 +1639,12 @@ fn attach_tdlib(
     if log_verbosity != fuyubot_tdlib::DEFAULT_LOG_VERBOSITY {
         client.set_log_verbosity(log_verbosity);
     }
-    println!("TDLib 日志详细度：{log_verbosity}");
+    cli!(info, "TDLib 日志详细度：{log_verbosity}");
 
     match pipeline.attach_tdlib(Arc::clone(&client)) {
         Ok(()) => Some(client),
         Err(_) => {
-            eprintln!("宿主已经接过一个 TDLib 客户端了");
+            cli!(warn, "宿主已经接过一个 TDLib 客户端了");
             None
         }
     }
@@ -1661,6 +1765,24 @@ mod tests {
         }
         // 级别名写错（如 `verbose`）交给 `parse_log_level` 报错，不在 clap 这里。
         assert!(Cli::try_parse_from(["fuyubot", "run", "--log-level", "verbose"]).is_ok());
+
+        // 来源过滤：可重复，顺序原样保留（打印「只看…」时按用户给的顺序）。
+        let cli = Cli::try_parse_from([
+            "fuyubot",
+            "run",
+            "--log-plugin",
+            "fuyubot.demo",
+            "--log-plugin",
+            "fuyubot.start",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run(args) => assert_eq!(
+                args.log_plugin,
+                vec!["fuyubot.demo".to_owned(), "fuyubot.start".to_owned()]
+            ),
+            other => panic!("解析成了 {other:?}"),
+        }
 
         // 后台运行：只是 `run` 的一个开关（`status` / `stop` 面对的是同一个实例）。
         let cli = Cli::try_parse_from(["fuyubot", "run", "--background"]).unwrap();

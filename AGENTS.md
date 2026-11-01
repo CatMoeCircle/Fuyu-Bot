@@ -150,7 +150,7 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 44. **`fuyubot-sdk check` 静态读导出表**，绝不 dlopen；ABI 版本只能运行时判定。
 45. **改文本用编辑器工具**，不要用 shell 读写源码（PowerShell 会把 UTF-8 当 cp936，毁中文并吞换行）。
 46. **发布资产契约**：tag `TDLib-v<版本>`、资产名 `TDLib-<os>-<arch>`（cargo 口径）、内容 `.tar.gz`；加平台要同时改 `ASSETS` 与 CI matrix。
-47. **实例状态是 `.fuyubot/` 三个文件**：`lock`（只用于独占）、`status`（启动后发布）、`stop`（优雅停止请求）；不要合并。
+47. **实例状态是 `.fuyubot/` 三个文件**：`lock`（只用于独占）、`status`（启动后发布）、`stop`（优雅停止请求）；另有可选的 `log-level`（运行期调插件日志级别的控制文件，新实例拿锁时清掉）。**不要合并**。
 48. **构建期把 tdjson 放到可执行文件同级**（`build.rs` 的 staging），改任一侧要同步 `loader::tests`。
 49. **发行形态是「下载即用」**：`fuyubot-<版本>-<OS>-<平台>.zip`（`<OS>` = windows / linux / macos，
     `<平台>` = x86_64 / aarch64），**解压出来就是本体**（zip 里不再套一层目录），

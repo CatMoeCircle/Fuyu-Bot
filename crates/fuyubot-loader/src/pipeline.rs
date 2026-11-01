@@ -117,17 +117,19 @@ impl UpdatePipeline {
             Routed::Update(update) => match self.process_value(update.payload) {
                 Ok(outcome) => {
                     for warning in &outcome.warnings {
-                        eprintln!("[fuyubot-pipeline] {warning}");
+                        tracing::warn!(target: "fuyubot::pipeline", "{warning}");
                     }
                 }
-                Err(e) => eprintln!("[fuyubot-pipeline] 丢掉一条处理不了的更新: {e}"),
+                Err(e) => {
+                    tracing::warn!(target: "fuyubot::pipeline", "丢掉一条处理不了的更新: {e}");
+                }
             },
             Routed::Response(response) => {
                 if self.runtime.trace_updates() {
-                    eprintln!("[response] {}", response.payload);
+                    tracing::trace!(target: "fuyubot::update", "{}", response.payload);
                 }
                 if let Err(e) = self.deliver_response(&response.payload) {
-                    eprintln!("[fuyubot-pipeline] 投递响应失败（继续）: {e}");
+                    tracing::warn!(target: "fuyubot::pipeline", "投递响应失败（继续）: {e}");
                 }
             }
         }
@@ -151,7 +153,7 @@ impl UpdatePipeline {
         // `--trace-updates`：在**任何中间件改动之前**打原始 JSON，这就是 TDLib 发来的现场。
         // 放这里而不是 `dispatch`，是为了让 `--replay` 的离线路径也打得出来。
         if self.runtime.trace_updates() {
-            eprintln!("[update] {}", payload);
+            tracing::trace!(target: "fuyubot::update", "{payload}");
         }
 
         let mut warnings = Vec::new();
@@ -178,7 +180,10 @@ impl UpdatePipeline {
             Err(e) => {
                 // 某个监听器返回了 Err：记下来，但管线本身不算失败。
                 warnings.push(format!("分发 {update_type} 时有监听器报错: {e}"));
-                eprintln!("[fuyubot-pipeline] 分发 {update_type} 时有监听器报错（继续）: {e}");
+                tracing::warn!(
+                    target: "fuyubot::pipeline",
+                    "分发 {update_type} 时有监听器报错（继续）: {e}"
+                );
                 0
             }
         };
@@ -201,7 +206,11 @@ impl UpdatePipeline {
         let mut ctx = MiddlewareContext::new(stage, payload);
         if let Err(e) = self.runtime.middleware().run(stage, &mut ctx) {
             warnings.push(format!("{} 阶段失败: {e}", stage.name()));
-            eprintln!("[fuyubot-pipeline] {} 阶段失败（继续）: {e}", stage.name());
+            tracing::warn!(
+                target: "fuyubot::pipeline",
+                "{} 阶段失败（继续）: {e}",
+                stage.name()
+            );
         }
         // 失败前已经改掉的内容照样往下传。
         ctx.payload

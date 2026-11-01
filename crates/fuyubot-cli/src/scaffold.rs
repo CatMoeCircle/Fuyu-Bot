@@ -137,6 +137,30 @@ impl Plugins {
     }
 }
 
+/// 面板 / 文档里按顺序展示的五档日志级别。
+///
+/// 顺序就是「越来越吵」：`error` → `trace`。面板的级别选择框直接拿它渲染。
+pub const LOG_LEVELS: [(&str, LogLevel); 5] = [
+    ("error", LogLevel::Error),
+    ("warn", LogLevel::Warn),
+    ("info", LogLevel::Info),
+    ("debug", LogLevel::Debug),
+    ("trace", LogLevel::Trace),
+];
+
+/// [`LogLevel`] 的规范名字（与 [`parse_log_level`] 认的写法一致）。
+///
+/// 状态文件、控制文件、面板都写这个名字；人读的 `warning` 别名只在解析时接受。
+pub fn log_level_name(level: LogLevel) -> &'static str {
+    match level {
+        LogLevel::Error => "error",
+        LogLevel::Warn => "warn",
+        LogLevel::Info => "info",
+        LogLevel::Debug => "debug",
+        LogLevel::Trace => "trace",
+    }
+}
+
 /// 把用户写的级别名解析成 [`LogLevel`]；写错就报错指路。
 ///
 /// `[plugins].log_level` 与 `run --log-level` 共用同一份解析，两边写法必须一致。
@@ -489,10 +513,15 @@ pub fn init(root: &Path, name: &str, api_id: i64) -> Result<PathBuf, String> {
     // 「构建/解包之后直接跑就有基础命令」，不用再 `plugin install` 三遍。
     match install_builtins(&plugins) {
         Ok(copied) if !copied.is_empty() => {
-            println!("已安装 {} 个内置插件到 {}", copied.len(), plugins.display());
+            cli!(
+                info,
+                "已安装 {} 个内置插件到 {}",
+                copied.len(),
+                plugins.display()
+            );
         }
         Ok(_) => {}
-        Err(error) => eprintln!("装内置插件失败（继续）: {error}"),
+        Err(error) => cli!(warn, "装内置插件失败（继续）: {error}"),
     }
     Ok(config)
 }
@@ -1082,6 +1111,12 @@ mod tests {
             error.contains("error") && error.contains("trace"),
             "报错要说清能写哪几个：{error}"
         );
+
+        // 规范名字与解析必须互为逆运算：状态文件 / 控制文件写的都是规范名字。
+        for (name, level) in LOG_LEVELS {
+            assert_eq!(parse_log_level(name).unwrap(), level);
+            assert_eq!(log_level_name(level), name);
+        }
 
         // 模板里写出来的那个值必须等于默认值，否则「默认 info」只存在于注释里。
         assert!(
