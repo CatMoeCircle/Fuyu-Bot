@@ -11,6 +11,7 @@
 //! fuyubot login                             只登录：建 client → 走完授权 → 打印账户 → 退出（不加载插件）
 //! fuyubot logout [--yes]                    清掉本地 TDLib 会话目录（默认只打印将要删什么）
 //! fuyubot status                            看这个目录上的实例在不在跑
+//! fuyubot run --tui                          终端操作面板（版本栏 + 导航 + 工作区 + 资源占用）
 //! fuyubot config                            打印**生效的**配置值（含默认值）
 //! fuyubot stop                              停掉它
 //! fuyubot plugin list                       列出插件目录里的插件
@@ -33,6 +34,7 @@ macro_rules! cli {
 mod instance;
 mod logging;
 mod logout;
+mod panel;
 mod scaffold;
 
 use std::path::{Path, PathBuf};
@@ -132,6 +134,17 @@ struct RunArgs {
     /// （或事先设 `TG_API_ID` / `TG_API_HASH`），之后就不用再问。
     #[arg(long)]
     background: bool,
+    /// 打开**终端操作面板**（顶部版本栏 + 左侧导航 + 中央工作区 + 底部两行），而不是在前台跑 bot。
+    ///
+    /// 面板自己**不接 TDLib、不加载插件**：TDLib 的数据目录同一时刻只能一个进程打开；
+    /// 面板里的「启动」会派生 `fuyubot run --background`，
+    /// 所以它显示的就是真正在跑的那个实例。退出面板不会停掉已启动的实例。
+    #[arg(
+        long = "tui",
+        short = 't',
+        conflicts_with_all = ["background", "replay"]
+    )]
+    tui: bool,
     /// 把一批更新的 JSON 灌进管线后退出：**不接 TDLib、不用账号**，纯离线验插件
     #[arg(long)]
     replay: Option<PathBuf>,
@@ -265,6 +278,7 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "下一步：fuyubot-sdk init demo --lang rust（插件脚手架由开发 CLI 生成）"
             );
         }
+        Command::Run(args) if args.tui => run_tui(args)?,
         Command::Run(args) if args.background => run_background(args)?,
         Command::Run(args) => run(args)?,
         Command::Login(args) => login(args)?,
@@ -585,6 +599,33 @@ fn enter_project_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ── run / plugin list ──────────────────────────────────────────────
+
+/// `fuyubot run --tui`：打开操作面板。
+///
+/// 与 `run` 共用「缺配置就自动 init」；面板本身**不接 TDLib、不加载插件**
+/// （TDLib 数据目录同一时刻只能一个进程打开），启停都派生 / 通知子进程。
+fn run_tui(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // 先确认是终端：非 TTY 下不该为了报错而先把项目建出来（自动 init 有副作用）。
+    panel::require_terminal()?;
+    // 与 `run` 一样先验参数，再自动 init：别等进了面板才因为参数错而退出。
+    let cli_api_id = checked_cli_api_id(args.api_id)?;
+    if let Some(raw) = &args.log_level {
+        scaffold::parse_log_level(raw)?;
+    }
+    let root = parent_or_dot(&args.config);
+    ensure_project(&root, &args.config, cli_api_id)?;
+
+    // 面板里按 `s` 起的后台实例要拿到同一组 `run` 参数（否则前后两次用不同的 api_id / 日志级别）。
+    let spawn = panel::SpawnOptions {
+        api_id: cli_api_id,
+        no_tdlib: args.no_tdlib,
+        no_login: args.no_login,
+        log_level: args.log_level.clone(),
+        log_plugins: args.log_plugin.clone(),
+        trace_updates: args.trace_updates,
+    };
+    panel::run(&args.config, args.plugin_dir.clone(), spawn)
+}
 
 /// 读面板写的日志级别请求；没有 / 不认识就保持 `current`。
 ///
@@ -1942,12 +1983,57 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     #[test]
     fn the_cli_definition_is_valid() {
         // clap 的 `debug_assert` 会检查短选项冲突之类的定义错误。
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// 面板开关：长写 `--tui`、短写 `-t`；与后台 / 回放互斥。
+    #[test]
+    fn run_accepts_the_tui_flag() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args.iter().map(OsString::from));
+
+        for spelling in ["--tui", "-t"] {
+            let cli = parse(&["fuyubot", "run", spelling]).expect("应当接受 {spelling}");
+            match cli.command {
+                Command::Run(args) => assert!(args.tui, "{spelling} 没打开面板"),
+                other => panic!("{spelling} 解析成了别的子命令：{other:?}"),
+            }
+        }
+
+        // 面板要占终端：与后台 / 回放同时出现是用法错误。
+        assert!(parse(&["fuyubot", "run", "--tui", "--background"]).is_err());
+        assert!(parse(&["fuyubot", "run", "--tui", "--replay", "updates.json"]).is_err());
+
+        // 无关参数原样保留。
+        let cli = parse(&["fuyubot", "run", "--tui", "--api-id", "42"]).unwrap();
+        match cli.command {
+            Command::Run(args) => {
+                assert!(args.tui);
+                assert_eq!(args.api_id, Some(42));
+            }
+            other => panic!("解析成了别的子命令：{other:?}"),
+        }
+    }
+
+    /// 日志级别控制文件：只有白名单里的名字才生效，写坏了保持当前级别。
+    #[test]
+    fn log_level_control_file_is_only_applied_when_valid() {
+        let root = test_support::temp("log-level-control");
+        std::fs::create_dir_all(root.join(instance::STATE_DIR)).unwrap();
+
+        assert_eq!(desired_log_level(&root, LogLevel::Info), LogLevel::Info);
+        instance::request_log_level(&root, "trace").unwrap();
+        assert_eq!(desired_log_level(&root, LogLevel::Info), LogLevel::Trace);
+        // 已经是目标值：调用方用 `!=` 判断，不会每圈重复 set。
+        assert_eq!(desired_log_level(&root, LogLevel::Trace), LogLevel::Trace);
+
+        std::fs::write(root.join(instance::STATE_DIR).join("log-level"), "verbose").unwrap();
+        assert_eq!(desired_log_level(&root, LogLevel::Debug), LogLevel::Debug);
     }
 
     /// 运行期判据（变更 3-b）：只有「要用户再出一次凭据」的状态才算被踢，

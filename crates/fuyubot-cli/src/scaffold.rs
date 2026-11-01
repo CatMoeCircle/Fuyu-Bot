@@ -285,6 +285,36 @@ pub fn remember_credentials(
     if !changed {
         return Ok(false);
     }
+    write_toml_lines(path, &original, lines)?;
+    Ok(true)
+}
+
+/// 单个配置项写回：在 `[section]` 段里把 `key` 设成 TOML 字面量 `value`。
+///
+/// 面板的「编辑单个配置项」走这里。和 [`remember_credentials`] 一样是**文本级替换**：
+/// 保留注释、顺序、CRLF，只改这一行（键/段不存在就补）。`value` 必须是**已校验并渲染好的
+/// TOML 字面量**（字符串带引号，数字原样），调用方负责类型校验。
+pub fn set_config_value(
+    path: &Path,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> Result<bool, String> {
+    if section.contains(['\n', '\r']) || key.contains(['\n', '\r']) {
+        return Err("配置段名 / 键名里不能有换行".to_owned());
+    }
+    let original =
+        std::fs::read_to_string(path).map_err(|e| format!("读不了 {}: {e}", path.display()))?;
+    let mut lines: Vec<String> = original.lines().map(str::to_owned).collect();
+    if !set_toml_key(&mut lines, section, key, value) {
+        return Ok(false);
+    }
+    write_toml_lines(path, &original, lines)?;
+    Ok(true)
+}
+
+/// 把改过的行写回文件，保留原文件的 EOL 与末尾换行。
+fn write_toml_lines(path: &Path, original: &str, lines: Vec<String>) -> Result<(), String> {
     // ⚠️ `lines()` 会把 `\r\n` 的 `\r` 也吃掉：Windows 上（或 git 开了 autocrlf）用户的
     // 配置是 CRLF，照 `join("\n")` 写回去等于把整个文件静默转成 LF——diff 里全是红。
     let eol = if original.contains("\r\n") {
@@ -297,8 +327,13 @@ pub fn remember_credentials(
     if original.ends_with('\n') {
         text.push_str(eol);
     }
-    write(path, &text)?;
-    Ok(true)
+    write(path, &text)
+}
+
+/// `[telegram] # 注释` 也算 `[telegram]` 段头（注释不能把段变成「不存在」）。
+fn section_header_is(line: &str, header: &str) -> bool {
+    let text = line.trim();
+    text.split('#').next().unwrap_or("").trim() == header
 }
 
 /// 在 `[section]` 段里把 `key` 设成 `value`（原地改 `lines`），返回有没有改动。
@@ -307,7 +342,10 @@ pub fn remember_credentials(
 /// `api_id_extra` 这种前缀相同的键也要放过（看 `key` 后面是不是紧跟 `=`）。
 fn set_toml_key(lines: &mut Vec<String>, section: &str, key: &str, value: &str) -> bool {
     let header = format!("[{section}]");
-    let start = match lines.iter().position(|line| line.trim() == header) {
+    let start = match lines
+        .iter()
+        .position(|line| section_header_is(line, &header))
+    {
         Some(index) => index + 1,
         // 连这一段都没有：补一段到文件末尾。
         None => {
@@ -337,7 +375,7 @@ fn set_toml_key(lines: &mut Vec<String>, section: &str, key: &str, value: &str) 
         if !rest.trim_start().starts_with('=') {
             continue;
         }
-        let rendered = format!("{key} = {value}");
+        let rendered = format!("{key} = {value}{}", trailing_comment(&lines[index]));
         if lines[index] == rendered {
             return false;
         }
@@ -354,8 +392,35 @@ fn set_toml_key(lines: &mut Vec<String>, section: &str, key: &str, value: &str) 
     true
 }
 
+/// 取行尾的 TOML 注释（含 `#` 前面那段空白），没有就返回空串。
+///
+/// 只认字符串外的 `#`：`path = "a#b" # note` 的注释是后面的 `# note`。
+fn trailing_comment(line: &str) -> String {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if let Some(active) = quote {
+            if active == '"' && ch == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if ch == active && !escaped {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '#' => return format!(" {}", line[index..].trim_end()),
+            _ => {}
+        }
+    }
+    String::new()
+}
+
 /// 包成 TOML 基本字符串（只转义 `\` 与 `"`）。
-fn quote_toml_string(value: &str) -> String {
+pub(crate) fn quote_toml_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
@@ -1137,6 +1202,44 @@ mod tests {
             !text.contains("__API_HASH__"),
             "模板占位符没被换掉：\n{text}"
         );
+    }
+
+    /// 面板改单个配置项：只动一行，注释和 CRLF 都保留；键/段不存在就补。
+    #[test]
+    fn set_config_value_keeps_comments_and_line_endings() {
+        let root = temp("set-config-value");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(
+            &path,
+            "# 顶上的注释\r\n\
+             [plugins] # 段注释\r\n\
+             # 别丢的注释\r\n\
+             dir = \"plugins\"\r\n\
+             log_level = \"info\" # 行尾注释\r\n",
+        )
+        .unwrap();
+
+        assert!(
+            set_config_value(&path, "plugins", "log_level", "\"debug\"").unwrap(),
+            "值变了"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# 顶上的注释"), "{text:?}");
+        assert!(text.contains("# 别丢的注释"), "{text:?}");
+        assert!(text.contains("log_level = \"debug\""), "{text:?}");
+        assert!(text.contains("# 行尾注释"), "行尾注释要保留：{text:?}");
+        assert_eq!(text.matches("[plugins]").count(), 1, "段头别重复：{text:?}");
+        assert!(text.contains("\r\n"), "CRLF 不能被转成 LF：{text:?}");
+
+        // 同值再写 = 没改动。
+        assert!(!set_config_value(&path, "plugins", "log_level", "\"debug\"").unwrap());
+
+        // 段里的键不存在：插到段内；段本身不存在：补一段。
+        assert!(set_config_value(&path, "tdlib", "log_verbosity", "3").unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[tdlib]"), "{text:?}");
+        assert!(text.contains("log_verbosity = 3"), "{text:?}");
+        assert_eq!(load_config(&path).unwrap().tdlib.log_verbosity(), 3);
     }
 
     /// 回写凭据：**值要能读回来，注释一个字都不能丢**。
