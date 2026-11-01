@@ -35,11 +35,31 @@ use std::path::{Path, PathBuf};
 /// `releases-repo` 没填真实值时用的占位符：下载必然 404，所以出错时要专门点出来。
 const PLACEHOLDER_REPO: &str = "fuyubot/fuyubot";
 
+/// 常规进度（转换了多少条、下载/缓存到哪里）只在它置位时才说。
+///
+/// **为什么默认闭嘴**：`cargo:warning=` 不是「打一行日志」。cargo 会把它和其它指令一起写进
+/// `target/<profile>/build/<pkg>-<hash>/output`，之后每次 `cargo build` / `cargo run`
+/// **即使构建脚本没有重跑**也会把这份缓存原样重播（`Finished ... in 0.28s` 时照样出现）。
+/// 构建脚本没有「只说一次」的通道，所以常规信息只能默认不打；要看就
+/// `FUYUBOT_TDLIB_VERBOSE=1 cargo build`。
+///
+/// 配套的 `rerun-if-env-changed`（见 [`main`]）不是可选项：没有它，置位那次留下的 warning
+/// 会永远留在缓存里，取消变量也不会重跑脚本，等于关不掉。
+const VERBOSE_ENV: &str = "FUYUBOT_TDLIB_VERBOSE";
+
+/// 打一条常规进度。只走 [`VERBOSE_ENV`] 这条路；真正的异常仍然用 `cargo:warning` 直说。
+fn note(message: impl std::fmt::Display) {
+    if std::env::var_os(VERBOSE_ENV).is_some_and(|value| !value.is_empty()) {
+        println!("cargo:warning={message}");
+    }
+}
+
 fn main() {
     for key in [
         "TDLIB_TD_API_TL",
         build_support::CACHE_ENV,
         build_support::REPO_ENV,
+        VERBOSE_ENV,
     ] {
         println!("cargo:rerun-if-env-changed={key}");
     }
@@ -80,8 +100,8 @@ fn acquire_schema(version: &str, configured_repo: Option<&str>) -> PathBuf {
         return vendored;
     }
 
-    // 缓存命中就**静默**复用：用的是哪份、多少条，`bake_schema` 那条汇总日志已经带了路径，
-    // 再说一遍只是每次重跑构建脚本都刷一条 warning。
+    // 缓存命中就**静默**复用：用的是哪份、多少条，`bake_schema` 的汇总（`note`）已经带了路径。
+    // 这里别再补一条 `cargo:warning`——它会被 cargo 缓存下来、之后每次构建都重播（见 [`note`]）。
     let relative = Path::new(version).join("td_api.tl");
     if let Some(cached) = build_support::find_cached(&relative) {
         return cached;
@@ -91,13 +111,13 @@ fn acquire_schema(version: &str, configured_repo: Option<&str>) -> PathBuf {
         panic!("{}", missing_repo_hint());
     };
     let url = build_support::release_url(&repo, version, "td_api.tl");
-    println!("cargo:warning=下载 TDLib {version} 的 td_api.tl：{url}");
+    note(format!("下载 TDLib {version} 的 td_api.tl：{url}"));
     let bytes = build_support::http_get(&url)
         .unwrap_or_else(|error| panic!("{}", download_hint(&url, &error, &repo)));
 
     let stored =
         build_support::store_download(&relative, &bytes).unwrap_or_else(|error| panic!("{error}"));
-    println!("cargo:warning=已缓存到 {}", stored.display());
+    note(format!("已缓存到 {}", stored.display()));
     stored
 }
 
@@ -220,13 +240,13 @@ fn bake_schema(schema_path: &Path) {
         );
     }
 
-    println!(
-        "cargo:warning=已转换 {}：共 {} 条（函数 {functions}、构造器 {constructors}、未归类 {}），\
+    note(format!(
+        "已转换 {}：共 {} 条（函数 {functions}、构造器 {constructors}、未归类 {}），\
          元数据与 Rust 类型都已烤进二进制",
         schema_path.display(),
         entries.len(),
         entries.len() - functions - constructors
-    );
+    ));
 
     write_json(
         &out_dir.join("td_api.json"),
