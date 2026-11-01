@@ -1,7 +1,10 @@
 //! 内置插件：`/start` 回一句欢迎语。
 //!
 //! 写法就是「插件作者从这儿抄」的最小样板：`fuyubot_simplify::on_command` 订阅
-//! `updateNewMessage`，命中 `/start` 就把回复按 `reply_to` 发回同一个会话。
+//! `updateNewMessage`，命中**不带参数的** `/start` 就把回复按 `reply_to` 发回同一个会话。
+//! 带参数的 `/start`（如深链 `/start payload`）是别的用途，这里不回。
+//! 点名给别人的（`/start@别的Bot`）**根本到不了这里**——`on_command` 已经按
+//! 「裸命令所有人都响应、带 `@` 的只有被点名的响应」过滤过了。
 //! 产物 `fuyubot_plugin_start.{dll,so,dylib}` 跟可执行文件一起打包，
 //! `fuyubot init` / `run` 会把它复制进项目的 `plugins/`。
 
@@ -37,7 +40,9 @@ impl Plugin for StartPlugin {
         let host = self.host;
         let sending = Arc::clone(&self.sending);
         let subscription = on_command(host, move |command: &Command| {
-            if !command.is("start") {
+            // 只回「裸」/start：带参数时 `args` 非空（如深链 `/start payload`），
+            // 那是别处的载荷，不该被欢迎语顶掉。
+            if !command.is("start") || !command.args.is_empty() {
                 return;
             }
             let params = SendMessageParams {

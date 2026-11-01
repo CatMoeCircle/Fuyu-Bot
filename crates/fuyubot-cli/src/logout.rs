@@ -387,8 +387,14 @@ mod tests {
             pid: 424242,
             started: crate::instance::unix_now(),
             version: "0.1.0".to_owned(),
+            log_level: "info".to_owned(),
             plugins: 0,
             name: "bot".to_owned(),
+            running: Some(true),
+            stopped_at: None,
+            connection: None,
+            authorization: None,
+            account: None,
             detail: crate::instance::PluginDetail::default(),
         })
         .unwrap();

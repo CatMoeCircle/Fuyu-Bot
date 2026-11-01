@@ -1960,6 +1960,13 @@ impl UpdateFilter {
 
 // ── 命令（插件最常见的那种入口）──────────────────────────────────
 
+/// 宿主「我是谁」那条 service 的名字（由 `fuyubot-loader` 提供）。
+///
+/// 方法 `usernames`（无参）返回自身全部活跃用户名的 JSON 数组，比如 `["FuyuBot"]`；
+/// 还没登录 / 没接 TDLib 时返回 `[]`（= 还不知道自己是谁）。[`on_command`] 靠它
+/// 判断「这条命令点名的是不是我」。
+pub const IDENTITY_SERVICE: &str = "fuyubot.host.identity";
+
 /// 一条 `updateNewMessage` 里的命令：`/start`、`/help@SomeBot 参数`。
 ///
 /// 只认**文本消息**，并跳过自己发的（`is_outgoing`）——机器人不该响应自己。
@@ -1971,6 +1978,12 @@ pub struct Command {
     pub name: String,
     /// `/cmd` 后面那一段（去首尾空白，可能为空）。
     pub args: String,
+    /// `@` 后面那个名字（原样保留大小写，比较时不分大小写）；裸命令是 `None`。
+    ///
+    /// Telegram 的约定：带 `@` 的命令只有被点名的那一方响应，不带的所有 bot 都响应。
+    /// [`on_command`] 已经按这条规则过滤过——插件经它拿到的 `Command` 要么是裸命令，
+    /// 要么点名的是自己；只有自己订阅 `updateNewMessage` 才会看到点名给别人的。
+    pub addressed_to: Option<String>,
     /// 整条消息文本（命令 + 参数）。
     pub text: String,
 }
@@ -1979,6 +1992,27 @@ impl Command {
     /// 是这条命令吗（不分大小写，`/Start` 也算）。
     pub fn is(&self, name: &str) -> bool {
         self.name.eq_ignore_ascii_case(name)
+    }
+
+    /// 这条命令点名的是不是 `username`（不分大小写）。裸命令不算点名。
+    pub fn is_addressed_to(&self, username: &str) -> bool {
+        self.addressed_to
+            .as_deref()
+            .is_some_and(|target| target.eq_ignore_ascii_case(username))
+    }
+
+    /// 该不该由「用户名是这些」的账号响应：裸命令谁都可以，点名命令只有被点到的那个。
+    ///
+    /// `usernames` 为空表示**还不知道自己是谁**（没登录 / 没接 TDLib）——这时一律算
+    /// 「该响应」：宁可多回一句，也别在身份没就绪时把命令吞掉。
+    pub fn is_for(&self, usernames: &[String]) -> bool {
+        match &self.addressed_to {
+            None => true,
+            Some(_) if usernames.is_empty() => true,
+            Some(target) => usernames
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(target)),
+        }
     }
 }
 
@@ -2002,12 +2036,13 @@ pub fn command_of(update: &Value) -> Option<Command> {
     let text = content.get("text")?.get("text")?.as_str()?;
     let trimmed = text.trim_start();
     let token = trimmed.split_whitespace().next()?;
-    // `/help@SomeBot args…` → `help`；`@` 之后是「发给哪个 bot」，不是命令的一部分。
-    let name = token
-        .strip_prefix('/')?
-        .split('@')
-        .next()
-        .unwrap_or_default();
+    // `/help@SomeBot args…` → `help` + `SomeBot`；`@` 之后是「发给哪个 bot」，
+    // 不是命令名的一部分，但**要留下来**——是不是自己，得有人判断。
+    let rest = token.strip_prefix('/')?;
+    let (name, addressed_to) = match rest.split_once('@') {
+        Some((name, target)) => (name, Some(target)),
+        None => (rest, None),
+    };
     if name.is_empty() {
         return None;
     }
@@ -2016,6 +2051,10 @@ pub fn command_of(update: &Value) -> Option<Command> {
         message_id: message.get("id")?.as_i64()?,
         name: name.to_ascii_lowercase(),
         args: trimmed[token.len()..].trim().to_owned(),
+        // 空 `@`（`/start@`）不算点名别人：按裸命令处理。
+        addressed_to: addressed_to
+            .filter(|target| !target.is_empty())
+            .map(str::to_owned),
         text: text.to_owned(),
     })
 }
@@ -2027,8 +2066,8 @@ pub fn command_of(update: &Value) -> Option<Command> {
 pub struct CommandSubscription {
     host: HostApi,
     handle: SubscriptionHandle,
-    /// 只负责**持有**回调；退订之前它的地址必须稳定。
-    _handler: Box<Box<dyn Fn(&Command) + Send + Sync>>,
+    /// 只负责**持有**回调与身份缓存；退订之前它的地址必须稳定。
+    _handler: Box<CommandHandler>,
 }
 
 impl Drop for CommandSubscription {
@@ -2039,7 +2078,49 @@ impl Drop for CommandSubscription {
     }
 }
 
-/// 订阅 `updateNewMessage`，把每条命令交给 `handler`（非命令、自己发的都不打扰它）。
+/// `on_command` 递给 C 回调的那份状态：插件自己的处理函数。
+struct CommandHandler {
+    host: HostApi,
+    handler: Box<dyn Fn(&Command) + Send + Sync>,
+}
+
+impl CommandHandler {
+    /// 这条命令该不该交给插件：点名别人的不交（裸命令、点名自己的都交）。
+    fn accepts(&self, command: &Command) -> bool {
+        if command.addressed_to.is_none() {
+            return true;
+        }
+        // 每次现问「我是谁」：用户名会变（`updateUser`），缓存住就会一直按旧名字判断。
+        // 这是纯内存的 service 读，不碰 TDLib，命令频率也不高。
+        command.is_for(&my_usernames(&self.host))
+    }
+}
+
+/// 问宿主「我是谁」：返回自身全部活跃用户名；拿不到（老宿主 / 还没登录 / 没接 TDLib）
+/// 返回空表。
+///
+/// 走的是 [`IDENTITY_SERVICE`] 这条 **service**（宿主登录后由 `getMe` 填好），不是 TDLib
+/// 请求——所以在事件回调里调它**不会**卡住接收循环。
+pub fn my_usernames(host: &HostApi) -> Vec<String> {
+    let Ok(reply) = host.call_service(IDENTITY_SERVICE, "usernames", "{}") else {
+        return Vec::new();
+    };
+    serde_json::from_str(&reply).unwrap_or_default()
+}
+
+/// 订阅 `updateNewMessage`，把**该由本插件响应的**命令交给 `handler`。
+///
+/// 不打扰它的：非命令、自己发的、以及**点名给别人的**（`/start@别的Bot`）。
+/// 交给它的：裸命令（`/start`，Telegram 的约定是所有 bot 都响应）与点名给自己的
+/// （`/start@本Bot`）。要看点名给别人的那种消息，自己 `host.on("updateNewMessage", …)`
+/// 拿原始更新，再配 [`command_of`] 解析。
+///
+/// 「自己是谁」来自宿主 [`IDENTITY_SERVICE`]：遇到点名命令时现问一次（纯内存读，
+/// 不碰 TDLib）。宿主在登录后把 `getMe` 写进去，之后每来一条 `updateUser` 都跟着更新——
+/// 用户名改了不会按旧名字判断。
+///
+/// 还没登录 / 没接 TDLib（`--no-tdlib` / `--replay`）时问不到，这时**不过滤**——
+/// 分不清「点名的是别人」还是「我还不知道自己是谁」，宁可多回一句也不吞命令。
 ///
 /// 插件在自己的 `start` 里调一次，把返回的守卫**存进插件状态**（drop 就退订）。
 /// 宿主拒绝订阅时返回 `None`。
@@ -2047,8 +2128,11 @@ pub fn on_command(
     host: HostApi,
     handler: impl Fn(&Command) + Send + Sync + 'static,
 ) -> Option<CommandSubscription> {
-    let mut owned: Box<Box<dyn Fn(&Command) + Send + Sync>> = Box::new(Box::new(handler));
-    // 递给 ABI 的是**内层 Box 的地址**：它是瘦指针，外层 Box 活着它就稳定。
+    let mut owned: Box<CommandHandler> = Box::new(CommandHandler {
+        host,
+        handler: Box::new(handler),
+    });
+    // 递给 ABI 的是这个 Box 的地址：它活着，指针就稳定。
     let user_data = (&raw mut *owned).cast::<c_void>();
     let handle = host.on("updateNewMessage", None, command_trampoline, user_data);
     handle.is_valid().then_some(CommandSubscription {
@@ -2058,20 +2142,22 @@ pub fn on_command(
     })
 }
 
-/// 命令订阅的 C 回调：把负载解成 [`Command`]，再交给闭包。
+/// 命令订阅的 C 回调：把负载解成 [`Command`]，过掉点名给别人的，再交给闭包。
 extern "C-unwind" fn command_trampoline(user_data: *mut c_void, payload: *const c_char) -> i32 {
     if user_data.is_null() || payload.is_null() {
         return -1;
     }
     // SAFETY: `user_data` 是 `on_command` 里那个 Box，订阅活多久它就活多久。
-    let handler = unsafe { &*(user_data as *const Box<dyn Fn(&Command) + Send + Sync>) };
+    let state = unsafe { &*(user_data as *const CommandHandler) };
     // SAFETY: 宿主保证 `payload` 是 NUL 结尾的临时字符串。
     let text = unsafe { CStr::from_ptr(payload) }.to_string_lossy();
     let Ok(update) = serde_json::from_str::<Value>(&text) else {
         return 0;
     };
-    if let Some(command) = command_of(&update) {
-        handler(&command);
+    if let Some(command) = command_of(&update)
+        && state.accepts(&command)
+    {
+        (state.handler)(&command);
     }
     0
 }
@@ -4471,8 +4557,51 @@ mod tests {
         assert_eq!(command.message_id, 42);
         assert_eq!(command.name, "help");
         assert_eq!(command.args, "参数 一");
+        assert_eq!(command.addressed_to.as_deref(), Some("FuyuBot"));
         assert!(command.is("HELP"), "命令名不分大小写");
         assert!(!command.is("start"));
+        assert!(command.is_addressed_to("fuyubot"), "点名比较不分大小写");
+        assert!(!command.is_addressed_to("OtherBot"));
+
+        // 「该由谁响应」：裸命令谁都行；点名命令只有被点到的那个；
+        // 还不知道自己是谁（空表）时一律算「该响应」，别把命令吞掉。
+        let me = vec!["FuyuBot".to_owned()];
+        assert!(command.is_for(&me));
+        assert!(!command.is_for(&["OtherBot".to_owned()]));
+        assert!(command.is_for(&[]));
+
+        let bare = json!({
+            "message": {
+                "id": 1,
+                "chat_id": 7,
+                "content": {
+                    "@type": "messageText",
+                    "text": { "@type": "formattedText", "text": "/start", "entities": [] },
+                },
+            },
+        });
+        let bare = command_of(&bare).expect("裸命令");
+        assert_eq!(bare.addressed_to, None);
+        assert!(
+            bare.is_for(&["OtherBot".to_owned()]),
+            "裸命令所有 bot 都响应"
+        );
+
+        // 空 `@`（`/start@`）按裸命令处理：它不是「点名了别人」。
+        let empty_target = json!({
+            "message": {
+                "id": 1,
+                "chat_id": 7,
+                "content": {
+                    "@type": "messageText",
+                    "text": { "@type": "formattedText", "text": "/start@", "entities": [] },
+                },
+            },
+        });
+        assert_eq!(
+            command_of(&empty_target).expect("裸命令").addressed_to,
+            None
+        );
 
         // 自己发的不算（机器人不该响应自己）
         let mut outgoing = update.clone();
@@ -4501,6 +4630,64 @@ mod tests {
             },
         });
         assert!(command_of(&photo).is_none());
+    }
+
+    /// `on_command` 只把「该由本插件响应的」命令交出去：点名别人的不交。
+    ///
+    /// 端到端过一遍真链路：宿主 `fuyubot.host.identity` service → `Command::is_for` →
+    /// 回调。也钉住「身份未知时不过滤」这条兜底（老宿主 / `--replay`）。
+    #[test]
+    fn on_command_skips_commands_addressed_to_other_bots() {
+        let rt = runtime();
+        // SAFETY: vtable 由活着的 runtime 持有，本函数期间一直有效。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.expect("vtable");
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let guard = on_command(api, move |command: &Command| {
+            sink.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(command.text.clone());
+        })
+        .expect("订阅 updateNewMessage 该成功");
+
+        let message = |text: &str| {
+            json!({
+                "@type": "updateNewMessage",
+                "message": {
+                    "id": 1,
+                    "chat_id": 7,
+                    "is_outgoing": false,
+                    "content": {
+                        "@type": "messageText",
+                        "text": { "@type": "formattedText", "text": text, "entities": [] },
+                    },
+                },
+            })
+        };
+
+        // 身份还不知道（没登录 / --no-tdlib / --replay）：不过滤，保持老行为。
+        rt.publish_update(&message("/start@OtherBot")).unwrap();
+
+        // 登录之后：点名别人的不交，点名自己的与裸命令照交。
+        rt.set_self_user(json!({
+            "id": 7,
+            "usernames": { "@type": "usernames", "active_usernames": ["FuyuBot"] },
+        }));
+        rt.publish_update(&message("/start@OtherBot")).unwrap();
+        rt.publish_update(&message("/start@FuyuBot")).unwrap();
+        rt.publish_update(&message("/start")).unwrap();
+
+        let seen = seen
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        assert_eq!(
+            seen,
+            vec!["/start@OtherBot", "/start@FuyuBot", "/start"],
+            "只有第一条例外：那时宿主还不知道自己是谁"
+        );
+        drop(guard);
     }
 
     #[test]

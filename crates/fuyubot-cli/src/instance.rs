@@ -72,6 +72,11 @@ pub struct Info {
     /// 启动时刻（Unix 秒）。
     pub started: u64,
     pub version: String,
+    /// 运行期插件日志门槛（`error` / `warn` / `info` / `debug` / `trace`）。
+    ///
+    /// 面板与 `fuyubot status` 都读它。老实例发布的 status 没有这一行 → 当 `info`
+    /// （与 [`fuyubot_loader::DEFAULT_LOG_VERBOSITY`] 一致），不因此判整份状态失败。
+    pub log_level: String,
     /// 已加载的插件数。
     ///
     /// ⚠️ 保留这个**独立**字段是为了兼容两处旧消费者：`--background` 的父进程等的是
@@ -79,6 +84,36 @@ pub struct Info {
     /// 真在跑的数量是 `detail.active.len()`，两者可能不等（有插件还在等依赖）。
     pub plugins: usize,
     pub name: String,
+    /// 这份状态是不是一个**还活着**的实例发布的。
+    ///
+    /// - `Some(true)`：还在跑的实例（崩溃 / 硬杀后留下的最后一份也是它）；
+    /// - `Some(false)`：优雅停止时补写的最后一份；
+    /// - `None`：老版本写的 status，没有这一行——退出方式未知，不能诬赖成异常退出。
+    pub running: Option<bool>,
+    /// 优雅停止的时刻（Unix 秒）；还在跑 / 没有正常停止就是 `None`。
+    pub stopped_at: Option<u64>,
+    /// 最新一条 `updateConnectionState` 的 TDLib 状态名（`connectionStateReady` 等）。
+    ///
+    /// TDLib **没有**「现在连上了吗」这种可主动查的方法，连接状态只以更新的形式出现
+    /// （`fuyubot_simplify::connection` 开头写着同一件事）：实例在收到更新的那一刻把它记下来，
+    /// 再写进这份 status——面板是**另一个进程**，拿不到实例的内存，只能这样看到连接状态。
+    ///
+    /// `None` = 本次没接 TDLib（`--no-tdlib` / `--replay`）、还没收到过更新，
+    /// 或者这份 status 是老实例写的（它还没有这一行）。
+    pub connection: Option<String>,
+    /// 最新一条 `updateAuthorizationState` 的 TDLib 状态名（`authorizationStateReady` 等）。
+    ///
+    /// 与 [`connection`](Self::connection) 同一套路：授权状态也只有更新、没有可主动查的方法，
+    /// 实例收到就记下，面板 / `status` 从这份 status 里读。和**连接**状态相互独立——
+    /// `connectionStateReady` 也可能还没登录。
+    ///
+    /// `None` = 没接 TDLib、还没收到过更新，或者这份 status 是老实例写的。
+    pub authorization: Option<String>,
+    /// 登录账户（`getMe`，之后跟着 `updateUser` 刷新）。
+    ///
+    /// `None` = 还没登录 / 没接 TDLib / 老实例写的 status。面板的「账户」行与
+    /// `fuyubot status` 的「账户」行都读它——它们都是**另一个进程**，只能这样看到。
+    pub account: Option<Account>,
     /// 插件速览：真在跑的、还在等的（含缺什么）。
     ///
     /// 放在 `status` 文件里而不是让 `status` 子命令自己去问进程——它是**另一个进程**，
@@ -206,15 +241,131 @@ impl PluginDetail {
     }
 }
 
+/// 登录账户的要点（`getMe` 的 `user` 里那几样）。
+///
+/// 面板 / `fuyubot status` 是**另一个进程**，拿不到实例的内存，所以这几行跟着
+/// status 文件走。`getMe` 只是登录那一刻的快照，之后 TDLib 会用 `updateUser`
+/// 改名字 / 用户名——实例把最新的那份写下来，这里显示的就不是死的。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Account {
+    pub id: i64,
+    /// 显示名（`first_name` + `last_name`，可能为空）。
+    pub name: String,
+    /// 主用户名（`usernames.active_usernames[0]`）。
+    pub username: Option<String>,
+    /// `user.type.@type == "userTypeBot"`（TDLib 的 `user` 没有顶层 `is_bot`）。
+    pub is_bot: bool,
+}
+
+impl Account {
+    /// 从 `getMe` / `updateUser` 的 `user` JSON 取；没有 `id` 就当取不到。
+    ///
+    /// 字段路径按真库核过（AGENTS 约束 42）：bot 判定在 `type.@type`、
+    /// 用户名在 `usernames.active_usernames[0]`。
+    pub fn from_user(user: &serde_json::Value) -> Option<Self> {
+        let id = user.get("id")?.as_i64()?;
+        let name = ["first_name", "last_name"]
+            .iter()
+            .filter_map(|key| user.get(key).and_then(serde_json::Value::as_str))
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let username = user
+            .pointer("/usernames/active_usernames/0")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let is_bot = user
+            .pointer("/type/@type")
+            .and_then(serde_json::Value::as_str)
+            == Some("userTypeBot");
+        Some(Self {
+            id,
+            name,
+            username,
+            is_bot,
+        })
+    }
+
+    /// 一行描述：`Fuyu Bot（id=7） @FuyuBot [bot]`。
+    pub fn label(&self) -> String {
+        let mut line = if self.name.is_empty() {
+            format!("id={}", self.id)
+        } else {
+            format!("{}（id={}）", self.name, self.id)
+        };
+        if let Some(username) = &self.username {
+            line.push_str(&format!(" @{username}"));
+        }
+        line.push_str(if self.is_bot { " [bot]" } else { " [user]" });
+        line
+    }
+
+    /// 写进 status 的几行；没有用户名就不留 `account_username=`。
+    fn render(&self) -> String {
+        let username = self
+            .username
+            .as_deref()
+            .map(|username| format!("account_username={username}\n"))
+            .unwrap_or_default();
+        format!(
+            "account_id={}\naccount_name={}\n{username}account_bot={}\n",
+            self.id,
+            self.name.replace(['\n', '\r'], " "),
+            u8::from(self.is_bot)
+        )
+    }
+
+    /// 解析 [`Self::render`] 的产物；没有 `account_id`（老实例 / 没登录）就是 `None`。
+    fn parse(text: &str) -> Option<Self> {
+        let field = |key: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+                .map(str::trim)
+        };
+        Some(Self {
+            id: field("account_id")?.parse().ok()?,
+            name: field("account_name").unwrap_or("").to_owned(),
+            username: field("account_username")
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            is_bot: field("account_bot") == Some("1"),
+        })
+    }
+}
+
 impl Info {
     pub fn render(&self) -> String {
         format!(
-            "pid={}\nstarted={}\nversion={}\nplugins={}\nname={}\n{}",
+            "pid={}\nstarted={}\nversion={}\nlog_level={}\nplugins={}\nname={}\n{}{}{}{}{}{}",
             self.pid,
             self.started,
             self.version,
+            self.log_level,
             self.plugins,
             self.name,
+            match self.running {
+                Some(true) => "running=1\n",
+                Some(false) => "running=0\n",
+                None => "",
+            },
+            self.stopped_at
+                .map(|stopped| format!("stopped_at={stopped}\n"))
+                .unwrap_or_default(),
+            // 没接 TDLib / 还没收到更新就不写这一行：缺行 = 不知道，别编一个「已连接」。
+            self.connection
+                .as_deref()
+                .map(|connection| format!("connection={connection}\n"))
+                .unwrap_or_default(),
+            // 授权状态同理：不知道就不写，别默认成「已登录」。
+            self.authorization
+                .as_deref()
+                .map(|authorization| format!("authorization={authorization}\n"))
+                .unwrap_or_default(),
+            // 账户信息：没登录就不写（面板显示「—」），别编一个 id=0。
+            self.account
+                .as_ref()
+                .map(Account::render)
+                .unwrap_or_default(),
             self.detail.render()
         )
     }
@@ -232,13 +383,37 @@ impl Info {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
             version: field("version").unwrap_or("?").to_owned(),
+            // 老实例没有这一行：默认 info，不因此判失败。
+            log_level: field("log_level").unwrap_or("info").to_owned(),
             plugins: field("plugins")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
             name: field("name").unwrap_or("fuyubot").to_owned(),
+            // 老实例没有 `running=`：`None` = 退出方式未知（不是「异常」）。
+            running: field("running").map(|value| value != "0"),
+            stopped_at: field("stopped_at").and_then(|value| value.parse().ok()),
+            // 老实例没有 `connection=`（那时还不报连接状态）：`None` = 不知道。
+            // 空值也当没有：写坏的文件不该让面板显示「未知状态（）」。
+            connection: field("connection")
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            // 授权状态同一套兼容：没有这一行就是不知道。
+            authorization: field("authorization")
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            // 账户信息：没有 `account_id=`（没登录 / 老实例）就是不知道。
+            account: Account::parse(text),
             // 老实例（这次改动之前发布的 status）没有这三行：当空表，不因此判失败。
             detail: PluginDetail::parse(text),
         })
+    }
+
+    /// 这份状态是不是**优雅停止**时补写的最后一份。
+    ///
+    /// 崩溃 / 硬杀留下的状态没有 `stopped_at`，老版本的状态没有 `running=`，
+    /// 两者都只会被当成「无法确认正常停止」。
+    pub fn stopped_gracefully(&self) -> bool {
+        self.running == Some(false) && self.stopped_at.is_some()
     }
 }
 
@@ -250,6 +425,46 @@ pub fn uptime_text(started: u64, now: u64) -> String {
         s if s < 3600 => format!("{} 分 {} 秒", s / 60, s % 60),
         s if s < 86_400 => format!("{} 小时 {} 分", s / 3600, (s % 3600) / 60),
         s => format!("{} 天 {} 小时", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+/// TDLib 连接状态的中文短标签（面板顶部与 `fuyubot status` 共用同一份说法）。
+///
+/// 五个构造器的名字与解析都来自 [`fuyubot_simplify::ConnectionState`]——那是
+/// `updateConnectionState` 最早被收在一处的地方，这里不另抄一份合法状态表。
+pub fn connection_label(state: fuyubot_simplify::ConnectionState) -> &'static str {
+    use fuyubot_simplify::ConnectionState;
+    match state {
+        ConnectionState::WaitingForNetwork => "等待网络",
+        ConnectionState::ConnectingToProxy => "连代理中",
+        ConnectionState::Connecting => "连接中",
+        ConnectionState::Updating => "同步中",
+        ConnectionState::Ready => "已连接",
+    }
+}
+
+/// TDLib 授权状态的中文短标签（面板概览与 `fuyubot status` 共用同一份说法）。
+///
+/// 状态表与字段路径都来自 [`fuyubot_tdlib::AuthState`]——登录流程用的就是它，
+/// 这里只负责把 `authorizationState*` 翻成人话，不另维护一份合法状态表。
+pub fn authorization_label(state: &fuyubot_tdlib::AuthState) -> &'static str {
+    use fuyubot_tdlib::AuthState;
+    match state {
+        AuthState::WaitTdlibParameters => "等待参数",
+        AuthState::WaitPhoneNumber => "等待手机号",
+        AuthState::WaitOtherDeviceConfirmation { .. } => "等待扫码确认",
+        AuthState::WaitCode { .. } => "等待验证码",
+        AuthState::WaitPassword { .. } => "等待两步密码",
+        AuthState::WaitRegistration => "等待注册",
+        AuthState::WaitEmailAddress => "等待邮箱",
+        AuthState::WaitEmailCode => "等待邮箱验证码",
+        AuthState::WaitPremiumPurchase { .. } => "等待购买",
+        AuthState::Ready => "已登录",
+        AuthState::LoggingOut => "正在登出",
+        AuthState::Closing => "正在关闭",
+        AuthState::Closed => "已关闭",
+        // 具体名字在 `AuthState::Unknown` 里，调用方想显示就自己取 `name()`。
+        AuthState::Unknown(_) => "未知状态",
     }
 }
 
@@ -385,7 +600,11 @@ pub fn stopped_pid(root: &Path) -> Option<u32> {
 pub enum State {
     /// 连锁文件都没有：这个目录从没跑过（或者跑完自己收了）。
     Absent,
-    /// 锁文件在但**没人持有**：上次没走正常退出。锁本身已经能再拿，不用谁去清理。
+    /// 锁文件在但**没人持有**：上次实例已经退出。
+    ///
+    /// 是正常停止还是异常退出要看 [`Info::stopped_gracefully`]：优雅退出会补写
+    /// `running=0` + `stopped_at`，崩溃 / 硬杀留下的最后一份只有 `running=1`。
+    /// 锁本身已经能再拿，不用谁去清理。
     Stale(Option<Info>),
     /// 有人持有：实例在跑（`None` = 还没发布状态，也就是「启动中」）。
     Running(Option<Info>),
@@ -427,13 +646,24 @@ pub fn status_lines(root: &Path) -> Vec<String> {
                     .to_owned(),
             ];
             match info {
+                Some(info) if info.stopped_gracefully() => {
+                    let stopped = info.stopped_at.unwrap_or(info.started);
+                    lines.push(format!(
+                        "  上次：{} pid {}，{}前正常停止（版本 {}，插件 {} 个）",
+                        info.name,
+                        info.pid,
+                        uptime_text(stopped, unix_now()),
+                        info.version,
+                        info.plugins
+                    ));
+                }
+                Some(info) if info.running == Some(true) => lines.push(format!(
+                    "  上次：{} pid {}，异常退出：没收到停止请求（版本 {}，插件 {} 个）",
+                    info.name, info.pid, info.version, info.plugins
+                )),
                 Some(info) => lines.push(format!(
-                    "  上次：{} pid {}，启动于 {}前（版本 {}，插件 {} 个）",
-                    info.name,
-                    info.pid,
-                    uptime_text(info.started, unix_now()),
-                    info.version,
-                    info.plugins
+                    "  上次：{} pid {}，已退出（老版本状态，退出方式未知；版本 {}）",
+                    info.name, info.pid, info.version
                 )),
                 None => lines.push("  上次没留下可读的状态".to_owned()),
             }
@@ -450,8 +680,35 @@ pub fn status_lines(root: &Path) -> Vec<String> {
                 format!("  已运行     {}", uptime_text(info.started, unix_now())),
                 format!("  版本       {}", info.version),
                 format!("  名字       {}", info.name),
+                format!("  日志级别   {}", info.log_level),
                 format!("  插件       {}", info.detail.summary()),
             ];
+            // 连接状态是**实例**从 `updateConnectionState` 学到的，status 只负责转述；
+            // 没有这一行（没接 TDLib / 还没收到）就不打，别让「不知道」看起来像「没连上」。
+            if let Some(connection) = info.connection.as_deref() {
+                let text = match fuyubot_simplify::ConnectionState::from_type_name(connection) {
+                    Some(state) => connection_label(state).to_owned(),
+                    None => format!("未知状态（{connection}）"),
+                };
+                lines.push(format!("  连接       TDLib {text}"));
+            }
+            // 授权状态同样只转述：`authorizationState*` 的名字来自实例收到的更新。
+            if let Some(authorization) = info.authorization.as_deref() {
+                let state = fuyubot_tdlib::AuthState::from_type_name(authorization);
+                lines.push(match state {
+                    fuyubot_tdlib::AuthState::Unknown(name) => {
+                        format!("  授权       TDLib 未知状态（{name}）")
+                    }
+                    state => format!(
+                        "  授权       TDLib {}（{authorization}）",
+                        authorization_label(&state)
+                    ),
+                });
+            }
+            // 账户信息：实例登录时拿到 `getMe`，之后跟着 `updateUser` 刷新——只转述。
+            if let Some(account) = &info.account {
+                lines.push(format!("  账户       {}", account.label()));
+            }
             // 「谁在等什么」是这个功能存在的理由：只说数量，人还是不知道该去配什么。
             for (name, missing) in &info.detail.pending {
                 lines.push(format!("    · {name} 在等 {}", missing.join(", ")));
@@ -574,8 +831,14 @@ mod tests {
             pid: 4242,
             started: 1_700_000_000,
             version: "0.1.0".to_owned(),
+            log_level: "debug".to_owned(),
             plugins: 3,
             name: "mybot".to_owned(),
+            running: Some(false),
+            stopped_at: Some(1_700_000_123),
+            connection: Some("connectionStateReady".to_owned()),
+            authorization: Some("authorizationStateReady".to_owned()),
+            account: None,
             detail: PluginDetail::default(),
         };
         assert_eq!(Info::parse(&info.render()).unwrap(), info);
@@ -583,10 +846,118 @@ mod tests {
         assert_eq!(Info::parse("version=0.1.0\n"), None);
         assert_eq!(Info::parse(""), None);
         // 缺的字段给默认值，认不出的数字不当成 0 之外的鬼东西。
+        // 老实例没有 `log_level` 这一行：默认 info（不是空串）。
         let partial = Info::parse("pid=7\n").unwrap();
         assert_eq!(partial.pid, 7);
         assert_eq!(partial.plugins, 0);
         assert_eq!(partial.version, "?");
+        assert_eq!(partial.log_level, "info");
+        // 老 status 没有 `running=` / `stopped_at=`：退出方式未知，不能凭空报「正常停止」，
+        // 也不能诬赖成「异常退出」。
+        assert_eq!(partial.running, None);
+        assert_eq!(partial.stopped_at, None);
+        // 老 status 也没有 `connection=` / `authorization=`：不知道就说不知道。
+        assert_eq!(partial.connection, None);
+        assert_eq!(partial.authorization, None);
+        // 空值当没有（写坏的文件不该变成「未知状态（）」）。
+        let broken = Info::parse("pid=7\nconnection=\nauthorization=\n").unwrap();
+        assert_eq!(broken.connection, None);
+        assert_eq!(broken.authorization, None);
+        assert!(!partial.stopped_gracefully());
+    }
+
+    /// 连接状态是**更新**、不是可查的状态：实例记下来之后要能跨进程原样读到。
+    #[test]
+    fn connection_state_survives_the_status_file_and_can_be_labelled() {
+        use fuyubot_simplify::ConnectionState;
+
+        let info = Info::parse("pid=1\nconnection=connectionStateReady\n").unwrap();
+        assert_eq!(info.connection.as_deref(), Some("connectionStateReady"));
+        assert_eq!(
+            ConnectionState::from_type_name("connectionStateReady"),
+            Some(ConnectionState::Ready)
+        );
+        assert_eq!(connection_label(ConnectionState::Ready), "已连接");
+        assert_eq!(
+            connection_label(ConnectionState::WaitingForNetwork),
+            "等待网络"
+        );
+
+        // 认不出的状态名不能被当成 Ready（simplify 的规矩，这里跟着）。
+        assert_eq!(
+            ConnectionState::from_type_name("connectionStateSomethingNew"),
+            None
+        );
+        // 写回文件时没有连接状态就不留 `connection=` 那一行。
+        let mut bare = info.clone();
+        bare.connection = None;
+        assert!(!bare.render().contains("connection="));
+    }
+
+    /// 授权状态与连接状态是两件事：状态名跨进程往返，标签覆盖「登录完成」与「等待凭据」。
+    #[test]
+    fn authorization_state_survives_the_status_file_and_can_be_labelled() {
+        use fuyubot_tdlib::AuthState;
+
+        let info = Info::parse("pid=1\nauthorization=authorizationStateReady\n").unwrap();
+        assert_eq!(
+            info.authorization.as_deref(),
+            Some("authorizationStateReady")
+        );
+        assert_eq!(
+            authorization_label(&AuthState::from_type_name("authorizationStateReady")),
+            "已登录"
+        );
+        assert_eq!(
+            authorization_label(&AuthState::from_type_name("authorizationStateWaitCode")),
+            "等待验证码"
+        );
+        assert_eq!(
+            authorization_label(&AuthState::from_type_name("authorizationStateWaitPassword")),
+            "等待两步密码"
+        );
+        // 认不出的状态不当成「已登录」，但名字要原样留着（面板能显示出来）。
+        let unknown = AuthState::from_type_name("authorizationStateSomethingNew");
+        assert_eq!(authorization_label(&unknown), "未知状态");
+        assert_eq!(unknown.name(), "authorizationStateSomethingNew");
+
+        // 没有授权状态时不留 `authorization=` 那一行。
+        let mut bare = info.clone();
+        bare.authorization = None;
+        assert!(!bare.render().contains("authorization="));
+    }
+
+    /// 正常停止和异常退出必须分得开：前者有 `stopped_at`，后者只有最后一圈写的 `running=1`。
+    #[test]
+    fn a_graceful_stop_is_distinguishable_from_a_crash() {
+        let stopped = Info::parse("pid=1\nrunning=0\nstopped_at=100\n").unwrap();
+        assert!(stopped.stopped_gracefully());
+        assert_eq!(stopped.stopped_at, Some(100));
+
+        let crashed = Info::parse("pid=1\nrunning=1\n").unwrap();
+        assert!(!crashed.stopped_gracefully());
+        assert_eq!(crashed.stopped_at, None);
+    }
+
+    /// 面板写 `.fuyubot/log-level`，实例下一圈读；新实例启动时把旧请求清掉。
+    #[test]
+    fn log_level_requests_are_validated_and_cleared_by_a_new_instance() {
+        let root = temp("instance-log-level");
+        std::fs::create_dir_all(root.join(STATE_DIR)).unwrap();
+        assert_eq!(requested_log_level(&root), None);
+
+        request_log_level(&root, "debug").unwrap();
+        assert_eq!(requested_log_level(&root).as_deref(), Some("debug"));
+
+        // 白名单之外的名字在写文件之前就被拒，免得实例每圈解析一遍垃圾。
+        assert!(request_log_level(&root, "verbose").is_err());
+        assert_eq!(requested_log_level(&root).as_deref(), Some("debug"));
+
+        // 上一轮的临时级别不能带到下一轮。
+        {
+            let _lock = InstanceLock::acquire(&root).unwrap();
+        }
+        assert_eq!(requested_log_level(&root), None);
     }
 
     #[test]
@@ -612,8 +983,14 @@ mod tests {
             pid: 4242,
             started: unix_now(),
             version: "0.1.0".to_owned(),
+            log_level: "info".to_owned(),
             plugins: 2,
             name: "bot".to_owned(),
+            running: Some(true),
+            stopped_at: None,
+            connection: None,
+            authorization: None,
+            account: None,
             detail: PluginDetail::default(),
         };
         lock.publish(&info).unwrap();
@@ -645,8 +1022,14 @@ mod tests {
                 pid: 99,
                 started: 1,
                 version: "0".to_owned(),
+                log_level: "info".to_owned(),
                 plugins: 0,
                 name: "old".to_owned(),
+                running: Some(true),
+                stopped_at: None,
+                connection: None,
+                authorization: None,
+                account: None,
                 detail: PluginDetail::default(),
             })
             .unwrap();
@@ -668,8 +1051,14 @@ mod tests {
             pid: 424242,
             started: unix_now(),
             version: "0.1.0".to_owned(),
+            log_level: "info".to_owned(),
             plugins: 1,
             name: "bot".to_owned(),
+            running: Some(true),
+            stopped_at: None,
+            connection: None,
+            authorization: None,
+            account: None,
             detail: PluginDetail::default(),
         })
         .unwrap();
@@ -690,8 +1079,14 @@ mod tests {
             pid: std::process::id(),
             started: unix_now(),
             version: "0.1.0".to_owned(),
+            log_level: "info".to_owned(),
             plugins: 0,
             name: "me".to_owned(),
+            running: Some(true),
+            stopped_at: None,
+            connection: None,
+            authorization: None,
+            account: None,
             detail: PluginDetail::default(),
         })
         .unwrap();
@@ -736,8 +1131,19 @@ mod tests {
             pid: 1234,
             started: unix_now(),
             version: "9.9.9".to_owned(),
+            log_level: "info".to_owned(),
             plugins: 7,
             name: "bot".to_owned(),
+            running: Some(true),
+            stopped_at: None,
+            connection: Some("connectionStateReady".to_owned()),
+            authorization: Some("authorizationStateReady".to_owned()),
+            account: Some(Account {
+                id: 42,
+                name: "Fuyu Bot".to_owned(),
+                username: Some("FuyuBot".to_owned()),
+                is_bot: true,
+            }),
             detail: PluginDetail {
                 active: vec!["a".to_owned(), "b".to_owned()],
                 pending: vec![("c".to_owned(), vec!["database".to_owned()])],
@@ -755,9 +1161,66 @@ mod tests {
         assert!(lines.contains("1 个等依赖"), "{lines}");
         assert!(lines.contains("1 个起不来"), "{lines}");
         assert!(lines.contains("9.9.9"), "{lines}");
+        // 连接状态是实例从 `updateConnectionState` 学来的，`status` 只转述。
+        assert!(lines.contains("连接       TDLib 已连接"), "{lines}");
+        // 授权状态同理（与连接状态相互独立）。
+        assert!(
+            lines.contains("授权       TDLib 已登录（authorizationStateReady）"),
+            "{lines}"
+        );
+        // 账户也是实例从 `getMe` / `updateUser` 学来的，`status` 只转述。
+        assert!(
+            lines.contains("账户       Fuyu Bot（id=42） @FuyuBot [bot]"),
+            "{lines}"
+        );
         // 「谁在等什么」是这个功能存在的理由：只说数量人还是不知道该去配什么。
         assert!(lines.contains("c 在等 database"), "{lines}");
         assert!(lines.contains("d 起不来：apply 报错"), "{lines}");
+
+        // 优雅停止：锁放掉之后，`status` 要能说清「上次是正常停止」而不是异常退出。
+        drop(lock);
+        let lock = InstanceLock::acquire(&root).unwrap();
+        lock.publish(&Info {
+            pid: 1234,
+            started: unix_now().saturating_sub(60),
+            version: "9.9.9".to_owned(),
+            log_level: "info".to_owned(),
+            plugins: 0,
+            name: "bot".to_owned(),
+            running: Some(false),
+            stopped_at: Some(unix_now()),
+            connection: None,
+            authorization: None,
+            account: None,
+            detail: PluginDetail::default(),
+        })
+        .unwrap();
+        drop(lock);
+        let lines = status_lines(&root).join("\n");
+        assert!(lines.contains("正常停止"), "{lines}");
+        assert!(!lines.contains("异常退出"), "{lines}");
+
+        // 崩溃 / 硬杀留下的最后一份状态没有 `stopped_at`：必须报异常退出。
+        let lock = InstanceLock::acquire(&root).unwrap();
+        lock.publish(&Info {
+            pid: 1234,
+            started: unix_now(),
+            version: "9.9.9".to_owned(),
+            log_level: "info".to_owned(),
+            plugins: 0,
+            name: "bot".to_owned(),
+            running: Some(true),
+            stopped_at: None,
+            connection: None,
+            authorization: None,
+            account: None,
+            detail: PluginDetail::default(),
+        })
+        .unwrap();
+        drop(lock);
+        let lines = status_lines(&root).join("\n");
+        assert!(lines.contains("异常退出"), "{lines}");
+        assert!(!lines.contains("正常停止"), "{lines}");
     }
 
     /// 插件速览要能跨进程往返：`run` 写、`status`（另一个进程）读。
@@ -778,12 +1241,69 @@ mod tests {
             pid: 7,
             started: 1,
             version: "1.0".to_owned(),
+            log_level: "info".to_owned(),
             plugins: 2,
             name: "bot".to_owned(),
+            running: Some(true),
+            stopped_at: None,
+            connection: None,
+            authorization: None,
+            account: None,
             detail: detail.clone(),
         };
         let parsed = Info::parse(&info.render()).expect("该能读回来");
         assert_eq!(parsed.detail, detail);
+    }
+
+    /// 账户信息要能跨进程往返：`run` 写进 status、面板 / `status` 读。
+    ///
+    /// 字段路径按约束 42 喂（`type.@type` 判 bot、`usernames.active_usernames[0]` 取用户名）。
+    #[test]
+    fn account_survives_the_status_file_round_trip() {
+        let user = serde_json::json!({
+            "id": 7,
+            "first_name": "Fuyu",
+            "last_name": "Bot",
+            "usernames": { "@type": "usernames", "active_usernames": ["FuyuBot"] },
+            "type": { "@type": "userTypeBot" },
+        });
+        let account = Account::from_user(&user).expect("有 id 就该解析出来");
+        assert_eq!(account.id, 7);
+        assert_eq!(account.name, "Fuyu Bot");
+        assert_eq!(account.username.as_deref(), Some("FuyuBot"));
+        assert!(account.is_bot);
+        assert_eq!(account.label(), "Fuyu Bot（id=7） @FuyuBot [bot]");
+
+        let mut info = Info {
+            pid: 7,
+            started: 1,
+            version: "1.0".to_owned(),
+            log_level: "info".to_owned(),
+            plugins: 0,
+            name: "bot".to_owned(),
+            running: Some(true),
+            stopped_at: None,
+            connection: None,
+            authorization: None,
+            account: Some(account.clone()),
+            detail: PluginDetail::default(),
+        };
+        let parsed = Info::parse(&info.render()).expect("该能读回来");
+        assert_eq!(parsed.account, Some(account));
+
+        // 没登录（或老实例）不写 `account_` 行：面板据此显示「还没登录」，而不是 id=0。
+        info.account = None;
+        assert!(!info.render().contains("account_"));
+        assert_eq!(Info::parse(&info.render()).unwrap().account, None);
+
+        // 没有 `id` 的 `user` 取不出账户；没有用户名也不编一个。
+        assert_eq!(
+            Account::from_user(&serde_json::json!({ "first_name": "x" })),
+            None
+        );
+        let bare = Account::from_user(&serde_json::json!({ "id": 9 })).unwrap();
+        assert_eq!(bare.username, None);
+        assert_eq!(bare.label(), "id=9 [user]");
     }
 
     /// 「变了才重发」靠的是 `PluginDetail` 的相等判定——它要是永远相等，

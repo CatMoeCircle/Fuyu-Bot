@@ -44,8 +44,15 @@ use fuyubot_core::{Kernel, Plugin as _};
 use fuyubot_loader::{
     DylibPlugin, LogLevel, PluginLoader, UpdatePipeline, find_script, plugin_files,
 };
+use fuyubot_simplify::{CONNECTION_UPDATE, ConnectionState};
 // 扩展 trait 要在作用域里才能对 `ConsolePrompter` 调 `ask`（固有方法不覆盖它）。
-use fuyubot_tdlib::Prompter as _;
+use fuyubot_tdlib::{AuthState, Prompter as _};
+
+/// 收摊时等 TDLib 走完 `close` → `authorizationStateClosed` 的预算。
+///
+/// 上限压在 `fuyubot stop` 的 8 秒兜底（`instance.rs`）之下：插件 `plugin_stop` 已经先跑过，
+/// 这里只留给「关数据库、刷盘」；等不到就照常销毁句柄，不让停止命令被 TDLib 拖死。
+const TD_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `fuyubot`：基于 TDLib 的插件化 bot 框架。
 #[derive(Parser, Debug)]
@@ -561,8 +568,19 @@ async fn login_async(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> 
         "登录完成：session 在 {}——`fuyubot run`（含 `--background`）起来会直接进 Ready",
         parameters.data_dir.display()
     );
+    // 登录完也走一次优雅关闭（没有接收循环，`receive` 归这里独占）：
+    // 让 TDLib 把刚写下的 session 刷进 `database_dir` 再销毁，而不是只靠 destroy 收尾。
+    if client.close_and_wait(TD_CLOSE_TIMEOUT) {
+        cli!(info, "TDLib 已关闭（数据库已刷盘）");
+    } else {
+        cli!(
+            warn,
+            "TDLib 没在 {:?} 内确认关闭，直接销毁客户端",
+            TD_CLOSE_TIMEOUT
+        );
+    }
 
-    // 收摊：没有插件要卸载、没有接收循环要停；客户端 drop 时 TDLib 自己关掉会话。
+    // 收摊：没有插件要卸载、没有接收循环要停；上面已经请 TDLib 关过会话。
     drop(instance_lock);
     kernel.stop().await?;
     Ok(())
@@ -714,10 +732,61 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // `spawn = true`：`run` 要的是真跑起来——装依赖、起进程、watch 一整套。
     let mut loaded = load_plugins(&mut kernel, &loader, &plugin_dir, true)?;
 
+    // ── TDLib 运行状态（面板顶部 / 概览页）─────────────────────────
+    //
+    // TDLib **没有**「现在连上了吗 / 登录到哪一步了」这种可查的方法：连接与授权都只有
+    // `update*` 这一条路，而且只在状态变化时来一条。这里各订阅一次、只记最新那条，
+    // 主循环再写进 `.fuyubot/status`——面板是**另一个进程**，只能通过这份文件看到它们
+    // （约束 47：面板自己不接 TDLib）。
+    //
+    // ⚠️ 连接状态的订阅必须早于 `drive_login`：登录窗口里 TDLib 就在发
+    //    `updateConnectionState`，而且只在**变化**时发，等登录完再订阅就漏掉 `connectionStateReady`。
+    //    授权状态正相反：`log_in_with` 把登录窗口里的 `updateAuthorizationState` **自己消费掉了**
+    //    （只把与授权无关的更新转给管线），事件总线看不到最后那条 `authorizationStateReady`——
+    //    所以登录成功后要补记一笔（见 `mark_authorized`）。`--no-login` 时 TDLib 会停在
+    //    `authorizationStateWaitTdlibParameters`，那条会正常经管线到达。
+    let connection: Arc<Mutex<Option<ConnectionState>>> = Arc::new(Mutex::new(None));
+    let _connection_watch = {
+        let slot = Arc::clone(&connection);
+        loader
+            .runtime()
+            .events()
+            .on(CONNECTION_UPDATE, None, move |payload| {
+                if let Some(state) = connection_update_state(payload) {
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
+                }
+                Ok(())
+            })
+    };
+    // 授权状态另存一份**名字**（`authorizationStateReady` 等）。这条只负责「记录」；
+    // 运行期「被下线」的报警由下面的 `_auth_watch` 单独负责——两者的时机与用途不同，
+    // 混在一起会让「登录窗口里的 WaitCode」被误当成「被踢」。
+    let authorization: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let _authorization_watch = {
+        let slot = Arc::clone(&authorization);
+        loader
+            .runtime()
+            .events()
+            .on("updateAuthorizationState", None, move |payload| {
+                if let Some(name) = authorization_update_name(payload) {
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(name);
+                }
+                Ok(())
+            })
+    };
+
     // ⑤⑥ 现在才驱动登录：等「等参数」状态 → 设置 → 等授权状态 →（要登录就登录）→ Ready。
     if let (Some(client), Some(parameters)) = (tdlib_client.as_ref(), parameters.as_ref()) {
         let account = config.telegram.account_type()?;
-        drive_login(client, parameters, account, &pipeline)?;
+        let me = drive_login(client, parameters, account, &pipeline)?;
+        // 身份交给运行时：插件经 `fuyubot.host.identity` 读到它，`on_command` 靠它
+        // 把「点名给别人的命令」挡在插件外面（`/start@别的Bot` 不该回欢迎语）。
+        if let Some(me) = me {
+            loader.runtime().set_self_user(me);
+        }
+        // 登录窗口里的授权更新被 `log_in_with` 自己消费了，事件总线收不到 Ready；
+        // 它正常返回就等于授权状态到了 Ready，补记这一笔（否则 status 里会一直没有授权状态）。
+        mark_authorized(&authorization);
     }
 
     // ⑦ 插件与登录都就位，现在才开接收循环（gaps 缺口 8：句柄要一直留着，否则停不掉）。
@@ -741,8 +810,15 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         loader.runtime().tools().len()
     );
     // 发布 / 重发状态用同一份计算：`--background` 的父进程等的是**第一次**发布，
-    // 而运行期插件上下线之后要让 `status` 跟上——两处算的必须是同一个东西。
-    let publish = |detail: instance::PluginDetail| -> Result<(), Box<dyn std::error::Error>> {
+    // 而运行期插件上下线 / 日志级别变化之后要让 `status` 跟上——两处算的必须是同一个东西。
+    //
+    // `running` / `stopped_at` 只在**收摊成功之后**才写 `running=0` + 时间：崩溃 / 硬杀
+    // 留下的最后一份仍是 `running=1`，面板据此区分「上次正常停止」与「上次异常退出」。
+    let publish = |detail: instance::PluginDetail,
+                   log_level: LogLevel,
+                   running: bool,
+                   stopped_at: Option<u64>|
+     -> Result<(), Box<dyn std::error::Error>> {
         let Some(lock) = instance_lock.as_ref() else {
             return Ok(());
         };
@@ -750,17 +826,31 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             pid: std::process::id(),
             started: started_at,
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            log_level: scaffold::log_level_name(log_level).to_owned(),
             plugins: detail.active.len(),
             name: bot_name.clone(),
+            running: Some(running),
+            stopped_at,
+            // 订阅没装（`--no-tdlib` / `--replay`）就一直 `None`：status 里没这一行。
+            connection: (*connection.lock().unwrap_or_else(|e| e.into_inner()))
+                .map(|state| state.type_name().to_owned()),
+            authorization: (*authorization.lock().unwrap_or_else(|e| e.into_inner())).clone(),
+            // 账户：宿主手里那份是**活的**（登录写一次，之后每条 `updateUser` 都刷新），
+            // 这里只做「JSON → status 行」的转换。
+            account: current_account(loader.runtime()),
             detail,
         })?;
         Ok(())
     };
     // 状态**这时候才发布**：`run --background` 的父进程等的就是它（拿上锁只说明进程活着）。
-    publish(detail.clone())?;
+    publish(detail.clone(), log_level, true, None)?;
     // 运行循环用它判断「要不要重发」——不记下来的话，每圈都算得出差异、
     // 或者干脆每圈都写一遍。
     let mut last_detail = detail;
+    let mut last_log_level = log_level;
+    let mut last_connection = *connection.lock().unwrap_or_else(|e| e.into_inner());
+    let mut last_authorization = (*authorization.lock().unwrap_or_else(|e| e.into_inner())).clone();
+    let mut last_account = current_account(loader.runtime());
 
     if let Some(replay) = args.replay {
         // 脚本插件在**另一个进程**里跑，反应要经管道回来，还可能捎带网络请求；
@@ -784,6 +874,12 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let Some(mut receive) = receive else {
         loaded.clear();
         kernel.stop().await?;
+        publish(
+            last_detail.clone(),
+            log_level,
+            false,
+            Some(instance::unix_now()),
+        )?;
         return Ok(());
     };
     // 有接收循环就一定有 client（`receive` 只可能由上面的 `tdlib_client` 派生出来）。
@@ -846,9 +942,24 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         // 是白费 I/O，还会让 `status` 的读和写撞上（Windows 上偶尔读到半份）。
         {
             let current = instance::PluginDetail::from_report(&kernel.report());
-            if current != last_detail {
-                publish(current.clone())?;
+            let connection_now = *connection.lock().unwrap_or_else(|e| e.into_inner());
+            let authorization_now =
+                (*authorization.lock().unwrap_or_else(|e| e.into_inner())).clone();
+            // 账户也会变：TDLib 用 `updateUser` 改名字 / 用户名，宿主已经收下最新的那份，
+            // 这里只负责发现「变了」并把 status 重发一遍。
+            let account_now = current_account(loader.runtime());
+            if current != last_detail
+                || log_level != last_log_level
+                || connection_now != last_connection
+                || authorization_now != last_authorization
+                || account_now != last_account
+            {
+                publish(current.clone(), log_level, true, None)?;
                 last_detail = current;
+                last_log_level = log_level;
+                last_connection = connection_now;
+                last_authorization = authorization_now;
+                last_account = account_now;
             }
         }
 
@@ -862,10 +973,29 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             receive.stop();
             receive.join().await;
             loaded.clear();
+            // 插件都停了、接收循环也退了，现在没有别人跟这里抢 `td_receive`：
+            // 请 TDLib 关闭会话并等 `authorizationStateClosed`（数据库刷完盘）。
+            if client.close_and_wait(TD_CLOSE_TIMEOUT) {
+                cli!(info, "TDLib 已关闭（数据库已刷盘）");
+            } else {
+                cli!(
+                    warn,
+                    "TDLib 没在 {:?} 内确认关闭，直接销毁客户端",
+                    TD_CLOSE_TIMEOUT
+                );
+            }
             if let Some(lock) = instance_lock.as_ref() {
                 lock.clear_stop();
             }
             kernel.stop().await?;
+            // 收摊成功之后才敢说「正常停止」：写 `running=0` + 时间，面板 / `status`
+            // 才能和崩溃留下的 `running=1` 区分开。
+            publish(
+                last_detail.clone(),
+                log_level,
+                false,
+                Some(instance::unix_now()),
+            )?;
             return Ok(());
         }
 
@@ -891,7 +1021,13 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
         receive.stop();
         receive.join().await;
-        drive_login(client, parameters, account, &pipeline)?;
+        // 重登之后账户可能换了（换号 / 改名）：和启动时一样把新的 `getMe` 交给宿主，
+        // 否则 `fuyubot.host.identity` 与面板上的账户行还停在旧账号。
+        if let Some(me) = drive_login(client, parameters, account, &pipeline)? {
+            loader.runtime().set_self_user(me);
+        }
+        // 与启动时同一个理由：登录窗口里的授权更新不进事件总线，成功返回就补记 Ready。
+        mark_authorized(&authorization);
         // 登录完再开分发。**插件不重新加载**：它们还订阅着，重载会重复注册。
         receive = pipeline.spawn_dispatch(client);
         cli!(info, "已重新进入运行状态");
@@ -1306,8 +1442,9 @@ fn drive_login(
     parameters: &fuyubot_tdlib::TdlibParameters,
     account: fuyubot_tdlib::AccountType,
     pipeline: &Arc<UpdatePipeline>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    cli!(
+        info,
         "等待 TDLib 到「等参数」授权状态并设置（账号类型 {account:?}，数据目录 {}）",
         parameters.data_dir.display()
     );
@@ -1336,16 +1473,24 @@ fn drive_login(
     }
 
     // 登录完成，问一次账户信息（变更 3-a 第 3 步）。
-    match call_and_wait(
+    // 拿到的 `user` 要交回调用方——插件的 `on_command` 靠它（经 `fuyubot.host.identity`
+    // service）判断「这条命令点名的是不是我」。
+    let me = match call_and_wait(
         client,
         serde_json::json!({ "@type": "getMe" }),
         Duration::from_secs(15),
         pipeline,
     ) {
-        Ok(me) => println!("已登录，账户：{}", describe_account(&me)),
-        Err(error) => eprintln!("已登录，但 getMe 没拿到（{error}）——不影响运行"),
-    }
-    Ok(())
+        Ok(me) => {
+            cli!(info, "已登录，账户：{}", describe_account(&me));
+            Some(me)
+        }
+        Err(error) => {
+            cli!(warn, "已登录，但 getMe 没拿到（{error}）——不影响运行");
+            None
+        }
+    };
+    Ok(me)
 }
 
 /// 发一条请求并等它的响应（`log_in_with` 那种同步循环的简化版）。
@@ -1386,43 +1531,54 @@ fn re_login_alert(payload: &serde_json::Value) -> Option<String> {
     state.needs_re_login().then(|| state.name().to_owned())
 }
 
+/// `updateConnectionState` → 面板 / `status` 要显示的那个连接状态。
+///
+/// 负载长这样：`{"@type":"updateConnectionState","state":{"@type":"connectionStateReady"}}`——
+/// 状态在 **`state`** 里，不在顶层（与 `updateAuthorizationState` 的 `authorization_state` 不同）。
+/// 认不出的状态（TDLib 以后新增的）返回 `None`：保留上一条已知状态，
+/// 比把它当「已连接」安全。
+fn connection_update_state(payload: &serde_json::Value) -> Option<ConnectionState> {
+    payload.get("state").and_then(ConnectionState::from_json)
+}
+
+/// `updateAuthorizationState` → 要写进 status 的状态名（`authorizationStateReady` 等）。
+///
+/// 负载形如 `{"@type":"updateAuthorizationState","authorization_state":{"@type":"authorizationStateReady"}}`，
+/// 与连接状态一样**嵌套**。取不出名字时返回 `None`：保留上一条已知状态，别把空串写进 status。
+/// 认不出的新状态保留原始名字——面板显示「未知状态（名字）」比假装「已登录」安全。
+fn authorization_update_name(payload: &serde_json::Value) -> Option<String> {
+    let state = AuthState::from_update(payload);
+    (!state.name().is_empty()).then(|| state.name().to_owned())
+}
+
+/// 登录成功之后补记 `authorizationStateReady`。
+///
+/// `log_in_with` 在登录窗口里**自己消费**了 `updateAuthorizationState`（只把非授权更新
+/// 转给管线），所以事件总线收不到最后那条 Ready；而 `drive_login` 只在
+/// `LoginOutcome::Ready` 时返回 `Ok`，因此「正常返回」本身就是权威判据。
+fn mark_authorized(slot: &Mutex<Option<String>>) {
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(AuthState::Ready.name().to_owned());
+}
+
 /// 把 `getMe` 的结果描述成一行。
 ///
-/// 字段路径按 AGENTS 约束 42 拿真库核过：bot 判定在 **`type.@type == "userTypeBot"`**、
-/// 用户名在 **`usernames.active_usernames[0]`**（`user` **没有**顶层 `is_bot` / `username`）。
+/// 字段路径（bot 在 `type.@type`、用户名在 `usernames.active_usernames[0]`）只在
+/// [`instance::Account::from_user`] 里写一次——这里只是它的显示形态，别抄第二份。
 fn describe_account(me: &serde_json::Value) -> String {
-    let id = me
-        .get("id")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
-    let name = ["first_name", "last_name"]
-        .iter()
-        .filter_map(|key| me.get(key).and_then(serde_json::Value::as_str))
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let username = me
-        .get("usernames")
-        .and_then(|u| u.get("active_usernames"))
-        .and_then(serde_json::Value::as_array)
-        .and_then(|list| list.first())
-        .and_then(serde_json::Value::as_str);
-    let is_bot = me
-        .get("type")
-        .and_then(|t| t.get("@type"))
-        .and_then(serde_json::Value::as_str)
-        == Some("userTypeBot");
+    instance::Account::from_user(me)
+        .map(|account| account.label())
+        .unwrap_or_else(|| "（getMe 的结果里没有 id，取不出账户信息）".to_owned())
+}
 
-    let mut line = if name.is_empty() {
-        format!("id={id}")
-    } else {
-        format!("{name}（id={id}）")
-    };
-    if let Some(username) = username {
-        line.push_str(&format!(" @{username}"));
-    }
-    line.push_str(if is_bot { " [bot]" } else { " [user]" });
-    line
+/// 宿主手里那份「我是谁」→ status / 面板要显示的账户行。
+///
+/// 宿主在登录时写入 `getMe`，之后每条 `updateUser`（id 是自己那条）都会替换掉它，
+/// 所以这里读到的是**最新的**名字 / 用户名，不是登录那一刻的死快照。
+fn current_account(runtime: &fuyubot_loader::HostRuntime) -> Option<instance::Account> {
+    runtime
+        .self_user()
+        .as_ref()
+        .and_then(instance::Account::from_user)
 }
 
 /// 去掉 Windows `canonicalize` 给的 `\\?\` 长路径前缀。
@@ -1733,6 +1889,107 @@ mod tests {
         assert_eq!(
             re_login_alert(&serde_json::json!({"@type": "updateNewMessage"})),
             None
+        );
+    }
+
+    /// `updateConnectionState` 的状态在 **`state`** 里；五种状态都要认得，
+    /// 认不出 / 根本不是这条更新时返回 `None`（保留上一条已知状态，不默认 Ready）。
+    #[test]
+    fn connection_updates_are_read_from_the_state_field() {
+        let update = |state: &str| {
+            serde_json::json!({
+                "@type": "updateConnectionState",
+                "state": { "@type": state }
+            })
+        };
+
+        for (name, expected) in [
+            (
+                "connectionStateWaitingForNetwork",
+                ConnectionState::WaitingForNetwork,
+            ),
+            (
+                "connectionStateConnectingToProxy",
+                ConnectionState::ConnectingToProxy,
+            ),
+            ("connectionStateConnecting", ConnectionState::Connecting),
+            ("connectionStateUpdating", ConnectionState::Updating),
+            ("connectionStateReady", ConnectionState::Ready),
+        ] {
+            assert_eq!(
+                connection_update_state(&update(name)),
+                Some(expected),
+                "{name} 没解析出来"
+            );
+        }
+
+        assert_eq!(
+            connection_update_state(&update("connectionStateSomethingNew")),
+            None
+        );
+        // 状态是嵌套的：把 `@type` 放在顶层（别的更新的形状）不算数。
+        assert_eq!(
+            connection_update_state(
+                &serde_json::json!({"@type": "updateConnectionState", "state": {}})
+            ),
+            None
+        );
+        assert_eq!(
+            connection_update_state(&serde_json::json!({"@type": "updateConnectionState"})),
+            None
+        );
+    }
+
+    /// 授权状态也读嵌套的 `authorization_state`；空的 / 别的更新不能写出空串。
+    #[test]
+    fn authorization_updates_are_read_from_the_authorization_state_field() {
+        let update = |state: &str| {
+            serde_json::json!({
+                "@type": "updateAuthorizationState",
+                "authorization_state": { "@type": state }
+            })
+        };
+
+        for name in [
+            "authorizationStateWaitTdlibParameters",
+            "authorizationStateWaitPhoneNumber",
+            "authorizationStateWaitCode",
+            "authorizationStateWaitPassword",
+            "authorizationStateReady",
+            "authorizationStateClosing",
+        ] {
+            assert_eq!(
+                authorization_update_name(&update(name)).as_deref(),
+                Some(name),
+                "{name} 没解析出来"
+            );
+        }
+
+        // 认不出的状态保留原始名字（面板会显示「未知状态（名字）」）。
+        assert_eq!(
+            authorization_update_name(&update("authorizationStateSomethingNew")).as_deref(),
+            Some("authorizationStateSomethingNew")
+        );
+        // 缺 `authorization_state` / 根本不是这条更新：不写空串，保留上一条。
+        assert_eq!(
+            authorization_update_name(&serde_json::json!({"@type": "updateAuthorizationState"})),
+            None
+        );
+        assert_eq!(
+            authorization_update_name(&serde_json::json!({"@type": "updateNewMessage"})),
+            None
+        );
+    }
+
+    /// `log_in_with` 把登录期的授权更新吃掉了：登录成功后必须自己补记 Ready，
+    /// 否则面板会一直显示「还没收到授权更新」。
+    #[test]
+    fn a_successful_login_records_the_ready_authorization_state() {
+        let slot = Mutex::new(None);
+        mark_authorized(&slot);
+        assert_eq!(
+            slot.into_inner().unwrap().as_deref(),
+            Some("authorizationStateReady")
         );
     }
 

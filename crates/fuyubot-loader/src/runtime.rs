@@ -266,6 +266,11 @@ pub struct HostRuntime {
     sent_requests: Mutex<VecDeque<SentRequest>>,
     /// 内置 scope service 的 vtable（`context` 指向本实例）。按值存，地址稳定。
     scope_vtable: ServiceVTable,
+    /// 内置「我是谁」service 的 vtable（同上）。
+    identity_vtable: ServiceVTable,
+    /// `getMe` 的结果（登录成功后由 CLI 用 [`HostRuntime::set_self_user`] 写进来）。
+    /// `fuyubot.host.identity` service 读它；没登录 / 没接 TDLib 时是 `None`。
+    self_user: Mutex<Option<Value>>,
     vtable: HostApiVTable,
     /// 全局配置（路径 + JSON 树）。`get_config` / `set_config` 读写它。
     config: Mutex<ConfigState>,
@@ -415,6 +420,15 @@ impl HostRuntime {
                 methods: PLUGIN_METHODS.0.as_ptr(),
                 method_count: PLUGIN_METHODS.0.len(),
             },
+            identity_vtable: ServiceVTable {
+                name: IDENTITY_SERVICE_C.as_ptr(),
+                version: 1,
+                size: core::mem::size_of::<ServiceVTable>() as u32,
+                context: weak.as_ptr() as *mut c_void,
+                methods: IDENTITY_METHODS.0.as_ptr(),
+                method_count: IDENTITY_METHODS.0.len(),
+            },
+            self_user: Mutex::new(None),
             config: Mutex::new(ConfigState::default()),
             log_plugins: Mutex::new(None),
             owner_names: Mutex::new(HashMap::new()),
@@ -451,6 +465,7 @@ impl HostRuntime {
         });
         rt.provide_scope_service();
         rt.provide_plugins_service();
+        rt.provide_identity_service();
         Ok(rt)
     }
 
@@ -483,6 +498,51 @@ impl HostRuntime {
             Ok(effect) => std::mem::forget(effect),
             Err(e) => self.warn(&format!("预置插件清单 service 失败: {e}")),
         }
+    }
+
+    /// 把内置的「我是谁」service 预置进服务表。
+    ///
+    /// 名字 [`IDENTITY_SERVICE`]，方法 `usernames`（无参）返回自身活跃用户名的 JSON 数组。
+    /// `fuyubot-simplify` 的 `on_command` 靠它判断「这条命令点名的是不是我」——
+    /// 插件在**命令回调里**就能读（纯内存，不是 TDLib 请求，不会卡接收循环）。
+    fn provide_identity_service(&self) {
+        let vtable = &self.identity_vtable as *const ServiceVTable;
+        match self.ctx.provide_named(IDENTITY_SERVICE, AbiService(vtable)) {
+            // 句柄故意 `forget`：它要活到进程结束，不能跟着谁 drop 就注销。
+            Ok(effect) => std::mem::forget(effect),
+            Err(e) => self.warn(&format!("预置身份 service 失败: {e}")),
+        }
+    }
+
+    /// 记下 `getMe` 的结果（CLI 在登录成功之后调）。
+    ///
+    /// 时机正好：插件早就加载好了，但接收循环还没开（`run` 的第 ⑦ 步），
+    /// 所以插件不可能在 `start()` 里同步问 TDLib——身份只能由宿主喂进来。
+    pub fn set_self_user(&self, me: Value) {
+        *self
+            .self_user
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(me);
+    }
+
+    /// 自己的全部活跃用户名（`usernames.active_usernames`，字段路径见约束 42）。
+    ///
+    /// 还没登录 / 没接 TDLib 时是空表——调用方据此判断「身份未知」，别拿空表当「谁都不匹配」。
+    pub fn self_usernames(&self) -> Vec<String> {
+        let self_user = self.self_user.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(me) = self_user.as_ref() else {
+            return Vec::new();
+        };
+        me.get("usernames")
+            .and_then(|usernames| usernames.get("active_usernames"))
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// 装进全局配置：`path` 是配置文件的落盘位置（`set_config` 回写用，可为 `None`），
@@ -719,7 +779,12 @@ impl HostRuntime {
     /// **两条通道都发**：具体的 `@type`（例如 `updateNewMessage`）和兜底通道 [`UPDATE_EVENT`]。
     /// 订阅者按 `@type` 能精确订阅，按 `"update"` 能收到全部。
     /// `Routed::Update` 的接线点就是这里。
+    ///
+    /// 顺带维护「我是谁」：`getMe` 只是**登录那一刻**的快照，用户名 / 名字之后还会变
+    /// （`updateUser`），所以每条 `updateUser` 都先过一遍 [`Self::absorb_self_update`]，
+    /// 广播出去的就是新值——[`IDENTITY_SERVICE`] 与面板看到的都不会是死的。
     pub fn publish_update(&self, payload: &Value) -> fuyubot_core::Result<usize> {
+        self.absorb_self_update(payload);
         let mut total = self.events.emit(UPDATE_EVENT, payload)?;
         if let Some(update_type) = payload.get("@type").and_then(Value::as_str) {
             if update_type != UPDATE_EVENT {
@@ -727,6 +792,40 @@ impl HostRuntime {
             }
         }
         Ok(total)
+    }
+
+    /// `updateUser` 里是不是**我自己**：是就把存的那份换成新的。
+    ///
+    /// 判据只看 id（`getMe` 的结果里那个 `user.id`）；别人的 `updateUser` 一概不碰。
+    /// 还没登录（`self_user` 是 `None`）时也不碰——那时连「我是谁」都还不知道。
+    fn absorb_self_update(&self, payload: &Value) {
+        if payload.get("@type").and_then(Value::as_str) != Some("updateUser") {
+            return;
+        }
+        let Some(user) = payload.get("user") else {
+            return;
+        };
+        let Some(incoming) = user.get("id").and_then(Value::as_i64) else {
+            return;
+        };
+        let mut slot = self.self_user.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(current) = slot.as_ref() else {
+            return;
+        };
+        if current.get("id").and_then(Value::as_i64) != Some(incoming) {
+            return;
+        }
+        *slot = Some(user.clone());
+    }
+
+    /// 宿主眼里的「我自己」（最近一次 `getMe` / `updateUser` 的 `user` JSON）。
+    ///
+    /// 没登录 / 没接 TDLib 时是 `None`。要用户名请用 [`Self::self_usernames`]。
+    pub fn self_user(&self) -> Option<Value> {
+        self.self_user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 读当前插件日志门槛（语义见上方 `log_verbosity` 字段）。
@@ -1631,6 +1730,60 @@ unsafe extern "C" fn api_plugin_report(
         return core::ptr::null();
     };
     host_string(&rt.plugin_report())
+}
+
+/// 内置「我是谁」service 的名字。插件用 ABI 的 `get_service` 查它；
+/// `fuyubot-simplify` 的 `on_command` 正是这么判断「命令点名的是不是我」的。
+pub const IDENTITY_SERVICE: &str = "fuyubot.host.identity";
+
+/// 同一个名字的 `CString` 版（`ServiceVTable.name` 要 NUL 结尾的指针）。
+const IDENTITY_SERVICE_C: &core::ffi::CStr = c"fuyubot.host.identity";
+
+/// 「我是谁」service 的方法表。
+///
+/// - `usernames`：无参，返回自身全部活跃用户名的 JSON 数组（没登录时 `[]`）；
+/// - `me`：无参，返回 `getMe` 的原始 `user` JSON（没登录时 `null`）。
+///
+/// 加方法只要在这张表里追加一项——插件侧本来就是按名字调的。
+struct IdentityMethods([ServiceMethod; 2]);
+
+// SAFETY: 与 `ScopeMethods` 同理：`name` 指向 `'static` 字面量，`func` 是纯函数指针。
+unsafe impl Sync for IdentityMethods {}
+
+static IDENTITY_METHODS: IdentityMethods = IdentityMethods([
+    ServiceMethod {
+        name: c"usernames".as_ptr(),
+        func: Some(api_identity_usernames),
+    },
+    ServiceMethod {
+        name: c"me".as_ptr(),
+        func: Some(api_identity_me),
+    },
+]);
+
+/// `usernames`：自身全部活跃用户名的 JSON 数组。
+unsafe extern "C" fn api_identity_usernames(
+    context: *mut c_void,
+    _input: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    host_string(&json!(rt.self_usernames()).to_string())
+}
+
+/// `me`：`getMe` 的原始 JSON（没登录时 `null`）。
+unsafe extern "C" fn api_identity_me(context: *mut c_void, _input: *const c_char) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    let me = rt
+        .self_user
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    host_string(&me.clone().unwrap_or(Value::Null).to_string())
 }
 
 // ── VTable 实现 ────────────────────────────────────────────────────
@@ -3951,6 +4104,93 @@ mod tests {
             assert!(error.contains("nope"), "{error}");
         }
         // vtable 是局部变量，活到本函数末尾——比所有调用都久。
+    }
+
+    /// 身份 service：登录前是空的，`set_self_user` 之后给出用户名。
+    ///
+    /// 名字必须与 `fuyubot-simplify` 里 `on_command` 用的那个常量一致——两边各写一份
+    /// 字符串字面量，漏改一边就是「命令过滤静默失效」。
+    #[test]
+    fn identity_service_reports_the_logged_in_user() {
+        let rt = runtime();
+        assert_eq!(IDENTITY_SERVICE, fuyubot_simplify::IDENTITY_SERVICE);
+
+        // 还没登录 / 没接 TDLib：空表 + null（调用方据此当「身份未知」）。
+        assert_eq!(
+            rt.call_service(IDENTITY_SERVICE, "usernames", "{}")
+                .unwrap(),
+            "[]"
+        );
+        assert_eq!(
+            rt.call_service(IDENTITY_SERVICE, "me", "{}").unwrap(),
+            "null"
+        );
+
+        // 登录之后：用户名在 `usernames.active_usernames`（约束 42）。
+        rt.set_self_user(json!({
+            "id": 7,
+            "usernames": {
+                "@type": "usernames",
+                "active_usernames": ["FuyuBot", "FuyuBotBackup"],
+            },
+            "type": { "@type": "userTypeBot" },
+        }));
+        assert_eq!(
+            rt.call_service(IDENTITY_SERVICE, "usernames", "{}")
+                .unwrap(),
+            r#"["FuyuBot","FuyuBotBackup"]"#
+        );
+        assert!(
+            rt.call_service(IDENTITY_SERVICE, "me", "{}")
+                .unwrap()
+                .contains(r#""id":7"#)
+        );
+    }
+
+    /// `getMe` 只是登录那一刻的快照：之后的 `updateUser`（id 是自己那条）要刷新它，
+    /// 别人的 `updateUser` 一概不碰。
+    #[test]
+    fn self_user_follows_update_user_updates() {
+        let rt = runtime();
+        rt.set_self_user(json!({
+            "id": 7,
+            "usernames": { "@type": "usernames", "active_usernames": ["OldName"] },
+        }));
+        assert_eq!(rt.self_usernames(), vec!["OldName".to_owned()]);
+
+        // 别人的：不动。
+        rt.publish_update(&json!({
+            "@type": "updateUser",
+            "user": { "id": 8, "usernames": { "active_usernames": ["SomeoneElse"] } },
+        }))
+        .unwrap();
+        assert_eq!(rt.self_usernames(), vec!["OldName".to_owned()]);
+
+        // 自己的：换成新值（改用户名 / 改名字都走这条）。
+        rt.publish_update(&json!({
+            "@type": "updateUser",
+            "user": {
+                "id": 7,
+                "first_name": "New",
+                "usernames": { "active_usernames": ["NewName"] },
+            },
+        }))
+        .unwrap();
+        assert_eq!(rt.self_usernames(), vec!["NewName".to_owned()]);
+        assert_eq!(
+            rt.self_user().unwrap().pointer("/first_name"),
+            Some(&json!("New"))
+        );
+
+        // 没登录时收到 `updateUser`：没有「我自己」可比，什么都不做。
+        let fresh = runtime();
+        fresh
+            .publish_update(&json!({
+                "@type": "updateUser",
+                "user": { "id": 7, "usernames": { "active_usernames": ["X"] } },
+            }))
+            .unwrap();
+        assert_eq!(fresh.self_user(), None);
     }
 
     /// 作用域的两种落点：`provide_service` 写调用者自己的 child，`provide_service_shared` 写根。
