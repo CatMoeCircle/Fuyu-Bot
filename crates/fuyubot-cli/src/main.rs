@@ -315,6 +315,80 @@ fn stop(args: &StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 新后台实例从空日志开始：截断旧文件（父进程已确认没有实例在跑）。
+fn reset_log_file(log: &Path) -> Result<(), String> {
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建不了 {}: {e}", parent.display()))?;
+    }
+    std::fs::write(log, "").map_err(|e| format!("清不了 {}: {e}", log.display()))
+}
+
+/// 让本进程的 stdin / stdout / stderr 不再被**随后**派生的子进程继承（仅 Windows）。
+///
+/// 为什么需要：`CreateProcessW(bInheritHandles = TRUE)` 会把父进程里**所有**带
+/// `HANDLE_FLAG_INHERIT` 的句柄都交给子进程，而 Rust 的 `Command` 现在正是这么调的
+/// （std 只用一把锁避免并发 spawn，没有收窄成 handle list）。`run --background` 的
+/// stdout / stderr 很可能就是**调用方的管道**——被 DETACHED 的 daemon 继承之后，调用方
+/// 读管道永远等不到 EOF。面板按 `s` 正是这条链：`Command::output()` 迟迟不返回，
+/// `busy` 一直停在「启动中…」，于是 `x` 被 `busy` 挡掉、`s` 也再起不来。
+///
+/// 只清 **launcher 自己** 标准句柄的继承位；daemon 的 stdio 仍由 `STARTUPINFO`
+/// 单独指定（日志文件 / NUL），不受影响。
+#[cfg(windows)]
+mod windows_handle_inheritance {
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+
+    unsafe extern "system" {
+        fn GetStdHandle(std_handle: u32) -> Handle;
+        fn SetHandleInformation(object: Handle, mask: u32, flags: u32) -> i32;
+        #[cfg(test)]
+        fn GetHandleInformation(object: Handle, flags: *mut u32) -> i32;
+    }
+
+    /// 清掉 launcher 三个标准句柄的继承位（无效句柄跳过）。
+    pub fn clear_std_inherit() {
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: 两个调用都没有前置条件；GetStdHandle 只读取进程的 std 句柄表。
+            let handle = unsafe { GetStdHandle(id) };
+            let _ = clear_handle_inherit(handle);
+        }
+    }
+
+    /// 清掉单个句柄的继承位。空句柄 / `INVALID_HANDLE_VALUE` / 系统拒绝都返回 `false`。
+    pub fn clear_handle_inherit(handle: Handle) -> bool {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        // SAFETY: 调用方给的是有效句柄；失败最多保留旧行为（子进程仍会继承）。
+        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) != 0 }
+    }
+
+    #[cfg(test)]
+    pub fn make_inheritable(handle: Handle) -> bool {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        // SAFETY: 同上，测试句柄来自仍然活着的 `File`。
+        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) != 0 }
+    }
+
+    #[cfg(test)]
+    pub fn is_inheritable(handle: Handle) -> Option<bool> {
+        let mut flags = 0u32;
+        // SAFETY: `flags` 指向本栈上的 u32；句柄无效时系统调用失败、返回 `None`。
+        let ok = unsafe { GetHandleInformation(handle, &mut flags) } != 0;
+        ok.then(|| flags & HANDLE_FLAG_INHERIT != 0)
+    }
+}
+
 /// `run --background` 的父进程：**派生一个没有终端的自己**，等它真起来再返回。
 ///
 /// 不做成「后台线程 + 父进程不退出」：用户要的是「敲完命令就回到提示符」，
@@ -328,11 +402,12 @@ fn run_background(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let root = parent_or_dot(&args.config);
     // 先在本进程里把项目建好：两个进程同时 init 会撞车（一个成功一个报「已经存在」）。
     ensure_project(&root, &args.config, cli_api_id)?;
+    // 新实例从空日志开始：旧日志不保留。必须在确认没有实例在跑之后再做，
+    // 否则会把正在运行实例的日志清掉。
+    refuse_while_running(&root)?;
 
     let log = instance::log_path(&root);
-    if let Some(parent) = log.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("建不了 {}: {e}", parent.display()))?;
-    }
+    reset_log_file(&log)?;
     let append = || {
         std::fs::OpenOptions::new()
             .create(true)
@@ -378,6 +453,10 @@ fn run_background(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         command.creation_flags(DETACHED_PROCESS);
+        // ⚠️ 必须在 spawn 之前清：std 的 `Command` 用 `bInheritHandles = TRUE` 派生，
+        // daemon 会把 launcher 从调用方继承来的 stdout / stderr 管道一起带走，
+        // 调用方（面板的 `Command::output()`）就永远读不到 EOF。见模块文档。
+        windows_handle_inheritance::clear_std_inherit();
     }
 
     let mut child = command
@@ -2240,5 +2319,40 @@ mod tests {
         let gone = root.join("nope.toml");
         let text = scaffold::config_lines(&gone, &root, &scaffold::Config::default()).join("\n");
         assert!(text.contains("不存在，下面全是默认值"), "{text}");
+    }
+
+    #[test]
+    fn a_new_background_instance_starts_with_an_empty_log() {
+        let root = test_support::temp("fresh-background-log");
+        let log = instance::log_path(&root);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "old run\nmore old\n").unwrap();
+        reset_log_file(&log).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+    }
+
+    /// 面板按 `s` 后 `x` 失效的根因：daemon 继承了 launcher 的 stdout / stderr 管道，
+    /// 面板的 `Command::output()` 永远等不到 EOF。这里测的是修复用的机制本身——
+    /// 一个本来可继承的句柄，清掉继承位之后查到的标志必须变。
+    #[cfg(windows)]
+    #[test]
+    fn clearing_the_inherit_flag_is_observable() {
+        use std::os::windows::io::AsRawHandle;
+
+        let root = test_support::temp("handle-inherit");
+        let file = std::fs::File::create(root.join("probe.txt")).unwrap();
+        let raw = file.as_raw_handle() as *mut std::ffi::c_void;
+
+        assert!(
+            windows_handle_inheritance::make_inheritable(raw),
+            "先把测试句柄标成可继承"
+        );
+        assert_eq!(windows_handle_inheritance::is_inheritable(raw), Some(true));
+        assert!(windows_handle_inheritance::clear_handle_inherit(raw));
+        assert_eq!(
+            windows_handle_inheritance::is_inheritable(raw),
+            Some(false),
+            "清掉继承位之后，子进程就不该再收到这个句柄"
+        );
     }
 }
