@@ -72,7 +72,30 @@ impl Plugin for ManagePlugin {
         });
         let subscription = subscription.ok_or_else(|| "订阅 updateNewMessage 失败".to_owned())?;
         self.subscription = Some(subscription);
+
+        // 经共享服务把自己的命令登记进 /help（见 fuyubot.help.commands 的 `register` 方法）。
+        match host.call_service(
+            "fuyubot.help.commands",
+            "register",
+            r#"{"name":"plugins","description":"看看装了哪些插件"}"#,
+        ) {
+            Ok(reply) => host.log(
+                LogLevel::Info,
+                &format!("manage 插件已向 /help 注册命令：{reply}"),
+            ),
+            Err(error) => host.log(
+                LogLevel::Warn,
+                &format!("manage 插件注册命令到 /help 失败：{error}"),
+            ),
+        }
+
         Ok(())
+    }
+
+    fn soft_inject() -> Vec<String> {
+        // 把自己的命令登记进 /help：等 help 插件的命令注册服务就位后再激活，
+        // 这样 start() 里 `call_service` 注册命令必定成功。
+        vec!["fuyubot.help.commands".to_owned()]
     }
 
     fn stop(&mut self) {
