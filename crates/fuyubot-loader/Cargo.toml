@@ -24,4 +24,6 @@ fuyubot-tool.workspace = true
 libloading.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# 库只发事件、不装订阅者：控制台格式与颜色是 CLI 的事，测试 / 别的宿主可以自己接。
+tracing.workspace = true
 toml.workspace = true

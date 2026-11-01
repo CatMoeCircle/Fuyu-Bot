@@ -41,14 +41,29 @@ clap = { version = "4.6.7", features = ["derive"] }
 flate2 = "1.1.10"
 jsonschema = { version = "0.58.6", default-features = false }
 libloading = "0.9.0"
+# 终端操作面板（`run --tui`）。只给 CLI：库 crate 不依赖它（与约束 40 同理）。
+# 只要 crossterm 后端 + 核心 widget（日历 / 宏这些默认特性用不上，少拖时间 / proc-macro 依赖）。
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+# 日志行按显示宽度折行（中文占两列）；同样是 CLI 面板专用。
+unicode-width = "0.2.3"
+# 面板底部的进程 CPU / 内存占用。只要 `system` 特性（disk / network / gpu / user 都不拖）。
+sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 semver = "1.0.28"
 sha2 = "0.10.9"
 tar = "0.4.46"
 thiserror = "2.0.21"
+# 控制台日志的时间列：`time` 只给 CLI 用（`local-offset` 在 Windows 上是对 kernel32 的
+# 直接 FFI，不多拖依赖）；库 crate 只发 `tracing` 事件，不碰时间格式。
+time = { version = "0.3.55", features = ["local-offset"] }
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml = "0.9.12"
+# 结构化日志：插件名 / 更新类型进字段，控制台、文件与 TUI 各自决定怎么显示。
+# `tracing-subscriber` 刻意不启 `env-filter`（它会拖 matchers + regex-automata），
+# 级别过滤由 `HostRuntime` 在源头做，这样才能被 `.fuyubot/log-level` 运行期改。
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "fmt", "registry", "smallvec", "std"] }
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 
 # 开发迭代用：比 dev 略高优化，保留完整调试信息。

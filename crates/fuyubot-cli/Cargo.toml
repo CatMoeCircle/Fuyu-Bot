@@ -19,8 +19,16 @@ vendored = ["fuyubot-tdlib/vendored"]
 clap.workspace = true
 fuyubot-core.workspace = true
 fuyubot-loader.workspace = true
+# 只用 `CONNECTION_UPDATE` / `ConnectionState`（连接更新的通道名与五个状态）；不碰它的 HostApi 那部分。
+fuyubot-simplify.workspace = true
 fuyubot-tdlib.workspace = true
+ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sysinfo.workspace = true
+time.workspace = true
 tokio.workspace = true
 toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+unicode-width.workspace = true
