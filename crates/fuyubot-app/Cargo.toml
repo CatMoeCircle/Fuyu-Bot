@@ -1,0 +1,17 @@
+[package]
+name = "fuyubot-app"
+description = "宿主应用编排：内核 → 宿主运行时 → 接 TDLib → 装插件 → 登录 → 分发（CLI / Android JNI 共用）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fuyubot-core.workspace = true
+fuyubot-loader.workspace = true
+fuyubot-tdlib.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

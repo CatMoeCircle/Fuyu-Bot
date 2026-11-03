@@ -188,7 +188,7 @@ if loads == 0:
 symbols = [
     "fuyubot_abi_version", "fuyubot_start", "fuyubot_stop",
     "fuyubot_is_running", "fuyubot_answer", "fuyubot_last_error",
-    "fuyubot_memory",
+    "fuyubot_plugins", "fuyubot_plugin_info", "fuyubot_td_request",
     "JNI_OnLoad",
 ]
 missing = [name for name in symbols if (name.encode() + b"\0") not in data]

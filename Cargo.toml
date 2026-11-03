@@ -25,6 +25,8 @@ repository = "https://github.com/CatMoeCircle/Fuyu-Bot"
 
 [workspace.dependencies]
 fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.2" }
+# 宿主编排层：CLI 与 Android JNI 共用同一条启动顺序。
+fuyubot-app = { path = "crates/fuyubot-app", version = "0.1.2" }
 fuyubot-cli = { path = "crates/fuyubot-cli", version = "0.1.2" }
 fuyubot-core = { path = "crates/fuyubot-core", version = "0.1.2" }
 fuyubot-event = { path = "crates/fuyubot-event", version = "0.1.2" }
@@ -40,6 +42,9 @@ cbindgen = "0.29.4"
 clap = { version = "4.6.7", features = ["derive"] }
 flate2 = "1.1.10"
 jsonschema = { version = "0.58.6", default-features = false }
+# Android JNI 运行时（`crates/fuyubot-android` → `libfuyubotjni.so`）。
+# 纯 Rust 的 FFI 声明，桌面也编得动——这样 `cargo build --workspace` 能一直盯着它。
+jni = "0.21.1"
 libloading = "0.9.0"
 # 终端操作面板（`run --tui`）。只给 CLI：库 crate 不依赖它（与约束 40 同理）。
 # 只要 crossterm 后端 + 核心 widget（日历 / 宏这些默认特性用不上，少拖时间 / proc-macro 依赖）。
@@ -65,6 +70,9 @@ toml = "0.9.12"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "fmt", "registry", "smallvec", "std"] }
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+# TUI 插件商店的 zip 解包。**只给 CLI**：加载器与运行时永远不碰压缩包（P1 的边界）。
+# 只要 deflate（flate2 后端）：aes/bzip2/zstd/xz 这些作者包里用不到，别拖一串 C 依赖。
+zip = { version = "4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # 开发迭代用：比 dev 略高优化，保留完整调试信息。
 [profile.debug]

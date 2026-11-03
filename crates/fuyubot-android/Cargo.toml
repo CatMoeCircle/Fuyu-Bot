@@ -1,0 +1,28 @@
+[package]
+name = "fuyubot-android"
+description = "Android JNI 运行时（libfuyubotjni.so）：只交付 .so，不出 APK"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# 只随 Android 打包发布，不发 crates.io。
+publish = false
+
+[lib]
+# `libfuyubotjni.so` ← 宿主侧 `System.loadLibrary("fuyubotjni")`。
+# 名字里的 `jni` 与发布包 `fuyubot-<tag>-android-jni-<abi>.zip` 一致，别再改。
+name = "fuyubotjni"
+crate-type = ["cdylib"]
+
+[dependencies]
+# 编排（内核 → 宿主 → TDLib → 插件 → 登录）全在 fuyubot-app：与 CLI 共用同一份顺序。
+fuyubot-app.workspace = true
+# 只要 `TdlibParameters` / `AccountType` / `LOGIN_BUDGET` 这几个类型与常量。
+fuyubot-tdlib.workspace = true
+jni.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

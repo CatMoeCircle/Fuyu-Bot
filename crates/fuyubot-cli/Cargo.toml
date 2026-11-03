@@ -17,6 +17,8 @@ vendored = ["fuyubot-tdlib/vendored"]
 
 [dependencies]
 clap.workspace = true
+# 宿主编排层：`run` / `login` 与 Android JNI 共用同一条启动顺序。
+fuyubot-app.workspace = true
 fuyubot-core.workspace = true
 fuyubot-loader.workspace = true
 # 只用 `CONNECTION_UPDATE` / `ConnectionState`（连接更新的通道名与五个状态）；不碰它的 HostApi 那部分。
@@ -25,6 +27,10 @@ fuyubot-tdlib.workspace = true
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# TUI 插件商店：索引/下载/解压/校验全部在这一层（不进运行时，也不单独建 crate）。
+sha2.workspace = true
+ureq.workspace = true
+zip.workspace = true
 sysinfo.workspace = true
 time.workspace = true
 tokio.workspace = true
