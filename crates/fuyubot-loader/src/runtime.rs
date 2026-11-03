@@ -24,7 +24,7 @@ use fuyubot_middleware::{
 };
 use fuyubot_service::{ServiceContextExt as _, ServiceHandle as SvcRegistration};
 use fuyubot_simplify::{Simplify, ops};
-use fuyubot_tdlib::{TdClient, schema::TdApiSchema};
+use fuyubot_tdlib::{TdClient, TdlibError, schema::TdApiSchema};
 use fuyubot_tool::{ToolDescriptor, ToolHandle as ToolRegistration, ToolHandlerFn, ToolRegistry};
 use serde_json::{Value, json};
 
@@ -297,6 +297,77 @@ pub struct SentRequest {
     pub id: u64,
     pub method: String,
     pub params: Value,
+}
+
+/// [`HostRuntime::td_request`] 的错误。
+///
+/// 与 [`fuyubot_tdlib::TdlibError`] 分开：那条只管「发不出去」，这条还要表达
+/// 「没接 TDLib」「请求形状不对」「等了但没回来」——宿主（JNI / TUI）要能分别说清楚。
+#[derive(Debug, thiserror::Error)]
+pub enum TdRequestError {
+    /// 这次运行没有接 TDLib（`--no-tdlib` / 回放，或客户端还没建好）。
+    #[error("这次运行没有接 TDLib")]
+    NoTdlib,
+    /// 请求不是 JSON 对象。
+    #[error("请求必须是 JSON 对象（例如 {{\"@type\":\"getMe\"}}）")]
+    NotObject,
+    /// 请求缺 `@type`：TDLib 的每条请求都靠它选方法。
+    #[error("请求缺 @type")]
+    MissingType,
+    /// 交给 `td_send` 时失败（含 NUL 字节、库未就绪）。
+    #[error("发不出去：{0}")]
+    Send(#[from] TdlibError),
+    /// 预算内没等到**它自己的**响应（没有接收循环 / TDLib 没回）。
+    #[error("{id} 的响应没在 {waited:?} 内回来")]
+    Timeout { id: u64, waited: Duration },
+}
+
+/// [`HostRuntime::td_request`] 的一次等待：请求号 → 响应（`None` = 还在等）。
+///
+/// 每次请求一份，用完即弃：这样并发调用之间不共享状态，也不会因为某次超时把
+/// 别的请求的响应吃掉。
+#[derive(Default)]
+struct TdWaiters {
+    slots: Mutex<HashMap<u64, Option<Value>>>,
+    ready: Condvar,
+}
+
+impl TdWaiters {
+    /// 响应通道的订阅者调它。只认**本表登记过**的请求号，别人的响应原样放过。
+    fn deliver(&self, payload: &Value) {
+        let Some(id) = payload.get("request_id").and_then(Value::as_u64) else {
+            return;
+        };
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = slots.get_mut(&id) {
+            if slot.is_none() {
+                *slot = Some(payload.clone());
+                self.ready.notify_all();
+            }
+        }
+    }
+
+    /// 等到 `id` 的响应或 `deadline`。返回 `None` = 超时。
+    ///
+    /// 调用方必须先 `insert(id, None)` 再调它：先占位、后等待，才不会丢掉「占位之前
+    /// 就回来」的响应（`deliver` 只填已经存在的槽）。
+    fn wait(&self, id: u64, deadline: Instant) -> Option<Value> {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(value) = slots.get(&id).and_then(|slot| slot.as_ref()) {
+                return Some(value.clone());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (next, _) = self
+                .ready
+                .wait_timeout(slots, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            slots = next;
+        }
+    }
 }
 
 // 当前作用域栈：栈顶是「当前 (owner, scope)」。栈底永远是 `(0, 0)`（宿主根）。
@@ -1004,6 +1075,58 @@ impl HostRuntime {
             object.insert("request_id".to_owned(), json!(id));
         }
         self.events.emit_scoped(owner, RESPONSE_EVENT, &forwarded)
+    }
+
+    /// 发一条**原始 td_api JSON** 并等它自己的响应（宿主侧：JNI / TUI / 测试共用）。
+    ///
+    /// 与插件那条路（`td_invoke*` → 按归属回投）的区别：这条**不经过插件归属**，
+    /// 也不需要 `@request_id` 约定——就是 TDLib 自己的「发一条 JSON、收一条 JSON」。
+    ///
+    /// 规则：
+    /// - `request` 必须是对象且带 `@type`；`@extra` 由 [`TdClient::send`] 填，传了也会被覆盖。
+    /// - **阻塞**到响应回来或 `timeout` 到期；超时返回 [`TdRequestError::Timeout`]。
+    /// - 响应原样返回（`@type: "error"` 也是 `Ok`），由调用方自己判。
+    /// - ⚠️ **必须有东西在收**：分发循环在跑，或者登录中的 `Session::login` 自己那条接收
+    ///   循环（它把杂项经 `bypass` 转给管线）。两者都没有时只会等到超时。
+    /// - ⚠️ 别在接收循环自己的回调里调它：那等于「收的人等自己要收的东西」，会一直等到超时。
+    ///
+    /// 等待表是**按调用**建的：每次请求一份槽位 + 一条临时订阅（退出时随句柄退订），
+    /// 所以并发调用互不串号，超时也不会留下悬空条目。
+    pub fn td_request(&self, request: Value, timeout: Duration) -> Result<Value, TdRequestError> {
+        if !request.is_object() {
+            return Err(TdRequestError::NotObject);
+        }
+        if request.get("@type").and_then(Value::as_str).is_none() {
+            return Err(TdRequestError::MissingType);
+        }
+        let client = self.td.get().ok_or(TdRequestError::NoTdlib)?.clone();
+
+        let waiters = Arc::new(TdWaiters::default());
+        // 先订阅、再发送：响应可能在 `send` 返回之前就到达接收循环。
+        let _subscription = {
+            let waiters = Arc::clone(&waiters);
+            self.events.on(RESPONSE_EVENT, None, move |payload| {
+                waiters.deliver(payload);
+                Ok(())
+            })
+        };
+
+        // 占位与发送**在同一把锁里**：退出这段之后槽位已经在了，`deliver` 不会漏。
+        // 持锁期间只做一次 `td_send`（不阻塞、不等待），不会把接收线程卡住。
+        let id = {
+            let mut slots = waiters.slots.lock().unwrap_or_else(|e| e.into_inner());
+            let id = client.send(request)?.as_u64();
+            slots.insert(id, None);
+            id
+        };
+
+        match waiters.wait(id, Instant::now() + timeout) {
+            Some(payload) => Ok(payload),
+            None => Err(TdRequestError::Timeout {
+                id,
+                waited: timeout,
+            }),
+        }
     }
 
     /// 当前归属：0 = 宿主自己，其它 = 正在跑的那个插件（本线程作用域栈顶）。
@@ -2742,6 +2865,71 @@ mod tests {
 
     fn runtime() -> Arc<HostRuntime> {
         HostRuntime::new(Context::new()).expect("运行时应该建得起来")
+    }
+
+    /// 没接 TDLib 时立刻报 `NoTdlib`，不能傻等到超时。
+    #[test]
+    fn td_request_without_a_client_reports_no_tdlib() {
+        let rt = runtime();
+        let started = Instant::now();
+        let error = rt
+            .td_request(json!({ "@type": "getMe" }), Duration::from_secs(5))
+            .unwrap_err();
+        assert!(matches!(error, TdRequestError::NoTdlib), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// 形状校验在「有没有客户端」之前：参数错误要报参数错误。
+    #[test]
+    fn td_request_checks_the_request_shape_first() {
+        let rt = runtime();
+        assert!(matches!(
+            rt.td_request(json!([1, 2]), Duration::from_secs(1)),
+            Err(TdRequestError::NotObject)
+        ));
+        assert!(matches!(
+            rt.td_request(json!({ "foo": 1 }), Duration::from_secs(1)),
+            Err(TdRequestError::MissingType)
+        ));
+    }
+
+    /// 等待位被**它自己的**响应叫醒；别人的响应只该被放过。
+    #[test]
+    fn a_registered_request_is_woken_by_its_own_response() {
+        let waiters = Arc::new(TdWaiters::default());
+        waiters
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(11, None);
+
+        // 先喂一条别人的响应：不能把 11 叫醒。
+        waiters.deliver(&json!({"@type": "ok", "request_id": 99}));
+
+        let waiter = Arc::clone(&waiters);
+        let handle =
+            std::thread::spawn(move || waiter.wait(11, Instant::now() + Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(20));
+        waiters.deliver(&json!({"@type": "ok", "request_id": 11}));
+
+        assert_eq!(
+            handle.join().unwrap(),
+            Some(json!({"@type": "ok", "request_id": 11}))
+        );
+    }
+
+    /// 没人登记的请求号不该在表里长出来（否则并发请求会互相吃响应）。
+    #[test]
+    fn responses_for_unknown_ids_are_ignored() {
+        let waiters = TdWaiters::default();
+        waiters.deliver(&json!({"@type": "ok", "request_id": 7}));
+        assert!(
+            waiters
+                .slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
     }
 
     /// 插件自己起的线程上没有宿主的作用域栈——归属必须从 `host_ctx` 里认出来，
