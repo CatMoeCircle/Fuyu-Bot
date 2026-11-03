@@ -1,6 +1,6 @@
 //! TUI 插件商店：索引 / 搜索 / 详情 / 下载 / 校验 / 解压 / 安装 / 卸载。
 //!
-//! 边界（见 `docs/plugin-format-v1.md` §7 与约束 61）：索引、下载、zip 解压**只在这里**，
+//! 边界（见[文档站](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/bundle/) §7 与约束 61）：索引、下载、zip 解压**只在这里**，
 //! `fuyubot-loader` 与运行时永远不联网、不碰压缩包；安装落盘之后的目录布局仍由 bundle
 //! 契约（`plugins/<id>/` 与 `plugins/scripts/<id>/`）说了算。
 //!
@@ -1011,7 +1011,7 @@ fn fetch_index(url: &str) -> Result<Index, String> {
 /// 解析索引 JSON 并确认 schema 是本宿主认识的。
 fn parse_index(bytes: &[u8]) -> Result<Index, String> {
     let index: Index = serde_json::from_slice(bytes).map_err(|error| {
-        format!("索引不是合法 JSON：{error}（对照 docs/plugin-format-v1.md §7 的字段）")
+        format!("索引不是合法 JSON：{error}（对照文档站「插件分发格式 v1」§7 的字段）")
     })?;
     if index.schema != INDEX_SCHEMA {
         return Err(format!(

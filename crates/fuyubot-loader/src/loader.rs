@@ -468,7 +468,7 @@ impl PluginLoader {
     ///
     /// 这条路径上的信息全部来自文件系统：读清单、校验平台、解析 `entry`、读入口文件
     /// 的魔数。所以「这包装不装得上」在插件代码跑起来之前就有答案——这正是分发格式
-    /// v1 存在的理由（见 `docs/plugin-format-v1.md`）。
+    /// v1 存在的理由（见文档站[「插件分发格式 v1」](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/bundle/)）。
     ///
     /// `abi_version` 取清单里的 `abi`（没写就是 0 = 「装完才知道」）；依赖取
     /// `depends` / `optional_depends` 合成的 [`Manifest`]，与 ABI v4 的自描述同构。

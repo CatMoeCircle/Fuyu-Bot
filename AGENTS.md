@@ -174,7 +174,7 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 56. **`plugin_manifest` 的 `version` 取 `env!("CARGO_PKG_VERSION")`**（宏在调用点展开，所以是**插件 crate** 的版本，不是 abi 的）：它是真值，不是 `"0.0.0"` 占位。所有字符串过 `quote()` 转义（`"` / `\` / `< 0x20` → `\u00XX`），非 ASCII 原样写 UTF-8。宿主侧 `declared()` 的优先级是「manifest 该侧非空 → 用它，否则回退 `[plugin.<名>].inject`」，**覆盖而非合并、且逐侧判定**——所以插件一旦声明 `inject`，配置里那份就静默失效。
 57. **`plugin_free_handle` 的签名永久冻结**：`void plugin_free_handle(PluginHandle)` 只接 handle 本身、**不碰 VTable**，宿主正是在「版本对不上、VTable 一律不可信」那一刻调它（`probe` 与 `load_with_config` 两条路径都必须调，否则 `init` 里分配的状态就漏了）。所以它不能加参数、不能改语义——改了等于让老宿主在未来的插件上乱调。没导出它的 v3 插件只能像以前一样把状态留在那儿，`load` 照样返回 `AbiMismatch`。
 
-58. **simplify 下沉成 op JSON 分发，不是一个方法一个函数指针**（ABI v5，`docs/decisions.md` 变更 12）：
+58. **simplify 下沉成 op JSON 分发，不是一个方法一个函数指针**（ABI v5）：
     宿主侧实现在 `fuyubot-simplify::ops`，`HostRuntime::run_simplify` 调它——与 Rust 插件用的是
     **同一个** `Simplify`，不存在第二套行为。加操作 = 往 `SYNC_OPS` / `ASYNC_OPS` 与 `dispatch`
     里加一项，**不动 ABI**。异步 op 只能走 `simplify_invoke`（宿主起工作线程跑，结果照 `@request_id`
@@ -184,8 +184,9 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     全局订阅者——插件只该收到最后那一条 `simplifyResult`。
 
 59. **插件分发格式 v1（bundle）**：一个插件 = `plugins/<id>/`（脚本插件仍在
-    `plugins/scripts/<id>/`），根上的 `plugin.json` 是**权威静态元数据**；契约见
-    `docs/plugin-format-v1.md`。`plugin_entries` 只扫一层：bundle 按 id 在前、旧形态
+    `plugins/scripts/<id>/`），根上的 `plugin.json` 是**权威静态元数据**；契约见文档站
+    [插件分发格式 v1](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/bundle/)。
+    `plugin_entries` 只扫一层：bundle 按 id 在前、旧形态
     平铺 dll 按文件名在后；`.disabled/` / `<id>.disable` 一律不当候选。
     加载器必须能**不 dlopen** 就拿到 `id/version/kind/entry/depends`（`probe_bundle`），
     真正 `dlopen` 只发生在 `DylibPlugin::apply`；`plugin_files` 只服务旧形态，
@@ -203,4 +204,3 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 ## 文档
 
 公开文档只在**文档站**（`FuyuBot-Docs/content/docs/**`）；改 ABI / CLI / 行为时同步那边。
-本仓 `docs/` 下是随源码分发的工程台账（HANDOFF / ROADMAP / gaps / pitfalls / decisions / tech-debt），不入库，也不再要求随每次改动更新。

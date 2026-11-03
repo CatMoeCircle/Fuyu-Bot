@@ -2,7 +2,7 @@
 //!
 //! 一个插件 = 一个目录 + 一份 `plugin.json`。这一层**不 dlopen**：列举、校验、
 //! 排序、平台过滤全在文件系统上做完，所以「装了什么、能不能装」在进程被插件代码
-//! 污染之前就有答案（契约见 `docs/plugin-format-v1.md` §2 / §3）。
+//! 污染之前就有答案（契约见[文档站](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/bundle/) §2 / §3）。
 //!
 //! 旧形态（平铺 `*.dll`）继续认，两种形态由 [`plugin_entries`] 一起给出：
 //! bundle 在前（按 id 字典序），legacy 在后（按文件名）。
@@ -119,7 +119,7 @@ pub enum BundleError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("plugin.json 缺少必填字段 {0}，或它的取值不合法（见 docs/plugin-format-v1.md §3）")]
+    #[error("plugin.json 缺少必填字段 {0}，或它的取值不合法（见文档站「插件分发格式 v1」§3）")]
     Missing(&'static str),
     #[error(
         "插件 id {0:?} 不合法：要匹配 [A-Za-z0-9][A-Za-z0-9._-]*、不超过 128 字节、\
