@@ -54,8 +54,7 @@ logs/
 /dist/
 
 # ── 生成的绑定与编译产物 ──────────────────────────────────────────────
-# `fuyubot_plugin.h` 是**产物不是源码**（AGENTS.md 约束 35）：谁要落盘就
-# `fuyubot-sdk codegen --lang c` / `init --lang c` 现写一份。
+# `fuyubot_plugin.h` 是**产物不是源码**（AGENTS.md 约束 35）：用 `fuyubot_abi::PLUGIN_HEADER` 现写一份。
 fuyubot_plugin.h
 *.obj
 *.o

@@ -3,7 +3,7 @@
 //! 这里不实现任何宿主函数：`HostApiVTable` 的实现全在 `fuyubot-loader` 里，
 //! 本文件只负责把内核、宿主运行时、插件目录接起来。
 //!
-//! **插件开发的事不在这里**：脚手架由 `fuyubot-sdk init` 生成（见 `docs/decisions.md` 变更 4）。
+//! **插件开发的事不在这里**：没有插件开发 CLI，写法与示例都在文档站（见 `docs/decisions.md` 变更 12）。
 //!
 //! ```text
 //! fuyubot init                              生成 fuyubot.toml + plugins/
@@ -289,7 +289,7 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             cli!(info, "插件目录：{}", args.dir.join("plugins").display());
             cli!(
                 info,
-                "下一步：fuyubot-sdk init demo --lang rust（插件脚手架由开发 CLI 生成）"
+                "下一步：装 fuyubot-script 插件，或按文档站示例自己写插件（plugins/ 或 plugins/scripts/）"
             );
         }
         Command::Run(args) if args.tui => run_tui(args)?,
@@ -2302,7 +2302,7 @@ mod tests {
             Command::Config(_)
         ));
 
-        // 插件的脚手架**不在**运行时 CLI 里（变更 4）——它只在 `fuyubot-sdk`。
+        // 插件开发**不在**运行时 CLI 里（变更 12）——没有 fuyubot-sdk 了，示例在文档站。
         assert!(Cli::try_parse_from(["fuyubot", "new-plugin", "demo"]).is_err());
         // 插件也不归运行时 CLI 编（变更 5）：`build-plugin` 已经拆掉了。
         assert!(Cli::try_parse_from(["fuyubot", "build-plugin"]).is_err());

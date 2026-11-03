@@ -1,8 +1,8 @@
 [workspace]
-# 只有运行时本体 + ABI 契约 + 插件。插件 SDK 在另一个仓库（FuyuBot-SDK），
-# 文档站在第三个仓库（FuyuBot-Docs）；这里不再编 `fuyubot-sdk`。
+# 只有运行时本体 + ABI 契约 + 插件。脚本插件宿主在另一个仓库（FuyuBot-Script），
+# 文档站在第三个仓库（FuyuBot-Docs）；这里不再编任何 SDK。
 # 按角色分目录，别再把插件和库混在一起：
-#   crates/    运行时库（含发 crates.io 的 abi / tdlib-sys）
+#   crates/    运行时库（含发 crates.io 的 abi）
 #   plugins/   内置插件（随发布包分发）
 #   examples/  示例插件；replay/ 是回放数据不是 crate，所以示例 crate 单独点名
 #   tests/     测试夹具插件（集成测试用 `cargo build -p` 编它们）
@@ -12,15 +12,14 @@ default-members = ["crates/*", "plugins/*"]
 resolver = "3"
 
 [workspace.package]
-# 0.1.0 是首次公开版本（crates.io 上这两个 crate 之前一个版本都没有）。
+# 0.1.0 是首次公开版本（crates.io 上之前一个版本都没有）。
 # 0.1.1 给 `HostApiVTable` 尾部加了 `provide_service_shared`（服务作用域）。
-# 0.1.2 加了 `simplify_invoke` / `simplify_invoke_result`（ABI 4 → 5，simplify 下沉到宿主）——
-# 都是破坏性改动，所以 SDK 侧的依赖也一起顶到最新版。
+# 0.1.2 加了 `simplify_invoke` / `simplify_invoke_result`（ABI 4 → 5，simplify 下沉到宿主）。
 version = "0.1.2"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
-# `fuyubot-abi` / `fuyubot-tdlib-sys` 会发到 crates.io（SDK 仓库依赖它们）。
+# `fuyubot-abi` / `fuyubot-tdlib-sys` 会发到 crates.io。
 repository = "https://github.com/CatMoeCircle/Fuyu-Bot"
 
 [workspace.dependencies]

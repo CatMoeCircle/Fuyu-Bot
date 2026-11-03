@@ -19,8 +19,8 @@
 
 - 一个目录只能跑一个实例：`.fuyubot/lock` 独占，第二次 `run` 会被拒并报出正在跑的 PID。
 - 凭据（bot token / 手机号 / 两步验证密码）只走环境变量或交互输入，**不落盘**；`api_id` / `api_hash` 例外，交互问过会写回 `fuyubot.toml`。
-- `scaffold` 的模板与 FuyuBot-SDK 只有一份来源（`include_str!`），不在这里复制第二份。
-- `clap` 只允许出现在本 crate 与 SDK CLI。
+- `scaffold` 的模板只有一份来源（`include_str!`），不在这里复制第二份。
+- `clap` 只允许出现在本 crate。
 
 ## 相关
 

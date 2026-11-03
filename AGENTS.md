@@ -11,10 +11,11 @@ TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` �
 | 仓库 | 放什么 |
 | --- | --- |
 | **Fuyu-Bot**（本仓） | 运行时全部 + `fuyubot-abi` + `fuyubot-tdlib-sys`（后两个发 crates.io） |
-| FuyuBot-SDK | `fuyubot-plugin-api`、`fuyubot-sdk-script`、`fuyubot-sdk` CLI + 五种语言示例 |
-| FuyuBot-Docs | 文档站（<https://catmoecircle.github.io/FuyuBot-docs/>，源在 `content/docs/**`） |
+| FuyuBot-Script | 一个脚本插件宿主 `fuyubot-script`（Python + JS/TS 同一个 dll）+ 两个薄 SDK（PyPI / npm）。没有 CLI、没有示例 |
+| FuyuBot-Docs | 文档站（<https://catmoecircle.github.io/FuyuBot-Docs/>，源在 `content/docs/**`） |
 
-跨仓依赖只有一条、单向：SDK 通过 crates.io 依赖本仓的 `fuyubot-abi` / `fuyubot-tdlib-sys`。
+跨仓依赖只有一条、单向：FuyuBot-Script 通过 crates.io 依赖本仓的 `fuyubot-abi`。
+**crates.io 上本仓发 `fuyubot-abi` 与 `fuyubot-tdlib-sys` 两个包**；SDK 时代的其余 crate 已删除（仓库内移除 + crates.io yank）。
 
 ## 结构
 
@@ -146,10 +147,10 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 34. **`Option<fn>` 的签名要内联写**，不能走类型别名（会退化成不完整结构体）。
 35. **`fuyubot_plugin.h` 是产物**，权威副本是 `fuyubot_abi::PLUGIN_HEADER`，别签进仓库。
 36. **脚本插件四条硬约定**：`plugin_start` 等 `ready`、事件带订阅号、stdio 钉 UTF-8、起不来就报错。
-37. `script_plugin!` 内部走 `$crate::__macro_support::…`，不额外要求插件依赖别的 crate。
+37. **薄 SDK 的协议实现只有一份**：Python / JS 都走 `fuyubot-sdk-native`，语言侧只做「回调 ↔ C 函数指针」的转换；`script_plugin!` 已删（脚本不再各自带 cdylib）。
 38. **`run --replay` 不接 TDLib**：回放必须离线可跑。
-39. CLI 的模板与 SDK 只有一份来源（`include_str!`），不许复制第二份。
-40. **`clap` 只允许出现在两个 CLI crate 里**，库 crate 不许依赖它。
+39. CLI 的模板只有一份来源（`include_str!`），不许复制第二份。
+40. **`clap` 只允许出现在 CLI crate 里**，库 crate 不许依赖它。
 41. **Bot Token / 手机号 / 两步验证密码一律不落盘**：只走 `TG_BOT_TOKEN` 或交互输入。
     `api_id` / `api_hash` 是**例外**：它们**每次冷启动**都要随 `setTdlibParameters` 发出去
     （session 有效也一样），不记住就得每次手输——`run` 交互问过之后**明文写回**
@@ -157,7 +158,7 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     插件 `set_config` 的全量重写由 `persist_toml` 补回）。写回只发生在「这次真问过」时。
 42. **TDLib 字段路径先问真库**（如 `file.id`；`user` 没有 `is_bot` / `username`）。
 43. **TDLib 方法名 ≠ Bot API**：发送一律 `sendMessage` + `input_message_content`；参数名以 `td_api.tl` 为准，并留一条 `check_request` 测试。
-44. **`fuyubot-sdk check` 静态读导出表**，绝不 dlopen；ABI 版本只能运行时判定。
+44. **插件导出表只静态读、绝不 dlopen**：ABI 版本只能由 `plugin_init` 返回的 handle 在运行时判定（静态检查工具已随 SDK 仓删除）。
 45. **改文本用编辑器工具**，不要用 shell 读写源码（PowerShell 会把 UTF-8 当 cp936，毁中文并吞换行）。
 46. **发布资产契约**：tag `TDLib-v<版本>`、资产名 `TDLib-<os>-<arch>`（cargo 口径）、内容 `.tar.gz`；加平台要同时改 `ASSETS` 与 CI matrix。
 47. **实例状态是 `.fuyubot/` 三个文件**：`lock`（只用于独占）、`status`（启动后发布）、`stop`（优雅停止请求）；另有可选的 `log-level`（运行期调插件日志级别的控制文件，新实例拿锁时清掉）。**不要合并**。
@@ -166,11 +167,12 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     `<平台>` = x86_64 / aarch64），**解压出来就是本体**（zip 里不再套一层目录），
     内容是 exe + tdjson + `plugins/`；内置插件**不单独打包**，中间 tar.gz 只留在 Actions artifacts。
 50. **Go 的 c-shared 插件不能卸载**：识别 `Go buildinf` 魔数并故意不卸载；同进程重复加载不可靠。
-51. **三仓发布顺序**：本仓先发 `fuyubot-abi` / `fuyubot-tdlib-sys` → SDK 发 `fuyubot-plugin-api` → `fuyubot-sdk-script`；不要把 patch 写进 SDK 的 `Cargo.toml`。
+51. **发布顺序**：本仓发 `fuyubot-abi` / `fuyubot-tdlib-sys` →
+    FuyuBot-Script 发各平台 dll 资产（不进 crates.io）。不要把 patch 写进下游的 `Cargo.toml`。
 52. **插件配置段是 `[plugin.<插件名>]`**（ABI v4）：插件名点分 → TOML 嵌套表，宿主把插件名当**点路径**在 `plugin` 表里下钻（`fuyubot.manage` → `plugin.fuyubot.manage`）。`get_config(section, key)` 读**任意**段（自己 + 别人）；`set_config(key, value)` **没有 section 参数**，只写调用者自己那段（靠 `owner_names` 映射判定，插件无法伪造）。`set_config` 落盘是 `toml::to_string_pretty` **全量重写**（注释会丢），写盘失败要还原内存。脚本插件侧同步入口是 `plugin_config()` / `pluginConfig()`（中间插件在 spawn 前把自己的段塞进 `config` 的 `plugin_config` 键）。
 53. **依赖声明以 `plugin_manifest` 为准**：`DylibPlugin::inject()` / `soft_inject()` 先读 manifest（probe 阶段 `read_manifest` 拿到，`plugin_free_string` 归还），为空才退回 `[plugin.<名>].inject` / `.soft_inject`。别把配置当唯一来源——那会让「换台机器忘了抄」变成静默的加载顺序错误。
 54. **`reconcile` 不许在 `apply` 期间递归推进**：`apply` 里注册服务会同步触发服务变更钩子；若钩子就地递归，提供者还在 `Activating`（`start` 没跑完）依赖方就被激活，软依赖「基础设施先起来」直接作废、硬依赖也会提前放人。钩子只置 `Progress::needed` 并返回，由外层 `reconcile_loop` 接着推进（`Progress::running` 是闸门，`RunningGuard` 保证 panic 也不焊死）。
-55. **新增插件导出符号要三处同步**：`fuyubot-abi` 的 `SYM_*` 常量、`build.rs` 的 `TRAILER`（手写声明）、SDK 的 `sdk check` 的 `ABI_SYMBOLS`。约束 18 只管**类型**（`export.include`），不管函数声明——ABI v4 的 `plugin_manifest` / `fuyubot_abi_version` / `plugin_free_handle` 就漏在头文件外过一轮，C 作者据此**根本不知道要写**。`TRAILER` 里用到 ABI 类型的声明必须留在 trailer（`after_includes` 在所有类型定义之前，放那儿 `-fsyntax-only` 直接报错，约束 33）。
+55. **新增插件导出符号要两处同步**：`fuyubot-abi` 的 `SYM_*` 常量、`build.rs` 的 `TRAILER`（手写声明）。约束 18 只管**类型**（`export.include`），不管函数声明——ABI v4 的 `plugin_manifest` / `fuyubot_abi_version` / `plugin_free_handle` 就漏在头文件外过一轮，C 作者据此**根本不知道要写**。`TRAILER` 里用到 ABI 类型的声明必须留在 trailer（`after_includes` 在所有类型定义之前，放那儿 `-fsyntax-only` 直接报错，约束 33）。
 56. **`plugin_manifest` 的 `version` 取 `env!("CARGO_PKG_VERSION")`**（宏在调用点展开，所以是**插件 crate** 的版本，不是 abi 的）：它是真值，不是 `"0.0.0"` 占位。所有字符串过 `quote()` 转义（`"` / `\` / `< 0x20` → `\u00XX`），非 ASCII 原样写 UTF-8。宿主侧 `declared()` 的优先级是「manifest 该侧非空 → 用它，否则回退 `[plugin.<名>].inject`」，**覆盖而非合并、且逐侧判定**——所以插件一旦声明 `inject`，配置里那份就静默失效。
 57. **`plugin_free_handle` 的签名永久冻结**：`void plugin_free_handle(PluginHandle)` 只接 handle 本身、**不碰 VTable**，宿主正是在「版本对不上、VTable 一律不可信」那一刻调它（`probe` 与 `load_with_config` 两条路径都必须调，否则 `init` 里分配的状态就漏了）。所以它不能加参数、不能改语义——改了等于让老宿主在未来的插件上乱调。没导出它的 v3 插件只能像以前一样把状态留在那儿，`load` 照样返回 `AbiMismatch`。
 

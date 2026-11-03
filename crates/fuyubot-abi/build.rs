@@ -104,7 +104,7 @@ const TRAILER: &str = r#"/**
  * - `plugin_start` / `plugin_stop` 可省略（只做元数据登记的插件不写）；
  * - `plugin_manifest`（ABI v4）可省略，但**省略就意味着依赖只能靠宿主配置**
  *   `[plugin.<名>].inject`。想被宿主按依赖排序就必须导出它；
- * - `fuyubot_abi_version`（ABI v4）可省略，只服务 `fuyubot-sdk check` 的静态检查；
+ * - `fuyubot_abi_version`（ABI v4）可省略，只服务**静态**兼容性检查；
  * - `plugin_free_handle`（ABI v4）可省略，ABI 版本不匹配时宿主用它释放
  *   `plugin_init` 分配的状态（那种时候调 `plugin_stop` 不安全）；
  * - `plugin_free_string` 只要插件往外交付过字符串（含 `plugin_manifest`）

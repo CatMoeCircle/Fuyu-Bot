@@ -38,8 +38,8 @@ pub const SIMPLIFY_RESULT_TYPE: &str = "simplifyResult";
 
 /// cbindgen 生成的头文件**原文**。
 ///
-/// 嵌进来是为了让头文件跟着 crate 一起分发：C/C++ 插件作者（以及
-/// `fuyubot-sdk init --lang c`）不用先跑一次构建才能拿到 `fuyubot_plugin.h`。
+/// 嵌进来是为了让头文件跟着 crate 一起分发：C/C++ 插件作者不用先跑一次构建
+/// 才能拿到 `fuyubot_plugin.h`。
 pub const PLUGIN_HEADER: &str = include_str!(concat!(env!("OUT_DIR"), "/fuyubot_plugin.h"));
 
 /// 插件入口符号名。
@@ -49,7 +49,7 @@ pub const SYM_PLUGIN_STOP: &[u8] = b"plugin_stop";
 pub const SYM_PLUGIN_FREE_STRING: &[u8] = b"plugin_free_string";
 /// 释放 `plugin_init` 分配的状态（ABI 版本不匹配时 `plugin_stop` 不安全，用它）。
 pub const SYM_PLUGIN_FREE_HANDLE: &[u8] = b"plugin_free_handle";
-/// 静态导出插件编译时的 ABI 版本，`fuyubot-sdk check` 不 dlopen 也能读到。
+/// 静态导出插件编译时的 ABI 版本，不 dlopen 也能读到。
 pub const SYM_PLUGIN_ABI_VERSION: &[u8] = b"fuyubot_abi_version";
 /// 自描述元数据（名字 / 版本 / 依赖），宿主在 `plugin_init` 之前读。
 pub const SYM_PLUGIN_MANIFEST: &[u8] = b"plugin_manifest";
@@ -1066,7 +1066,7 @@ pub type PluginFreeHandleFn = unsafe extern "C" fn(handle: PluginHandle);
 
 /// `fuyubot_abi_version`：返回插件编译时的 ABI 版本（静态导出，不走 VTable）。
 ///
-/// `fuyubot-sdk check` 靠它做**静态**兼容性检查，不必 dlopen。
+/// 静态检查工具靠它做**静态**兼容性检查，不必 dlopen。
 pub type PluginAbiVersionFn = unsafe extern "C" fn() -> u32;
 
 /// `plugin_manifest`：返回自描述元数据 JSON（静态导出，不走 VTable）。
@@ -1209,7 +1209,7 @@ macro_rules! define_plugin {
             drop(unsafe { ::std::boxed::Box::from_raw(handle.context as *mut $ty) });
         }
 
-        /// 静态导出 ABI 版本，`fuyubot-sdk check` 不 dlopen 就能读。
+        /// 静态导出 ABI 版本，不 dlopen 就能读。
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn fuyubot_abi_version() -> u32 {
             $crate::ABI_VERSION

@@ -21,7 +21,7 @@ dev = "run -p fuyubot-cli -- run --config .fuyubot/fuyubot.toml --log-level trac
 # tdjson.dll（+ 兄弟 DLL）由 build.rs 一并放到 exe 旁边（loader 优先级 2 认「可执行文件目录」），
 # 内置插件则被 `fuyubot init` / `run` 复制进项目的 `plugins/`（只装缺的，不覆盖）。
 # 所以 `target/release/` 整个拷走、配一份 `fuyubot.toml` 就能跑。
-# SDK 不在这个仓库：`fuyubot-sdk` 由 FuyuBot-SDK 仓库编（`cargo build -p fuyubot-sdk-cli`）。
+# 脚本插件宿主不在这个仓库：`fuyubot-script` 由 FuyuBot-Script 仓库编。
 package-bot = [
     "build",
     "--release",

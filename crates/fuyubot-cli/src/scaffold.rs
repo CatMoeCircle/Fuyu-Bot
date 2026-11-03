@@ -1,6 +1,6 @@
 //! 运行时 CLI 的脚手架：`fuyubot init`（项目配置）与 `plugin install`。
 //!
-//! **插件的脚手架不在这里**——那是开发 CLI `fuyubot-sdk init` 的事（`docs/decisions.md` 变更 4）。
+//! **插件开发不在这里**——没有开发 CLI 了，脚手架与示例都在文档站（`docs/decisions.md` 变更 12）。
 //! 这里只剩「项目配置」与「把编好的插件装进插件目录」两件事。
 //!
 //! 项目模板用 `include_str!` 嵌进二进制，所以 `fuyubot init` 在任何目录都能跑，

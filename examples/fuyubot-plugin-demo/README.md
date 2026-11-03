@@ -17,5 +17,5 @@
 ## 相关
 
 - [插件开发](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/)
-- [SDK 五种语言示例](https://github.com/CatMoeCircle/FuyuBot-SDK/tree/main/examples)
+- [各语言插件示例](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/)
 - [仓库](https://github.com/CatMoeCircle/Fuyu-Bot)

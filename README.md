@@ -44,7 +44,7 @@
 2026-10-31 07:05:13 cli INFO  已安装 3 个内置插件到 demo\plugins
 2026-10-31 07:05:13 cli INFO  已生成 demo\fuyubot.toml
 2026-10-31 07:05:13 cli INFO  插件目录：demo\plugins
-2026-10-31 07:05:13 cli INFO  下一步：fuyubot-sdk init demo --lang rust（插件脚手架由开发 CLI 生成）
+2026-10-31 07:05:13 cli INFO  下一步：装 fuyubot-script 插件，或按文档站示例自己写插件（plugins/ 或 plugins/scripts/）
 ```
 
 命令行输出**全部**走 `tracing`：命令结果、运行期诊断、致命错误都是同一份
@@ -156,16 +156,18 @@ Rust / C / Python / JS 四种写法见
 
 ## 插件
 
-内置三个：`/start`、`/help`、`/plugins`。自己的插件放进 `plugins/` 即可，一个动态库就是一个插件；
-用 Python / JS / TS 写的话，脚本要和那个动态库**同目录**。
-
-写插件用 **[`fuyubot-sdk`](https://github.com/CatMoeCircle/FuyuBot-SDK)**（在 SDK 仓库）：
+内置三个：`/start`、`/help`、`/plugins`。自己的插件放进 `plugins/`：Rust / C / C++ / Go 编成动态库；
+Python / JS / TS 写脚本目录，由 [`fuyubot-script`](https://github.com/CatMoeCircle/FuyuBot-Script)
+托管（从它的 Release 下 `fuyubot-script-<OS>-<平台>.zip`，解压到 `plugins/`）：
 
 ```bash
-fuyubot-sdk init <名字> --lang <rust|c|cpp|python|js> --dir <项目目录>
-fuyubot-sdk codegen --lang <…> --dir <工程目录>   # 刷新 C 头 / .pyi / .d.ts
-fuyubot-sdk check <产物路径>                      # 静态检查（不加载、不运行）
+pip install fuyubot    # Python 脚本薄 SDK
+bun add fuyubot        # JS / TS 脚本薄 SDK
 ```
+
+Rust 插件直接依赖 [`fuyubot-abi`](https://crates.io/crates/fuyubot-abi) 写 `define_plugin!`；
+C / C++ 用 `fuyubot_abi::PLUGIN_HEADER`。**没有插件开发 CLI**：脚手架、示例与各语言模板都在
+[文档站的「插件开发」](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/)。
 
 编是插件作者自己的工具链的事（`cargo build`、`cl /LD`、`gcc -shared`…），
 `fuyubot` **不编译插件**，`plugin install` 只负责把编好的东西复制进插件目录：
@@ -174,19 +176,16 @@ fuyubot-sdk check <产物路径>                      # 静态检查（不加载
 fuyubot plugin install <插件工程目录> --plugin-dir <插件目录>
 ```
 
-各语言的模板、ABI 与调试方法见[文档站的「插件开发」](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/)，示例工程在
-[SDK 仓库的 `examples/`](https://github.com/CatMoeCircle/FuyuBot-SDK/tree/main/examples)。
-
 ## 文档
 
 | 去哪 | 看什么 |
 | --- | --- |
 | [FuyuBot-Docs](https://github.com/CatMoeCircle/FuyuBot-Docs) | **使用文档站**：安装、配置、运行、回放、排错 |
-| [FuyuBot-SDK](https://github.com/CatMoeCircle/FuyuBot-SDK) | 插件 SDK、`fuyubot-sdk` CLI、五种语言示例 |
+| [FuyuBot-Script](https://github.com/CatMoeCircle/FuyuBot-Script) | 脚本插件宿主（Python / JS / TS）+ 两个薄 SDK |
 | [架构与数据流](https://catmoecircle.github.io/FuyuBot-docs/docs/dev/architecture/) | 内核、更新管线、绑定层与数据流 |
 | [调用 TDLib](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/tdlib/) | `td_invoke`、响应通道、`fuyubot-simplify` 全量对照 |
 
-本仓只放运行时；插件 SDK 在 FuyuBot-SDK，文档站在 FuyuBot-Docs。
+本仓只放运行时；脚本插件宿主在 FuyuBot-Script，文档站在 FuyuBot-Docs。
 
 ## 从源码构建
 

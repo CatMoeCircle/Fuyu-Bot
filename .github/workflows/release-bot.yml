@@ -6,8 +6,8 @@
 # 多个版本可以并存，用户能一眼看出下的是哪个版本。`<OS>` = windows / linux / macos，
 # `<平台>` = x86_64 / aarch64。
 #
-# 本仓库只发**运行时**。插件开发 CLI（`fuyubot-sdk`）在 FuyuBot-SDK 仓库的
-# `release-sdk.yml` 里发；文档站在 FuyuBot-Docs。
+# 本仓库只发**运行时**。脚本插件宿主（`fuyubot-script`）在 FuyuBot-Script 仓库发；
+# 文档站在 FuyuBot-Docs。
 #
 # 桌面平台集合 = `crates/fuyubot-tdlib/src/loader/vendored.rs` 的 `ASSETS` 表：
 #   Windows x86_64 / aarch64、Linux x86_64 / aarch64、macOS **只有 aarch64**
@@ -478,7 +478,7 @@ jobs:
             "| --- | --- |" \
             "$table" \
             "" \
-            "插件开发 CLI（\`fuyubot-sdk\`）在 FuyuBot-SDK 仓库的 Release 里单独发布（不需要 tdjson）。")
+            "脚本插件宿主（\`fuyubot-script\`）在 FuyuBot-Script 仓库的 Release 里单独发布。")
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/*.zip --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit "$TAG" --notes "$notes" --repo "$GITHUB_REPOSITORY"

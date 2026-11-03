@@ -36,9 +36,9 @@ const ID_MAX_LEN: usize = 128;
 pub enum PluginKind {
     /// 原生动态库：宿主自己 dlopen。
     Native,
-    /// Python 脚本：由 SDK 的 `fuyubot_python_host` 中间插件跑。
+    /// Python 脚本：由 FuyuBot-Script 的 `fuyubot-script` 插件托管。
     Python,
-    /// JavaScript / TypeScript 脚本：由 `fuyubot_js_host` 跑。
+    /// JavaScript / TypeScript 脚本：同样由 `fuyubot-script` 托管。
     Js,
 }
 
@@ -452,8 +452,8 @@ pub fn disabled_bundles(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 
 /// 列出脚本插件根（`plugins/scripts/`）下带 `plugin.json` 的子目录。
 ///
-/// 只用于**列举**：真正的发现 / 启停仍归 SDK 的 `fuyubot_python_host` /
-/// `fuyubot_js_host`。没有清单的老脚本目录不会出现在这里（调用方可以自己看
+/// 只用于**列举**：真正的发现 / 启停仍归 `fuyubot-script` 插件。
+/// 没有清单的老脚本目录不会出现在这里（调用方可以自己看
 /// `package.json` / `pyproject.toml`）。目录不存在时返回 `Ok(vec![])`。
 pub fn script_bundles(scripts_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
