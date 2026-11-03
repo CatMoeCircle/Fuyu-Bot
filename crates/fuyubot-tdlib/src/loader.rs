@@ -174,9 +174,23 @@ pub fn resolve() -> Result<ResolvedLibrary, TdlibLoadError> {
 }
 
 /// 裸库名是否真的能被系统链接器找到。`resolve_with` 用它判定优先级 4 是否命中。
+///
+/// ⚠️ **成功之后故意不卸载**。`dlopen` 不是「只看看」：它会跑库里的静态构造器
+/// （C++ 全局 ctor、`__attribute__((constructor))`），而 libc++ / 某些库会在构造或
+/// 首次使用里 `pthread_key_create` 注册线程局部析构。bionic **不会**在 `dlclose`
+/// 时摘掉那个 key 的 destructor——之后任何用过这份 TLS 的线程退出，
+/// `pthread_key_clean_all` 就会跳到已解除映射的代码上（`pc == fault addr`，2026
+/// 设备侧实测）。探测只判存在性，多留一份映射不影响任何调用方；真正的加载在后面
+/// 走 `open_library`，同一个 soname 会直接复用这份映射。
 fn bare_name_loads(name: &Path) -> bool {
-    // SAFETY: 只是探测能不能加载；加载成功的话句柄立即 drop，不执行任何代码。
-    unsafe { Library::new(name) }.is_ok()
+    match unsafe { Library::new(name) } {
+        Ok(lib) => {
+            // SAFETY: 与上面的理由相同——这份映射要活到进程结束。
+            std::mem::forget(lib);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// 用给定的环境与探测函数解析，便于测试。
@@ -379,6 +393,67 @@ pub unsafe fn open_library(target: &Path) -> Result<Library, libloading::Error> 
     }
     // SAFETY: 由调用方的契约保证。
     unsafe { Library::new(target) }
+}
+
+/// Android：`libtdjson.so` 的运行时依赖是**独立 .so**（libc++_shared / libcrypto / libssl），
+/// 必须和它放在同一目录。这里在 `dlopen(tdjson)` 之前按依赖顺序把它们加载一遍，
+/// 并且**永不关闭**（`forget`）：这些库自己 `pthread_key_create` 注册的 TLS 析构
+/// 不能跟着任何一次 `dlclose` 一起消失，否则线程退出时就会在
+/// `pthread_key_clean_all` 里跳到已解除映射的地址。
+///
+/// 顺序固定：libc++_shared → libcrypto → libssl（libssl 依赖 libcrypto）。
+/// 找不到文件**不算错**：老包（静态并入的）本来就没有这些文件。
+///
+/// 注意：宿主如果在 `start` 之前就 `System.load(tdjson)`，那一步仍然要靠
+/// `libtdjson.so` 的 `$ORIGIN` rpath 找到依赖；本函数只负责把已经能加载的钉住。
+#[cfg(target_os = "android")]
+pub fn preload_runtime_deps(dir: &Path) {
+    for path in siblings_to_preload(dir) {
+        match unsafe { open_library(&path) } {
+            Ok(lib) => {
+                // 故意泄漏：库要活到进程结束（理由见函数文档）。
+                std::mem::forget(lib);
+            }
+            Err(error) => {
+                eprintln!(
+                    "预加载 {} 失败：{error}（继续，交给 tdjson 自己找）",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// 同目录下要预加载的依赖，已按加载顺序排好。
+///
+/// 单独拆出来是为了能在桌面上单测（Android 上跑不了单测）。
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn siblings_to_preload(dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<(u8, String, PathBuf)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let rank = if name == "libc++_shared.so" {
+            0
+        } else if name.starts_with("libcrypto.so") {
+            1
+        } else if name.starts_with("libssl.so") {
+            2
+        } else {
+            continue;
+        };
+        found.push((rank, name.to_owned(), path));
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    found.into_iter().map(|(_, _, path)| path).collect()
 }
 
 /// 解析 5 个符号。
@@ -605,5 +680,70 @@ mod tests {
         let got = resolve_with(&env_with("linux"), &|_| true).unwrap();
         assert_eq!(got.source, LibrarySource::BareName);
         assert_eq!(got.target, PathBuf::from("libtdjson.so"));
+    }
+
+    /// Android 的依赖预加载：只挑那三个，且顺序必须是 c++ → crypto → ssl。
+    #[test]
+    fn siblings_are_picked_and_ordered() {
+        let dir = tempdir();
+        for name in [
+            "libtdjson.so",
+            "libssl.so.3",
+            "libcrypto.so.3",
+            "libc++_shared.so",
+            "fuyubot_plugin_help.so",
+            "notes.txt",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+
+        let picked: Vec<String> = super::siblings_to_preload(dir.path())
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            picked,
+            ["libc++_shared.so", "libcrypto.so.3", "libssl.so.3"],
+            "顺序错了：libssl 依赖 libcrypto，libc++ 要先于两者"
+        );
+    }
+
+    /// 老包（依赖静态并入）里没有这些文件：不该报错，也不该返回半个路径。
+    #[test]
+    fn siblings_absent_is_empty() {
+        let dir = tempdir();
+        std::fs::write(dir.path().join("libtdjson.so"), b"x").unwrap();
+        assert!(super::siblings_to_preload(dir.path()).is_empty());
+    }
+
+    /// 临时目录：不引 `tempfile`（运行时依赖清单是硬约束）。
+    ///
+    /// 落在仓内 `target/test-tmp/`（和 `fuyubot-loader` 的夹具同一个地方）：
+    /// 本机沙箱对 `%TEMP%` 的写入是拒绝的（`os error 5`），用系统临时目录会假红。
+    fn tempdir() -> TempDir {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(format!(
+                "fuyubot-tdlib-deps-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        TempDir(path)
+    }
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }

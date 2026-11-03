@@ -176,7 +176,12 @@ pub struct TdClient {
     waiters: Waiters,
     next_id: AtomicU64,
     /// 保持动态库存活；`None` 只出现在测试注入符号时。
+    ///
+    /// ⚠️ **drop 时故意不卸载**（见 [`Drop`]）：TDLib 在第一次 `create` 时就起了自己的
+    /// manager / scheduler 线程，它们活到进程结束；`dlclose` 之后它们再跑一步就是访问违例。
     _lib: Option<Library>,
+    /// 这次加载的 tdjson 绝对路径（诊断用：内存报告要按路径把库的映射认出来）。
+    library_path: Option<std::path::PathBuf>,
 }
 
 // SAFETY: TDLib 的 json-client 接口按文档是线程安全的（td_send / td_receive 可从任意线程调用）。
@@ -191,6 +196,14 @@ impl TdClient {
         let resolved = loader::resolve()?;
         let location = resolved.target.display().to_string();
 
+        // Android：tdjson 的依赖（libc++_shared / libcrypto / libssl）是独立 .so，
+        // 和它放同一目录。先把它们加载好并钉住（永不 dlclose），再开 tdjson——
+        // 否则这些库里的 pthread key destructor 会跟着某次 dlclose 一起悬空。
+        #[cfg(target_os = "android")]
+        if let Some(dir) = resolved.target.parent() {
+            loader::preload_runtime_deps(dir);
+        }
+
         // SAFETY: target 来自 loader，且我们把 Library 一直留在结构体里。
         let lib = unsafe { loader::open_library(&resolved.target) }.map_err(|source| {
             TdlibLoadError::Dlopen {
@@ -200,7 +213,20 @@ impl TdClient {
         })?;
 
         // SAFETY: lib 是刚加载的 TDLib，随后由 self 持有。
-        let api = unsafe { loader::resolve_symbols(&lib) }?;
+        //
+        // ⚠️ 从这里起库已经映射进进程，**任何错误出口都不能 dlclose**：`open_library`
+        // 已经跑过它的静态构造器（libc++ / OpenSSL 都在 `libtdjson.so` 里，见
+        // `build-tdlib-android.sh` 的 `c++_static`），它们注册的线程局部析构在
+        // `dlclose` 之后不会撤销——之后线程退出就会跳进已解除映射的地址
+        // （2026 设备侧实测：`pc == fault addr`，帧在 `pthread_key_clean_all`）。
+        // 与 `Drop` 里那条「永远不卸载 tdjson」同一条理由，只是这里更早。
+        let api = match unsafe { loader::resolve_symbols(&lib) } {
+            Ok(api) => api,
+            Err(error) => {
+                std::mem::forget(lib);
+                return Err(error.into());
+            }
+        };
 
         // 日志详细度先压到默认值（**在 create 之前**）：TDLib 自己的默认太啰嗦，
         // 每轮 `td_receive` 的超时、`Begin to wait for updates…` 之类全打 stderr。
@@ -212,6 +238,8 @@ impl TdClient {
         // SAFETY: 符号已解析；客户端句柄由 TDLib 分配。
         let raw = unsafe { (api.create)() };
         if raw.is_null() {
+            // 与上面同一个理由：库已经初始化过 TDLib 的全局状态，别 dlclose。
+            std::mem::forget(lib);
             return Err(TdlibLoadError::NullClientHandle.into());
         }
 
@@ -222,6 +250,7 @@ impl TdClient {
             waiters: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             _lib: Some(lib),
+            library_path: Some(resolved.target),
         })
     }
 
@@ -235,7 +264,15 @@ impl TdClient {
             waiters: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             _lib: None,
+            library_path: None,
         }
+    }
+
+    /// 这次加载的 tdjson 路径（`from_parts` 造的测试客户端是 `None`）。
+    ///
+    /// 内存报告用它把 `smaps` 里那些映射认成 TDLib，而不是算进宿主余量。
+    pub fn library_path(&self) -> Option<&std::path::Path> {
+        self.library_path.as_deref()
     }
 
     /// 覆盖日志详细度（默认 [`crate::ffi::DEFAULT_LOG_VERBOSITY`] = 1，在 [`new`](Self::new) 里设好）。
@@ -439,7 +476,10 @@ impl TdClient {
                 }
             }
         });
-        ReceiveLoop { stop, handle }
+        ReceiveLoop {
+            stop,
+            handle: Some(handle),
+        }
     }
 
     /// 已发出、还没收到响应的请求（`RequestId`、方法名、等了多久）。
@@ -459,13 +499,20 @@ impl TdClient {
 
 /// 接收循环的停止把手（gaps 缺口 8）。
 ///
-/// **停止是显式的 [`stop`](Self::stop)，不是 drop 即停** —— 这点刻意和 `Effect` /
-/// `Subscription` 那套「drop 即注销」相反：后台任务被静默丢掉时，调用方很容易误以为
+/// **正路是显式的 [`stop`](Self::stop) + [`join`](Self::join)，不是 drop 即停** —— 这点刻意和
+/// `Effect` / `Subscription` 那套「drop 即注销」相反：后台任务被静默丢掉时，调用方很容易误以为
 /// 「还在收更新」，而一个明确的 `stop()` 让「谁在什么时候停的」在代码里看得见。
+///
+/// ⚠️ 但 drop **必须有兜底**：把手在错误路径 / panic 里被丢掉时，如果不置停止位，那个
+/// `spawn_blocking` 任务会一直循环；tokio 的 `Runtime::drop` 会**无限期**等所有阻塞任务
+/// （它没有超时），于是整个进程卡死在退出那一刻。`Drop` 里置停止位不改变「显式 stop 才是
+/// 正路」，只保证「丢错了也不会把 tokio 焊死」——任务最迟一个轮询周期（1s）后自己退出。
 #[derive(Debug)]
 pub struct ReceiveLoop {
     stop: Arc<AtomicBool>,
-    handle: tokio::task::JoinHandle<()>,
+    /// `Option` 只为 [`join`](Self::join)：它按值取走句柄去 await，而 `Drop` 之后
+    /// 不能再从 `self` 里移出字段。
+    handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ReceiveLoop {
@@ -475,9 +522,21 @@ impl ReceiveLoop {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// 等循环真的退出。`stop()` 之后调；**没 stop 就 await 会一直等下去**。
-    pub async fn join(self) {
-        let _ = self.handle.await;
+    /// 等循环真的退出。`stop()` 之后调；**没 stop 就 await 会一直等下去**
+    /// （那时 `Drop` 还没机会跑——把手被 `join` 按值拿走了）。
+    pub async fn join(mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for ReceiveLoop {
+    fn drop(&mut self) {
+        // 兜底：见类型文档。`Drop` 里不能 await，所以只置停止位；任务会在下一个轮询周期
+        // 看到它并退出（`Runtime::drop` 等得到，但不会等一个永远不结束的循环）。
+        // 已经 `stop()` 过再 drop 是幂等的。
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -495,7 +554,17 @@ impl Drop for TdClient {
             unsafe { (self.api.destroy)(self.raw) };
             self.raw = std::ptr::null_mut();
         }
-        // self.lib 随后自然 drop，动态库在该句柄使用完之后卸载。
+        // ⚠️ **故意不卸载 tdjson**（与 Go 的 c-shared 插件同一条理由，AGENTS 约束 50）：
+        // `td_json_client_destroy` 只是把销毁**排进** TDLib 自己的线程，`ClientManager` /
+        // `Scheduler` 那些线程从第一次 `create` 起就活着、到进程结束才停。这里 `dlclose` /
+        // `FreeLibrary` 之后，它们下一次被唤醒就是在执行已被解除映射的代码——访问违例。
+        // 在 Android 上这一条尤其致命：进程不会跟着退出，表现是「stop 之后过一会儿
+        // 整个 App 崩掉」。多留一份映射不花什么钱，换掉的是一整类退出崩溃。
+        //
+        // 注意：`destroy` 照常调（那是 TDLib 的契约），只是**库本身**留到进程结束。
+        if let Some(lib) = self._lib.take() {
+            std::mem::forget(lib);
+        }
     }
 }
 
@@ -870,5 +939,31 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("被取消的等待者没被摘掉");
+    }
+
+    /// 把手被丢掉（错误路径 / panic）时也必须让阻塞任务退出。
+    ///
+    /// 反例是真实踩到过的：`spawn_blocking` 的循环只认停止位，把手静默 drop 之后
+    /// 停止位永远是 `false`；`Runtime::drop` 会**无限期**等这个阻塞任务，进程就卡在
+    /// 退出那一刻（`tokio` 没有任何超时兜底）。这里用「另一个线程里 drop 运行时 +
+    /// 超时收结果」把「卡死」变成一条会红的测试。
+    #[test]
+    fn dropping_the_handle_lets_a_runtime_shut_down() {
+        let (client, _sent) = fake_client();
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().expect("建不了 tokio 运行时");
+            runtime.block_on(async {
+                let receive = client.spawn_receive_loop(|_| {});
+                // 故意不 stop，直接丢把手：模拟 CLI / JNI 在错误分支上提前 return。
+                drop(receive);
+                drop(client);
+            });
+            // 以前这里会永远等下去：阻塞任务还在 while 循环里。
+            drop(runtime);
+            let _ = done.send(());
+        });
+        wait.recv_timeout(Duration::from_secs(5))
+            .expect("丢掉 ReceiveLoop 后 Runtime::drop 没返回——tokio 被卡死了");
     }
 }

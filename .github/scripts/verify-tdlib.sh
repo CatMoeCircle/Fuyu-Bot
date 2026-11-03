@@ -70,15 +70,27 @@ if [[ ! -f "$(dirname "$LIB")/VERSION.json" ]]; then
   exit 1
 fi
 
-# Reject packages that still ship openssl/zlib/c++_shared runtime DLLs/so/dylib.
+# 桌面平台的依赖必须静态并入（包里出现 openssl/zlib/c++_shared 就是打错了）。
+# **Android 是例外**：libc++_shared / libcrypto / libssl 是独立 .so，必须随包发。
 DIR="$(dirname "$LIB")"
-for bad in libssl.so libssl.so.3 libcrypto.so libcrypto.so.3 libz.so \
-  libssl.3.dylib libcrypto.3.dylib libssl-3-x64.dll libcrypto-3-x64.dll zlib.dll; do
-  if [[ -f "$DIR/$bad" ]]; then
-    echo "error: package must not ship runtime dep $bad (deps are statically merged)" >&2
+if [[ "$PLATFORM" != "android" ]]; then
+  for bad in libssl.so libssl.so.3 libcrypto.so libcrypto.so.3 libz.so \
+    libssl.3.dylib libcrypto.3.dylib libssl-3-x64.dll libcrypto-3-x64.dll zlib.dll; do
+    if [[ -f "$DIR/$bad" ]]; then
+      echo "error: package must not ship runtime dep $bad (deps are statically merged)" >&2
+      exit 1
+    fi
+  done
+else
+  [[ -f "$DIR/libc++_shared.so" ]] || {
+    echo "error: Android 包缺 libc++_shared.so（tdjson 现在是动态依赖它）" >&2
+    ls -la "$DIR" >&2 || true
     exit 1
-  fi
-done
+  }
+  # libcrypto / libssl 的 SONAME 带版本号（libcrypto.so.3），按前缀找。
+  compgen -G "$DIR/libcrypto.so*" >/dev/null || { echo "error: Android 包缺 libcrypto.so*" >&2; exit 1; }
+  compgen -G "$DIR/libssl.so*" >/dev/null || { echo "error: Android 包缺 libssl.so*" >&2; exit 1; }
+fi
 
 echo "==> verifying $LIB"
 python3 - "$LIB" "$PLATFORM" "$ARCH" <<'PY'
@@ -102,12 +114,23 @@ if meta.get("platform") != platform:
     raise SystemExit(f"platform mismatch: {meta.get('platform')} vs {platform}")
 if meta.get("arch") != arch:
     raise SystemExit(f"arch mismatch: {meta.get('arch')} vs {arch}")
-# Expect static linkage metadata (OpenSSL/zlib merged into tdjson).
+# 桌面：linkage 必须是 static、runtime_deps 必须为空。
+# Android：linkage=shared，runtime_deps 非空，且每一项都真的在包里。
 linkage = meta.get("linkage")
-if linkage and linkage != "static":
-    raise SystemExit(f"expected linkage=static, got {linkage!r}")
-if meta.get("runtime_deps") not in ([], None):
-    raise SystemExit(f"runtime_deps should be empty after static merge: {meta.get('runtime_deps')}")
+deps = meta.get("runtime_deps") or []
+if platform == "android":
+    if linkage != "shared":
+        raise SystemExit(f"Android 期望 linkage=shared，实际 {linkage!r}")
+    if not deps:
+        raise SystemExit("Android 包的 runtime_deps 不能为空（应有 libc++_shared / libcrypto / libssl）")
+    for dep in deps:
+        if not (lib.parent / dep).is_file():
+            raise SystemExit(f"runtime_deps 里的 {dep} 不在包里")
+else:
+    if linkage and linkage != "static":
+        raise SystemExit(f"expected linkage=static, got {linkage!r}")
+    if deps:
+        raise SystemExit(f"runtime_deps should be empty after static merge: {deps}")
 
 magic = data[:4]
 if magic == b"\x7fELF":
@@ -163,6 +186,6 @@ elif magic in (
 else:
     raise SystemExit(f"unknown binary magic: {data[:8].hex()}")
 
-print(f"OK {platform}/{arch} package verified (static linkage): {lib}")
+print(f"OK {platform}/{arch} package verified (linkage={meta.get('linkage')}): {lib}")
 print(json.dumps(meta, indent=2))
 PY

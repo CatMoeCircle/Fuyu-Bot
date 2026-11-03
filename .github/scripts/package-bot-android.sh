@@ -47,6 +47,21 @@ mkdir -p "$STAGE/plugins"
 cp "$BIN" "$STAGE/fuyubot"
 cp "$TDLIB_DIR/libtdjson.so" "$STAGE/libtdjson.so"
 
+# 运行时依赖：libc++_shared / libcrypto / libssl 是**独立 .so**，必须与 tdjson 同级。
+# 加载器会先按路径加载并钉住它们（永不 dlclose），再开 tdjson；缺一个设备上就起不来。
+shopt -s nullglob
+for pattern in 'libc++_shared.so*' 'libcrypto.so*' 'libssl.so*'; do
+  for f in "$TDLIB_DIR/"$pattern; do
+    [[ -f "$f" ]] || continue
+    cp -aL "$f" "$STAGE/$(basename "$f")"
+  done
+done
+shopt -u nullglob
+if [[ ! -f "$STAGE/libc++_shared.so" ]]; then
+  echo "warning: $TDLIB_DIR 里没有 libc++_shared.so——这是「静态并入」的旧 tdjson 产物；" >&2
+  echo "         新包应带 libc++_shared / libcrypto / libssl 三个独立 .so（见 build-tdlib-android.sh）" >&2
+fi
+
 # 内置插件：cdylib 文件名在 Linux 上有 `lib` 前缀，包里必须是**无前缀**的
 # `fuyubot_plugin_<名字>.so`（`scaffold::install_builtins` 按 `{stem}.so` 找）。
 for stem in fuyubot_plugin_start fuyubot_plugin_help fuyubot_plugin_manage; do
@@ -63,7 +78,8 @@ done
 printf '%s\n' \
   "fuyubot for Android（${TRIPLE}）—— 可执行文件，不是 apk" \
   "" \
-  "外置 TDLib：${VERSION}（commit ${COMMIT}，库与可执行文件同级，别删 libtdjson.so）" \
+  "外置 TDLib：${VERSION}（commit ${COMMIT}，库与可执行文件同级，别删 libtdjson.so" \
+  "  以及同级的 libc++_shared.so / libcrypto.so* / libssl.so*——tdjson 动态依赖它们）" \
   "内置插件在 plugins/（/start、/help、/plugins），init/run 会自动装进项目" \
   "" \
   "放哪儿跑：**要可执行权限的目录**——Termux 家目录（\$HOME）或 adb 推的 /data/local/tmp。" \

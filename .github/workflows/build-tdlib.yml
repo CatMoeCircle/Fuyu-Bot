@@ -1,7 +1,12 @@
 name: Build TDLib
 
 # Build follows https://tdlib.github.io/td/build.html (official CMake + tdjson).
-# Extra on top: OpenSSL/zlib statically merged into tdjson (static flags / triplets).
+# Extra on top:
+#   - 桌面：OpenSSL/zlib 静态并入 tdjson（static flags / triplets），包里只有一个库。
+#   - Android：**不并入**。libc++_shared / libcrypto / libssl 作为独立 .so 随包发，
+#     与 libtdjson.so 同级；loader 会在 dlopen 前预加载并钉住它们（见
+#     `build-tdlib-android.sh` 文件头：静态并入会把库里的 pthread key destructor
+#     一起带进 tdjson，dlclose 后线程退出会跳飞）。
 #
 # ⚠️ 职责边界：**这个 workflow 只产 TDLib（tdjson 动态库）**，不编 `fuyubot` 本体。
 #    `fuyubot` 二进制 / 内置插件 / zip / Release 全在 `release-bot.yml`（含 Android）。
@@ -506,7 +511,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out dist
-          # 脚本内部：host 生成源码 → 静态 OpenSSL(NDK) → cmake(android.toolchain.cmake) → tdjson
+          # 脚本内部：host 生成源码 → shared OpenSSL(NDK) → cmake(android.toolchain.cmake) → tdjson
+          # （OpenSSL / libc++ 是独立 .so，和 tdjson 一起产出，见脚本文件头）
           .github/scripts/build-tdlib-android.sh \
             "$GITHUB_WORKSPACE/td-src" \
             "$GITHUB_WORKSPACE/out" \
@@ -659,7 +665,7 @@ jobs:
             echo "| TDLib version | \`${VER}\` |"
             echo "| TDLib commit | \`${COMMIT:-resolved from ref}\` |"
             echo "| Build run | \`${RUN_URL}\` |"
-            echo "| Linkage | OpenSSL/zlib **statically merged into tdjson** |"
+            echo "| Linkage | 桌面：OpenSSL/zlib **statically merged**；Android：libc++_shared / libcrypto / libssl 为**独立 .so**（随包同级） |"
             echo "| Schema | \`td_api.tl\` |"
             echo
             echo "## Packages"
@@ -680,8 +686,9 @@ jobs:
                   print(f"| {platform} | {arch} | `{asset}` | `{asset}/` | `{libraries[platform]}` |")
           PY
             echo
-            echo "Each package contains only \`tdjson\` (+ \`VERSION.json\` / README)."
-            echo "No separate \`libssl\` / \`libcrypto\` / \`libz\` runtime files."
+            echo "Each desktop package contains only \`tdjson\` (+ \`VERSION.json\` / README)."
+            echo "Android packages also contain \`libc++_shared.so\`, \`libcrypto.so*\`, \`libssl.so*\` —"
+            echo "keep them in the **same directory** as \`libtdjson.so\`; the loader preloads and pins them."
             echo
             echo "Also attached: \`td_api.tl\`（构建期转换用，loader 不下载它）。"
             echo

@@ -64,13 +64,33 @@ STAGE_ROOT="$(mktemp -d)"
 STAGE_DIR="$STAGE_ROOT/$ASSET_NAME"
 mkdir -p "$STAGE_DIR"
 
-# 只带 tdjson 本身（+ Windows 的导入库）。OpenSSL/zlib 是静态并进去的，没有独立运行时依赖。
+# 只带 tdjson 本身（+ Windows 的导入库）。桌面平台的 OpenSSL/zlib 是静态并进去的，
+# 没有独立运行时依赖；**Android 是例外**：libc++_shared / libcrypto / libssl 是
+# 独立 .so（见 build-tdlib-android.sh 文件头），必须和 tdjson 同级一起发，
+# 否则设备上 dlopen 直接报“library not found”。
 cp -a "$TDLIB_JSON_DIR/$LIB_NAME" "$STAGE_DIR/"
 if [[ -f "$TDLIB_JSON_DIR/tdjson.lib" ]]; then
   cp -a "$TDLIB_JSON_DIR/tdjson.lib" "$STAGE_DIR/"
 fi
 if [[ -f "$TDLIB_JSON_DIR/build-info.txt" ]]; then
   cp -a "$TDLIB_JSON_DIR/build-info.txt" "$STAGE_DIR/"
+fi
+
+RUNTIME_DEPS=()
+shopt -s nullglob
+for pattern in 'libc++_shared.so*' 'libcrypto.so*' 'libssl.so*'; do
+  for f in "$TDLIB_JSON_DIR/"$pattern; do
+    [[ -f "$f" ]] || continue
+    cp -a "$f" "$STAGE_DIR/"
+    RUNTIME_DEPS+=("$(basename "$f")")
+  done
+done
+shopt -u nullglob
+
+# JSON 数组：有依赖就列出来，没有就是 `[]`。
+RUNTIME_DEPS_JSON="[]"
+if [[ ${#RUNTIME_DEPS[@]} -gt 0 ]]; then
+  RUNTIME_DEPS_JSON="[$(printf '"%s",' "${RUNTIME_DEPS[@]}" | sed 's/,$//')]"
 fi
 
 LINKAGE="static"
@@ -85,6 +105,11 @@ if [[ -f "$STAGE_DIR/tdjson.lib" ]]; then
   LINK_LIB_JSON="\"tdjson.lib\""
 fi
 
+LINKAGE_NOTE="OpenSSL/zlib are statically linked into ${LIB_NAME}"
+if [[ ${#RUNTIME_DEPS[@]} -gt 0 ]]; then
+  LINKAGE_NOTE="${LIB_NAME} dynamically depends on: ${RUNTIME_DEPS[*]} (shipped alongside; keep them in the same directory)"
+fi
+
 cat > "$STAGE_DIR/VERSION.json" <<EOF
 {
   "tdlib_version": "${TDLIB_VERSION}",
@@ -94,9 +119,9 @@ cat > "$STAGE_DIR/VERSION.json" <<EOF
   "arch": "${ARCH}",
   "library": "${LIB_NAME}",
   "linkage": "${LINKAGE}",
-  "linkage_note": "OpenSSL/zlib are statically linked into ${LIB_NAME}",
+  "linkage_note": "${LINKAGE_NOTE}",
   "import_lib": ${LINK_LIB_JSON},
-  "runtime_deps": [],
+  "runtime_deps": ${RUNTIME_DEPS_JSON},
   "build_date_utc": "${BUILD_DATE}",
   "consumed_by": "fuyubot (dynamically loaded by fuyubot-tdlib::loader)"
 }
@@ -109,7 +134,7 @@ cat > "$STAGE_DIR/README.md" <<EOF
 - **平台 / 架构**：${PLATFORM} / ${ARCH}
 - **TDLib 版本 / commit**：${TDLIB_VERSION} / ${TDLIB_COMMIT}
 - **动态库**：\`${LIB_NAME}\`
-- **链接方式**：${LINKAGE}（OpenSSL/zlib 静态并入，不需要额外的 libssl / libcrypto / libz）
+- **链接方式**：${LINKAGE}（${LINKAGE_NOTE}）
 - **构建时间 (UTC)**：${BUILD_DATE}
 
 ## fuyubot 怎么用它
@@ -135,8 +160,9 @@ ${ASSET_NAME}/
 - macOS：\`libtdjson.dylib\` 链的是静态 OpenSSL/zlib；带 \`@rpath\` id 与 ad-hoc codesign。
 - Windows：\`tdjson.dll\` 用 vcpkg **static** triplet 构建；可选的 \`tdjson.lib\` 只是导入库，
   **不是**运行时依赖。
-- Android：\`libtdjson.so\` 用 NDK 交叉编译（\`c++_static\` + 静态 OpenSSL），
-  zlib 用系统自带的 \`libz.so\`；**是** loader 的发布资产（与桌面同款 \`TDLib-android-<arch>\`），
+- Android：\`libtdjson.so\` 用 NDK 交叉编译；**libc++_shared / libcrypto / libssl 是独立 .so**，
+  必须与 \`libtdjson.so\` 放在**同一目录**（loader 会先加载并钉住它们，再开 tdjson）；
+  zlib 用系统自带的 \`libz.so\`。**是** loader 的发布资产（与桌面同款 \`TDLib-android-<arch>\`），
   同时 CI 另存一份 \`tdjson-android-<abi>\` 的 workflow artifact 给框架构建兜底。
 EOF
 
@@ -144,5 +170,5 @@ EOF
 tar -czf "$ARCHIVE_PATH" -C "$STAGE_ROOT" "$ASSET_NAME"
 
 rm -rf "$STAGE_ROOT"
-echo "==> packaged $ARCHIVE_PATH (asset=$ASSET_NAME, tar.gz, static-linked tdjson only)"
+echo "==> packaged $ARCHIVE_PATH (asset=$ASSET_NAME, tar.gz, runtime_deps=${RUNTIME_DEPS_JSON})"
 ls -lh "$ARCHIVE_PATH"

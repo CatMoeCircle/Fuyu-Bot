@@ -9,9 +9,15 @@
 #    主机编译器把生成器跑一遍，把源码落到 `$TDLIB_SRC/td/generate/auto`，再做 Android 构建。
 #    ⇒ host 侧需要 gperf + 一个 C++ 编译器（CI 的 apt 装了 g++）。
 #
-# 2. **Android 没有系统 OpenSSL**。这里自己用 NDK 编译一份**静态** OpenSSL
-#    （`no-shared`），zlib 用 NDK sysroot 里的 `libz.so`（Android 系统自带，不算额外运行依赖）。
-#    这与桌面的「静态并入 OpenSSL/zlib」目标一致：tdjson 只留一个文件。
+# 2. **Android 没有系统 OpenSSL**。这里自己用 NDK 编译一份 **shared** OpenSSL
+#    （`shared`），zlib 用 NDK sysroot 里的 `libz.so`（Android 系统自带，不算额外运行依赖）。
+#    ⚠️ 与桌面不同：这里**不**把 OpenSSL / libc++ 静态并进 tdjson，而是把
+#    `libssl.so*` / `libcrypto.so*` / `libc++_shared.so` 作为**独立 .so** 一起产出。
+#    理由（2026 设备侧）：静态并进去之后，这些库自己 `pthread_key_create` 注册的
+#    TLS 析构也跟着进了 tdjson；bionic 不会因为 `dlclose(tdjson)` 撤销那个 key，
+#    之后线程退出就在 `pthread_key_clean_all` 里跳到已解除映射的地址。拆成独立
+#    文件后，宿主/加载器可以把它们**钉住**（加载一次、永不关闭），key 的
+#    destructor 就永远有效。
 #
 # Args: <tdlib-src-dir> <output-dir> <abi: arm64-v8a | armeabi-v7a | x86 | x86_64>
 #
@@ -108,13 +114,14 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2) 静态 OpenSSL（每个 ABI 一份，缓存在 $OUT_DIR/openssl/<abi>）
+# 2) shared OpenSSL（每个 ABI 一份，缓存在 $OUT_DIR/openssl/<abi>）
 # ---------------------------------------------------------------------------
+# 用 `shared` 而不是 `no-shared`：产物要作为独立 .so 随包分发（见文件头 2.）。
 OPENSSL_PREFIX="$OUT_DIR/openssl/$ABI"
-if [[ -f "$OPENSSL_PREFIX/lib/libcrypto.a" && -f "$OPENSSL_PREFIX/lib/libssl.a" ]]; then
+if [[ -e "$OPENSSL_PREFIX/lib/libcrypto.so" && -e "$OPENSSL_PREFIX/lib/libssl.so" ]]; then
   echo "==> 复用已有 OpenSSL：$OPENSSL_PREFIX"
 else
-  echo "==> 编译静态 OpenSSL $OPENSSL_VERSION ($OPENSSL_TARGET)"
+  echo "==> 编译 shared OpenSSL $OPENSSL_VERSION ($OPENSSL_TARGET)"
   CACHE="${OPENSSL_CACHE_DIR:-$OUT_DIR/openssl-src}"
   mkdir -p "$CACHE"
   TARBALL="$CACHE/openssl-$OPENSSL_VERSION.tar.gz"
@@ -145,7 +152,7 @@ else
     cd "$SRC_DIR"
     PATH="$TOOLCHAIN/bin:$PATH" ./Configure "$OPENSSL_TARGET" \
       "-D__ANDROID_API__=$API_LEVEL" \
-      no-shared no-tests no-apps no-docs \
+      shared no-tests no-apps no-docs \
       --prefix="$OPENSSL_PREFIX" --openssldir="$OPENSSL_PREFIX/ssl"
 
     # ⚠️ OpenSSL 的 make 有三个坑，都踩过：
@@ -171,7 +178,8 @@ else
   )
 fi
 
-[[ -f "$OPENSSL_PREFIX/lib/libcrypto.a" ]] || { echo "error: libcrypto.a 没编出来" >&2; exit 1; }
+OPENSSL_SO="$(find "$OPENSSL_PREFIX/lib" -maxdepth 1 -name 'libcrypto.so*' -type f | head -n1 || true)"
+[[ -n "$OPENSSL_SO" ]] || { echo "error: libcrypto.so 没编出来（shared 没生效？）" >&2; ls -la "$OPENSSL_PREFIX/lib" >&2 || true; exit 1; }
 
 # ---------------------------------------------------------------------------
 # 3) 交叉编译 TDLib（tdjson）
@@ -185,17 +193,21 @@ CMAKE_ARGS=(
   -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake"
   -DANDROID_ABI="$ABI"
   -DANDROID_PLATFORM="android-$API_LEVEL"
-  # c++_static：把 libc++ 并进 tdjson，宿主侧只需要一个 .so（和桌面的「单文件」目标一致）。
-  -DANDROID_STL=c++_static
+  # c++_shared：libc++ / libc++abi 单独一个 .so，**不**并进 tdjson。这样宿主可以把它
+  # 钉住到进程结束，库里的 pthread key（API 21 的 `__cxa_thread_atexit` 兜底）不会
+  # 跟着 tdjson 一起被 dlclose（见文件头 2.）。
+  -DANDROID_STL=c++_shared
   # Android 15 起要求 16KB 页对齐（NDK r27+ 的开关）。
   -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON
   -DBUILD_SHARED_LIBS=ON
   -DTD_ENABLE_JNI=OFF
   -DOPENSSL_ROOT_DIR="$OPENSSL_PREFIX"
   -DOPENSSL_INCLUDE_DIR="$OPENSSL_PREFIX/include"
-  -DOPENSSL_SSL_LIBRARY="$OPENSSL_PREFIX/lib/libssl.a"
-  -DOPENSSL_CRYPTO_LIBRARY="$OPENSSL_PREFIX/lib/libcrypto.a"
-  -DOPENSSL_USE_STATIC_LIBS=TRUE
+  -DOPENSSL_SSL_LIBRARY="$OPENSSL_PREFIX/lib/libssl.so"
+  -DOPENSSL_CRYPTO_LIBRARY="$OPENSSL_PREFIX/lib/libcrypto.so"
+  # 依赖全在 tdjson 自己旁边（宿主目录 / 缓存目录都是「所有 .so 同级」）。
+  # 没这条，`System.load("/data/.../libtdjson.so")` 会报 libc++_shared.so / libcrypto.so 找不到。
+  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath,\$ORIGIN"
 )
 
 # zlib 用 NDK sysroot 里按 API 分层的 stub（Android 系统自带 libz.so）。
@@ -230,18 +242,65 @@ fi
 cp -aL "$MAIN" "$OUT_DIR/tdjson/libtdjson.so"
 "$TOOLCHAIN/bin/llvm-strip" --strip-unneeded "$OUT_DIR/tdjson/libtdjson.so"
 
+# 依赖单独出包：libc++_shared + OpenSSL 的 libcrypto/libssl（保留 SONAME 文件名，
+# 例如 libcrypto.so.3；tdjson 的 DT_NEEDED 认的就是这个）。
+# ← 这三个文件必须**和 libtdjson.so 同级**，宿主的加载器会在同一目录预加载并钉住它们。
+echo "==> 收集运行时依赖"
+shopt -s nullglob
+for pattern in 'libcrypto.so*' 'libssl.so*'; do
+  for f in "$OPENSSL_PREFIX/lib/"$pattern; do
+    [[ -f "$f" ]] || continue
+    base="$(basename "$f")"
+    # 不带版本号的 `libcrypto.so` 通常是软链；解引用会多出一份 5 MB 的副本。
+    # tdjson 的 DT_NEEDED 只认带 SONAME 的那个（如 libcrypto.so.3），所以跳过软链。
+    if [[ -L "$f" ]]; then
+      continue
+    fi
+    cp -aL "$f" "$OUT_DIR/tdjson/$base"
+  done
+done
+shopt -u nullglob
+
+LIBCXX="$(find "$SYSROOT/usr/lib/$TRIPLE" -maxdepth 1 -name 'libc++_shared.so' -type f 2>/dev/null | head -n1 || true)"
+if [[ -z "$LIBCXX" ]]; then
+  echo "error: sysroot 里没有 libc++_shared.so（$SYSROOT/usr/lib/$TRIPLE）" >&2
+  exit 1
+fi
+cp -aL "$LIBCXX" "$OUT_DIR/tdjson/libc++_shared.so"
+
+for f in "$OUT_DIR/tdjson/"libcrypto.so* "$OUT_DIR/tdjson/"libssl.so* "$OUT_DIR/tdjson/libc++_shared.so"; do
+  [[ -f "$f" ]] && "$TOOLCHAIN/bin/llvm-strip" --strip-unneeded "$f" || true
+done
+
 LIB="$OUT_DIR/tdjson/libtdjson.so"
 echo "==> llvm-readelf -h"
 "$TOOLCHAIN/bin/llvm-readelf" -h "$LIB" | grep -E 'Class|Machine|Type' || true
 
-# OpenSSL/zlib 必须是**静态**并进去的：出现 libssl/libcrypto 的 DT_NEEDED 就说明并失败了。
-echo "==> DT_NEEDED（不允许出现 libssl / libcrypto / libc++_shared）"
+# 现在**必须**是动态依赖：少一个就说明又并回去了（或者根本没链上）。
+echo "==> DT_NEEDED（必须是动态依赖 libc++_shared / libcrypto）"
 NEEDED="$("$TOOLCHAIN/bin/llvm-readelf" -d "$LIB" | grep -E 'NEEDED' || true)"
 echo "$NEEDED"
-if echo "$NEEDED" | grep -E 'libssl|libcrypto|libc\+\+_shared' >/dev/null; then
-  echo "error: tdjson 仍然动态依赖 openssl / libc++_shared（静态并入失败）" >&2
-  exit 1
-fi
+for required in 'libc++_shared' 'libcrypto'; do
+  if ! echo "$NEEDED" | grep -F "$required" >/dev/null; then
+    echo "error: tdjson 没有动态依赖 $required（又静态并进去了？）" >&2
+    exit 1
+  fi
+done
+# DT_NEEDED 里的每个非系统库都必须真的躺在同级目录里，否则设备上 dlopen 直接失败。
+while IFS= read -r dep; do
+  dep="$(echo "$dep" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')"
+  if [[ -z "$dep" ]]; then
+    continue
+  fi
+  case "$dep" in
+    libc.so|libdl.so|libm.so|libz.so|liblog.so|libandroid.so|ld-android.so) continue ;;
+  esac
+  if [[ ! -f "$OUT_DIR/tdjson/$dep" ]]; then
+    echo "error: DT_NEEDED 里的 $dep 不在 $OUT_DIR/tdjson（设备上会加载失败）" >&2
+    ls -la "$OUT_DIR/tdjson" >&2 || true
+    exit 1
+  fi
+done <<< "$NEEDED"
 
 {
   echo "platform=android"
@@ -252,12 +311,12 @@ fi
   echo "openssl_version=${OPENSSL_VERSION}"
   echo "doc=https://tdlib.github.io/td/build.html"
   echo "official_flow=host-generate+cmake(ndk toolchain)+tdjson"
-  echo "linkage=static"
-  echo "openssl_lib=${OPENSSL_PREFIX}/lib/libcrypto.a"
+  echo "linkage=shared"
+  echo "runtime_deps=libc++_shared.so,libcrypto.so,libssl.so"
   echo "zlib_note=libz.so comes from the Android system (NDK sysroot stub)"
-  echo "note=OpenSSL merged into libtdjson.so (static), libc++ merged via c++_static"
+  echo "note=libc++ (c++_shared) and OpenSSL are separate .so files next to libtdjson.so; rpath=\$ORIGIN"
 } > "$OUT_DIR/tdjson/build-info.txt"
 
 file "$LIB" || true
-ls -lh "$LIB"
+ls -lh "$OUT_DIR/tdjson"
 echo "==> Android $ABI tdjson ready"

@@ -1,17 +1,10 @@
 # ── AI / 开发过程文档：留在本机干活，**不进仓库** ─────────────────────
 # 这些记的是「东西是怎么做出来的」（路线图、交接说明、会话账、验收记录），
-# 不是**源代码的文档**。源代码的文档照常入库，见下面的说明。
+# 不是**源代码的文档**：源码的文档在 crate README 与文档注释里，公开文档只在文档站。
 # 用 .gitignore 而不是删掉：本机的开发流还要读它们。
-# 2026：交接文档按分工拆成了几份（入口 / 坑 / 缺口 / 决定 / 欠账），它们同样是过程文档。
-/docs/HANDOFF.md
-/docs/ROADMAP.md
-/docs/SESSION-SUMMARY.md
-/docs/acceptance-phase-*.md
-/docs/pitfalls.md
-/docs/gaps.md
-/docs/decisions.md
-/docs/tech-debt.md
-/docs/design-*.md
+# 2026：交接文档按分工拆成了几份（入口 / 坑 / 缺口 / 决定 / 欠账），
+# Android JNI 的设计稿与 crates.io 记录也在这里——整个 docs/ 都不进仓库。
+/docs/
 
 # ── 本机运行残留：备份、截图工具、ultralight 运行时 ───────────────────
 # `fuyubot.toml.bak-*` 里有**明文 api_hash**（约束 41 只允许它落在主配置里），

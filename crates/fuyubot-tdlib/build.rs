@@ -123,6 +123,27 @@ fn stage_next_to_binary(vendored_dir: Option<&Path>, version: &str) {
                 );
             }
         }
+        // Android 的 tdjson 依赖是**独立 .so**（libc++_shared / libcrypto / libssl），
+        // 一起放到可执行文件旁边：从 target/<triple>/<profile>/ 直接跑也能加载。
+        if os == "android" {
+            let dir = if source.is_dir() {
+                source.clone()
+            } else {
+                source.parent().map(Path::to_path_buf).unwrap_or_default()
+            };
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let android_dep = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(is_android_runtime_dep);
+                    if android_dep {
+                        let _ = copy_library(&path, &dest_dir);
+                    }
+                }
+            }
+        }
         return; // 第一个有货的来源说了算
     }
 }
@@ -145,6 +166,11 @@ fn staging_sources(
         sources.push(root.join(vendored::relative_library_dir(version, os, arch)));
     }
     sources
+}
+
+/// Android 上 tdjson 的独立运行时依赖（见 `build-tdlib-android.sh`）。
+fn is_android_runtime_dep(name: &str) -> bool {
+    name == "libc++_shared.so" || name.starts_with("libcrypto.so") || name.starts_with("libssl.so")
 }
 
 /// 复制（大小一样就当已经拷过——每次构建搬 28MB 没必要）。

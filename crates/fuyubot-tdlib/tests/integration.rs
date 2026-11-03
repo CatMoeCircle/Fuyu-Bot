@@ -510,3 +510,52 @@ fn log_in_hands_non_auth_updates_to_the_bypass() {
         "登录窗口里的更新被吞了（bypass 一条都没收到）：{seen:?}"
     );
 }
+
+/// 客户端销毁之后 tdjson **必须仍然映射着**（`TdClient::drop` 故意不 `dlclose`）。
+///
+/// 为什么：TDLib 在第一次 `create` 时就起了自己的 manager / scheduler 线程，它们活到
+/// 进程结束；库被卸载之后它们下一次被唤醒就是在执行已解除映射的代码。桌面端进程通常
+/// 紧跟着退出（看不出来），**Android 上进程不退出**——表现就是「stop 之后过一会儿整个
+/// App 崩」。这条测试把「库还映射着」钉住：把 `Drop` 改回自然释放，它会立刻红。
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[test]
+#[ignore = "需要真实 TDLib（TDLIB_TDJSON_PATH 或 vendored）"]
+fn tdjson_stays_loaded_after_the_client_is_dropped() {
+    let client = TdClient::new().expect("加载 TDLib 失败");
+    let resolved = fuyubot_tdlib::resolve().expect("解析 tdjson 失败");
+    let name = resolved
+        .target
+        .file_name()
+        .expect("tdjson 路径没有文件名")
+        .to_string_lossy()
+        .into_owned();
+
+    drop(client);
+
+    assert!(
+        library_is_still_mapped(&name),
+        "{name} 在客户端销毁后被卸载了——TDLib 的线程还在跑，这会变成访问违例"
+    );
+}
+
+/// Windows：模块还在进程的模块表里。
+#[cfg(windows)]
+fn library_is_still_mapped(name: &str) -> bool {
+    use std::ffi::c_void;
+
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+    }
+
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: 传的是本进程里以 NUL 结尾的宽字符串；查不到只返回 NULL。
+    !unsafe { GetModuleHandleW(wide.as_ptr()) }.is_null()
+}
+
+/// Linux / Android：`/proc/self/maps` 里还有这个库的影子。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn library_is_still_mapped(name: &str) -> bool {
+    std::fs::read_to_string("/proc/self/maps")
+        .map(|maps| maps.contains(name))
+        .unwrap_or(false)
+}

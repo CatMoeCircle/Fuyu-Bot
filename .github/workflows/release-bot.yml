@@ -344,10 +344,13 @@ jobs:
           export "CC_${triple//-/_}=$linker"
           export "AR_${triple//-/_}=$toolchain/bin/llvm-ar"
           echo "==> linker: $linker"
+          # 16KB 页对齐（Android 15 的 16KB 页设备要求所有 .so 的 PT_LOAD 对齐 >= 0x4000）。
+          # tdjson 那边由 cmake 的 `ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON` 管，这里管我们自己编的。
+          export RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
           cargo build --release --target "$triple" \
-            -p fuyubot-cli \
+            -p fuyubot-cli -p fuyubot-android \
             -p fuyubot-plugin-start -p fuyubot-plugin-help -p fuyubot-plugin-manage
-          ls -lh "target/$triple/release/fuyubot"
+          ls -lh "target/$triple/release/fuyubot" "target/$triple/release/libfuyubotjni.so"
 
       - name: Package fuyubot (Android)
         shell: bash
@@ -374,10 +377,35 @@ jobs:
             ".tdlib-cache/${TDLIB_VERSION}/android-${{ matrix.arch }}" \
             "$pkg"
 
+      # JNI 运行时（只有 .so）：给 APK 用，**不是**可执行文件、也不是 apk。
+      # 同一个 job、同一份交叉编译产物，只是多打一个 zip（`libfuyubotjni.so` + `libtdjson.so`）。
+      - name: Package fuyubotjni (Android)
+        shell: bash
+        env:
+          GIT_REF: ${{ github.ref }}
+          GIT_REF_NAME: ${{ github.ref_name }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [[ "$GIT_REF" == refs/tags/* ]]; then
+            version="$GIT_REF_NAME"
+          else
+            version="dev-${GIT_SHA:0:7}"
+          fi
+          pkg="fuyubot-${version}-android-jni-${{ matrix.abi }}"
+          # 参数顺序（见脚本头）：<triple> <abi> <tdlib版本> <tdlib commit> <dist> [tdjson目录] [包名]
+          .github/scripts/package-fuyubot-jni.sh \
+            "${{ matrix.target }}" "${{ matrix.abi }}" "$TDLIB_VERSION" \
+            "$GIT_SHA" dist \
+            ".tdlib-cache/${TDLIB_VERSION}/android-${{ matrix.arch }}" \
+            "$pkg"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: dist/*.tar.gz
+          # 可执行文件包（.tar.gz）与 JNI 包（.zip）都从这里上传；publish 里再各按形态处理。
+          path: dist/*
           if-no-files-found: error
 
   publish:
@@ -428,6 +456,8 @@ jobs:
                 *-linux-x86_64)    label="Linux（x86_64）" ;;
                 *-linux-aarch64)   label="Linux（ARM64）" ;;
                 *-macos-aarch64)   label="macOS（Apple Silicon）" ;;
+                *-android-jni-arm64-v8a) label="Android（arm64-v8a，JNI 库，给 APK 用）" ;;
+                *-android-jni-x86_64)    label="Android（x86_64，JNI 库，给 APK 用）" ;;
                 *-android-aarch64) label="Android（arm64-v8a，可执行文件）" ;;
                 *-android-x86_64)  label="Android（x86_64，模拟器 / 可执行文件）" ;;
                 *)                 label="$name" ;;
@@ -440,6 +470,9 @@ jobs:
             "" \
             "每个平台一个 zip：**解压出来就是本体**（没有额外的一层目录），" \
             "TDLib 动态库与可执行文件同级，内置插件（/start、/help、/plugins）在 \`plugins/\` 里。" \
+            "" \
+            "\`*-android-jni-*.zip\` 是**给 APK 用的 JNI 库**（\`libfuyubotjni.so\` + \`libtdjson.so\`），" \
+            "不是可执行文件、也不是 apk——装法与契约见压缩包里的 \`README.txt\` 与 \`include/fuyubot_jni.h\`。" \
             "" \
             "| 系统 | 资产 |" \
             "| --- | --- |" \
