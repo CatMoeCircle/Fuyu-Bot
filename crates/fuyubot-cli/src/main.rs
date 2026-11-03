@@ -1301,11 +1301,11 @@ fn plugin_list(args: PluginDirArgs) -> Result<(), Box<dyn std::error::Error>> {
         cli!(info, "  {}\tlegacy\t{}", file_name_of(path), path.display());
     }
 
-    // ③ 脚本插件（SDK 的 Python / JS 中间插件托管；这里只读静态清单）
+    // ③ 脚本插件（由 fuyubot.script 插件托管；这里只读静态清单）
     let rows = script_plugin_rows(&plugin_dir.join(fuyubot_loader::SCRIPTS_DIR));
     cli!(
         info,
-        "脚本插件（{} 个，由 SDK 的中间插件托管）：",
+        "脚本插件（{} 个，由 fuyubot.script 托管）：",
         rows.len()
     );
     if rows.is_empty() {
@@ -1894,7 +1894,7 @@ fn current_account(runtime: &fuyubot_loader::HostRuntime) -> Option<instance::Ac
 /// `--replay` 的等待窗口要按「有没有脚本插件」选。
 ///
 /// 判据基于 [`plugin_entries`]（契约 §4）：包看 `kind`，旧形态 dll 看同主干的
-/// 同伴脚本；另外 `plugins/scripts/` 非空也算——脚本由 SDK 中间插件在**另一个进程**
+/// 同伴脚本；另外 `plugins/scripts/` 非空也算——脚本由 `fuyubot.script` 在**另一个进程**
 /// 里跑，回放完要等它经管道回来。
 fn has_script_plugins(plugin_dir: &Path) -> bool {
     let entries = fuyubot_loader::plugin_entries(plugin_dir).unwrap_or_default();

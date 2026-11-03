@@ -931,7 +931,7 @@ const SKIP_ON_COPY: &[&str] = &[
 
 /// `source` 是不是一个**脚本插件目录**：带着 manifest，且 manifest 里有 fuyubot 身份段。
 ///
-/// 判据刻意与两个中间插件的 `discover` 一致（格式是公开契约），但这里不引 SDK——
+/// 判据刻意与 `fuyubot.script` 的 `discover` 一致（格式是公开契约），但这里不引它——
 /// CLI 不该依赖插件作者那一侧的 crate。两边各自轻量解析，格式漂移由端到端测试兜。
 pub fn is_script_plugin_dir(source: &Path) -> bool {
     if !source.is_dir() {

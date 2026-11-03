@@ -230,7 +230,7 @@ impl App {
                     continue;
                 }
             };
-            // 脚本包由 SDK 的中间插件从 `plugins/scripts/` 发现，宿主**不直接 dlopen**
+            // 脚本包由 `fuyubot.script` 插件从 `plugins/scripts/` 发现，宿主**不直接 dlopen**
             // 它的入口（那是一个 .py/.ts）。放错位置就明确报出来，别等 dlopen 报「不是动态库」。
             if probe.kind.is_script() {
                 tracing::warn!(
