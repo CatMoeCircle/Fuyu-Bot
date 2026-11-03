@@ -847,7 +847,8 @@ registry_url = "https://catmoecircle.github.io/FuyuBot-plugins/index.json"
 ```
 
 - 解析顺序：`FUYUBOT_REGISTRY_URL` → `[plugins].registry_url` → **未配置**（商店页空态 + 配置指引）；
-  官方商城地址定下来之前不写死默认值，避免把用户导到一个不存在的域名。
+  官方商城地址是 `https://catmoecircle.github.io/FuyuBot-plugins/index.json`，但**不硬编码默认值**：
+  用户显式配置才联网（模板里给了注释示例）。
 - **`[plugins.store]` 这种嵌套段属于 P1**（镜像 / TTL / 强制签名），P0 不实现，别照着写配置；
 - P0 想做镜像就改 `registry_url` 指向镜像的 `index.json`——索引与资产同源，
   顺带避开「只换资产、不换索引」那个信任问题（[§11](#11-镜像--离线--可复现)）。
