@@ -25,6 +25,8 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use crate::instance::{self, PluginDetail, State};
 use crate::panel::clipboard;
 use crate::panel::logfmt::{self, LevelFilter, LogFilter, SourceFilter};
+use crate::panel::login::{self, LoginEvent, LoginModal};
+use crate::panel::store::{self, StoreKey};
 use crate::scaffold;
 
 /// 首屏从文件尾部装多少行（再往回看就按段加载）。
@@ -41,20 +43,22 @@ const TOAST_SECS: u64 = 4;
 
 // ── 页面 ───────────────────────────────────────────────────────────
 
-/// 左侧导航的五个页面。
+/// 左侧导航的六个页面。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Overview,
     Plugins,
+    Store,
     Logs,
     Config,
     Help,
 }
 
 impl Page {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Overview,
         Self::Plugins,
+        Self::Store,
         Self::Logs,
         Self::Config,
         Self::Help,
@@ -64,6 +68,7 @@ impl Page {
         match self {
             Self::Overview => "概览",
             Self::Plugins => "插件",
+            Self::Store => "商店",
             Self::Logs => "日志",
             Self::Config => "配置",
             Self::Help => "帮助",
@@ -74,9 +79,10 @@ impl Page {
         match self {
             Self::Overview => 0,
             Self::Plugins => 1,
-            Self::Logs => 2,
-            Self::Config => 3,
-            Self::Help => 4,
+            Self::Store => 2,
+            Self::Logs => 3,
+            Self::Config => 4,
+            Self::Help => 5,
         }
     }
 
@@ -94,15 +100,19 @@ impl Page {
 /// 插件目录里看得见的东西（不 dlopen 也能列出来）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginKind {
-    /// 原生动态库（`.dll` / `.so` / `.dylib`）。
+    /// 原生插件包（`plugins/<id>/plugin.json`，kind = native）。
+    Bundle,
+    /// 原生动态库（旧形态，`.dll` / `.so` / `.dylib`）。
     Native,
-    /// 脚本插件目录（带 `package.json` 的 `fuyubot.name` 或 `pyproject.toml` 的 `[tool.fuyubot]`）。
+    /// 脚本插件目录（`plugins/scripts/<id>/`，或带 `package.json` 的
+    /// `fuyubot.name` / `pyproject.toml` 的 `[tool.fuyubot]`）。
     Script,
 }
 
 impl PluginKind {
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Bundle => "包",
             Self::Native => "dylib",
             Self::Script => "脚本",
         }
@@ -112,48 +122,192 @@ impl PluginKind {
 /// 插件目录里的一项。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskPlugin {
-    /// 文件名主干（原生）或目录名（脚本）。
+    /// 文件名主干（原生）或目录名 / 包 id（脚本、包）。禁用之后仍然是**原来的**名字：
+    /// `foo.dll.disable` 报 `foo`，面板上认得出是同一个插件。
     pub name: String,
     pub kind: PluginKind,
+    /// 磁盘上真实的路径（禁用的原生插件是 `…​.dll.disable`；禁用的包在 `.disabled/` 下）。
     pub path: PathBuf,
+    /// 启用着没有。禁用项仍然列出来，才能在这里再启用回去。
+    pub enabled: bool,
 }
 
-/// 扫插件目录。**不加载**：插件名要 dlopen 之后才知道，这里列的是磁盘上的文件。
+impl DiskPlugin {
+    /// 能在这个面板里开关吗。
+    ///
+    /// 三种都能：文件走改名（`.dll` ↔ `.dll.disable`），目录（包 / 脚本）整个挪到
+    /// `plugins/.disabled/<name>/` 再挪回来（契约 §2）。
+    pub fn toggleable(&self) -> bool {
+        matches!(
+            self.kind,
+            PluginKind::Bundle | PluginKind::Native | PluginKind::Script
+        )
+    }
+}
+
+/// 扫插件目录。**不加载**：名字与版本都来自磁盘（清单 / 文件名），一个 dll 都不开。
+///
+/// 收四类东西（契约 §2）：
+/// - `plugins/<id>/plugin.json` 的插件包；
+/// - 旧形态平铺 dylib（含被改名的 `<stem>.dll.disable`）；
+/// - `plugins/scripts/<dir>/` 的脚本插件（有清单的按 `id` 展示）；
+/// - 禁用项：`plugins/.disabled/<name>/`（包 / 脚本目录）与旧面板的 `<id>.disable/` 目录。
 ///
 /// 目录不存在 / 读不了都当空表（面板刚打开时项目可能还没装插件）。
 pub fn scan_plugins(dir: &Path) -> Vec<DiskPlugin> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut plugins: Vec<DiskPlugin> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
+    let mut plugins = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
-            if path.is_file()
-                && path
+            let disk_name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_file() {
+                if path
                     .extension()
                     .is_some_and(|extension| extension == fuyubot_loader::DLL_EXTENSION)
-            {
-                let name = path.file_stem()?.to_string_lossy().into_owned();
-                return Some(DiskPlugin {
-                    name,
-                    kind: PluginKind::Native,
-                    path,
-                });
+                {
+                    if let Some(stem) = path.file_stem() {
+                        plugins.push(DiskPlugin {
+                            name: stem.to_string_lossy().into_owned(),
+                            kind: PluginKind::Native,
+                            path,
+                            enabled: true,
+                        });
+                    }
+                } else if fuyubot_loader::is_disabled(&path) {
+                    // 禁用的原生插件：`foo.dll.disable`。
+                    let enabled = fuyubot_loader::enabled_path(&path);
+                    if enabled
+                        .extension()
+                        .is_some_and(|extension| extension == fuyubot_loader::DLL_EXTENSION)
+                    {
+                        if let Some(stem) = enabled.file_stem() {
+                            plugins.push(DiskPlugin {
+                                name: stem.to_string_lossy().into_owned(),
+                                kind: PluginKind::Native,
+                                path,
+                                enabled: false,
+                            });
+                        }
+                    }
+                }
+                continue;
             }
-            if scaffold::is_script_plugin_dir(&path) {
-                let name = path.file_name()?.to_string_lossy().into_owned();
-                return Some(DiskPlugin {
+            // 顶层目录：`scripts/` 与 `.disabled/` 在下面单独扫。
+            if !path.is_dir()
+                || disk_name == fuyubot_loader::SCRIPTS_DIR
+                || disk_name.starts_with('.')
+            {
+                continue;
+            }
+            // 旧面板的禁用形态：整个目录改名为 `<id>.disable`。
+            let (name, enabled) = match disk_name.strip_suffix(fuyubot_loader::DISABLED_SUFFIX) {
+                Some(stem) => (stem.to_owned(), false),
+                None => (disk_name.clone(), true),
+            };
+            if fuyubot_loader::is_bundle_dir(&path) {
+                plugins.push(DiskPlugin {
+                    name: bundle_display_name(&path, &name),
+                    kind: bundle_panel_kind(&path),
+                    path,
+                    enabled,
+                });
+            } else if scaffold::is_script_plugin_dir(&path) {
+                plugins.push(DiskPlugin {
                     name,
                     kind: PluginKind::Script,
                     path,
+                    enabled,
                 });
             }
-            None
-        })
-        .collect();
-    plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+    }
+
+    // 脚本插件：`plugins/scripts/<dir>/`（有 `plugin.json` 的按 id 展示）。
+    if let Ok(entries) = std::fs::read_dir(dir.join(fuyubot_loader::SCRIPTS_DIR)) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let disk_name = entry.file_name().to_string_lossy().into_owned();
+            if !path.is_dir()
+                || disk_name.starts_with('.')
+                || disk_name.ends_with(fuyubot_loader::DISABLED_SUFFIX)
+            {
+                continue;
+            }
+            if fuyubot_loader::is_bundle_dir(&path) {
+                plugins.push(DiskPlugin {
+                    name: bundle_display_name(&path, &disk_name),
+                    kind: PluginKind::Script,
+                    path,
+                    enabled: true,
+                });
+            } else if scaffold::is_script_plugin_dir(&path) {
+                plugins.push(DiskPlugin {
+                    name: disk_name,
+                    kind: PluginKind::Script,
+                    path,
+                    enabled: true,
+                });
+            }
+        }
+    }
+
+    // 禁用项：`plugins/.disabled/<name>/`（包或脚本目录）。
+    if let Ok(entries) = std::fs::read_dir(dir.join(fuyubot_loader::DISABLED_DIR)) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let disk_name = entry.file_name().to_string_lossy().into_owned();
+            if !path.is_dir() || disk_name.starts_with('.') {
+                continue;
+            }
+            if fuyubot_loader::is_bundle_dir(&path) {
+                plugins.push(DiskPlugin {
+                    name: bundle_display_name(&path, &disk_name),
+                    kind: bundle_panel_kind(&path),
+                    path,
+                    enabled: false,
+                });
+            } else if scaffold::is_script_plugin_dir(&path) {
+                plugins.push(DiskPlugin {
+                    name: disk_name,
+                    kind: PluginKind::Script,
+                    path,
+                    enabled: false,
+                });
+            }
+        }
+    }
+
+    // 同名的一对（有人把禁用文件和启用文件同时留着）只留启用那个：
+    // 排序把 `enabled` 放前面，`dedup_by` 只丢掉紧挨着的重复项。
+    plugins.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| b.enabled.cmp(&a.enabled))
+            .then_with(|| a.kind.label().cmp(b.kind.label()))
+    });
+    plugins.dedup_by(|a, b| a.name == b.name && a.kind == b.kind);
     plugins
+}
+
+/// 包在面板上显示的名字：清单里的 `id` 优先（契约 §2：目录名与 id 不一致时以 id 为准）。
+fn bundle_display_name(dir: &Path, fallback: &str) -> String {
+    fuyubot_loader::BundleManifest::load(dir)
+        .map(|manifest| manifest.id)
+        .unwrap_or_else(|_| fallback.to_owned())
+}
+
+/// 包在面板里的分类：脚本包显示成「脚本」，其余算「包」。
+fn bundle_panel_kind(dir: &Path) -> PluginKind {
+    fuyubot_loader::BundleManifest::load(dir)
+        .map(|manifest| {
+            if manifest.kind.is_script() {
+                PluginKind::Script
+            } else {
+                PluginKind::Bundle
+            }
+        })
+        .unwrap_or(PluginKind::Bundle)
 }
 
 /// 把字节按 `\n` 切成行，顺带记下每行在文件里占的字节数（含换行）。
@@ -886,6 +1040,15 @@ pub struct App {
     /// 配置读不出来时的错误原文（配置页直接展示）。
     pub config_error: Option<String>,
     pub disk_plugins: Vec<DiskPlugin>,
+    /// TUI 插件商店（懒建：第一次进商店页才建，建的时候才拉索引）。
+    pub store: Option<store::Store>,
+    /// 商店索引地址：`[plugins].registry_url` 或 `FUYUBOT_REGISTRY_URL`。
+    pub registry_url: Option<String>,
+    /// 插件页选中了磁盘清单里的第几项（开关 `Space` 作用在它身上）。
+    pub plugin_selected: usize,
+    /// 插件页磁盘清单的滚动位置与视口高度（表头占 1 行）。
+    pub plugin_scroll: usize,
+    pub plugin_view: usize,
     pub log_lines: Vec<String>,
     /// 每行折成几行（和 `log_lines` 对齐；`0` = 还没算，宽度变了就整表作废）。
     ///
@@ -966,6 +1129,13 @@ pub struct App {
     last_usage_sample: Instant,
     tx: Sender<JobDone>,
     rx: Receiver<JobDone>,
+    /// 登录弹窗（`None` = 没有在走登录流程）。一次只显示一个问题。
+    pub login: Option<LoginModal>,
+    /// 后台登录线程 → 界面。
+    login_rx: Receiver<LoginEvent>,
+    login_tx: Sender<LoginEvent>,
+    /// 登录线程还活着（模态框关掉、等下一个问题的时候也是 `true`）。
+    login_busy: bool,
 }
 
 impl App {
@@ -986,6 +1156,7 @@ impl App {
             .and_then(|raw| scaffold::parse_log_level(raw).ok())
             .map(|level| scaffold::log_level_name(level).to_owned());
         let (tx, rx) = channel();
+        let (login_tx, login_rx) = channel();
         let mut app = Self {
             log_path: instance::log_path(&root),
             plugin_dir: plugin_dir_override
@@ -997,6 +1168,11 @@ impl App {
             config_items: Vec::new(),
             config_error: None,
             disk_plugins: Vec::new(),
+            store: None,
+            registry_url: None,
+            plugin_selected: 0,
+            plugin_scroll: 0,
+            plugin_view: 10,
             log_lines: Vec::new(),
             log_heights: Vec::new(),
             log_heights_width: 0,
@@ -1043,6 +1219,10 @@ impl App {
             last_usage_sample: Instant::now(),
             tx,
             rx,
+            login: None,
+            login_rx,
+            login_tx,
+            login_busy: false,
         };
         app.refresh_all();
         app
@@ -1189,7 +1369,7 @@ impl App {
         self.reload_config();
         self.state = instance::probe(&self.root);
         self.refresh_usage();
-        self.disk_plugins = scan_plugins(&self.plugin_dir);
+        self.rescan_plugins();
         self.reload_logs();
         self.last_refresh = Instant::now();
     }
@@ -1198,9 +1378,29 @@ impl App {
     pub fn refresh_live(&mut self) {
         self.state = instance::probe(&self.root);
         self.refresh_usage();
-        self.disk_plugins = scan_plugins(&self.plugin_dir);
+        self.rescan_plugins();
         self.reload_logs();
         self.last_refresh = Instant::now();
+    }
+
+    /// 重扫插件目录，并把选中行夹回新清单里。
+    ///
+    /// 目录随时可能被外部改动（`fuyubot plugin install`、用户手删），选中行不能
+    /// 因此指到空处：夹一下、重算滚动位置就够。
+    fn rescan_plugins(&mut self) {
+        self.disk_plugins = scan_plugins(&self.plugin_dir);
+        self.plugin_select(self.plugin_selected);
+    }
+
+    /// 懒建商店页：第一次进商店才建（建的时候才拉索引，不在启动时联网）。
+    pub fn ensure_store(&mut self) {
+        if self.store.is_some() {
+            return;
+        }
+        self.store = Some(store::Store::new(
+            self.plugin_dir.clone(),
+            self.registry_url.clone(),
+        ));
     }
 
     /// 采一次运行中实例的 CPU / 内存。
@@ -1254,8 +1454,15 @@ impl App {
                     .clone()
                     .filter(|name| !name.trim().is_empty())
                     .unwrap_or_else(|| "fuyubot".to_owned());
-                if self.plugin_dir_override.is_none() {
-                    self.plugin_dir = config.plugin_dir(&self.root);
+                let new_plugin_dir = if self.plugin_dir_override.is_none() {
+                    config.plugin_dir(&self.root)
+                } else {
+                    self.plugin_dir.clone()
+                };
+                if new_plugin_dir != self.plugin_dir {
+                    // 商店的安装目标跟着插件目录走：换目录就把旧状态丢掉。
+                    self.plugin_dir = new_plugin_dir;
+                    self.store = None;
                 }
                 // 配置里写错就按默认 info 显示；错误原文由配置页负责（不在这里吞掉）。
                 self.configured_level = config
@@ -1264,6 +1471,25 @@ impl App {
                     .map(scaffold::log_level_name)
                     .unwrap_or("info")
                     .to_owned();
+                // 商店索引地址：环境变量优先（便于临时换商城），其次 `[plugins].registry_url`。
+                let registry_url = std::env::var("FUYUBOT_REGISTRY_URL")
+                    .ok()
+                    .map(|url| url.trim().to_owned())
+                    .filter(|url| !url.is_empty())
+                    .or_else(|| {
+                        config
+                            .plugins
+                            .registry_url
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|url| !url.is_empty())
+                            .map(str::to_owned)
+                    });
+                if registry_url != self.registry_url {
+                    // 地址变了：旧索引不该继续展示（安装目标可能已经不是同一个商城）。
+                    self.store = None;
+                    self.registry_url = registry_url;
+                }
                 let items = build_config_items(&self.config_path, &self.root, &config);
                 self.config_error = None;
                 self.config_items = items;
@@ -1412,6 +1638,12 @@ impl App {
 
     /// 事件循环每转一圈调一次：收工作线程结果、清过期提示、到点刷新。
     pub fn tick(&mut self) {
+        self.poll_login();
+        // 商店的后台线程（索引 / 安装）要靠这里回投；离开商店页也要排空，
+        // 否则安装完成后状态会一直停在「进行中」。
+        if let Some(store) = self.store.as_mut() {
+            store.tick();
+        }
         while let Ok(done) = self.rx.try_recv() {
             self.busy = None;
             let level = if done.ok { Level::Info } else { Level::Error };
@@ -1439,6 +1671,150 @@ impl App {
         });
     }
 
+    // ── 登录（只登录；面板自己不接 TDLib）────────────────────────────
+
+    /// 起一次「只登录」：后台线程跑 `fuyubot-app` 的 boot + login，问题弹成输入框。
+    ///
+    /// 为什么必须在实例停着的时候做：TDLib 的数据库同一时刻只允许一个进程打开（约束 47）。
+    pub fn start_login(&mut self) {
+        if self.login_busy {
+            self.set_toast("登录进行中…", Level::Info);
+            return;
+        }
+        if matches!(self.state, State::Running(_)) {
+            self.set_toast(
+                "实例在跑：先停止再登录（TDLib 数据库只能一个进程开）",
+                Level::Info,
+            );
+            return;
+        }
+        let options = match self.login_options() {
+            Ok(options) => options,
+            Err(error) => {
+                self.set_toast(error, Level::Info);
+                return;
+            }
+        };
+        self.login_busy = true;
+        self.set_toast(
+            "开始登录：登完 session 落在 data/，之后启动实例会直接 Ready",
+            Level::Info,
+        );
+        let tx = self.login_tx.clone();
+        let _ = login::spawn_login(options, tx);
+    }
+
+    /// `start_login` 的输入：目录 + 配置树 + TDLib 设置 + TUI 宿主。
+    ///
+    /// ⚠️ 凭据**必须已经在环境 / 配置里**：这里绝不调用会读 stdin 的交互路径
+    /// （终端此刻在 alternate screen 里，读 stdin 等于把界面搞花）。
+    fn login_options(&self) -> Result<fuyubot_app::AppOptions, String> {
+        let config = scaffold::load_config(&self.config_path)?;
+
+        let api_id = self.spawn.api_id.or(config.telegram.api_id).unwrap_or(0);
+        let api_hash = std::env::var("TG_API_HASH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| scaffold::load_api_hash(&self.config_path));
+        let Some(api_hash) = api_hash else {
+            return Err("缺 api_hash：先设 TG_API_HASH（或跑一次 `fuyubot login`）".to_owned());
+        };
+        if api_id <= 0 {
+            return Err(
+                "缺 api_id：设 TG_API_ID 或写进 fuyubot.toml 的 [telegram].api_id".to_owned(),
+            );
+        }
+
+        let data_dir = self
+            .root
+            .join(config.telegram.data_dir.as_deref().unwrap_or("data"));
+        let parameters = fuyubot_tdlib::TdlibParameters::new(data_dir, api_id as i32, api_hash);
+        let account = config.telegram.account_type()?;
+        let log_level = match &self.spawn.log_level {
+            Some(raw) => scaffold::parse_log_level(raw)?,
+            None => config.plugins.log_level()?,
+        };
+
+        Ok(fuyubot_app::AppOptions {
+            data_dir: parameters.data_dir.clone(),
+            plugin_dir: config.plugin_dir(&self.root),
+            log_level,
+            log_plugins: Vec::new(),
+            config: config.to_json()?,
+            config_path: Some(self.config_path.clone()),
+            tdjson_path: config.tdlib.path.as_deref().map(PathBuf::from),
+            tdlib: Some(fuyubot_app::TdlibSettings {
+                parameters,
+                account,
+                bot_token: std::env::var("TG_BOT_TOKEN")
+                    .ok()
+                    .filter(|value| !value.is_empty()),
+                log_verbosity: Some(config.tdlib.log_verbosity()),
+                login_budget: fuyubot_tdlib::LOGIN_BUDGET,
+                login: true,
+            }),
+            host: login::TuiHost::new(self.login_tx.clone()),
+        })
+    }
+
+    /// 登录弹窗开着时的按键：只管输入。
+    fn on_login_key(&mut self, key: KeyEvent) {
+        let Some(mut modal) = self.login.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                modal.cancel();
+                self.login_busy = false;
+                self.set_toast("已取消登录", Level::Info);
+            }
+            KeyCode::Enter => {
+                modal.submit();
+                // 下一个问题会由 `poll_login` 再弹；这里不设 busy=false。
+            }
+            KeyCode::Backspace => modal.backspace(),
+            KeyCode::Char(character) => modal.push(character),
+            _ => {
+                self.login = Some(modal);
+            }
+        }
+    }
+
+    fn poll_login(&mut self) {
+        // 先把事件取干净再处理：处理里会 `&mut self`，不先收集会和 `login_rx` 的借用打架。
+        let events: Vec<LoginEvent> =
+            std::iter::from_fn(|| self.login_rx.try_recv().ok()).collect();
+        for event in events {
+            match event {
+                LoginEvent::Ask {
+                    kind,
+                    prompt,
+                    reply,
+                } => {
+                    self.login = Some(LoginModal::new(kind, prompt, reply));
+                }
+                LoginEvent::State(state, detail) => {
+                    if state == fuyubot_app::AppState::Ready {
+                        self.set_toast("登录完成", Level::Info);
+                    } else {
+                        self.set_toast(detail, Level::Info);
+                    }
+                }
+                LoginEvent::Done(result) => {
+                    self.login_busy = false;
+                    self.login = None;
+                    match result {
+                        Ok(()) => {
+                            self.set_toast("登录成功：会话已落盘，可以启动实例了", Level::Info)
+                        }
+                        Err(error) => self.set_toast(format!("登录失败：{error}"), Level::Info),
+                    }
+                    self.refresh_all();
+                }
+            }
+        }
+    }
+
     // ── 按键 ──────────────────────────────────────────────────────
 
     /// 处理一次按键。只有 `Press` 算数：Windows 上松开也会来一条，不滤就会触发两次。
@@ -1448,6 +1824,12 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             self.quit = true;
+            return;
+        }
+
+        // 登录弹窗是模态的：开着的时候只认它自己的按键（输入 / 提交 / 取消）。
+        if self.login.is_some() {
+            self.on_login_key(key);
             return;
         }
 
@@ -1517,6 +1899,25 @@ impl App {
                 self.filter_picker = None;
             }
             return;
+        }
+
+        // 商店页：按键先交给它（搜索输入要吃掉普通字符；`q` / `Tab` 仍交回全局）。
+        if self.page == Page::Store && self.workspace_focused() {
+            self.ensure_store();
+            let outcome = self
+                .store
+                .as_mut()
+                .map(|store| store.handle_key(key))
+                .unwrap_or(StoreKey::Ignored);
+            match outcome {
+                StoreKey::Consumed => return,
+                StoreKey::Close => {
+                    self.page = Page::Plugins;
+                    return;
+                }
+                // 没处理的（q 退出、Tab 换焦点…）继续走下面的全局按键。
+                StoreKey::Ignored => {}
+            }
         }
 
         // 配置编辑框：Enter 保存、Esc 取消、←→/Home/End 移光标。
@@ -1620,7 +2021,7 @@ impl App {
             KeyCode::Right => self.page = self.page.next(),
             KeyCode::Char('h') if !self.workspace_focused() => self.page = self.page.prev(),
             KeyCode::Char('l') if !self.workspace_focused() => self.page = self.page.next(),
-            KeyCode::Char(digit @ '1'..='5') => {
+            KeyCode::Char(digit @ '1'..='6') => {
                 self.page = Page::ALL[(digit as u8 - b'1') as usize];
             }
             KeyCode::Enter if self.page == Page::Logs && self.workspace_focused() => {
@@ -1631,8 +2032,17 @@ impl App {
             {
                 self.open_config_edit();
             }
+            // 插件页：`Space` 启用 / 禁用选中的那个（禁用 = 文件加 `.disable` 后缀）。
+            KeyCode::Char(' ') if self.page == Page::Plugins && self.workspace_focused() => {
+                self.toggle_plugin();
+            }
+            KeyCode::Enter if self.page == Page::Plugins && self.workspace_focused() => {
+                self.toggle_plugin();
+            }
             KeyCode::Char('s') => self.start(),
             KeyCode::Char('x') => self.ask_stop(),
+            // 大写 L：只在实例停着时有效（TDLib 数据库只能一个进程开）。
+            KeyCode::Char('L') => self.start_login(),
             // 日志页的专属操作只在工作区获得焦点时响应。
             KeyCode::Char('c') if self.page == Page::Logs && self.workspace_focused() => {
                 self.ask_clear_logs();
@@ -1678,6 +2088,7 @@ impl App {
                 self.follow = false;
             }
             Page::Config => self.config_move(-(amount as isize)),
+            Page::Plugins => self.plugin_move(-(amount as isize)),
             Page::Help => {
                 let max = self.help_rows.saturating_sub(self.help_view.max(1));
                 self.help_scroll = self.help_scroll.saturating_sub(amount).min(max);
@@ -1694,6 +2105,7 @@ impl App {
                 self.follow = false;
             }
             Page::Config => self.config_move(amount as isize),
+            Page::Plugins => self.plugin_move(amount as isize),
             Page::Help => {
                 let max = self.help_rows.saturating_sub(self.help_view.max(1));
                 self.help_scroll = self.help_scroll.saturating_add(amount).min(max);
@@ -1714,6 +2126,7 @@ impl App {
                 self.follow = false;
             }
             Page::Config => self.config_select(0),
+            Page::Plugins => self.plugin_select(0),
             Page::Help => self.help_scroll = 0,
             _ => {}
         }
@@ -1727,6 +2140,7 @@ impl App {
                 self.set_toast("已回到日志末尾", Level::Info);
             }
             Page::Config => self.config_select(self.config_items.len().saturating_sub(1)),
+            Page::Plugins => self.plugin_select(self.disk_plugins.len().saturating_sub(1)),
             Page::Help => {
                 self.help_scroll = self.help_rows.saturating_sub(self.help_view.max(1));
             }
@@ -1743,6 +2157,165 @@ impl App {
         let next = (self.config_selected as isize + delta).clamp(0, last as isize) as usize;
         self.config_selected = next;
         self.ensure_config_visible();
+    }
+
+    /// 插件页选中行上下移动（磁盘清单那一半；上半是实例自报的，只读）。
+    pub fn plugin_move(&mut self, delta: isize) {
+        if self.disk_plugins.is_empty() {
+            return;
+        }
+        let last = self.disk_plugins.len() - 1;
+        let next = (self.plugin_selected as isize + delta).clamp(0, last as isize) as usize;
+        self.plugin_select(next);
+    }
+
+    fn plugin_select(&mut self, index: usize) {
+        if self.disk_plugins.is_empty() {
+            self.plugin_selected = 0;
+            self.plugin_scroll = 0;
+            return;
+        }
+        self.plugin_selected = index.min(self.disk_plugins.len() - 1);
+        self.ensure_plugin_visible();
+    }
+
+    /// 让选中行留在表格视口里（表头占 1 行）。
+    pub(crate) fn ensure_plugin_visible(&mut self) {
+        let visible = self.plugin_view.saturating_sub(1).max(1);
+        if self.plugin_selected < self.plugin_scroll {
+            self.plugin_scroll = self.plugin_selected;
+        } else if self.plugin_selected >= self.plugin_scroll + visible {
+            self.plugin_scroll = self.plugin_selected + 1 - visible;
+        }
+        let max = self.disk_plugins.len().saturating_sub(visible);
+        self.plugin_scroll = self.plugin_scroll.min(max);
+    }
+
+    /// 当前该从第几行开始画插件清单（表头另占一行）。
+    pub fn plugin_offset(&self) -> usize {
+        let visible = self.plugin_view.saturating_sub(1).max(1);
+        let max = self.disk_plugins.len().saturating_sub(visible);
+        self.plugin_scroll.min(max)
+    }
+
+    /// 选中的那个磁盘插件。
+    pub fn selected_plugin(&self) -> Option<&DiskPlugin> {
+        self.disk_plugins.get(self.plugin_selected)
+    }
+
+    /// 概览页那一行：`4 项`（都启用）/ `4 项（1 个已禁用）`。
+    pub fn plugin_dir_summary(&self) -> String {
+        let disabled = self
+            .disk_plugins
+            .iter()
+            .filter(|plugin| !plugin.enabled)
+            .count();
+        if disabled == 0 {
+            format!("{} 项", self.disk_plugins.len())
+        } else {
+            format!("{} 项（{disabled} 个已禁用）", self.disk_plugins.len())
+        }
+    }
+
+    /// `Space`：把选中的插件启用 / 禁用。
+    ///
+    /// 两种形态、两条路：
+    /// - **文件**（旧形态 dylib）：改名，`foo.dll` ↔ `foo.dll.disable`；
+    /// - **目录**（插件包 / 脚本目录）：整个挪到 `plugins/.disabled/<name>/`，再按一次
+    ///   挪回原来的家（包回 `plugins/<name>/`，脚本回 `plugins/scripts/<name>/`）；
+    ///   旧面板留下的 `<name>.disable/` 目录仍然按「去掉后缀」恢复。
+    ///
+    /// 加载器只扫启用态的名字，所以改完下次 `run` 就不会再碰它——没有第二份清单要
+    /// 维护，也没有残留状态。
+    ///
+    /// ⚠️ 运行中的实例**已经把插件映射进进程了**，改名 / 挪目录不会让它当场卸载：
+    /// 停止再启动才生效（见提示语）。Windows 上动态库被占用时改名会失败，
+    /// 那种情况把错误原文报出来就行，别假装成功。
+    pub fn toggle_plugin(&mut self) {
+        let Some(plugin) = self.selected_plugin().cloned() else {
+            return;
+        };
+        if !plugin.toggleable() {
+            self.set_toast("这一项没有开关，手动改插件目录吧", Level::Info);
+            return;
+        }
+        let disabled_root = self.plugin_dir.join(fuyubot_loader::DISABLED_DIR);
+        let (target, enabling) = if plugin.enabled {
+            if plugin.path.is_dir() {
+                (disabled_root.join(&plugin.name), false)
+            } else {
+                (fuyubot_loader::disabled_path(&plugin.path), false)
+            }
+        } else if plugin.path.is_dir() {
+            let from_disabled = plugin.path.parent() == Some(disabled_root.as_path());
+            if from_disabled {
+                let parent = match plugin.kind {
+                    // 包回 `plugins/<id>/`；脚本回 `plugins/scripts/<id>/`。
+                    PluginKind::Bundle => self.plugin_dir.clone(),
+                    PluginKind::Script => self.plugin_dir.join(fuyubot_loader::SCRIPTS_DIR),
+                    PluginKind::Native => self.plugin_dir.clone(),
+                };
+                (parent.join(&plugin.name), true)
+            } else {
+                // 旧面板的 `<name>.disable/` 目录：去掉后缀就是启用态。
+                (fuyubot_loader::enabled_path(&plugin.path), true)
+            }
+        } else {
+            (fuyubot_loader::enabled_path(&plugin.path), true)
+        };
+        if target.exists() {
+            self.set_toast(
+                format!(
+                    "{} 已经存在了——先把那个位置挪开再开关",
+                    target.file_name().unwrap_or_default().to_string_lossy()
+                ),
+                Level::Warn,
+            );
+            return;
+        }
+        // 禁用目录可能还不存在（第一次禁用）；目标父目录也可能因为脚本根被删而没了。
+        if !plugin.enabled && plugin.path.is_dir() {
+            if let Some(parent) = target.parent() {
+                if let Err(error) = std::fs::create_dir_all(parent) {
+                    self.set_toast(
+                        format!("建不了 {}: {error}", parent.display()),
+                        Level::Error,
+                    );
+                    return;
+                }
+            }
+        }
+        if plugin.enabled && plugin.path.is_dir() && !disabled_root.is_dir() {
+            if let Err(error) = std::fs::create_dir_all(&disabled_root) {
+                self.set_toast(
+                    format!("建不了 {}: {error}", disabled_root.display()),
+                    Level::Error,
+                );
+                return;
+            }
+        }
+        match std::fs::rename(&plugin.path, &target) {
+            Ok(()) => {
+                let name = plugin.name.clone();
+                // 立刻重扫：`Space` 连按两下要能来回切，不能等下一次 tick。
+                self.rescan_plugins();
+                self.set_toast(
+                    format!(
+                        "已{}插件 {name}（重启后生效）",
+                        if enabling { "启用" } else { "禁用" }
+                    ),
+                    Level::Info,
+                );
+            }
+            Err(error) => {
+                let hint = if self.can_stop() && plugin.enabled {
+                    "（实例在跑：Windows 上库被占用时改名会失败，先 x 停止实例）"
+                } else {
+                    ""
+                };
+                self.set_toast(format!("开关失败：{error}{hint}"), Level::Error);
+            }
+        }
     }
 
     fn config_select(&mut self, index: usize) {
@@ -2350,9 +2923,9 @@ mod tests {
                 .iter()
                 .map(|page| page.title())
                 .collect::<Vec<_>>(),
-            ["概览", "插件", "日志", "配置", "帮助"]
+            ["概览", "插件", "商店", "日志", "配置", "帮助"]
         );
-        // 导航顺序与 `1..=5` 的编号一致。
+        // 导航顺序与 `1..=6` 的编号一致。
         for (index, page) in Page::ALL.iter().enumerate() {
             assert_eq!(page.index(), index);
         }
@@ -2361,14 +2934,29 @@ mod tests {
     #[test]
     fn number_keys_jump_to_pages() {
         let mut app = app();
-        app.on_key(key(KeyCode::Char('3')));
+        app.on_key(key(KeyCode::Char('4')));
         assert_eq!(app.page, Page::Logs);
-        app.on_key(key(KeyCode::Char('5')));
+        app.on_key(key(KeyCode::Char('6')));
         assert_eq!(app.page, Page::Help);
         // Tab 不再换页，只换焦点。
         app.on_key(key(KeyCode::Tab));
         assert_eq!(app.page, Page::Help);
         assert_eq!(app.focus, Focus::Workspace);
+    }
+
+    /// 商店页的 Esc 只回插件页，不退出面板（退出仍走 `q`）。
+    #[test]
+    fn store_page_esc_goes_back_and_q_still_quits() {
+        let mut app = app();
+        app.page = Page::Store;
+        app.focus = Focus::Workspace;
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.page, Page::Plugins);
+        assert!(!app.quit, "Esc 只关商店页");
+
+        app.page = Page::Store;
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.quit, "商店页不吞 q");
     }
 
     #[test]
@@ -2807,8 +3395,280 @@ mod tests {
         assert_eq!(plugins.len(), 2, "{plugins:?}");
         assert_eq!(plugins[0].name, "bot_plugin");
         assert_eq!(plugins[0].kind, PluginKind::Native);
+        assert!(plugins[0].enabled);
         assert_eq!(plugins[1].name, "demo-script");
         assert_eq!(plugins[1].kind, PluginKind::Script);
+        assert!(plugins[1].enabled, "脚本目录当前没有开关，恒为启用");
+    }
+
+    /// 禁用过的 dylib 仍要出现在清单里（不然面板上没法再启用它），
+    /// 而且名字要报**原来的**主干、`enabled = false`。
+    #[test]
+    fn scan_also_lists_disabled_libraries() {
+        let dir = temp("panel-scan-disabled");
+        let dll = dir.join(format!("off_plugin.{}", fuyubot_loader::DLL_EXTENSION));
+        let off = fuyubot_loader::disabled_path(&dll);
+        std::fs::write(&off, "").unwrap();
+        // 名字里带 `.disable` 但不是动态库后面的，不认（脚本目录的约定不是这个）。
+        std::fs::write(dir.join("notes.disable"), "").unwrap();
+
+        let plugins = scan_plugins(&dir);
+        assert_eq!(plugins.len(), 1, "{plugins:?}");
+        assert_eq!(plugins[0].name, "off_plugin");
+        assert_eq!(plugins[0].kind, PluginKind::Native);
+        assert!(!plugins[0].enabled);
+        assert_eq!(plugins[0].path, off);
+    }
+
+    /// 造一个插件包：根上有 `plugin.json`，入口文件真的存在。
+    fn write_bundle(dir: &Path, id: &str, kind: &str) {
+        let entry = if kind == "native" {
+            "bin/plugin.dll"
+        } else {
+            "index.ts"
+        };
+        if let Some((parent, _)) = entry.rsplit_once('/') {
+            std::fs::create_dir_all(dir.join(parent)).unwrap();
+        }
+        std::fs::write(dir.join(entry), b"x").unwrap();
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "id": id,
+            "name": "Demo",
+            "version": "1.0.0",
+            "kind": kind,
+            "entry": entry,
+        });
+        std::fs::write(dir.join("plugin.json"), manifest.to_string()).unwrap();
+    }
+
+    /// 插件包与禁用包都要出现；脚本目录继续从 `plugins/scripts/` 列。
+    #[test]
+    fn scan_lists_bundles_and_disabled_bundles() {
+        let dir = temp("panel-scan-bundles");
+        write_bundle(
+            &dir.join("com.example.weather"),
+            "com.example.weather",
+            "native",
+        );
+        write_bundle(
+            &dir.join(".disabled/com.example.gone"),
+            "com.example.gone",
+            "native",
+        );
+        let script = dir.join("scripts/js-demo");
+        std::fs::create_dir_all(&script).unwrap();
+        std::fs::write(
+            script.join("package.json"),
+            r#"{"name":"demo","fuyubot":{"name":"fuyubot.example.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(script.join("index.ts"), b"export {}").unwrap();
+
+        let plugins = scan_plugins(&dir);
+        assert_eq!(plugins.len(), 3, "{plugins:?}");
+        // 排序按名字：gone < weather < js-demo。
+        assert_eq!(plugins[0].name, "com.example.gone");
+        assert_eq!(plugins[0].kind, PluginKind::Bundle);
+        assert!(!plugins[0].enabled, "`.disabled/` 下的是禁用包");
+        assert_eq!(plugins[0].path, dir.join(".disabled/com.example.gone"));
+
+        assert_eq!(plugins[1].name, "com.example.weather");
+        assert_eq!(plugins[1].kind, PluginKind::Bundle);
+        assert!(plugins[1].enabled);
+        assert_eq!(plugins[1].path, dir.join("com.example.weather"));
+
+        assert_eq!(plugins[2].name, "js-demo");
+        assert_eq!(plugins[2].kind, PluginKind::Script);
+        assert!(plugins[2].enabled);
+    }
+
+    /// 插件包在面板里显示清单的 `id`（不是目录名）。
+    #[test]
+    fn a_bundle_is_shown_by_its_manifest_id() {
+        let dir = temp("panel-bundle-id");
+        write_bundle(&dir.join("some-dir-name"), "com.example.weather", "native");
+
+        let plugins = scan_plugins(&dir);
+        assert_eq!(plugins.len(), 1, "{plugins:?}");
+        assert_eq!(plugins[0].name, "com.example.weather");
+        assert_eq!(plugins[0].kind, PluginKind::Bundle);
+    }
+
+    /// `Space` 对目录形态 = 整个挪进 `plugins/.disabled/<name>/`，再挪回来。
+    #[test]
+    fn space_toggles_a_bundle_into_the_disabled_directory() {
+        let dir = temp("panel-toggle-bundle");
+        let bundle = dir.join("com.example.weather");
+        write_bundle(&bundle, "com.example.weather", "native");
+
+        let mut app = app();
+        // 走 `plugin_dir_override`：`refresh_all` 会按配置重算 `plugin_dir`。
+        app.plugin_dir = dir.clone();
+        app.plugin_dir_override = Some(dir.clone());
+        app.page = Page::Plugins;
+        app.focus = Focus::Workspace;
+        app.refresh_all();
+        assert_eq!(app.disk_plugins.len(), 1);
+        assert!(app.disk_plugins[0].enabled);
+
+        app.on_key(key(KeyCode::Char(' ')));
+        let off = dir.join(".disabled/com.example.weather");
+        assert!(!bundle.exists(), "包目录该被整个挪走");
+        assert!(off.is_dir(), "禁用 = 挪进 .disabled/<id>/");
+        assert!(!app.disk_plugins[0].enabled, "面板立刻反映新状态");
+        assert!(
+            app.toast.as_ref().is_some_and(
+                |toast| toast.text.contains("已禁用") && toast.text.contains("重启后生效")
+            ),
+            "{:?}",
+            app.toast
+        );
+
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(
+            bundle.is_dir() && !off.exists(),
+            "再按一次挪回 plugins/<id>/"
+        );
+        assert!(app.disk_plugins[0].enabled);
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("已启用")),
+            "{:?}",
+            app.toast
+        );
+    }
+
+    /// `Space` 的整个开关就是一次改名：`.dll` ↔ `.dll.disable`，来回都能切。
+    #[test]
+    fn space_toggles_a_dylib_by_renaming_it() {
+        let dir = temp("panel-toggle");
+        let dll = dir.join(format!("toggle_me.{}", fuyubot_loader::DLL_EXTENSION));
+        std::fs::write(&dll, b"lib").unwrap();
+
+        let mut app = app();
+        // 走 `plugin_dir_override`：`refresh_all` 会按配置重算 `plugin_dir`，
+        // 只改字段的话下一秒就被指回项目自己的 `plugins/`。
+        app.plugin_dir = dir.clone();
+        app.plugin_dir_override = Some(dir.clone());
+        app.page = Page::Plugins;
+        app.focus = Focus::Workspace;
+        app.refresh_all();
+        assert_eq!(app.disk_plugins.len(), 1);
+        assert!(app.disk_plugins[0].enabled);
+
+        app.on_key(key(KeyCode::Char(' ')));
+        let off = fuyubot_loader::disabled_path(&dll);
+        assert!(!dll.exists(), "启用文件应该已经改名");
+        assert!(off.exists(), "禁用 = 加 .disable 后缀");
+        assert!(!app.disk_plugins[0].enabled, "面板立刻反映新状态");
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("已禁用")),
+            "{:?}",
+            app.toast
+        );
+        // 加载器那边同步看不见它了——这正是「禁用」的实际效果。
+        assert!(
+            fuyubot_loader::plugin_files(&dir).unwrap().is_empty(),
+            "加载器不该再把禁用的库当候选"
+        );
+
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(dll.exists() && !off.exists(), "再按一次改回来");
+        assert!(app.disk_plugins[0].enabled);
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("已启用")),
+            "{:?}",
+            app.toast
+        );
+    }
+
+    /// 脚本插件目录也能开关：整个挪进 `.disabled/`，再挪回 `plugins/scripts/`。
+    #[test]
+    fn script_directories_can_be_disabled_and_restored() {
+        let dir = temp("panel-toggle-script");
+        let script = dir.join("scripts").join("demo-script");
+        std::fs::create_dir_all(&script).unwrap();
+        std::fs::write(
+            script.join("package.json"),
+            r#"{"name":"demo","fuyubot":{"name":"demo"}}"#,
+        )
+        .unwrap();
+
+        let mut app = app();
+        // 走 `plugin_dir_override`：`refresh_all` 会按配置重算 `plugin_dir`，
+        // 只改字段的话下一秒就被指回项目自己的 `plugins/`。
+        app.plugin_dir = dir.clone();
+        app.plugin_dir_override = Some(dir.clone());
+        app.page = Page::Plugins;
+        app.focus = Focus::Workspace;
+        app.refresh_all();
+        assert_eq!(app.disk_plugins.len(), 1, "{:?}", app.disk_plugins);
+
+        app.on_key(key(KeyCode::Char(' ')));
+        let off = dir.join(".disabled").join("demo-script");
+        assert!(!script.exists(), "脚本目录该被整个挪走");
+        assert!(off.is_dir(), "禁用 = 挪进 .disabled/<目录名>/");
+        assert!(!app.disk_plugins[0].enabled);
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("已禁用")),
+            "{:?}",
+            app.toast
+        );
+
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(
+            script.is_dir() && !off.exists(),
+            "再按一次挪回 plugins/scripts/<目录名>/"
+        );
+        assert!(app.disk_plugins[0].enabled);
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("已启用")),
+            "{:?}",
+            app.toast
+        );
+    }
+
+    /// 上下移动只在插件页动选中行，不影响别的页。
+    #[test]
+    fn plugin_page_moves_the_selection_with_the_arrow_keys() {
+        let dir = temp("panel-move");
+        for index in 0..3 {
+            std::fs::write(
+                dir.join(format!("p{index}.{}", fuyubot_loader::DLL_EXTENSION)),
+                b"x",
+            )
+            .unwrap();
+        }
+
+        let mut app = app();
+        app.plugin_dir = dir.clone();
+        app.plugin_dir_override = Some(dir);
+        app.page = Page::Plugins;
+        app.focus = Focus::Workspace;
+        app.refresh_all();
+        assert_eq!(app.disk_plugins.len(), 3);
+
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.plugin_selected, 1);
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.plugin_selected, 2, "到底了不越界");
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.plugin_selected, 1);
+        app.on_key(key(KeyCode::End));
+        assert_eq!(app.plugin_selected, 2);
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.plugin_selected, 0);
     }
 
     #[test]

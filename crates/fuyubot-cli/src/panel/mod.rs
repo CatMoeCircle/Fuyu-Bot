@@ -22,6 +22,8 @@
 mod app;
 mod clipboard;
 mod logfmt;
+mod login;
+pub mod store;
 mod ui;
 
 use std::io::IsTerminal;

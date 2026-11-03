@@ -108,6 +108,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_filter_picker(frame, app, area);
     } else if app.config_edit.is_some() {
         draw_config_editor(frame, app, area);
+    } else if app.login.is_some() {
+        draw_login(frame, app, area);
     }
 }
 
@@ -169,15 +171,18 @@ fn draw_nav(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_top_nav(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Navigation;
     let full = area.width >= 36;
+    // 40 列左右放不下 6 个「标题 + 竖线」，改用空格分隔；再窄就只留单字。
+    let separator = if area.width >= 48 { " │ " } else { " " };
     let mut spans = vec![Span::raw(" ")];
     for (index, page) in Page::ALL.iter().enumerate() {
         if index > 0 {
-            spans.push(Span::styled(" │ ", Style::new().fg(Color::DarkGray)));
+            spans.push(Span::styled(separator, Style::new().fg(Color::DarkGray)));
         }
         let selected = *page == app.page;
         let short = match page {
             Page::Overview => "概",
             Page::Plugins => "插",
+            Page::Store => "店",
             Page::Logs => "日",
             Page::Config => "配",
             Page::Help => "帮",
@@ -205,9 +210,17 @@ fn draw_top_nav(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_workspace(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.workspace_focused();
+    // 商店页进来才建（第一次建的时候才拉索引，不在启动时联网）。
+    if app.page == Page::Store {
+        app.ensure_store();
+    }
+    let title = match (app.page, app.store.as_ref()) {
+        (Page::Store, Some(store)) => store.title(),
+        _ => app.page.title().to_owned(),
+    };
     let block = Block::bordered()
         .title(Line::from(vec![Span::styled(
-            format!(" {} ", app.page.title()),
+            format!(" {title} "),
             Style::new().add_modifier(Modifier::BOLD),
         )]))
         .border_style(Style::new().fg(if focused {
@@ -226,9 +239,20 @@ fn draw_workspace(frame: &mut Frame, app: &mut App, area: Rect) {
     match app.page {
         Page::Overview => draw_overview(frame, app, inner),
         Page::Plugins => draw_plugins(frame, app, inner),
+        Page::Store => draw_store(frame, app, inner),
         Page::Logs => draw_logs(frame, app, inner),
         Page::Config => draw_config(frame, app, inner),
         Page::Help => draw_help(frame, app, inner),
+    }
+}
+
+/// 商店页：整块区域交给 [`crate::panel::store::Store`]（它自己画左右两栏 + 状态区）。
+///
+/// 懒建放在绘制里而不是按键里：导航焦点下按 `Enter` 进入工作区时也要先有内容可画。
+fn draw_store(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.ensure_store();
+    if let Some(store) = app.store.as_mut() {
+        store.render(frame, area);
     }
 }
 
@@ -327,7 +351,7 @@ fn overview_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         connection_line(app, false),
         authorization_line(app, false),
         account_line(app, false),
-        kv("插件目录", format!("{} 项", app.disk_plugins.len())),
+        kv("插件目录", app.plugin_dir_summary()),
         kv(
             "日志级别",
             format!("{}（日志页按 l 调整）", app.effective_level()),
@@ -361,7 +385,7 @@ fn overview_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
     lines
 }
 
-fn draw_plugins(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_plugins(frame: &mut Frame, app: &mut App, area: Rect) {
     let compact = area.width < 60;
     let [top, bottom] =
         Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
@@ -443,30 +467,68 @@ fn draw_plugins(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(table, top);
     }
 
-    // 下半：磁盘上的插件目录（不 dlopen 也能列）。
-    let bottom_title = format!(" 插件目录 · {} 项 ", app.disk_plugins.len());
-    let mut rows: Vec<Row> = app
+    // 下半：磁盘上的插件目录（不 dlopen 也能列）。**这一半可以开关**：`Space` 把
+    // 选中的 dylib 改名成 `….disable`（禁用）/ 改回来（启用）。
+    let disabled = app
+        .disk_plugins
+        .iter()
+        .filter(|plugin| !plugin.enabled)
+        .count();
+    let bottom_title = if disabled > 0 {
+        format!(
+            " 插件目录 · {} 项（{} 个已禁用） ",
+            app.disk_plugins.len(),
+            disabled
+        )
+    } else {
+        format!(" 插件目录 · {} 项 ", app.disk_plugins.len())
+    };
+    app.plugin_view = bottom.height.max(1) as usize;
+    app.ensure_plugin_visible();
+    let focused = app.workspace_focused();
+    let offset = app.plugin_offset();
+    let selected = app.plugin_selected;
+    let rows: Vec<Row> = app
         .disk_plugins
         .iter()
         .map(|plugin| {
-            let color = match plugin.kind {
-                PluginKind::Native => Color::Cyan,
-                PluginKind::Script => Color::Magenta,
+            let color = if !plugin.enabled {
+                Color::DarkGray
+            } else {
+                match plugin.kind {
+                    PluginKind::Bundle => Color::Blue,
+                    PluginKind::Native => Color::Cyan,
+                    PluginKind::Script => Color::Magenta,
+                }
+            };
+            // 状态列：● 启用 / ○ 禁用。禁用的一行整体压暗，一眼看得出「它不会加载」。
+            let (marker, marker_color) = if plugin.enabled {
+                ("●", Color::Green)
+            } else {
+                ("○", Color::DarkGray)
             };
             let file = plugin
                 .path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let dim = !plugin.enabled;
+            let name_cell = Cell::from(plugin.name.clone()).style(if dim {
+                Style::new().fg(Color::DarkGray)
+            } else {
+                Style::new()
+            });
             if compact {
                 Row::new(vec![
+                    Cell::from(marker).style(Style::new().fg(marker_color)),
                     Cell::from(plugin.kind.label()).style(Style::new().fg(color)),
-                    Cell::from(plugin.name.clone()),
+                    name_cell,
                 ])
             } else {
                 Row::new(vec![
+                    Cell::from(marker).style(Style::new().fg(marker_color)),
                     Cell::from(plugin.kind.label()).style(Style::new().fg(color)),
-                    Cell::from(plugin.name.clone()),
+                    name_cell,
                     Cell::from(file).style(Style::new().fg(Color::DarkGray)),
                 ])
             }
@@ -475,7 +537,11 @@ fn draw_plugins(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut bottom_block = Block::bordered()
         .title(bottom_title)
-        .border_style(Style::new().fg(Color::DarkGray));
+        .border_style(Style::new().fg(if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }));
     if !compact {
         bottom_block = bottom_block.title_bottom(
             Line::from(Span::styled(
@@ -494,23 +560,34 @@ fn draw_plugins(frame: &mut Frame, app: &App, area: Rect) {
             bottom,
         );
     } else {
-        rows.insert(
-            0,
-            Row::new(if compact {
-                vec![Cell::from("类型"), Cell::from("名字")]
-            } else {
-                vec![Cell::from("类型"), Cell::from("名字"), Cell::from("文件")]
-            })
-            .style(
-                Style::new()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
+        let header = if compact {
+            Row::new(vec![
+                Cell::from("状"),
+                Cell::from("类型"),
+                Cell::from("名字"),
+            ])
+        } else {
+            Row::new(vec![
+                Cell::from("状态"),
+                Cell::from("类型"),
+                Cell::from("名字"),
+                Cell::from("文件"),
+            ])
+        }
+        .style(
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
         );
         let widths = if compact {
-            vec![Constraint::Length(6), Constraint::Min(0)]
+            vec![
+                Constraint::Length(2),
+                Constraint::Length(4),
+                Constraint::Min(0),
+            ]
         } else {
             vec![
+                Constraint::Length(2),
                 Constraint::Length(6),
                 Constraint::Length(30),
                 Constraint::Min(0),
@@ -518,8 +595,18 @@ fn draw_plugins(frame: &mut Frame, app: &App, area: Rect) {
         };
         let table = Table::new(rows, widths)
             .column_spacing(1)
+            .header(header)
+            .row_highlight_style(if focused {
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().add_modifier(Modifier::BOLD)
+            })
+            .highlight_symbol("▸ ")
             .block(bottom_block);
-        frame.render_widget(table, bottom);
+        let mut state = TableState::new()
+            .with_selected(Some(selected))
+            .with_offset(offset);
+        frame.render_stateful_widget(table, bottom, &mut state);
     }
 }
 
@@ -990,6 +1077,10 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("r", "刷新状态、插件、日志与配置"),
         ("Enter / e", "日志页：进入选择模式；配置页：编辑选中项"),
         (
+            "Space / Enter",
+            "插件页（工作区焦点）：启用 / 禁用选中的 dylib（禁用 = 文件加 .disable 后缀）",
+        ),
+        (
             "y / Enter",
             "日志选择模式：复制选中行（TDLib Update 复制完整 JSON）",
         ),
@@ -1003,7 +1094,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         (
             "Home / End",
-            "日志：Home 到窗口最早，End 回到最新（重读尾部）；帮助 / 配置跳到首尾",
+            "日志：Home 到窗口最早，End 回到最新（重读尾部）；插件 / 帮助 / 配置跳到首尾",
         ),
         ("q / Ctrl+C", "退出面板"),
     ];
@@ -1048,6 +1139,9 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     ));
     lines.push(Line::from(
         "  插件目录里的动态库不会被加载：插件名与状态来自运行中实例发布的 .fuyubot/status",
+    ));
+    lines.push(Line::from(
+        "  插件页的开关只改文件名（foo.dll ↔ foo.dll.disable）：加载器只认 .dll，改完重启实例才生效",
     ));
     lines.push(Line::from(
         "  日志页只装一个窗口（首屏是尾部，往上翻按段回读）；底栏提示还能不能往回翻",
@@ -1315,6 +1409,26 @@ fn operations_line(app: &App, compact: bool) -> Line<'static> {
                 ("c", "清空"),
                 ("Esc", "返回"),
             ]),
+            Page::Plugins if compact => {
+                items.extend([("↑↓", "选"), ("空格", "开关"), ("Esc", "返回")])
+            }
+            Page::Plugins => {
+                items.extend([("↑↓", "选择"), ("空格", "启用 / 禁用"), ("Esc", "返回")])
+            }
+            Page::Store if compact => items.extend([
+                ("↑↓", "选"),
+                ("Enter", "装"),
+                ("/", "搜索"),
+                ("Esc", "返回"),
+            ]),
+            Page::Store => items.extend([
+                ("↑↓", "选择"),
+                ("Enter", "安装"),
+                ("x", "卸载"),
+                ("/", "搜索"),
+                ("r", "刷新"),
+                ("Esc", "返回"),
+            ]),
             Page::Config if compact => {
                 items.extend([("↑↓", "选"), ("Enter", "编辑"), ("Esc", "返回")])
             }
@@ -1326,7 +1440,6 @@ fn operations_line(app: &App, compact: bool) -> Line<'static> {
             ]),
             Page::Help if compact => items.extend([("↑↓", "滚动"), ("Esc", "返回")]),
             Page::Help => items.extend([("↑↓", "滚动"), ("PgUp/Dn", "翻页"), ("Esc", "返回")]),
-            _ => items.push(("Esc", "返回")),
         }
         if !compact {
             items.push(("q", "退出"));
@@ -1347,7 +1460,7 @@ fn operations_line(app: &App, compact: bool) -> Line<'static> {
         } else {
             items.extend([
                 ("←→", "换页"),
-                ("1–5", "直达"),
+                ("1–6", "直达"),
                 ("Tab", "聚焦"),
                 start_or_stop,
                 ("r", "刷新"),
@@ -1666,6 +1779,54 @@ fn filter_row(selected: bool, label: &'static str, value: &'static str) -> Line<
 }
 
 /// 编辑单个配置项（配置页按 Enter / e）。
+/// 登录输入框：一个问题 + 一行输入（密码打码）。
+///
+/// 面板里每显示一次，就代表 `fuyubot-app` 的登录流程正卡在 `AppHost::ask` 那一步等人。
+fn draw_login(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(modal) = app.login.as_ref() else {
+        return;
+    };
+    let popup_width = area.width.saturating_sub(2).min(74).max(24);
+    let popup = centered(area, popup_width, 9);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .title(Line::from(vec![Span::styled(
+            " 登录 ",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )]))
+        .border_style(Style::new().fg(Color::Cyan));
+
+    let shown = if modal.masked() {
+        "•".repeat(modal.input.chars().count())
+    } else {
+        modal.input.clone()
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            modal.prompt.clone(),
+            Style::new().fg(Color::Gray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("> ", Style::new().fg(Color::Cyan)),
+            Span::raw(shown),
+            Span::styled("▏", Style::new().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter 提交 · Esc 取消（登录期间实例必须是停的）",
+            Style::new().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
 fn draw_config_editor(frame: &mut Frame, app: &App, area: Rect) {
     let Some(edit) = app.config_edit.as_ref() else {
         return;
@@ -2976,12 +3137,46 @@ mod tests {
             name: "fuyubot_plugin_start".to_owned(),
             kind: PluginKind::Native,
             path: app.plugin_dir.join("fuyubot_plugin_start.dll"),
+            enabled: true,
         }];
         app.page = Page::Plugins;
         let screen = text(&render(&mut app, 120, 30));
         assert!(screen.contains("fuyubot.start"), "{screen}");
         assert!(screen.contains("fuyubot_plugin_start"), "{screen}");
         assert!(screen.contains("dylib"), "{screen}");
+    }
+
+    /// 禁用状态要看得出来：状态列 `○`、标题里报数、文件名带 `.disable`。
+    #[test]
+    fn plugins_page_marks_disabled_ones() {
+        let mut app = app();
+        app.disk_plugins = vec![
+            crate::panel::app::DiskPlugin {
+                name: "fuyubot_plugin_start".to_owned(),
+                kind: PluginKind::Native,
+                path: app.plugin_dir.join("fuyubot_plugin_start.dll"),
+                enabled: true,
+            },
+            crate::panel::app::DiskPlugin {
+                name: "fuyubot_plugin_help".to_owned(),
+                kind: PluginKind::Native,
+                path: app
+                    .plugin_dir
+                    .join("fuyubot_plugin_help.dll")
+                    .with_extension("dll.disable"),
+                enabled: false,
+            },
+        ];
+        app.page = Page::Plugins;
+        app.focus = Focus::Workspace;
+        let screen = text(&render(&mut app, 120, 30));
+        assert!(screen.contains("1 个已禁用"), "{screen}");
+        assert!(
+            screen.contains("fuyubot_plugin_help.dll.disable"),
+            "{screen}"
+        );
+        // 开关键必须出现在这一页的操作行里，不然没人知道能按。
+        assert!(screen.contains("启用 / 禁用"), "{screen}");
     }
 
     #[test]
@@ -2992,6 +3187,7 @@ mod tests {
             name: "fuyubot_plugin_start".to_owned(),
             kind: PluginKind::Native,
             path: app.plugin_dir.join("fuyubot_plugin_start.dll"),
+            enabled: true,
         }];
         app.page = Page::Plugins;
         let screen = text(&render(&mut app, 40, 24));
@@ -3053,6 +3249,20 @@ mod tests {
             "窄屏路径应是相对的：\n{screen}"
         );
         assert!(!screen.contains("[工作区]"), "窄栏用短标记：\n{screen}");
+    }
+
+    /// 商店页没有配置索引地址时也要能画出来：标题给「未配置」，不 panic、不联网。
+    #[test]
+    fn store_page_renders_without_a_registry_url() {
+        let mut app = app();
+        app.page = Page::Store;
+        app.focus = Focus::Workspace;
+        let buffer = render(&mut app, 100, 30);
+        let screen = text(&buffer);
+        assert!(
+            screen.contains("插件商店（未配置）"),
+            "商店标题不对：\n{screen}"
+        );
     }
 
     #[test]

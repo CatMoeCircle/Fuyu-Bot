@@ -68,7 +68,7 @@ $env:TG_API_HASH = "…"
 | `fuyubot init --dir <目录> --name <名字> --api-id <id>` | 建项目：生成 `fuyubot.toml`、`plugins/`，并复制内置插件 |
 | `fuyubot run --config <目录>/fuyubot.toml` | 前台跑（含登录） |
 | `fuyubot run … --background` | 后台跑，日志进 `<项目>/logs/fuyubot.log`（每次启动先清空旧日志） |
-| `fuyubot run --tui`（短写 `-t`） | 终端操作面板：顶部版本栏 + 导航/工作区 + 底部资源占用，`s` 启动 / `x` 停止 |
+| `fuyubot run --tui`（短写 `-t`） | 终端操作面板：顶部版本栏 + 导航/工作区 + 底部资源占用，`s` 启动 / `x` 停止 / 插件页 `Space` 开关插件 |
 | `fuyubot status --config …` / `fuyubot stop --config …` | 看状态 / 优雅停止 |
 | `fuyubot config --config …` | 打印**生效**配置（默认值 + 实际读到的文件） |
 | `fuyubot run --replay <json> --plugin-dir <目录>` | 离线回放：不接 TDLib、不用账号 |
@@ -84,6 +84,9 @@ $env:TG_API_HASH = "…"
 `Tab` 在**导航 / 工作区**之间切换焦点（当前窗口边框高亮），`Enter` 进入工作区、`Esc` 返回导航。
 焦点在导航时 `↑↓` / `1–5` 换页；焦点在工作区时 `↑↓` / `PgUp` / `PgDn` 滚动日志或选择配置项。
 `r` 刷新，`?` 看全部按键。
+插件页（工作区焦点）按 `Space` 启用 / 禁用选中的 dylib：**禁用就是改名**（`foo.dll` →
+`foo.dll.disable`），加载器只认扩展名正好是 `dll` 的文件，所以下次 `run` 不会再加载它；
+再按一次改回来。改完重启实例才生效（运行中的实例已经把库映射进进程了）。
 日志页（工作区焦点）按 `l` 调整运行中实例的插件日志级别（写 `.fuyubot/log-level`，实例下一圈生效；
 只对本次运行有效，重启回到 `[plugins].log_level`）；按 `F` 按**级别**和**来源**（插件 / 宿主 / 管道 /
 更新 / TDLib / 其他）过滤日志，`f` 开关跟随末尾。TDLib Update 行只显示 `@type`；

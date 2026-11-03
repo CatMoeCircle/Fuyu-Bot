@@ -37,15 +37,13 @@ mod logout;
 mod panel;
 mod scaffold;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use fuyubot_core::{Kernel, Plugin as _};
-use fuyubot_loader::{
-    DylibPlugin, LogLevel, PluginLoader, UpdatePipeline, find_script, plugin_files,
-};
+use fuyubot_loader::{BundleManifest, LogLevel, PluginEntry, UpdatePipeline, find_script};
 use fuyubot_simplify::{CONNECTION_UPDATE, ConnectionState};
 // 扩展 trait 要在作用域里才能对 `ConsolePrompter` 调 `ask`（固有方法不覆盖它）。
 use fuyubot_tdlib::{AuthState, Prompter as _};
@@ -220,12 +218,17 @@ struct PluginArgs {
 
 #[derive(Subcommand, Debug)]
 enum PluginCommand {
-    /// 列出插件目录里能被加载的插件（脚本插件展平到每个脚本）
+    /// 静态列出插件目录里的插件（不 dlopen、不建 Kernel）
     List(PluginDirArgs),
-    /// 把一个插件装进插件目录（目录 = 脚本插件，文件 = 原生插件）
+    /// 把一个插件装进插件目录（目录 = 插件包 / 脚本插件，文件 = 原生插件）
     Install(InstallArgs),
-    /// 卸载一个插件（脚本插件按目录名，原生插件按动态库名）
+    /// 卸载一个插件（包按 id，脚本按目录名，旧形态按动态库名）
     Uninstall(UninstallArgs),
+    /// 把旧形态插件迁成插件包（`plugins/<id>/plugin.json`）
+    ///
+    /// 平铺 dll 会**允许 dlopen 一次**来问名字 / 版本 / 依赖（用户显式触发，进程即将退出）；
+    /// `scripts/<dir>` 只是补一份 `plugin.json`，目录不动。`--dry-run` 只打印计划。
+    Migrate(MigrateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -238,9 +241,20 @@ struct PluginDirArgs {
 
 #[derive(Args, Debug)]
 struct InstallArgs {
-    /// 插件动态库，或插件工程目录（目录里会去找 target/ 下的产物）；
-    /// **脚本插件**传目录（带 package.json / pyproject.toml 的那个）
+    /// 插件包目录（根部有 plugin.json）、脚本插件目录（package.json / pyproject.toml），
+    /// 或一个编好的动态库
     path: PathBuf,
+    #[arg(long, default_value = scaffold::CONFIG_FILE)]
+    config: PathBuf,
+    #[arg(long)]
+    plugin_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct MigrateArgs {
+    /// 只打印计划，不动任何文件
+    #[arg(long)]
+    dry_run: bool,
     #[arg(long, default_value = scaffold::CONFIG_FILE)]
     config: PathBuf,
     #[arg(long)]
@@ -290,6 +304,7 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             PluginCommand::List(args) => plugin_list(args)?,
             PluginCommand::Install(args) => plugin_install(args)?,
             PluginCommand::Uninstall(args) => plugin_uninstall(args)?,
+            PluginCommand::Migrate(args) => migrate_plugins(args)?,
         },
     }
     Ok(())
@@ -677,24 +692,9 @@ async fn login_async(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> 
     // 锁一直拿到本命令退出：登录期间 `fuyubot run` 会被这把锁挡在外面。
     let instance_lock = instance::InstanceLock::acquire(&root)?;
 
-    let mut kernel = Kernel::new();
-    kernel.start().await?;
-    let loader = PluginLoader::new(kernel.context().clone())?;
-    let pipeline = Arc::new(loader.pipeline());
-
-    // ⚠️ 这里**不** `load_plugins`、也**不** `spawn_dispatch`：登录只需要一个能收发
-    // TDLib 更新的客户端，插件与分发都是 `run` 的事（不然登个录还要装/起一遍插件）。
-    let Some(client) = attach_tdlib(
-        &pipeline,
-        config.tdlib.path.as_deref(),
-        config.tdlib.log_verbosity(),
-    ) else {
-        kernel.stop().await?;
-        return Err("TDLib 没就绪，登录没法进行——上面的报错说明了缺什么\
-                    （TDLIB_TDJSON_PATH、exe 同级 tdjson，或 [tdlib].path）"
-            .into());
-    };
-
+    // ⚠️ 这里**不**装插件、**不**开分发：登录只需要一个能收发 TDLib 更新的客户端，
+    // 插件与分发都是 `run` 的事（不然登个录还要装/起一遍插件）。
+    // `App::boot` = 内核 + 宿主 + 接 TDLib（不登录）；`login` 才是走授权状态机。
     let parameters = resolve_parameters(&config, &config_path, &root, cli_api_id)?;
     let account = config.telegram.account_type()?;
     cli!(
@@ -702,15 +702,38 @@ async fn login_async(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> 
         "只登录：不加载插件、不开接收循环；登完就退出\
          （之后 `fuyubot run` 会直接用这份 session）"
     );
-    drive_login(&client, &parameters, account, &pipeline)?;
+
+    let app_options = fuyubot_app::AppOptions {
+        data_dir: parameters.data_dir.clone(),
+        plugin_dir: config.plugin_dir(&root),
+        log_level: config.plugins.log_level()?,
+        log_plugins: Vec::new(),
+        config: config.to_json()?,
+        config_path: Some(config_path.clone()),
+        tdjson_path: config.tdlib.path.as_deref().map(PathBuf::from),
+        tdlib: Some(fuyubot_app::TdlibSettings {
+            parameters: parameters.clone(),
+            account,
+            bot_token: std::env::var("TG_BOT_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty()),
+            log_verbosity: Some(config.tdlib.log_verbosity()),
+            login_budget: fuyubot_tdlib::LOGIN_BUDGET,
+            login: true,
+        }),
+        host: Arc::new(ConsoleHost::new()),
+    };
+
+    let mut app = fuyubot_app::App::boot(app_options).await?;
+    app.login()?;
     cli!(
         info,
         "登录完成：session 在 {}——`fuyubot run`（含 `--background`）起来会直接进 Ready",
         parameters.data_dir.display()
     );
-    // 登录完也走一次优雅关闭（没有接收循环，`receive` 归这里独占）：
-    // 让 TDLib 把刚写下的 session 刷进 `database_dir` 再销毁，而不是只靠 destroy 收尾。
-    if client.close_and_wait(TD_CLOSE_TIMEOUT) {
+    // 登录完也走一次优雅关闭：让 TDLib 把刚写下的 session 刷进 `database_dir` 再销毁，
+    // 而不是只靠 destroy 收尾。
+    if app.shutdown(None, TD_CLOSE_TIMEOUT).await? {
         cli!(info, "TDLib 已关闭（数据库已刷盘）");
     } else {
         cli!(
@@ -720,9 +743,7 @@ async fn login_async(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> 
         );
     }
 
-    // 收摊：没有插件要卸载、没有接收循环要停；上面已经请 TDLib 关过会话。
     drop(instance_lock);
-    kernel.stop().await?;
     Ok(())
 }
 
@@ -762,7 +783,7 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // （配置文件所在目录）：插件配置里写成 `cache` / `Cache` 的相对路径就稳稳落在
     // `fuyubot.toml` 旁边，跟 `[telegram].data_dir` 的语义一致。
     enter_project_root(&root)?;
-    // 插件目录不在就建一个空的：`plugin_files` 对**不存在的目录**是 io 错误，
+    // 插件目录不在就建一个空的：`plugin_entries` 对**不存在的目录**是 io 错误，
     // 而 `run` 不该因为「还没装过插件」就死在一个 `Os { code: 3 }` 上
     // （`init` 只在缺配置时才会建 `plugins/`，配置已存在而目录被删掉就轮到这条兜底）。
     std::fs::create_dir_all(&plugin_dir)
@@ -789,24 +810,48 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => Some(instance::InstanceLock::acquire(&root)?),
     };
 
-    let mut kernel = Kernel::new();
-    kernel.start().await?;
+    // ── ③～⑧ 交给编排层（`fuyubot-app`）───────────────────────────
+    //
+    // 「内核 → 宿主运行时 → 接 TDLib → 装插件 → 登录」这段顺序只有一份，在 `fuyubot-app` 里
+    // （Android 的 JNI 运行时走的是同一份）。这里只留 CLI 自己的东西：
+    // 实例锁、`.fuyubot/status`、回放、重登、插件日志门槛、`--trace-updates`。
+    //
+    // 装插件必须在登录**之前**：插件要在 TDLib 开始产出之前订阅好，否则登录窗口里的更新
+    // 就漏了（窗口里收到的东西也不会被吞：`Session::login` 的 `bypass` 转给管线）。
+    let replaying = args.replay.is_some();
 
-    // 宿主运行时把事件 / 服务 / 工具 / 中间件装进 kernel 的 Context，
-    // 并生成给插件用的 HostApiVTable。
-    let loader = PluginLoader::new(kernel.context().clone())?;
-    let pipeline = Arc::new(loader.pipeline());
+    // ② 凭据先问清楚。`--no-login` 不问也不发参数——TDLib 会停在
+    //    `authorizationStateWaitTdlibParameters`，**已有的 session 也不会被打开**
+    //    （数据库目录正是在 `setTdlibParameters` 里给的）。它只适合「只想把插件跑起来」。
+    let parameters = if args.no_login || args.no_tdlib || replaying {
+        None
+    } else {
+        Some(resolve_parameters(
+            &config,
+            &config_path,
+            &root,
+            cli_api_id,
+        )?)
+    };
 
-    // 缺口 12 的宿主消费者：插件的 Loaded / Activated / Deactivated / Failed / Unloaded
-    // 发到事件总线（`plugin_*` 通道），插件自己也能订阅。守卫要留住，drop 就退订。
-    let _lifecycle = loader.runtime().install_lifecycle_bridge(kernel.plugins());
-
-    // 把全局配置装进宿主运行时：插件经 ABI 的 `get_config` / `set_config` 读写它。
-    // 必须在插件加载之前——插件 `start` 里就可能读自己的段。
-    let config_json = config.to_json()?;
-    loader
-        .runtime()
-        .install_config(Some(config_path.clone()), config_json);
+    // 回放 / `--no-tdlib` 不接 TDLib；否则先探一次库——**探不到就不接、但照常跑**
+    // （与以前的 `attach_tdlib` 一致：插件与回放都不需要 TDLib）。
+    let attach = if args.no_tdlib || replaying {
+        if replaying {
+            cli!(info, "--replay：本次不接 TDLib（回放是离线的，请求只留档）");
+        } else {
+            cli!(info, "--no-tdlib：跳过 TDLib，插件照常加载");
+        }
+        false
+    } else {
+        match fuyubot_tdlib::resolve() {
+            Ok(_) => true,
+            Err(error) => {
+                cli!(warn, "TDLib 未就绪（不接更新）：{error}");
+                false
+            }
+        }
+    };
 
     // 插件日志门槛：`[plugins].log_level`，`--log-level` 覆盖它。**必须在插件加载之前**——
     // 插件 `init` / `start` 里打的日志也受它管。
@@ -814,10 +859,6 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(raw) => scaffold::parse_log_level(raw)?,
         None => config.plugins.log_level()?,
     };
-    pipeline.runtime().set_log_verbosity(log_level);
-    // 来源过滤：`--log-plugin fuyubot.start` 只留这个插件打出来的日志。
-    // 只挡插件日志，宿主 / 管线的告警照旧——过滤时最该看见的恰恰是「框架说哪里不对」。
-    pipeline.runtime().set_log_plugins(args.log_plugin.clone());
     cli!(
         info,
         "插件日志级别：{}",
@@ -826,6 +867,65 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !args.log_plugin.is_empty() {
         cli!(info, "只看插件日志：{}", args.log_plugin.join(", "));
     }
+
+    // `[tdlib].path` 指到不存在的路径就别硬塞给 loader：告诉用户，然后走自动查找。
+    let tdjson_path = match config.tdlib.path.as_deref() {
+        Some(path) if !path.trim().is_empty() => {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                cli!(info, "TDLib 用配置里的路径：{}", path.display());
+                Some(path)
+            } else {
+                cli!(
+                    warn,
+                    "配置里的 tdlib.path 不存在：{}，回退到自动查找",
+                    path.display()
+                );
+                None
+            }
+        }
+        _ => None,
+    };
+
+    let data_dir = parameters
+        .as_ref()
+        .map(|parameters| parameters.data_dir.clone())
+        .unwrap_or_else(|| root.join(config.telegram.data_dir.as_deref().unwrap_or("data")));
+
+    let app_options = fuyubot_app::AppOptions {
+        data_dir: data_dir.clone(),
+        plugin_dir: plugin_dir.clone(),
+        log_level,
+        log_plugins: args.log_plugin.clone(),
+        config: config.to_json()?,
+        config_path: Some(config_path.clone()),
+        tdjson_path,
+        tdlib: if attach {
+            Some(fuyubot_app::TdlibSettings {
+                // `--no-login` 时参数只是占位（`login: false`，永远不会发给 TDLib）。
+                parameters: parameters.unwrap_or_else(|| {
+                    fuyubot_tdlib::TdlibParameters::new(data_dir, 0, String::new())
+                }),
+                account: config.telegram.account_type()?,
+                bot_token: std::env::var("TG_BOT_TOKEN")
+                    .ok()
+                    .filter(|token| !token.is_empty()),
+                log_verbosity: Some(config.tdlib.log_verbosity()),
+                login_budget: fuyubot_tdlib::LOGIN_BUDGET,
+                login: !args.no_login,
+            })
+        } else {
+            None
+        },
+        host: Arc::new(ConsoleHost::new()),
+    };
+
+    let mut app = fuyubot_app::App::boot(app_options).await?;
+
+    // ⑥ 装插件（**在发 `setTdlibParameters` 之前**）。
+    app.load_plugins()?;
+    // 运行期调日志级别 / `--trace-updates` 走同一条管线（`fuyubot-app` 已经把门槛与来源过滤设好）。
+    let pipeline = Arc::clone(app.pipeline());
     if args.trace_updates {
         pipeline.runtime().set_trace_updates(true);
         cli!(
@@ -834,55 +934,6 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // ── 启动顺序 ────────────────────────────────────────────────
-    //
-    //   ① 自动 init（上面刚做）
-    //   ② **交互式问 api_id / api_hash**（缺了才问；环境变量/配置都有就不问）
-    //   ③ 把 client 挂进宿主运行时 —— 插件 `start` 期发的请求才会真的进 TDLib
-    //   ④ **加载全部插件**
-    //   ⑤ 才等 TDLib 到「等参数」状态并 `setTdlibParameters` → 登录
-    //   ⑥ `getMe` 打印账户信息
-    //   ⑦ 最后才开始分发更新
-    //
-    // ③④ 必须在 ⑤ **之前**：插件要在 TDLib 开始产出之前订阅好，否则登录窗口里的
-    // 更新就漏了（登录窗口收到的东西也不会被吞，见 `log_in_with` 的 `bypass`）。
-    //
-    // 回放模式**不接 TDLib**：它是「离线验插件」用的，接了反而有两宗罪——
-    // 需要账号/网络，而且接收循环停不下来（见 docs/gaps.md 缺口 8），
-    // tokio 运行时 drop 时会一直等它，进程退不出去。
-    let replaying = args.replay.is_some();
-    let tdlib_client = if args.no_tdlib || replaying {
-        if replaying {
-            cli!(info, "--replay：本次不接 TDLib（回放是离线的，请求只留档）");
-        } else {
-            cli!(info, "--no-tdlib：跳过 TDLib，插件照常加载");
-        }
-        None
-    } else {
-        attach_tdlib(
-            &pipeline,
-            config.tdlib.path.as_deref(),
-            config.tdlib.log_verbosity(),
-        )
-    };
-
-    // ② 凭据先问清楚。`--no-login` 不问也不发参数——TDLib 会停在
-    //    `authorizationStateWaitTdlibParameters`，**已有的 session 也不会被打开**
-    //    （数据库目录正是在 `setTdlibParameters` 里给的）。它只适合「只想把插件跑起来」。
-    let parameters = match (tdlib_client.as_ref(), args.no_login) {
-        (Some(_), false) => Some(resolve_parameters(
-            &config,
-            &config_path,
-            &root,
-            cli_api_id,
-        )?),
-        _ => None,
-    };
-
-    // ④ 插件全部加载完（**在发 `setTdlibParameters` 之前**）。
-    // `spawn = true`：`run` 要的是真跑起来——装依赖、起进程、watch 一整套。
-    let mut loaded = load_plugins(&mut kernel, &loader, &plugin_dir, true)?;
-
     // ── TDLib 运行状态（面板顶部 / 概览页）─────────────────────────
     //
     // TDLib **没有**「现在连上了吗 / 登录到哪一步了」这种可查的方法：连接与授权都只有
@@ -890,7 +941,7 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // 主循环再写进 `.fuyubot/status`——面板是**另一个进程**，只能通过这份文件看到它们
     // （约束 47：面板自己不接 TDLib）。
     //
-    // ⚠️ 连接状态的订阅必须早于 `drive_login`：登录窗口里 TDLib 就在发
+    // ⚠️ 连接状态的订阅必须早于登录：登录窗口里 TDLib 就在发
     //    `updateConnectionState`，而且只在**变化**时发，等登录完再订阅就漏掉 `connectionStateReady`。
     //    授权状态正相反：`log_in_with` 把登录窗口里的 `updateAuthorizationState` **自己消费掉了**
     //    （只把与授权无关的更新转给管线），事件总线看不到最后那条 `authorizationStateReady`——
@@ -899,8 +950,7 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let connection: Arc<Mutex<Option<ConnectionState>>> = Arc::new(Mutex::new(None));
     let _connection_watch = {
         let slot = Arc::clone(&connection);
-        loader
-            .runtime()
+        app.runtime()
             .events()
             .on(CONNECTION_UPDATE, None, move |payload| {
                 if let Some(state) = connection_update_state(payload) {
@@ -915,8 +965,7 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let authorization: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let _authorization_watch = {
         let slot = Arc::clone(&authorization);
-        loader
-            .runtime()
+        app.runtime()
             .events()
             .on("updateAuthorizationState", None, move |payload| {
                 if let Some(name) = authorization_update_name(payload) {
@@ -926,24 +975,18 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             })
     };
 
-    // ⑤⑥ 现在才驱动登录：等「等参数」状态 → 设置 → 等授权状态 →（要登录就登录）→ Ready。
-    if let (Some(client), Some(parameters)) = (tdlib_client.as_ref(), parameters.as_ref()) {
-        let account = config.telegram.account_type()?;
-        let me = drive_login(client, parameters, account, &pipeline)?;
-        // 身份交给运行时：插件经 `fuyubot.host.identity` 读到它，`on_command` 靠它
-        // 把「点名给别人的命令」挡在插件外面（`/start@别的Bot` 不该回欢迎语）。
-        if let Some(me) = me {
-            loader.runtime().set_self_user(me);
-        }
+    // ⑦ 现在才驱动登录：等「等参数」状态 → 设置 → 等授权状态 →（要登录就登录）→ Ready。
+    //    账户信息（`getMe`）由 `App::login` 交给运行时：插件经 `fuyubot.host.identity`
+    //    读到它，`on_command` 靠它把「点名给别人的命令」挡在插件外面。
+    if app.should_login() {
+        app.login()?;
         // 登录窗口里的授权更新被 `log_in_with` 自己消费了，事件总线收不到 Ready；
         // 它正常返回就等于授权状态到了 Ready，补记这一笔（否则 status 里会一直没有授权状态）。
         mark_authorized(&authorization);
     }
 
-    // ⑦ 插件与登录都就位，现在才开接收循环（gaps 缺口 8：句柄要一直留着，否则停不掉）。
-    let receive = tdlib_client
-        .as_ref()
-        .map(|client| pipeline.spawn_dispatch(client));
+    // ⑧ 插件与登录都就位，现在才开接收循环（gaps 缺口 8：句柄要一直留着，否则停不掉）。
+    let receive = app.dispatch();
 
     let bot_name = config
         .bot
@@ -952,23 +995,27 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "fuyubot".to_owned());
     // 插件速览：`status` 是**另一个进程**，只能从这份文件读，所以要写下来。
     // （插件自己那条路走 `fuyubot.host.plugins` 服务，`load_plugins` 里已经装了活来源。）
-    let detail = instance::PluginDetail::from_report(&kernel.report());
+    let detail = instance::PluginDetail::from_report(&app.kernel().report());
     cli!(
         info,
         "{bot_name}（fuyubot {}）已启动：插件 {} 个，工具 {} 个",
         env!("CARGO_PKG_VERSION"),
         detail.active.len(),
-        loader.runtime().tools().len()
+        app.runtime().tools().len()
     );
     // 发布 / 重发状态用同一份计算：`--background` 的父进程等的是**第一次**发布，
     // 而运行期插件上下线 / 日志级别变化之后要让 `status` 跟上——两处算的必须是同一个东西。
     //
     // `running` / `stopped_at` 只在**收摊成功之后**才写 `running=0` + 时间：崩溃 / 硬杀
     // 留下的最后一份仍是 `running=1`，面板据此区分「上次正常停止」与「上次异常退出」。
+    //
+    // `account` 由调用方算好传进来：宿主手里那份是**活的**（登录写一次，之后每条
+    // `updateUser` 都刷新），闭包里不碰 `App` 才不会和后面的 `login` / `shutdown` 抢借用。
     let publish = |detail: instance::PluginDetail,
                    log_level: LogLevel,
                    running: bool,
-                   stopped_at: Option<u64>|
+                   stopped_at: Option<u64>,
+                   account: Option<instance::Account>|
      -> Result<(), Box<dyn std::error::Error>> {
         let Some(lock) = instance_lock.as_ref() else {
             return Ok(());
@@ -986,56 +1033,54 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             connection: (*connection.lock().unwrap_or_else(|e| e.into_inner()))
                 .map(|state| state.type_name().to_owned()),
             authorization: (*authorization.lock().unwrap_or_else(|e| e.into_inner())).clone(),
-            // 账户：宿主手里那份是**活的**（登录写一次，之后每条 `updateUser` 都刷新），
-            // 这里只做「JSON → status 行」的转换。
-            account: current_account(loader.runtime()),
+            account,
             detail,
         })?;
         Ok(())
     };
     // 状态**这时候才发布**：`run --background` 的父进程等的就是它（拿上锁只说明进程活着）。
-    publish(detail.clone(), log_level, true, None)?;
+    publish(
+        detail.clone(),
+        log_level,
+        true,
+        None,
+        current_account(app.runtime()),
+    )?;
     // 运行循环用它判断「要不要重发」——不记下来的话，每圈都算得出差异、
     // 或者干脆每圈都写一遍。
     let mut last_detail = detail;
     let mut last_log_level = log_level;
     let mut last_connection = *connection.lock().unwrap_or_else(|e| e.into_inner());
     let mut last_authorization = (*authorization.lock().unwrap_or_else(|e| e.into_inner())).clone();
-    let mut last_account = current_account(loader.runtime());
+    let mut last_account = current_account(app.runtime());
 
     if let Some(replay) = replay {
         // 脚本插件在**另一个进程**里跑，反应要经管道回来，还可能捎带网络请求；
         // 纯 Rust/C 插件是同步的，回放完就已经尘埃落定。按这个差别选等待窗口。
-        let scripted = plugin_files(&plugin_dir)?
-            .iter()
-            .any(|path| find_script(path).is_some());
+        let scripted = has_script_plugins(&plugin_dir);
         replay_updates(
             &pipeline,
             &replay,
-            loader.runtime(),
+            app.runtime(),
             scripted,
             args.replay_wait,
         )?;
-        loaded.clear();
-        kernel.stop().await?;
+        app.shutdown(None, TD_CLOSE_TIMEOUT).await?;
         return Ok(());
     }
 
     // 没有 TDLib 就到此为止：接收循环没起来，本进程只是个「装好插件的空壳」。
     let Some(mut receive) = receive else {
-        loaded.clear();
-        kernel.stop().await?;
+        let account = current_account(app.runtime());
+        app.shutdown(None, TD_CLOSE_TIMEOUT).await?;
         publish(
             last_detail.clone(),
             log_level,
             false,
             Some(instance::unix_now()),
+            account,
         )?;
         return Ok(());
-    };
-    // 有接收循环就一定有 client（`receive` 只可能由上面的 `tdlib_client` 派生出来）。
-    let Some(client) = tdlib_client.as_ref() else {
-        unreachable!("有接收循环就一定有 TDLib 客户端")
     };
 
     // ── 运行期盯授权状态（变更 3-b）──────────────────────────────────
@@ -1049,8 +1094,7 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let alert: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let _auth_watch = {
         let slot = Arc::clone(&alert);
-        loader
-            .runtime()
+        app.runtime()
             .events()
             .on("updateAuthorizationState", None, move |payload| {
                 if let Some(state) = re_login_alert(payload) {
@@ -1092,20 +1136,20 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         // ⚠️ **只在真的变了才写**：`publish` 会整份重写文件，每 500ms 都写一遍
         // 是白费 I/O，还会让 `status` 的读和写撞上（Windows 上偶尔读到半份）。
         {
-            let current = instance::PluginDetail::from_report(&kernel.report());
+            let current = instance::PluginDetail::from_report(&app.kernel().report());
             let connection_now = *connection.lock().unwrap_or_else(|e| e.into_inner());
             let authorization_now =
                 (*authorization.lock().unwrap_or_else(|e| e.into_inner())).clone();
             // 账户也会变：TDLib 用 `updateUser` 改名字 / 用户名，宿主已经收下最新的那份，
             // 这里只负责发现「变了」并把 status 重发一遍。
-            let account_now = current_account(loader.runtime());
+            let account_now = current_account(app.runtime());
             if current != last_detail
                 || log_level != last_log_level
                 || connection_now != last_connection
                 || authorization_now != last_authorization
                 || account_now != last_account
             {
-                publish(current.clone(), log_level, true, None)?;
+                publish(current.clone(), log_level, true, None, account_now.clone())?;
                 last_detail = current;
                 last_log_level = log_level;
                 last_connection = connection_now;
@@ -1121,12 +1165,10 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             .is_some_and(instance::InstanceLock::stop_requested)
         {
             cli!(info, "收到停止请求：停接收循环、卸载插件");
-            receive.stop();
-            receive.join().await;
-            loaded.clear();
-            // 插件都停了、接收循环也退了，现在没有别人跟这里抢 `td_receive`：
-            // 请 TDLib 关闭会话并等 `authorizationStateClosed`（数据库刷完盘）。
-            if client.close_and_wait(TD_CLOSE_TIMEOUT) {
+            // 收摊前的账户先取出来：`shutdown` 会消费 `app`。
+            let account = current_account(app.runtime());
+            let closed = app.shutdown(Some(receive), TD_CLOSE_TIMEOUT).await?;
+            if closed {
                 cli!(info, "TDLib 已关闭（数据库已刷盘）");
             } else {
                 cli!(
@@ -1138,7 +1180,6 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(lock) = instance_lock.as_ref() {
                 lock.clear_stop();
             }
-            kernel.stop().await?;
             // 收摊成功之后才敢说「正常停止」：写 `running=0` + 时间，面板 / `status`
             // 才能和崩溃留下的 `running=1` 区分开。
             publish(
@@ -1146,6 +1187,7 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
                 log_level,
                 false,
                 Some(instance::unix_now()),
+                account,
             )?;
             return Ok(());
         }
@@ -1154,17 +1196,15 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         };
         // 退回登录要用启动时那套参数。`--no-login` 下我们根本没发过参数，也就没有可重登的
-        // 东西——**这条必须在停循环之前判**：`join()` 会按值消费 `receive`，从这里 `continue`
-        // 就会跳过下面那次重新赋值，编译器直接报 use-after-move（也确实会漏掉循环）。
-        let Some(parameters) = parameters.as_ref() else {
+        // 东西——**这条必须在停循环之前判**：`shutdown` 会按值消费 `app`。
+        if !app.should_login() {
             cli!(
                 warn,
                 "⚠️ 授权状态变成 {state}，但本次是 --no-login（没发过 setTdlibParameters），\
                  没有可用的重登参数——只能继续等"
             );
             continue;
-        };
-        let account = config.telegram.account_type()?;
+        }
 
         cli!(
             warn,
@@ -1172,109 +1212,259 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
         receive.stop();
         receive.join().await;
-        // 重登之后账户可能换了（换号 / 改名）：和启动时一样把新的 `getMe` 交给宿主，
+        // 重登之后账户可能换了（换号 / 改名）：`App::login` 会把新的 `getMe` 交给宿主，
         // 否则 `fuyubot.host.identity` 与面板上的账户行还停在旧账号。
-        if let Some(me) = drive_login(client, parameters, account, &pipeline)? {
-            loader.runtime().set_self_user(me);
-        }
+        app.login()?;
         // 与启动时同一个理由：登录窗口里的授权更新不进事件总线，成功返回就补记 Ready。
         mark_authorized(&authorization);
         // 登录完再开分发。**插件不重新加载**：它们还订阅着，重载会重复注册。
-        receive = pipeline.spawn_dispatch(client);
+        receive = match app.dispatch() {
+            Some(receive) => receive,
+            None => unreachable!("刚登录完一定有 TDLib 客户端"),
+        };
         cli!(info, "已重新进入运行状态");
     }
 }
 
-/// `fuyubot plugin list`：列出插件目录里的插件。
+/// `fuyubot plugin list`：**纯静态**列出插件目录里的插件（不 dlopen、不建 Kernel）。
 ///
-/// 两层输出：**动态库插件**一行一个（dlopen 之后才知道名字，所以真的加载一次），
-/// 外加**脚本插件展平**——两个中间插件把自己托管的清单暴露成
-/// `fuyubot.host.scripts.<lang>` service，这里按前缀枚举后逐个 `list`。
-/// 不展平的话用户只能看到两个 dll，看不到它们究竟管着哪些脚本。
+/// 四段（契约 §6）：
+/// 1. 原生插件包：`id  version  ABI n|?  kind  path`；
+/// 2. 旧形态 dll：`文件名  legacy  path`；
+/// 3. 脚本插件：`scripts/<dir>` 有 `plugin.json` 就按它列，没有就按
+///    `package.json` / `pyproject.toml` 的 fuyubot 身份段列；
+/// 4. 已禁用：`.disabled/<id>/` 与 `*.disable`。
 ///
-/// 给插件传 `"spawn": false`：列清单不该替用户跑 `bun install` / `uv sync`，
-/// 更不该把作者的脚本进程拉起来（中间插件据此进入只发现模式）。
+/// 单个包坏掉（清单读不了 / 入口不在 / 平台不匹配）只打一行原因，继续列其余的。
 fn plugin_list(args: PluginDirArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        let root = project_root(&parent_or_dot(&args.config)).unwrap_or_else(|| PathBuf::from("."));
-        let config = scaffold::load_config(&args.config)?;
-        let plugin_dir = args.plugin_dir.unwrap_or_else(|| config.plugin_dir(&root));
+    let root = project_root(&parent_or_dot(&args.config)).unwrap_or_else(|| PathBuf::from("."));
+    let config = scaffold::load_config(&args.config)?;
+    let plugin_dir = args.plugin_dir.unwrap_or_else(|| config.plugin_dir(&root));
 
-        let mut kernel = Kernel::new();
-        kernel.start().await?;
-        let loader = PluginLoader::new(kernel.context().clone())?;
-
-        let files = plugin_files(&plugin_dir).unwrap_or_default();
-        if files.is_empty() {
-            cli!(
-                warn,
-                "{} 里没有插件（.{}）",
-                plugin_dir.display(),
-                fuyubot_loader::DLL_EXTENSION
-            );
+    let entries = match fuyubot_loader::plugin_entries(&plugin_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            cli!(warn, "读不了插件目录 {}: {error}", plugin_dir.display());
+            Vec::new()
         }
-        // 插件名只有 dlopen 之后才知道，所以这里是「真的加载一次再看」。
-        // 用与 `run` 同一个加载函数：带脚本的插件（Python/JS）同样需要拿到
-        // 脚本的绝对路径，否则会按当前目录去找、然后加载失败。
-        // `spawn = false`：只发现不启动（见函数文档）。
-        //
-        // ⚠️ `loaded` 必须**绑到变量上**：`LoadedPlugin` drop 即 `plugin_stop` +
-        // owner 回滚，它一死，中间插件注册的清单 service 跟着注销——后面
-        // `print_managed_scripts` 就什么都查不到。写在 `for` 的临时位置里
-        // 正是踩过这个坑。
-        let loaded = load_plugins(&mut kernel, &loader, &plugin_dir, false)?;
-        for plugin in &loaded {
-            cli!(
-                info,
-                "{}\tABI {}\t{}",
-                plugin.name(),
-                plugin.abi_version(),
-                plugin.path().display()
-            );
+    };
+    let mut bundles = Vec::new();
+    let mut legacy = Vec::new();
+    for entry in entries {
+        match entry {
+            PluginEntry::Bundle(dir) => bundles.push(dir),
+            PluginEntry::Legacy(path) => legacy.push(path),
         }
+    }
 
-        print_managed_scripts(&loader);
-        Ok::<(), Box<dyn std::error::Error>>(())
-    })
+    // ① 原生插件包
+    cli!(info, "原生插件包（{} 个）：", bundles.len());
+    if bundles.is_empty() {
+        cli!(info, "  （无）");
+    }
+    for dir in &bundles {
+        match BundleManifest::load(dir) {
+            Ok(manifest) => {
+                // 平台 / 入口在列举时就判：装了一个跑不起来的包，越早知道越好。
+                if let Err(error) = manifest.validate(dir) {
+                    cli!(warn, "  跳过 {}：{error}", dir.display());
+                    continue;
+                }
+                let abi = manifest
+                    .abi
+                    .map(|abi| format!("ABI {abi}"))
+                    .unwrap_or_else(|| "ABI ?".to_owned());
+                cli!(
+                    info,
+                    "  {}\t{}\t{}\t{}\t{}",
+                    manifest.id,
+                    manifest.version,
+                    abi,
+                    manifest.kind.as_str(),
+                    dir.display()
+                );
+            }
+            Err(error) => cli!(warn, "  跳过 {}：{error}", dir.display()),
+        }
+    }
+
+    // ② 旧形态平铺 dll（不探测：读不了元数据就直说，别 dlopen）
+    cli!(
+        info,
+        "旧形态动态库（{} 个，建议 `fuyubot plugin migrate` 迁成插件包）：",
+        legacy.len()
+    );
+    if legacy.is_empty() {
+        cli!(info, "  （无）");
+    }
+    for path in &legacy {
+        cli!(info, "  {}\tlegacy\t{}", file_name_of(path), path.display());
+    }
+
+    // ③ 脚本插件（SDK 的 Python / JS 中间插件托管；这里只读静态清单）
+    let rows = script_plugin_rows(&plugin_dir.join(fuyubot_loader::SCRIPTS_DIR));
+    cli!(
+        info,
+        "脚本插件（{} 个，由 SDK 的中间插件托管）：",
+        rows.len()
+    );
+    if rows.is_empty() {
+        cli!(info, "  （无）");
+    }
+    for row in rows {
+        cli!(info, "  {row}");
+    }
+
+    // ④ 已禁用
+    print_disabled_plugins(&plugin_dir);
+    Ok(())
 }
 
-/// 把中间插件托管的脚本清单摊开打印。
+/// 脚本插件的静态行：`id  version  kind  entry  path`。
 ///
-/// 约定：名字以 `fuyubot.host.scripts` 开头的 service 都有一个 `list` 方法，
-/// 返回 `{"lang":…,"scripts":[…]}`。按前缀枚举而不是写死两个名字：
-/// 将来多一门语言（`fuyubot.host.scripts.go` 之类）不用改这里。
-fn print_managed_scripts(loader: &PluginLoader) {
-    let runtime = loader.runtime();
-    let mut lines: Vec<String> = Vec::new();
-    for service in runtime.service_names() {
-        if !service.starts_with("fuyubot.host.scripts") {
-            continue;
+/// 有 `plugin.json` 的按清单列；老脚本目录按 `package.json` / `pyproject.toml`
+/// 的 fuyubot 身份段列（[`scaffold::script_metadata`]），都没有的目录不是插件。
+fn script_plugin_rows(scripts_dir: &Path) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for dir in fuyubot_loader::script_bundles(scripts_dir).unwrap_or_default() {
+        seen.insert(dir.clone());
+        match BundleManifest::load(&dir) {
+            Ok(manifest) => rows.push(format!(
+                "{}\t{}\t{}\t{}\t{}",
+                manifest.id,
+                manifest.version,
+                manifest.kind.as_str(),
+                manifest.entry,
+                dir.display()
+            )),
+            Err(error) => cli!(warn, "  跳过 {}：{error}", dir.display()),
         }
-        let lang = service.rsplit('.').next().unwrap_or("?").to_owned();
-        match runtime.call_service(&service, "list", "{}") {
-            Ok(json) => match serde_json::from_str::<serde_json::Value>(&json) {
-                Ok(parsed) => {
-                    for script in parsed["scripts"].as_array().into_iter().flatten() {
-                        let name = script["name"].as_str().unwrap_or("?");
-                        let entry = [script["dir"].as_str(), script["entry"].as_str()]
-                            .into_iter()
-                            .flatten()
-                            .collect::<PathBuf>();
-                        lines.push(format!("  {name}\t{lang}\t{}", entry.display()));
-                    }
+    }
+    let Ok(entries) = std::fs::read_dir(scripts_dir) else {
+        return rows;
+    };
+    let mut rest: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && !seen.contains(path)
+                && path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    !name.starts_with('.') && !name.ends_with(fuyubot_loader::DISABLED_SUFFIX)
+                })
+        })
+        .collect();
+    rest.sort();
+    for dir in rest {
+        if let Some(meta) = scaffold::script_metadata(&dir) {
+            rows.push(format!(
+                "{}\t{}\t{}\t{}\t{}",
+                meta.id,
+                meta.version,
+                meta.kind.as_str(),
+                meta.entry,
+                dir.display()
+            ));
+        }
+    }
+    rows
+}
+
+/// 被禁用（`.disabled/<id>/` 或 `*.disable`）的插件单独列一段。
+///
+/// 不说的话，面板里关掉一个插件之后 `plugin list` 里它就凭空消失了——用户会以为
+/// 文件丢了。这里不 dlopen 它们（禁用就是不想让它被加载），只读清单 / 文件名。
+fn print_disabled_plugins(plugin_dir: &Path) {
+    let mut lines = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    // 契约形态：整个包挪进 `plugins/.disabled/`。
+    if let Ok(entries) = std::fs::read_dir(plugin_dir.join(fuyubot_loader::DISABLED_DIR)) {
+        dirs.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir()),
+        );
+    }
+    // 旧面板形态：目录改名为 `<id>.disable`，文件留在原地。
+    if let Ok(entries) = std::fs::read_dir(plugin_dir) {
+        dirs.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_dir()
+                        && path.file_name().is_some_and(|name| {
+                            name.to_string_lossy()
+                                .ends_with(fuyubot_loader::DISABLED_SUFFIX)
+                        })
+                }),
+        );
+    }
+    dirs.sort();
+    dirs.dedup();
+
+    for dir in dirs {
+        let label = if fuyubot_loader::is_bundle_dir(&dir) {
+            match BundleManifest::load(&dir) {
+                Ok(manifest) => format!(
+                    "{}\t{}\t{}",
+                    manifest.id,
+                    manifest.version,
+                    manifest.kind.as_str()
+                ),
+                Err(error) => {
+                    cli!(warn, "  跳过 {}：{error}", dir.display());
+                    continue;
                 }
-                Err(e) => cli!(warn, "{service} 返回的不是合法 JSON: {e}"),
-            },
-            Err(e) => cli!(warn, "查不了 {service}: {e}"),
+            }
+        } else if let Some(meta) = scaffold::script_metadata(&dir) {
+            format!("{}\t{}\t{}", meta.id, meta.version, meta.kind.as_str())
+        } else {
+            file_name_of(&dir)
+        };
+        lines.push(format!("  {label}\t{}（已禁用）", dir.display()));
+    }
+
+    // 旧形态：`foo.dll.disable` 文件。
+    if let Ok(entries) = std::fs::read_dir(plugin_dir) {
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file() && fuyubot_loader::is_disabled(path))
+            .collect();
+        files.sort();
+        for path in files {
+            lines.push(format!(
+                "  {}\tlegacy\t{}（已禁用）",
+                file_name_of(&path),
+                path.display()
+            ));
         }
     }
-    if !lines.is_empty() {
-        cli!(info, "脚本插件（{} 个，由中间插件托管）：", lines.len());
-        for line in lines {
-            cli!(info, "{line}");
-        }
+
+    if lines.is_empty() {
+        return;
     }
+    cli!(
+        info,
+        "已禁用 {} 个（重启后生效；删掉 {} 或改成原名就恢复）：",
+        lines.len(),
+        fuyubot_loader::DISABLED_SUFFIX
+    );
+    for line in lines {
+        cli!(info, "{line}");
+    }
+}
+
+/// 路径的文件名（非 UTF-8 用替换字符，够展示）。
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn plugin_install(args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1283,7 +1473,19 @@ fn plugin_install(args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
     let plugin_dir = args.plugin_dir.unwrap_or_else(|| config.plugin_dir(&root));
 
     for path in scaffold::install(&args.path, &plugin_dir)? {
-        cli!(info, "已安装 {}", path.display());
+        if path.is_dir() {
+            cli!(
+                info,
+                "已安装插件包 {}（`fuyubot plugin list` 可见；重启后生效）",
+                path.display()
+            );
+        } else {
+            cli!(
+                info,
+                "已安装旧形态插件 {}（重启后生效；迁成插件包用 `fuyubot plugin migrate`）",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -1299,7 +1501,28 @@ fn plugin_uninstall(args: UninstallArgs) -> Result<(), Box<dyn std::error::Error
     let plugin_dir = args.plugin_dir.unwrap_or_else(|| config.plugin_dir(&root));
 
     for path in scaffold::uninstall(&args.name, &plugin_dir)? {
-        cli!(info, "已卸载 {}", path.display());
+        cli!(
+            info,
+            "已卸载 {}（正在跑的实例要重启才彻底放手）",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// `fuyubot plugin migrate [--dry-run]`：把旧形态插件迁成插件包。
+///
+/// 逻辑全在 [`scaffold::migrate`]（可单测）；这里只把报告逐行打出来。
+fn migrate_plugins(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let root = project_root(&parent_or_dot(&args.config)).unwrap_or_else(|| PathBuf::from("."));
+    let config = scaffold::load_config(&args.config)?;
+    let plugin_dir = args.plugin_dir.unwrap_or_else(|| config.plugin_dir(&root));
+
+    if args.dry_run {
+        cli!(info, "--dry-run：只打印计划，不改动任何文件");
+    }
+    for line in scaffold::migrate(&plugin_dir, args.dry_run)? {
+        cli!(info, "{line}");
     }
     Ok(())
 }
@@ -1405,6 +1628,42 @@ impl fuyubot_tdlib::Prompter for ConsolePrompter {
 
     fn notify(&mut self, message: &str) {
         cli!(info, "{message}");
+    }
+}
+
+/// `fuyubot-app` 的控制台宿主：把「状态 / 提问 / 二维码」接到 stderr / stdin。
+///
+/// 与 [`ConsolePrompter`] 的关系：后者是 `fuyubot-tdlib` 的 `Prompter`（`login` 子命令
+/// 里 `resolve_parameters` 提问 api_id / api_hash 还在用它）；这里是编排层要的
+/// `AppHost`，内部直接复用同一套提问输出——同一份体验，没有第二套问法。
+struct ConsoleHost {
+    prompter: Mutex<ConsolePrompter>,
+}
+
+impl ConsoleHost {
+    fn new() -> Self {
+        Self {
+            prompter: Mutex::new(ConsolePrompter::default()),
+        }
+    }
+}
+
+impl fuyubot_app::AppHost for ConsoleHost {
+    fn state(&self, state: fuyubot_app::AppState, detail: &str) {
+        if state == fuyubot_app::AppState::Failed {
+            cli!(error, "{detail}");
+        } else {
+            cli!(info, "{detail}");
+        }
+    }
+
+    fn ask(&self, _kind: fuyubot_app::AskKind, prompt: &str) -> Option<String> {
+        let mut prompter = self.prompter.lock().unwrap_or_else(|e| e.into_inner());
+        <ConsolePrompter as fuyubot_tdlib::Prompter>::ask(&mut prompter, prompt).ok()
+    }
+
+    fn qr(&self, link: &str) {
+        cli!(info, "扫码登录：{link}");
     }
 }
 
@@ -1581,96 +1840,6 @@ fn resolve_parameters(
     ))
 }
 
-/// 驱动登录到 `Ready`，成功后用 `getMe` 把账户信息打到控制台。
-///
-/// ⚠️ `log_in_with` 是**同步阻塞**的（自己 `receive` 轮询）。调用它的两个时机都要保证
-/// 接收循环**没在跑**：启动时（还没起）与运行期退回登录时（先 `stop()` + `join()`）。
-///
-/// 登录窗口里与授权无关的东西（别的更新、插件请求的响应）经 `bypass` **直接进管线**——
-/// 插件这时候已经加载好了（`run` 刻意让插件先于 `setTdlibParameters`），吞掉就是漏更新。
-fn drive_login(
-    client: &Arc<fuyubot_tdlib::TdClient>,
-    parameters: &fuyubot_tdlib::TdlibParameters,
-    account: fuyubot_tdlib::AccountType,
-    pipeline: &Arc<UpdatePipeline>,
-) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
-    cli!(
-        info,
-        "等待 TDLib 到「等参数」授权状态并设置（账号类型 {account:?}，数据目录 {}）",
-        parameters.data_dir.display()
-    );
-    let mut prompter = ConsolePrompter::default();
-    let mut bypass = |routed| pipeline.dispatch(routed);
-    match fuyubot_tdlib::log_in_with(
-        client,
-        parameters,
-        account,
-        &mut prompter,
-        Duration::from_secs(600),
-        &mut bypass,
-    )? {
-        fuyubot_tdlib::LoginOutcome::Ready => {}
-        fuyubot_tdlib::LoginOutcome::Closed => {
-            return Err("TDLib 把会话关掉了（authorizationStateClosed）".into());
-        }
-    }
-    // 登录期判据（变更 3-b）：一次都没问过就进了 Ready，说明 `data_dir` 里的 session
-    // 还有效——要明说，否则用户会以为自己刚输入的凭据生效了（其实根本没用到）。
-    if !prompter.asked {
-        cli!(
-            info,
-            "已有有效 session，TDLib 直接进了 authorizationStateReady（本次没有走任何登录交互）"
-        );
-    }
-
-    // 登录完成，问一次账户信息（变更 3-a 第 3 步）。
-    // 拿到的 `user` 要交回调用方——插件的 `on_command` 靠它（经 `fuyubot.host.identity`
-    // service）判断「这条命令点名的是不是我」。
-    let me = match call_and_wait(
-        client,
-        serde_json::json!({ "@type": "getMe" }),
-        Duration::from_secs(15),
-        pipeline,
-    ) {
-        Ok(me) => {
-            cli!(info, "已登录，账户：{}", describe_account(&me));
-            Some(me)
-        }
-        Err(error) => {
-            cli!(warn, "已登录，但 getMe 没拿到（{error}）——不影响运行");
-            None
-        }
-    };
-    Ok(me)
-}
-
-/// 发一条请求并等它的响应（`log_in_with` 那种同步循环的简化版）。
-///
-/// ⚠️ 期间收到**别的**东西一律交给 `pipeline.dispatch`，不吞：调用点在「插件已经加载好」
-/// 之后（`getMe` 是在 `drive_login` 里、插件早就位），丢掉就是漏更新。
-/// 前提同样是**接收循环没在跑**。
-fn call_and_wait(
-    client: &fuyubot_tdlib::TdClient,
-    request: serde_json::Value,
-    budget: Duration,
-    pipeline: &Arc<UpdatePipeline>,
-) -> Result<serde_json::Value, String> {
-    let id = client
-        .send(request)
-        .map_err(|error| format!("发请求失败：{error}"))?;
-    let deadline = std::time::Instant::now() + budget;
-    while std::time::Instant::now() < deadline {
-        match client.receive(Duration::from_millis(500)) {
-            Some(fuyubot_tdlib::Routed::Response(response)) if response.id == id => {
-                return Ok(response.payload);
-            }
-            Some(other) => pipeline.dispatch(other),
-            None => continue,
-        }
-    }
-    Err(format!("等 {id:?} 的响应超时（{budget:?}）"))
-}
-
 /// 运行期那条判据的**唯一**实现（变更 3-b）：这条更新是不是「被下线 / 封禁」的信号？
 ///
 /// 返回「要用户再出一次凭据」的那个状态名；不是就返回 `None`。
@@ -1711,16 +1880,6 @@ fn mark_authorized(slot: &Mutex<Option<String>>) {
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(AuthState::Ready.name().to_owned());
 }
 
-/// 把 `getMe` 的结果描述成一行。
-///
-/// 字段路径（bot 在 `type.@type`、用户名在 `usernames.active_usernames[0]`）只在
-/// [`instance::Account::from_user`] 里写一次——这里只是它的显示形态，别抄第二份。
-fn describe_account(me: &serde_json::Value) -> String {
-    instance::Account::from_user(me)
-        .map(|account| account.label())
-        .unwrap_or_else(|| "（getMe 的结果里没有 id，取不出账户信息）".to_owned())
-}
-
 /// 宿主手里那份「我是谁」→ status / 面板要显示的账户行。
 ///
 /// 宿主在登录时写入 `getMe`，之后每条 `updateUser`（id 是自己那条）都会替换掉它，
@@ -1732,78 +1891,24 @@ fn current_account(runtime: &fuyubot_loader::HostRuntime) -> Option<instance::Ac
         .and_then(instance::Account::from_user)
 }
 
-/// 去掉 Windows `canonicalize` 给的 `\\?\` 长路径前缀。
+/// `--replay` 的等待窗口要按「有没有脚本插件」选。
 ///
-/// 语义上两种写法等价（fs 调用、拼接都兼容），但带前缀的路径打到终端、
-/// 混进 `plugin list` 输出里就是一串看不懂的 `\\?\F:\…`，纯属噪声。
-fn strip_unc_prefix(path: PathBuf) -> PathBuf {
-    const UNC: &str = r"\\?\";
-    match path.to_string_lossy().strip_prefix(UNC) {
-        Some(rest) => PathBuf::from(rest),
-        None => path,
-    }
-}
-
-fn load_plugins(
-    kernel: &mut Kernel,
-    loader: &PluginLoader,
-    plugin_dir: &Path,
-    spawn: bool,
-) -> Result<Vec<Arc<DylibPlugin>>, Box<dyn std::error::Error>> {
-    // 插件自己算不出「插件目录」在哪（它跑在宿主进程里），只能由宿主告诉它。
-    // 内置的 `/plugins` 命令就靠这个配置；绝对路径，免得随启动目录漂。
-    // `canonicalize` 在 Windows 上带 `\\?\` 长路径前缀——去掉，配置与输出都干净。
-    let absolute = strip_unc_prefix(
-        plugin_dir
-            .canonicalize()
-            .unwrap_or_else(|_| plugin_dir.into()),
-    );
-    // 脚本插件的家是 `<plugin_dir>/scripts/`（`plugin install` 的落点）：
-    // 传绝对路径给中间插件（它读 `scripts_dir`），别让它按 cwd 猜 `plugins/scripts`
-    // ——`--config` / `--plugin-dir` 指到别处、或不在项目根目录起进程时那样必错。
-    let scripts_dir = absolute.join("scripts");
-
-    // 先把目录扫成探针：插件名只有 dlopen 之后才知道，而依赖是按**名字**声明的。
-    // 探测只问名字、不 start（见 `PluginLoader::probe`）。
-    let mut adapters: Vec<Arc<DylibPlugin>> = Vec::new();
-    for path in plugin_files(plugin_dir)? {
-        let config = match find_script(&path) {
-            Some(script) => serde_json::json!({ "script": script, "plugins_dir": absolute, "scripts_dir": scripts_dir, "spawn": spawn }),
-            None => serde_json::json!({ "plugins_dir": absolute, "scripts_dir": scripts_dir, "spawn": spawn }),
+/// 判据基于 [`plugin_entries`]（契约 §4）：包看 `kind`，旧形态 dll 看同主干的
+/// 同伴脚本；另外 `plugins/scripts/` 非空也算——脚本由 SDK 中间插件在**另一个进程**
+/// 里跑，回放完要等它经管道回来。
+fn has_script_plugins(plugin_dir: &Path) -> bool {
+    let entries = fuyubot_loader::plugin_entries(plugin_dir).unwrap_or_default();
+    if entries.iter().any(|entry| match entry {
+        PluginEntry::Bundle(dir) => {
+            BundleManifest::load(dir).is_ok_and(|manifest| manifest.kind.is_script())
         }
-        .to_string();
-        // 探测失败就跳过这一个，原因打出来——文件在那儿却悄悄消失是最难查的那类事。
-        match DylibPlugin::probe(loader, &path, config) {
-            Ok(adapter) => adapters.push(Arc::new(adapter)),
-            Err(error) => cli!(warn, "跳过 {}: {error}", path.display()),
-        }
+        PluginEntry::Legacy(path) => find_script(path).is_some(),
+    }) {
+        return true;
     }
-
-    // 交给内核：依赖齐的当场激活，不齐的停在 Pending**等着**（不是失败），
-    // 能力出现/消失时内核自己的钩子会重新求值——这就是「依赖持续跟踪」。
-    let plugins: Vec<Arc<dyn fuyubot_core::Plugin>> = adapters
-        .iter()
-        .map(|adapter| Arc::clone(adapter) as Arc<dyn fuyubot_core::Plugin>)
-        .collect();
-    kernel.plugins().load_all(plugins)?;
-
-    // 让插件经 ABI 问得到「进程里加载了哪些」：装的是**活来源**而不是快照，
-    // 所以之后插件怎么上下线都不用手动刷新（旧接口要求每次变化后刷，实际没人刷得到）。
-    loader.runtime().install_plugin_reporter(kernel.reporter());
-
-    // Pending 的要说清楚：不说的话，人就会以为它在正常跑。
-    for (name, missing) in kernel.plugins().pending() {
-        cli!(
-            warn,
-            "插件 {name} 的依赖还没齐，先不启动：缺 {}",
-            missing.join(", ")
-        );
-    }
-    for (name, reason) in kernel.plugins().failed() {
-        cli!(error, "插件 {name} 启动失败：{reason}");
-    }
-
-    Ok(adapters)
+    std::fs::read_dir(plugin_dir.join(fuyubot_loader::SCRIPTS_DIR)).is_ok_and(|mut entries| {
+        entries.any(|entry| entry.is_ok_and(|entry| entry.path().is_dir()))
+    })
 }
 
 /// 把一批更新灌进管线：不需要 Telegram 账号，也能验插件的判断与回投。
@@ -1877,82 +1982,6 @@ fn wait_until_quiet(runtime: &fuyubot_loader::HostRuntime, quiet_ms: u64) {
             last_change = std::time::Instant::now();
         } else if last_change.elapsed() >= quiet {
             return;
-        }
-    }
-}
-
-/// 解析 TDLib、建客户端，并起接收循环把它接上更新管线。
-///
-/// 把 TDLib 挂进宿主运行时，返回那个客户端（**不起接收循环**）。
-///
-/// 返回 `None` 表示「没有可用的 TDLib」——**这不是启动失败**：插件照样加载，
-/// `td_invoke*` 只留档 + 发合成请求号（整条链路在没有真库时也能被跑通）。
-///
-/// ⚠️ 接收循环由调用方在**插件全部加载完之后**用
-/// [`UpdatePipeline::spawn_dispatch`] 起（否则插件会漏订阅）。
-fn attach_tdlib(
-    pipeline: &Arc<UpdatePipeline>,
-    configured: Option<&str>,
-    log_verbosity: i32,
-) -> Option<Arc<fuyubot_tdlib::TdClient>> {
-    let resolved = match configured.filter(|path| !path.trim().is_empty()) {
-        Some(path) => {
-            let path = PathBuf::from(path);
-            if !path.exists() {
-                cli!(
-                    warn,
-                    "配置里的 tdlib.path 不存在：{}，回退到自动查找",
-                    path.display()
-                );
-                fuyubot_tdlib::resolve()
-            } else {
-                // 配置点名了库的位置，就用它当优先级 1（不再去猜裸库名）。
-                let mut env = fuyubot_tdlib::LoadEnv::from_process();
-                env.tdlib_path = Some(path);
-                fuyubot_tdlib::resolve_with(&env, &|_| false)
-            }
-        }
-        None => fuyubot_tdlib::resolve(),
-    };
-
-    match resolved {
-        Ok(resolved) => {
-            cli!(
-                info,
-                "TDLib {} 命中「{}」：{}",
-                fuyubot_tdlib::TDLIB_VERSION,
-                resolved.source,
-                resolved.target.display()
-            );
-            for note in &resolved.notes {
-                cli!(info, "  {note}");
-            }
-        }
-        Err(e) => {
-            cli!(warn, "TDLib 未就绪（不接更新）：{e}");
-            return None;
-        }
-    }
-
-    let client = match fuyubot_tdlib::TdClient::new() {
-        Ok(client) => Arc::new(client),
-        Err(e) => {
-            cli!(warn, "创建 TDLib 客户端失败（不接更新）：{e}");
-            return None;
-        }
-    };
-    // `new()` 已经把日志压到默认值（1）；这里让 `[tdlib] log_verbosity` 覆盖它。
-    // 全局设置，调一次对所有客户端生效。
-    if log_verbosity != fuyubot_tdlib::DEFAULT_LOG_VERBOSITY {
-        client.set_log_verbosity(log_verbosity);
-    }
-    cli!(info, "TDLib 日志详细度：{log_verbosity}");
-
-    match pipeline.attach_tdlib(Arc::clone(&client)) {
-        Ok(()) => Some(client),
-        Err(_) => {
-            cli!(warn, "宿主已经接过一个 TDLib 客户端了");
-            None
         }
     }
 }
@@ -2198,6 +2227,23 @@ mod tests {
                 command: PluginCommand::Install(_)
             })
         ));
+
+        // `migrate` 是 **plugin 的子命令**（不是顶层），`--dry-run` 要能解析。
+        let cli = Cli::try_parse_from(["fuyubot", "plugin", "migrate", "--dry-run"]).unwrap();
+        match cli.command {
+            Command::Plugin(PluginArgs {
+                command: PluginCommand::Migrate(args),
+            }) => {
+                assert!(args.dry_run);
+                assert_eq!(args.config, PathBuf::from(scaffold::CONFIG_FILE));
+                assert_eq!(args.plugin_dir, None);
+            }
+            other => panic!("解析成了 {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["fuyubot", "migrate"]).is_err(),
+            "migrate 应该在 plugin 下面（与 list / install / uninstall 一组）"
+        );
 
         let cli = Cli::try_parse_from(["fuyubot", "run", "--replay", "u.json"]).unwrap();
         match cli.command {
