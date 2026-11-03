@@ -334,20 +334,25 @@ impl BundleManifest {
 /// 只认发布矩阵里的组合；其余（不常见的 OS / 架构）返回 `"unknown"`——
 /// 清单里写 `platforms: []` 或 `["any"]` 的插件照样能用，写死了具体平台的则不会误装。
 pub fn current_platform() -> &'static str {
-    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        "windows-x86_64"
-    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
-        "windows-aarch64"
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "linux-x86_64"
-    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        "linux-aarch64"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "macos-x86_64"
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "macos-aarch64"
-    } else {
-        "unknown"
+    platform_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// 把 `(os, arch)` 映射成发布资产用的平台串。
+///
+/// Android 单独区分：它虽然用 Linux 内核，但用户态是 Bionic，
+/// 不能和 `linux-*` 的 glibc 动态库混用。
+fn platform_for(os: &str, arch: &str) -> &'static str {
+    match (os, arch) {
+        ("windows", "x86_64") => "windows-x86_64",
+        ("windows", "aarch64") => "windows-aarch64",
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("macos", "x86_64") => "macos-x86_64",
+        ("macos", "aarch64") => "macos-aarch64",
+        ("android", "aarch64") => "android-aarch64",
+        ("android", "x86_64") => "android-x86_64",
+        ("android", "arm") => "android-armv7",
+        _ => "unknown",
     }
 }
 
@@ -1012,6 +1017,18 @@ mod tests {
         assert!(
             platform.contains('-'),
             "平台串是 <os>-<arch> 形态：{platform}"
+        );
+    }
+
+    #[test]
+    fn android_platforms_are_recognized() {
+        assert_eq!(platform_for("android", "aarch64"), "android-aarch64");
+        assert_eq!(platform_for("android", "x86_64"), "android-x86_64");
+        assert_eq!(platform_for("android", "arm"), "android-armv7");
+        // Android 不能复用 Linux 的 glibc 包。
+        assert_ne!(
+            platform_for("android", "aarch64"),
+            platform_for("linux", "aarch64")
         );
     }
 
