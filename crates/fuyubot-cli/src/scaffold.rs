@@ -523,7 +523,7 @@ pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<Str
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .unwrap_or("未配置（TUI 商店不可用）")
+                .unwrap_or("未配置（商店不可用）")
         ),
         format!("[tdlib]     path         = {tdlib_path}"),
         format!(
@@ -2558,10 +2558,12 @@ mod tests {
         let lines = config_lines(&path, &root, &config).join("\n");
         assert!(lines.contains("registry_url = 未配置"), "{lines}");
 
-        // 模板里要有一行注释示例（不写死商城地址）。
+        // 模板默认写官方商店，用户可替换或删掉。
         assert!(
-            TEMPLATE_CONFIG.contains("# registry_url"),
-            "模板缺商店索引的注释示例：\n{TEMPLATE_CONFIG}"
+            TEMPLATE_CONFIG.contains(
+                "registry_url = \"https://catmoecircle.github.io/FuyuBot-plugins/index.json\""
+            ),
+            "模板缺默认商店地址：\n{TEMPLATE_CONFIG}"
         );
     }
 
