@@ -1,13 +1,26 @@
 # fuyubot
 
-**基于 TDLib 的 Telegram bot / user 框架**：Rust 内核 + C ABI 插件。
+**基于 TDLib 的 Telegram bot / user 框架**：Rust 内核 + C ABI 插件。一个宿主进程负责内核与
+Telegram 连接，每个插件都是独立编译的动态库，按需加载、按依赖排序、可单独启用停用。
 
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
-- **插件就是动态库**（`.dll` / `.so` / `.dylib`），Rust / C / C++ / Python / JS / TypeScript 都能写。
-- **下载即用**：Release 包里可执行文件、TDLib（`tdjson`）和内置插件都是齐的，不用装 Rust。
-- **bot 与 user 两种账号**都支持；登录一次，session 由 TDLib 存进 `data/`，之后不用再登。
-- **离线也能验插件**：`--replay` 把一批更新灌进管线，不需要 Telegram 账号、不联网。
+## 特性
+
+- **插件就是动态库**：`.dll` / `.so` / `.dylib`，Rust、C、C++、Go、Python、JS / TS 都能写。
+  插件只认少数几个导出符号加一张宿主编排表（`HostApiVTable`），跨语言共享同一份契约。
+- **一个进程，两种账号**：bot（Bot Token）与 user（手机号 / 验证码 / 扫码）走同一套授权状态机，
+  登录态由 TDLib 自己落盘，下次启动直接复用。
+- **下载即用**：Release 包里可执行文件、TDLib（`tdjson`）与内置插件都是齐的，不需要装 Rust，
+  也不用另外配置 TDLib。
+- **离线验证插件**：`--replay` 把一批更新灌进真实管线，不接 TDLib、不用账号、不联网。
+- **内核与机制分离**：`Context` 按名字寻址的服务表，加上事件 / 服务 / 工具 / 中间件四个机制 crate，
+  组合全部发生在宿主层。
+- **运行期可控**：实例锁、优雅停止、平台面板（启停实例、插件开关、日志过滤与级别、配置编辑）。
+- **TDLib 运行时加载**：五级定位（环境变量 → 随包分发 → exe 同级 → 系统库 → 裸库名），
+  换 TDLib 不用重编。
+- **全链路 tracing**：命令结果、宿主诊断、插件日志、TDLib 更新是同一份 `时间 来源 级别 内容`
+  格式，各带颜色。
 
 ## 下载
 
@@ -44,11 +57,9 @@
 2026-10-31 07:05:13 cli INFO  已安装 3 个内置插件到 demo\plugins
 2026-10-31 07:05:13 cli INFO  已生成 demo\fuyubot.toml
 2026-10-31 07:05:13 cli INFO  插件目录：demo\plugins
-2026-10-31 07:05:13 cli INFO  下一步：装 fuyubot-script 插件，或按文档站示例自己写插件（plugins/ 或 plugins/scripts/）
 ```
 
-命令行输出**全部**走 `tracing`：命令结果、运行期诊断、致命错误都是同一份
-`时间 来源 级别 内容` 格式（插件是 `[plugins - 名字]`、TDLib 更新是 `TDLib Update`，各带颜色；日期灰、时间亮蓝）。
+`init` 建出项目骨架：`fuyubot.toml`、`plugins/`，并把三个内置插件复制进去。
 
 `api_id` 到 <https://my.telegram.org> 申请，它**不是**秘密，写进配置没问题。
 `api_hash` 是凭据，**不写配置文件**——用环境变量 `TG_API_HASH`，或者跑起来后按提示输入。
@@ -68,7 +79,7 @@ $env:TG_API_HASH = "…"
 | `fuyubot init --dir <目录> --name <名字> --api-id <id>` | 建项目：生成 `fuyubot.toml`、`plugins/`，并复制内置插件 |
 | `fuyubot run --config <目录>/fuyubot.toml` | 前台跑（含登录） |
 | `fuyubot run … --background` | 后台跑，日志进 `<项目>/logs/fuyubot.log`（每次启动先清空旧日志） |
-| `fuyubot run --tui`（短写 `-t`） | 终端操作面板：顶部版本栏 + 导航/工作区 + 底部资源占用，`s` 启动 / `x` 停止 / 插件页 `Space` 开关插件 |
+| `fuyubot run --tui`（短写 `-t`） | 终端操作面板：顶部版本栏 + 导航/工作区 + 底部资源占用 |
 | `fuyubot status --config …` / `fuyubot stop --config …` | 看状态 / 优雅停止 |
 | `fuyubot config --config …` | 打印**生效**配置（默认值 + 实际读到的文件） |
 | `fuyubot run --replay <json> --plugin-dir <目录>` | 离线回放：不接 TDLib、不用账号 |
@@ -76,39 +87,24 @@ $env:TG_API_HASH = "…"
 | `fuyubot plugin install <工程目录或产物> --plugin-dir <目录>` | 把编好的插件复制进插件目录 |
 
 一个目录只能跑一个实例：第二次 `run` 会被拒，报错里带正在跑的那个 PID。
-`--no-login` 只接 TDLib、不走登录，适合「先让它起来」的场景；`--no-tdlib` 则完全不接 TDLib。
+`--no-login` 只接 TDLib、不走登录；`--no-tdlib` 则完全不接 TDLib。
+
+### 终端面板
 
 `run --tui` 打开的是**操作面板**而不是前台 bot：面板自己不接 TDLib、不加载插件，只读
-`.fuyubot/status`、配置、插件目录与日志；按 `s` 会派生 `run --background`，按 `x` 走
-与 `fuyubot stop` 相同的优雅停止。退出面板（`q`）**不会**停掉已经起来的实例。
-`Tab` 在**导航 / 工作区**之间切换焦点（当前窗口边框高亮），`Enter` 进入工作区、`Esc` 返回导航。
-焦点在导航时 `↑↓` / `1–5` 换页；焦点在工作区时 `↑↓` / `PgUp` / `PgDn` 滚动日志或选择配置项。
-`r` 刷新，`?` 看全部按键。
-插件页（工作区焦点）按 `Space` 启用 / 禁用选中的 dylib：**禁用就是改名**（`foo.dll` →
-`foo.dll.disable`），加载器只认扩展名正好是 `dll` 的文件，所以下次 `run` 不会再加载它；
-再按一次改回来。改完重启实例才生效（运行中的实例已经把库映射进进程了）。
-日志页（工作区焦点）按 `l` 调整运行中实例的插件日志级别（写 `.fuyubot/log-level`，实例下一圈生效；
-只对本次运行有效，重启回到 `[plugins].log_level`）；按 `F` 按**级别**和**来源**（插件 / 宿主 / 管道 /
-更新 / TDLib / 其他）过滤日志，`f` 开关跟随末尾。TDLib Update 行只显示 `@type`；
-日志字段不按固定列补空格，长行按显示宽度折行（续行缩进两格）。
-日志页**不显示行数**（窗口里装多少行随滚动变）：首屏只读文件尾部（最多 800 行），
-往回翻到头会自动**分段回读**更早的日志——一次 256KB，窗口最多留 2 万行 / 8MB，
-超过就从另一头丢（滑动窗口），内存不会随翻页增长；底栏的 `↑ 更早` 说明还能往回翻。
-翻在中间时窗口**冻结**（实例继续写也不往窗口里塞），按 `End`（或 `f` 打开跟随）
-重读尾部、回到最新。
-日志页按 `Enter` 进入选择模式，`↑↓` 选行，`y` / `Enter` 复制选中行（TDLib Update 复制**完整 JSON**）。
-`c` 清空当前日志文件（要确认）；后台实例每次新启动也会先清空旧日志。
-窄终端（如 Termux 40 列）会自动收缩：宽度 < 60 列时导航移到工作区上方，变成一行
-横向标签，用 `←` / `→` 或 `h` / `l`（导航焦点）切换；更窄时标签退化成单字。
-底栏在窄屏只留 `CPU / 内存 / 级别`，不显示运行时长、插件数量和 PID；配置项在窄屏
-改成「完整键 + 值」两行显示，帮助页可以 `↑↓` / `PgUp` / `PgDn` 滚动；日志窄屏只留
-`HH:MM:SS`、插件名最后一段和级别，消息照常折行。复制优先用
-`termux-clipboard-set`（装 `termux-api` 后可用），否则退回 OSC 52。
-配置页（工作区焦点）用 `↑↓` 选中一行，`Enter` / `e` 编辑单个配置项：文本 / 整数 / 枚举先校验，
-写回时保留注释与 CRLF；运行中改完**重启生效**。`api_hash`、凭据和 `[plugin.*]` 段只读。
-界面顶部是版本栏（`[fuyubot - v…]`，右侧**始终**显示实例状态：运行中 / 上次已停止 / 上次异常退出 /
-未运行；正常停止会带上停止时间，崩溃或硬杀则标成异常退出），底部两行分别是**当前可用操作**与
-**CPU · 内存 · 运行时长 · 插件数 · 日志级别 · PID**（取的是运行中实例的进程）。
+`.fuyubot/status`、配置、插件目录与日志。面板里可以：
+
+- **启停实例**：`s` 派生 `run --background`，`x` 走与 `fuyubot stop` 相同的优雅停止。
+  退出面板（`q`）不会停掉已经起来的实例。
+- **开关插件**：插件页 `Space` 启用 / 禁用选中的 dylib——禁用即改名（`foo.dll` → `foo.dll.disable`），
+  加载器只认扩展名为 `dll` 的文件；再按一次改回来，重启实例生效。
+- **看日志**：首屏读文件尾部，往回翻自动分段回读更早的日志（滑动窗口），翻在中间时窗口冻结，
+  `End` 回到最新；`F` 按级别与来源（插件 / 宿主 / 管道 / 更新 / TDLib）过滤，`c` 清空当前日志。
+- **调插件日志级别**：`l` 写 `.fuyubot/log-level`，运行中的实例下一圈生效，重启回到配置值。
+- **改配置**：配置页选中一行，`Enter` / `e` 编辑，文本 / 整数 / 枚举先校验，写回保留注释与 CRLF，
+  重启生效；`api_hash`、凭据与 `[plugin.*]` 段只读。
+- **窄终端自适应**：Termux 这类 40 列终端会自动收缩布局，完整按键见
+  [文档站](https://catmoecircle.github.io/FuyuBot-docs/docs/usage/run)。
 
 ## 配置
 
@@ -166,15 +162,18 @@ bun add fuyubot        # JS / TS 脚本薄 SDK
 ```
 
 Rust 插件直接依赖 [`fuyubot-abi`](https://crates.io/crates/fuyubot-abi) 写 `define_plugin!`；
-C / C++ 用 `fuyubot_abi::PLUGIN_HEADER`。**没有插件开发 CLI**：脚手架、示例与各语言模板都在
+C / C++ 用 `fuyubot_abi::PLUGIN_HEADER`。脚手架、示例与各语言模板见
 [文档站的「插件开发」](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/)。
 
-编是插件作者自己的工具链的事（`cargo build`、`cl /LD`、`gcc -shared`…），
-`fuyubot` **不编译插件**，`plugin install` 只负责把编好的东西复制进插件目录：
+插件用你自己的工具链编（`cargo build`、`cl /LD`、`gcc -shared`…），`plugin install` 负责把编好的
+产物复制进插件目录：
 
 ```bash
 fuyubot plugin install <插件工程目录> --plugin-dir <插件目录>
 ```
+
+插件分发遵循 **bundle** 格式：一个插件一个目录，根上的 `plugin.json` 声明 `id` / `version` /
+`kind` / `entry` / `depends`，加载器不加载动态库就能先读到依赖，再按依赖顺序决定加载次序。
 
 ## 文档
 
@@ -184,8 +183,6 @@ fuyubot plugin install <插件工程目录> --plugin-dir <插件目录>
 | [FuyuBot-Script](https://github.com/CatMoeCircle/FuyuBot-Script) | 脚本插件宿主（Python / JS / TS）+ 两个薄 SDK |
 | [架构与数据流](https://catmoecircle.github.io/FuyuBot-docs/docs/dev/architecture/) | 内核、更新管线、绑定层与数据流 |
 | [调用 TDLib](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/tdlib/) | `td_invoke`、响应通道、`fuyubot-simplify` 全量对照 |
-
-本仓只放运行时；脚本插件宿主在 FuyuBot-Script，文档站在 FuyuBot-Docs。
 
 ## 从源码构建
 
@@ -197,4 +194,4 @@ cargo build --workspace          # 产物在 target/debug/
 cargo build --release -p fuyubot-cli
 ```
 
-改代码前先看[开发文档](https://catmoecircle.github.io/FuyuBot-docs/docs/dev/)：结构、构建与测试、发布与排错。
+开发文档：[结构、构建与测试、发布与排错](https://catmoecircle.github.io/FuyuBot-docs/docs/dev/)。
