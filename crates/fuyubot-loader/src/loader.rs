@@ -14,6 +14,7 @@ use fuyubot_abi::{
 use fuyubot_core::{Context, Effect};
 use libloading::{Library, Symbol};
 
+use crate::bundle::{BundleError, BundleManifest, PluginEntry, PluginKind, plugin_entries};
 use crate::pipeline::UpdatePipeline;
 use crate::runtime::{HostRuntime, PluginHost};
 
@@ -56,6 +57,26 @@ pub enum LoadError {
     StartFailed { path: PathBuf, code: i32 },
     #[error("配置字符串里有 NUL 字节")]
     BadConfig,
+    #[error("插件包 {dir} 不可用: {source}")]
+    Bundle {
+        dir: PathBuf,
+        #[source]
+        source: BundleError,
+    },
+    #[error(
+        "Go 插件 {path} 没有 plugin.json：它无法卸载，必须先有静态元数据才能安全加载\
+         （跑 `fuyubot plugin migrate` 建包，或手工补一个 plugin.json）"
+    )]
+    GoRequiresManifest { path: PathBuf },
+    #[error(
+        "插件包 {path} 的 plugin_init 自报名是 {actual}，与清单 id {declared} 不一致：\
+         依赖与配置都按清单 id 寻址，请把 plugin.json 的 id 改成 {actual}，或改插件里的名字"
+    )]
+    BundleNameMismatch {
+        path: PathBuf,
+        declared: String,
+        actual: String,
+    },
 }
 
 /// 一个已加载并已启动的插件。
@@ -311,9 +332,40 @@ impl PluginLoader {
     /// 代价是这个库被映射了两次（探测一次、加载一次）。Windows / Linux 都有
     /// 文件映射缓存，第二次几乎免费；换来的是**正式加载路径完全不用改**，
     /// 也不必把 `LoadedPlugin` 拆成「已 init / 已 start」两种状态。
+    ///
+    /// ⚠️ **探测打开的那一份永远不 `dlclose`**（见 [`ProbeLibrary`]）：探测会真的跑
+    /// 插件代码（`plugin_init` / `plugin_stop`），而 Rust std 会为 `thread_local!` 的
+    /// 析构注册一个 pthread key；bionic 在 `dlclose` 时不摘那个 key 的 destructor，
+    /// 之后线程退出就会跳进已解除映射的地址（2026 设备侧实测）。
+    ///
+    /// ⚠️ **Go 的 c-shared 会被拒绝**（[`LoadError::GoRequiresManifest`]）：它一旦映射
+    /// 就永远不能卸载，所以没有 `plugin.json` 就不许碰。要探测它就显式用
+    /// [`Self::probe_for_migration`]。
     pub fn probe(&self, path: impl AsRef<Path>) -> Result<Probe, LoadError> {
-        let path = path.as_ref();
+        self.probe_impl(path.as_ref(), false)
+    }
+
+    /// 只给 `plugin migrate` 用：允许探测 Go 的 c-shared。
+    ///
+    /// 会 dlopen（进程即将退出），调用方负责提示「已永久映射，仅本次迁移进程」。
+    /// 其余语义与 [`Self::probe`] 完全一致。
+    pub fn probe_for_migration(&self, path: &Path) -> Result<Probe, LoadError> {
+        self.probe_impl(path, true)
+    }
+
+    /// [`Self::probe`] 的本体：`allow_go` 决定「没有清单的 Go 库」是拒绝还是照探。
+    fn probe_impl(&self, path: &Path, allow_go: bool) -> Result<Probe, LoadError> {
         let location = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+
+        // Go 的 c-shared 卸载即崩（运行时限制），所以「没有静态元数据」时连探测都不做：
+        // 探测本身就会把它永久映射进本进程。这一步只读文件魔数，**不 dlopen**。
+        let go_runtime = looks_like_go_binary(&location);
+        if go_runtime && !allow_go {
+            return Err(LoadError::GoRequiresManifest {
+                path: path.to_owned(),
+            });
+        }
+
         // SAFETY: 加载动态库等于执行其中的代码，只加载可信文件。
         let lib = unsafe { fuyubot_tdlib::loader::open_library(&location) }.map_err(|source| {
             LoadError::Library {
@@ -321,6 +373,15 @@ impl PluginLoader {
                 source,
             }
         })?;
+        // ⚠️ 探测结束**一律不卸载**（不只是 Go）：这一步已经在这个映射里跑过插件代码
+        // （`plugin_init` / `plugin_stop`）。dlclose 一个「跑过代码」的库在 Android 上
+        // 不止一种翻车方式：Rust std 的 TLS 析构列表（老系统 / 没解析到
+        // `__cxa_thread_atexit_impl` 时走 pthread key 兜底）、库自己
+        // `pthread_key_create` 注册的 destructor、`atexit`、残留线程——bionic 都
+        // **不会**因为 dlclose 帮你撤销。之后线程退出时就会跳到已解除映射的地址
+        // （2026 设备侧实测：`pc == fault addr`，帧在 `pthread_key_clean_all`）。
+        // 多留一份映射，换掉一整类「启动 / 收摊后随机崩」。
+        let lib = ProbeLibrary { lib: Some(lib) };
 
         // 探测期内不能让宿主任就把东西注册了：这个 scope **不 commit**，
         // drop 时整批回滚（见 `HostRuntime::plugin_scope`）。
@@ -395,25 +456,88 @@ impl PluginLoader {
             name,
             abi_version: handle.abi_version,
             manifest,
+            // 旧形态：入口就是那个文件本身。
+            entry: path.to_owned(),
+            kind: PluginKind::Native,
+            bundle: None,
+            go_runtime,
         })
+    }
+
+    /// 探测一个**目录包**（`<dir>/plugin.json`）。**绝不 dlopen。**
+    ///
+    /// 这条路径上的信息全部来自文件系统：读清单、校验平台、解析 `entry`、读入口文件
+    /// 的魔数。所以「这包装不装得上」在插件代码跑起来之前就有答案——这正是分发格式
+    /// v1 存在的理由（见 `docs/plugin-format-v1.md`）。
+    ///
+    /// `abi_version` 取清单里的 `abi`（没写就是 0 = 「装完才知道」）；依赖取
+    /// `depends` / `optional_depends` 合成的 [`Manifest`]，与 ABI v4 的自描述同构。
+    pub fn probe_bundle(&self, dir: &Path) -> Result<Probe, LoadError> {
+        let (manifest, entry) = bundle_parts(dir)?;
+
+        // 契约 §2：目录名与 id 不一致时以 id 为准，但要留一条能查的日志。
+        let dir_name = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if dir_name != manifest.id {
+            self.runtime.warn(&format!(
+                "插件包目录名 {dir_name} 与 plugin.json 的 id {} 不一致（以 id 为准）",
+                manifest.id
+            ));
+        }
+
+        // 只读魔数：Go 的 c-shared 在 bundle 里是允许的（它有静态元数据了），
+        // 但调用方要知道「这个装了就卸不掉」，好把它排在队列最后。
+        let go_runtime = looks_like_go_binary(&entry);
+        let probe_manifest = Manifest {
+            name: manifest.id.clone(),
+            version: manifest.version.clone(),
+            inject: manifest.depends.clone(),
+            soft_inject: manifest.optional_depends.clone(),
+        };
+
+        Ok(Probe {
+            path: dir.to_owned(),
+            name: manifest.id.clone(),
+            abi_version: manifest.abi.unwrap_or(0),
+            manifest: Some(probe_manifest),
+            entry,
+            kind: manifest.kind,
+            bundle: Some(manifest),
+            go_runtime,
+        })
+    }
+
+    /// 探测一个扫描结果：目录包走 [`Self::probe_bundle`]，平铺库走 [`Self::probe`]。
+    pub fn probe_entry(&self, entry: &PluginEntry) -> Result<Probe, LoadError> {
+        match entry {
+            PluginEntry::Bundle(dir) => self.probe_bundle(dir),
+            PluginEntry::Legacy(path) => self.probe(path),
+        }
     }
 
     /// 扫描目录逐个加载；单个失败不中断其余的。
     ///
-    /// 顺序是文件名字典序——**没有依赖语义**，见 [`Self::load_dir_ordered`]。
+    /// 顺序由 [`plugin_entries`] 决定（bundle 按 id 在前，legacy 按文件名在后）——
+    /// **没有依赖语义**，依赖排序交给内核的 fiber 状态机。
     pub fn load_dir(
         &self,
         dir: impl AsRef<Path>,
     ) -> std::io::Result<Vec<(PathBuf, Result<LoadedPlugin, LoadError>)>> {
         let mut results = Vec::new();
-        for path in plugin_files(dir)? {
-            let outcome = self.load(&path);
-            results.push((path, outcome));
+        for entry in plugin_entries(dir.as_ref())? {
+            // 展示路径用包目录 / 平铺文件本身，不是包内的入口文件。
+            let shown = match &entry {
+                PluginEntry::Bundle(path) | PluginEntry::Legacy(path) => path.clone(),
+            };
+            let outcome = self.load_entry(&entry);
+            results.push((shown, outcome));
         }
         Ok(results)
     }
 
-    /// 扫描目录，为每个动态库造一个 [`DylibPlugin`]（**只探测，不启动**）。
+    /// 扫描目录，为每个候选造一个 [`DylibPlugin`]（**只探测，不启动**）。
     ///
     /// 依赖排序**不在这里做**：拿到适配器之后交给
     /// [`PluginManager::load_all`](fuyubot_core::PluginManager::load_all)，
@@ -426,9 +550,9 @@ impl PluginLoader {
         config_for: impl Fn(&Probe) -> String,
     ) -> std::io::Result<Vec<Result<DylibPlugin, LoadError>>> {
         let mut adapters = Vec::new();
-        for path in plugin_files(dir)? {
+        for entry in plugin_entries(dir.as_ref())? {
             // 先探一次拿到配置需要的元数据（脚本路径那类东西由调用方按 path 决定）。
-            match self.probe(&path) {
+            match self.probe_entry(&entry) {
                 Ok(probe) => {
                     let config = config_for(&probe);
                     adapters.push(Ok(DylibPlugin::new(
@@ -442,24 +566,147 @@ impl PluginLoader {
         }
         Ok(adapters)
     }
+
+    /// 直接加载一个扫描结果（不经过 `Probe`：旧形态照旧只开一次库）。
+    fn load_entry(&self, entry: &PluginEntry) -> Result<LoadedPlugin, LoadError> {
+        match entry {
+            PluginEntry::Legacy(path) => self.load(path),
+            // 包要先把 `entry` 解析出来——`load` 只认文件。
+            PluginEntry::Bundle(dir) => {
+                let (manifest, entry) = bundle_parts(dir)?;
+                let loaded = self.load(&entry)?;
+                // 与内核那条路径（`DylibPlugin::apply`）同一套身份校验：
+                // 装上了但自报名不是清单 id = 没装上（`drop` 会 plugin_stop 并回滚注册）。
+                if loaded.name != manifest.id {
+                    let actual = loaded.name.clone();
+                    drop(loaded);
+                    return Err(LoadError::BundleNameMismatch {
+                        path: entry,
+                        declared: manifest.id,
+                        actual,
+                    });
+                }
+                Ok(loaded)
+            }
+        }
+    }
 }
 
-/// 一个动态库的**探测结果**：它是谁，还不知道要不要它。
+/// 探测期间持有的动态库；**任何出口都不卸载**。
 ///
-/// 探测只做「把元数据问出来」：`dlopen` → `plugin_init` → 读名字 →
+/// 最早只有 Go 的 c-shared 需要这样（它的运行时线程一旦 dlclose 就崩）；现在这条规则
+/// 适用于**所有跑过代码的库**：探测已经执行了 `plugin_init` / `plugin_stop`，库里的
+/// TLS 析构、pthread key destructor、`atexit`、残留线程都不受 dlclose 管理，
+/// 之后线程退出时可能跳到已解除映射的代码上。多留一份映射，换掉一整类随机崩。
+struct ProbeLibrary {
+    lib: Option<Library>,
+}
+
+impl std::ops::Deref for ProbeLibrary {
+    type Target = Library;
+
+    fn deref(&self) -> &Self::Target {
+        self.lib.as_ref().expect("探测期间库一直在")
+    }
+}
+
+impl Drop for ProbeLibrary {
+    fn drop(&mut self) {
+        if let Some(lib) = self.lib.take() {
+            // 与 `LoadedPlugin` 的软卸载、`TdClient` 对 tdjson 的处理同一条纪律：
+            // 跑过代码的库不 dlclose（理由见类型文档）。
+            std::mem::forget(lib);
+        }
+    }
+}
+
+/// 读清单、校验平台与入口，返回（清单, 入口路径）。
+///
+/// [`PluginLoader::probe_bundle`] 与 [`PluginLoader::load_entry`] 共用同一条校验链：
+/// 免得「探测放行、加载拒绝」这类两边不一致。
+fn bundle_parts(dir: &Path) -> Result<(BundleManifest, PathBuf), LoadError> {
+    let map = |source: BundleError| LoadError::Bundle {
+        dir: dir.to_owned(),
+        source,
+    };
+    let manifest = BundleManifest::load(dir).map_err(map)?;
+    manifest.validate(dir).map_err(map)?;
+    let entry = manifest.entry_path(dir).map_err(map)?;
+    Ok((manifest, entry))
+}
+
+/// 一个插件的**探测结果**：它是谁，还不知道要不要它。
+///
+/// 旧形态的探测只做「把元数据问出来」：`dlopen` → `plugin_init` → 读名字 →
 /// 交给 `plugin_stop` 收拾 → 释放。全程**不碰 `plugin_start`**，插件的业务
 /// 逻辑一次也没跑过。真正要加载时，正式那条路径会自己再开一遍。
+///
+/// 目录包（[`Self::bundle`] 非空）的探测**根本不 dlopen**：清单、平台、入口
+/// 全从文件系统读出来（见 [`PluginLoader::probe_bundle`]）。
 #[derive(Debug, Clone)]
 pub struct Probe {
+    /// 展示路径：目录包是那个目录，旧形态是那个动态库。
     pub path: PathBuf,
-    /// `plugin_init` 自己报出来的名字（插件名是点分的，和 dll 文件名常常不同）。
+    /// 插件名（bundle = 清单里的 `id`；legacy = `plugin_init` 自己报的名字）。
     pub name: String,
+    /// 静态包：清单里的 `abi`，没写就是 0（未知，装完才知道）；legacy：真实值。
     pub abi_version: u32,
-    /// ABI v4 的自描述（名字 / 版本 / 依赖）。老插件没有这个导出，就是 `None`。
+    /// 依赖自描述。bundle 用 `depends` / `optional_depends` 合成；
+    /// legacy 读 ABI v4 的 `plugin_manifest`（老插件没有这个导出，就是 `None`）。
     pub manifest: Option<Manifest>,
+    /// 真正要 `dlopen` 的那个文件（bundle = 包内入口；legacy = 文件自己）。
+    pub entry: PathBuf,
+    /// 谁来跑这个入口（原生库 / Python / JS）。
+    pub kind: PluginKind,
+    /// 目录包的原样清单；旧形态是 `None`。
+    pub bundle: Option<BundleManifest>,
+    /// 入口文件是不是 Go 编出来的 c-shared（**只读魔数**判定的，没加载）。
+    /// 是的话它一旦映射就永远不能卸载，调用方应当把它排在加载队列最后。
+    pub go_runtime: bool,
+}
+
+/// 禁用插件用的后缀：`foo.dll` → `foo.dll.disable`。
+///
+/// **禁用就是改名**：加载器只认后缀正好是 [`DLL_EXTENSION`] 的文件，`.dll.disable`
+/// 的扩展名是 `disable`，于是连候选都进不了。没有第二份「禁用清单」要跟插件目录
+/// 同步，卸掉壳重命名回来就恢复——面板的开关（`Space`）关到底就是这一次改名。
+///
+/// 加在**最后**而不是替换扩展名：`foo.disable` 会让人以为插件名变了，
+/// `foo.dll.disable` 一眼能看出「本来是哪个文件被停用了」。
+pub const DISABLED_SUFFIX: &str = ".disable";
+
+/// 这个路径上的插件被禁用过没有（`foo.dll.disable` → `true`）。
+pub fn is_disabled(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| name.to_string_lossy().ends_with(DISABLED_SUFFIX))
+        .unwrap_or(false)
+}
+
+/// 启用状态下的路径：`foo.dll.disable` → `foo.dll`（本来就没禁用就原样返回）。
+pub fn enabled_path(path: &Path) -> PathBuf {
+    let Some(name) = path.file_name().map(|name| name.to_string_lossy()) else {
+        return path.to_path_buf();
+    };
+    match name.strip_suffix(DISABLED_SUFFIX) {
+        Some(stem) => path.with_file_name(stem),
+        None => path.to_path_buf(),
+    }
+}
+
+/// 禁用状态下的路径：`foo.dll` → `foo.dll.disable`（已经禁用就原样返回）。
+pub fn disabled_path(path: &Path) -> PathBuf {
+    if is_disabled(path) {
+        return path.to_path_buf();
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(DISABLED_SUFFIX);
+    path.with_file_name(name)
 }
 
 /// 目录下的候选插件文件（按扩展名筛），已排序。
+///
+/// 被禁用的（[`DISABLED_SUFFIX`]）**不在**结果里：扩展名已经不是
+/// [`DLL_EXTENSION`] 了，这一层判断天然把它们滤掉，不需要额外的豁免清单。
 pub fn plugin_files(dir: impl AsRef<Path>) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -472,18 +719,28 @@ pub fn plugin_files(dir: impl AsRef<Path>) -> std::io::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// 插件名：优先用 `plugin_init` 给的那个静态字符串（插件自己持有，框架不释放）。
-fn plugin_name(handle: &PluginHandle, path: &Path) -> String {
-    if !handle.name.is_null() {
-        // SAFETY: ABI 契约要求 name 是插件持有的 NUL 结尾字符串，库还活着。
-        let name = unsafe { CStr::from_ptr(handle.name) }.to_string_lossy();
-        if !name.is_empty() {
-            return name.into_owned();
-        }
+/// 插件自报的名字：`plugin_init` 给的静态字符串（插件自己持有，框架不释放）。
+/// 没给（NULL / 空串）就是 `None`。
+fn declared_plugin_name(handle: &PluginHandle) -> Option<String> {
+    if handle.name.is_null() {
+        return None;
     }
-    path.file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "unknown".to_owned())
+    // SAFETY: ABI 契约要求 name 是插件持有的 NUL 结尾字符串，库还活着。
+    let name = unsafe { CStr::from_ptr(handle.name) }.to_string_lossy();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.into_owned())
+    }
+}
+
+/// 插件名：优先用 `plugin_init` 给的那个，没有就退回文件 stem（诊断用）。
+fn plugin_name(handle: &PluginHandle, path: &Path) -> String {
+    declared_plugin_name(handle).unwrap_or_else(|| {
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_owned())
+    })
 }
 
 /// 插件自描述：ABI v4 的 `plugin_manifest` 导出。
@@ -580,10 +837,16 @@ fn declared_name(lib: &Library, path: &Path) -> String {
 /// 和 [`PluginLoader::load_with_config`] 的分工：那边「加载完就把生命周期交出去」，
 /// 返回一个自己管收摊的 [`LoadedPlugin`]；这里把四件东西交回来，由
 /// [`DylibPlugin`] 决定什么时候、以什么顺序收。
+///
+/// `expected_bundle` 只对目录包有值：契约要求**插件自报的名字必须与清单 id 一致**，
+/// 不一致就拒绝——否则依赖是按 id 声明的、内核按 id 寻址，装上的却叫另一个名字。
+/// 版本不一致只告警（`plugin_manifest` 的 version 来自插件的 `CARGO_PKG_VERSION`，
+/// 作者可能故意让它和发行包版本不同）。
 fn start_library(
     runtime: &Arc<HostRuntime>,
     path: &Path,
     config: &str,
+    expected_bundle: Option<&BundleManifest>,
 ) -> Result<
     (
         PluginHandle,
@@ -606,7 +869,7 @@ fn start_library(
         }
     })?;
 
-    let (init, start, stop) = {
+    let (init, start, stop, free_handle) = {
         // SAFETY: 只从刚加载的库里取符号，名字与类型由 ABI 约定。
         let init: Symbol<PluginInitFn> =
             unsafe { lib.get(SYM_PLUGIN_INIT) }.map_err(|source| LoadError::MissingSymbol {
@@ -621,7 +884,10 @@ fn start_library(
         let stop = unsafe { lib.get::<PluginStopFn>(SYM_PLUGIN_STOP) }
             .ok()
             .map(|symbol| *symbol);
-        (init, start, stop)
+        let free_handle = unsafe { lib.get::<PluginFreeHandleFn>(SYM_PLUGIN_FREE_HANDLE) }
+            .ok()
+            .map(|symbol| *symbol);
+        (init, start, stop, free_handle)
     };
 
     // 从这里开始，任何提前返回都会让 `scope` 在 drop 时把这批注册整批回滚。
@@ -654,6 +920,35 @@ fn start_library(
     // 名字必须在 start 之前登记：插件在 `start` 里就可能调 `set_config`，
     // 宿主靠 owner → 名字的映射判定「这是谁的段」。
     let name = plugin_name(&handle, path);
+
+    // 目录包的身份校验（AGENTS 约束 59）：自报名非空且不等于清单 id → 硬失败。
+    // 还没 `plugin_start`，所以只走 v4 的 `plugin_free_handle` 归还 init 里分配的状态。
+    if let Some(bundle) = expected_bundle {
+        if let Some(reported) = declared_plugin_name(&handle) {
+            if reported != bundle.id {
+                if let Some(free) = free_handle {
+                    // SAFETY: handle 来自同一轮 init；该符号只读 handle 里的 context。
+                    unsafe { free(handle) };
+                }
+                runtime.unregister_owner_name(owner);
+                return Err(LoadError::BundleNameMismatch {
+                    path: path.to_owned(),
+                    declared: bundle.id.clone(),
+                    actual: reported,
+                });
+            }
+        }
+        // 版本只告警：发行包版本与插件 crate 版本本来就可以不同。
+        // SAFETY: lib 还活着，契约同 `read_manifest`。
+        if let Some(described) = unsafe { read_manifest(&lib) } {
+            if !described.version.is_empty() && described.version != bundle.version {
+                runtime.warn(&format!(
+                    "插件包 {} 的清单版本 {} 与 plugin_manifest 的 {} 不一致（以清单为准）",
+                    bundle.id, bundle.version, described.version
+                ));
+            }
+        }
+    }
     runtime.register_owner_name(owner, &name);
 
     if let Some(start) = start {
@@ -704,15 +999,19 @@ fn looks_like_go_binary(path: &Path) -> bool {
 /// 它只负责：`apply` = dlopen + `plugin_init` + `plugin_start`，
 /// 返回的 `Effect` = `plugin_stop` + 宿主侧注册整批回滚。
 ///
-/// ⚠️ **卸载是软的（不 `dlclose`）**：`Effect` 跑完只停插件、撤注册，动态库本身
-/// 留在 `Slot::Stopped` 里，进程退出才释放。原因是安全边界——事件总线的订阅快照
-/// 持着指向插件代码的回调 `Arc`，`dlclose` 之后那条订阅万一被调到就是访问违例。
+/// ⚠️ **卸载是软的（不 `dlclose`）**：`Effect` 跑完只停插件、撤注册，动态库与那份
+/// `host_ctx` **直接 `forget`**，进程退出才由系统回收。原因是安全边界——事件总线的
+/// 订阅快照持着指向插件代码的回调 `Arc`，插件自己也可能留下没 join 干净的线程，
+/// `dlclose` 之后它们再跑一步就是访问违例（Android 上表现为「stop 之后整个 App 崩」）。
 /// Cordis 那边靠 GC 托管根本没有这个问题；我们只能选择不卸载。
 /// 代价是每个卸过的插件留几 MB 映射，换掉的是一整类崩溃。
 /// （Go 的 c-shared 本来就不能卸载，见约束 50——现在两种插件口径一致了。）
 pub struct DylibPlugin {
     name: String,
+    /// 展示路径：目录包是那个目录，旧形态是那个动态库。
     path: PathBuf,
+    /// 真正 `dlopen` 的文件。目录包是包内入口，旧形态与 `path` 相同。
+    entry: PathBuf,
     config: String,
     /// 承载 `plugin_init` / `plugin_start` / `plugin_stop` 与全部 ABI 状态。
     ///
@@ -724,9 +1023,14 @@ pub struct DylibPlugin {
     slot: Arc<Mutex<Slot>>,
     runtime: Arc<HostRuntime>,
     /// 探测阶段就知道的 ABI 版本（只为诊断；真加载时会再校验一次）。
+    /// 目录包可能是 0——清单没写 `abi`，装完才知道。
     abi_version: u32,
     /// ABI v4 的自描述：依赖与版本以插件自己说的为准。
     manifest: Option<Manifest>,
+    /// 谁来跑这个入口（原生库 / Python / JS）。
+    kind: PluginKind,
+    /// 目录包的原样清单（旧形态是 `None`）。
+    bundle: Option<BundleManifest>,
 }
 
 /// 把 dylib 插件伪装成内核插件。
@@ -801,15 +1105,18 @@ impl fuyubot_core::Plugin for DylibPlugin {
     }
 
     fn apply(&self, _ctx: &Context) -> Result<Effect, fuyubot_core::KernelError> {
-        let (handle, stop, lib, owner, host) =
-            start_library(&self.runtime, &self.path, &self.config).map_err(|error| {
-                // 内核的 `KernelError` 不认 `LoadError`（那是本 crate 的类型，
-                // 且 core 不许依赖 loader）。带上原因文本，日志里还能看懂。
-                fuyubot_core::KernelError::PluginApplyFailed {
-                    plugin: self.name.clone(),
-                    reason: error.to_string(),
-                }
-            })?;
+        // ⚠️ 用 `entry` 而不是 `path`：目录包要打开的是包内那个动态库。
+        // 目录包还要求自报名等于清单 id（约束 59），旧形态没有这条约束。
+        let expected_bundle = self.bundle.as_ref();
+        let started = start_library(&self.runtime, &self.entry, &self.config, expected_bundle);
+        let (handle, stop, lib, owner, host) = started.map_err(|error| {
+            // 内核的 `KernelError` 不认 `LoadError`（那是本 crate 的类型，
+            // 且 core 不许依赖 loader）。带上原因文本，日志里还能看懂。
+            fuyubot_core::KernelError::PluginApplyFailed {
+                plugin: self.name.clone(),
+                reason: error.to_string(),
+            }
+        })?;
 
         // `manifest.version` 以前读进来就躺在结构里没人用。它的用途是诊断：
         // 激活时把「插件自己说它是哪个版本、要什么」记一笔——插件名可以撞车
@@ -857,26 +1164,22 @@ enum Slot {
         /// 这个插件那份 `host_ctx`（含 vtable 副本）；`plugin_stop` 期间还活着。
         _host: Box<PluginHost>,
     },
-    /// 已经断了，动态库留着不让卸载（见 [`DylibPlugin`] 的文档）。
-    /// 装着 `Library` 与那份 `host_ctx` 只为让它们活到进程结束，字段本身不读。
-    #[allow(dead_code)]
-    Stopped {
-        lib: Library,
-        host: Box<PluginHost>,
-    },
 }
 
 impl DylibPlugin {
-    /// 包装一个已经探测过的动态库，但**不启动它**。
+    /// 包装一个已经探测过的插件，但**不启动它**。
     pub fn new(probe: Probe, config: impl Into<String>, runtime: Arc<HostRuntime>) -> Self {
         Self {
             name: probe.name,
             path: probe.path,
+            entry: probe.entry,
             config: config.into(),
             slot: Arc::new(Mutex::new(Slot::Idle)),
             runtime,
             abi_version: probe.abi_version,
             manifest: probe.manifest,
+            kind: probe.kind,
+            bundle: probe.bundle,
         }
     }
 
@@ -885,18 +1188,41 @@ impl DylibPlugin {
         self.manifest.as_ref()
     }
 
+    /// 目录包的原样清单；旧形态（平铺动态库）是 `None`。
+    pub fn bundle(&self) -> Option<&BundleManifest> {
+        self.bundle.as_ref()
+    }
+
+    /// 谁来跑这个入口（原生库 / Python / JS）。
+    pub fn kind(&self) -> PluginKind {
+        self.kind
+    }
+
     /// 探测 + 包装一步到位。
+    ///
+    /// 传目录就是目录包（读 `plugin.json`，**不 dlopen**），传文件就是旧形态的动态库。
     pub fn probe(
         loader: &PluginLoader,
         path: impl AsRef<Path>,
         config: impl Into<String>,
     ) -> Result<Self, LoadError> {
-        let probe = loader.probe(path)?;
+        let path = path.as_ref();
+        let probe = if path.is_dir() {
+            loader.probe_bundle(path)?
+        } else {
+            loader.probe(path)?
+        };
         Ok(Self::new(probe, config, Arc::clone(loader.runtime())))
     }
 
+    /// 展示路径：目录包是那个目录，旧形态是那个动态库。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 真正 `dlopen` 的文件（目录包是包内入口）。
+    pub fn entry(&self) -> &Path {
+        &self.entry
     }
 
     pub fn abi_version(&self) -> u32 {
@@ -912,17 +1238,19 @@ impl DylibPlugin {
         self.slot.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 停掉并撤掉它注册的一切，把库留在 [`Slot::Stopped`] 里。
+    /// 停掉并撤掉它注册的一切；**动态库与 `host_ctx` 都留到进程结束**。
     ///
-    /// `lib` 是这次激活打开的动态库。它**不会被 drop**——收进 `Stopped` 让它活到
-    /// 进程结束，这就是「软卸载」的全部实现（理由见类型文档）。
+    /// `lib` 是这次激活打开的动态库。它**不会被 drop**——直接 `forget`，这就是
+    /// 「软卸载」的全部实现（理由见类型文档）：收摊之后事件总线里可能还有在途的广播
+    /// 快照，插件自己也可能留下了没 join 干净的线程；`dlclose` 之后它们再跑一步就是
+    /// SIGSEGV（Android 上表现为「stop 之后整个 App 崩」）。`host_ctx` 同理——残留线程
+    /// 还可能调宿主，指针不能悬空。
     ///
     /// 收成**自由函数**而不是 `&self` 上的方法：回滚闭包要 `'static`，只拿得到
     /// `Arc<Mutex<Slot>>` 与 `Arc<HostRuntime>`，拿不到 `&self`。
     fn teardown(slot: &Arc<Mutex<Slot>>, runtime: &HostRuntime, lib: Library) {
         let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-        // 先取出运行中的那套，收摊后再把库与 `host_ctx` 一起塞进 `Stopped`：
-        // 两者都要活到进程结束（插件代码一直映射着，残留线程仍可能调宿主）。
+        // 先取出运行中的那套，收摊后再决定「库去哪」。
         let previous = std::mem::replace(&mut *guard, Slot::Idle);
         match previous {
             Slot::Running {
@@ -940,7 +1268,9 @@ impl DylibPlugin {
                 }
                 runtime.rollback_owner(owner);
                 runtime.unregister_owner_name(owner);
-                *guard = Slot::Stopped { lib, host };
+                // ⚠️ 故意不卸载：见函数文档与 AGENTS 约束 50（Go c-shared 同一条理由）。
+                std::mem::forget(lib);
+                std::mem::forget(host);
             }
             // 理论上到不了：teardown 只由 Running 状态的 Effect 调。真到了也别把库丢了。
             other => {
@@ -948,6 +1278,49 @@ impl DylibPlugin {
                 std::mem::forget(lib);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod disabled_tests {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp/fuyubot-loader")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn renaming_is_the_only_bookkeeping() {
+        let dll = Path::new("plugins").join(format!("foo.{DLL_EXTENSION}"));
+        let off = disabled_path(&dll);
+        assert_eq!(
+            off.file_name().unwrap().to_string_lossy(),
+            format!("foo.{DLL_EXTENSION}.disable"),
+            "后缀加在最后，扩展名不变形"
+        );
+        assert!(is_disabled(&off));
+        assert!(!is_disabled(&dll));
+        assert_eq!(enabled_path(&off), dll);
+        // 幂等：已经是那个方向就原样返回，别叠出 `.disable.disable`。
+        assert_eq!(disabled_path(&off), off);
+        assert_eq!(enabled_path(&dll), dll);
+    }
+
+    #[test]
+    fn a_disabled_plugin_drops_out_of_the_candidate_list() {
+        let dir = temp("disabled-scan");
+        let live = dir.join(format!("live.{DLL_EXTENSION}"));
+        let off = dir.join(format!("off.{DLL_EXTENSION}.disable"));
+        std::fs::write(&live, b"x").unwrap();
+        std::fs::write(&off, b"x").unwrap();
+
+        let found = plugin_files(&dir).unwrap();
+        assert_eq!(found, vec![live], "禁用的不进候选表：{found:?}");
     }
 }
 
@@ -1087,5 +1460,317 @@ mod declared_tests {
             ),
             vec!["media.ffmpeg"]
         );
+    }
+}
+
+/// 目录包（`plugin.json`）的探测：静态、不加载、Go 的两种口径。
+#[cfg(test)]
+mod bundle_probe_tests {
+    use super::*;
+    use crate::bundle::BUNDLE_MANIFEST;
+    // `DylibPlugin::name()` 是内核插件 trait 的方法，调用点在测试里要显式带进来。
+    use fuyubot_core::Plugin as _;
+
+    /// 测试临时目录：仓库约定放 `target/test-tmp`（不用系统 TEMP）。
+    fn temp(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp/fuyubot-loader")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn loader() -> PluginLoader {
+        PluginLoader::new(Context::new()).expect("宿主运行时该装得起来")
+    }
+
+    /// 落一个完整的包。入口写**纯文本**：真去 dlopen 一定失败，探测成功即证明没加载。
+    fn package(root: &Path, dir_name: &str, id: &str) -> PathBuf {
+        let dir = root.join(dir_name);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin").join("plugin.dll"), b"not a real library").unwrap();
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "id": id,
+            "name": "Weather",
+            "version": "1.2.0",
+            "kind": "native",
+            "entry": "bin/plugin.dll",
+            "abi": 5,
+            "depends": ["fuyubot.help.commands"],
+            "optional_depends": ["media.ffmpeg"],
+        });
+        std::fs::write(dir.join(BUNDLE_MANIFEST), manifest.to_string()).unwrap();
+        dir
+    }
+
+    /// **静态探测不加载**：入口是纯文本，`probe_bundle` 仍然成功。
+    #[test]
+    fn a_bundle_probe_never_loads_the_entry() {
+        let root = temp("probe-bundle-static");
+        let dir = package(&root, "com.example.weather", "com.example.weather");
+
+        let probe = loader().probe_bundle(&dir).expect("静态探测不该失败");
+        assert_eq!(probe.name, "com.example.weather");
+        assert_eq!(probe.path, dir);
+        assert_eq!(probe.entry, dir.join("bin").join("plugin.dll"));
+        assert_eq!(probe.kind, PluginKind::Native);
+        assert_eq!(probe.abi_version, 5, "清单写了 abi=5");
+        assert!(!probe.go_runtime);
+        let bundle = probe.bundle.as_ref().expect("原样清单要带上");
+        assert_eq!(bundle.version, "1.2.0");
+        let manifest = probe.manifest.as_ref().expect("bundle 一定有依赖自描述");
+        assert_eq!(manifest.name, "com.example.weather");
+        assert_eq!(manifest.version, "1.2.0");
+        assert_eq!(manifest.inject, ["fuyubot.help.commands"]);
+        assert_eq!(manifest.soft_inject, ["media.ffmpeg"]);
+    }
+
+    /// 适配器存的是「展示路径 = 包目录 / 入口 = 包内文件」这两条路径。
+    #[test]
+    fn the_adapter_keeps_the_display_path_and_the_real_entry_apart() {
+        let root = temp("adapter-entry");
+        let dir = package(&root, "com.example.weather", "com.example.weather");
+
+        let adapter = DylibPlugin::probe(&loader(), &dir, "").expect("目录该走 probe_bundle");
+        assert_eq!(adapter.path(), dir);
+        assert_eq!(adapter.entry(), dir.join("bin").join("plugin.dll"));
+        assert_eq!(adapter.kind(), PluginKind::Native);
+        assert!(adapter.bundle().is_some());
+        assert_eq!(adapter.abi_version(), 5);
+    }
+
+    /// 清单坏掉时错误要指到包上，而不是「打不开动态库」。
+    #[test]
+    fn a_broken_manifest_surfaces_as_a_bundle_error() {
+        let root = temp("probe-bundle-broken");
+        let dir = package(&root, "com.example.weather", "com.example.weather");
+        std::fs::remove_file(dir.join("bin").join("plugin.dll")).unwrap();
+
+        match loader().probe_bundle(&dir) {
+            Err(LoadError::Bundle {
+                dir: reported,
+                source,
+            }) => {
+                assert_eq!(reported, dir);
+                assert!(
+                    matches!(source, BundleError::EntryMissing(_)),
+                    "入口没了该报 EntryMissing，实际 {source:?}"
+                );
+            }
+            other => panic!("坏包该报 Bundle，实际 {other:?}"),
+        }
+
+        // 平台不匹配同样走 Bundle（先判平台，不拿「入口不存在」误导人）。
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "id": "com.example.weather",
+            "name": "Weather",
+            "version": "1.2.0",
+            "kind": "native",
+            "entry": "bin/plugin.dll",
+            "platforms": ["plan9-mips"],
+        });
+        std::fs::write(dir.join(BUNDLE_MANIFEST), manifest.to_string()).unwrap();
+        assert!(matches!(
+            loader().probe_bundle(&dir),
+            Err(LoadError::Bundle {
+                source: BundleError::UnsupportedPlatform { .. },
+                ..
+            })
+        ));
+    }
+
+    /// Go 的平铺库**没有清单就拒绝**，而且拒绝发生在 dlopen 之前（不崩、不映射）。
+    #[test]
+    fn a_go_library_without_a_manifest_is_refused() {
+        let dir = temp("go-legacy");
+        let dll = dir.join(format!("goplugin.{DLL_EXTENSION}"));
+        let mut bytes = vec![0_u8; 4096];
+        bytes.extend_from_slice(b"\xff Go buildinf:");
+        bytes.extend_from_slice(&[0_u8; 64]);
+        std::fs::write(&dll, &bytes).unwrap();
+
+        let loader = loader();
+        match loader.probe(&dll) {
+            Err(LoadError::GoRequiresManifest { path }) => assert_eq!(path, dll),
+            other => panic!("Go 平铺库该被拒绝，实际 {other:?}"),
+        }
+
+        // 迁移入口允许探测 Go：它绕过了「没清单」那道闸，直接走到 dlopen，
+        // 所以这里拿到的是「打不开」（假文件），而不是「没清单」。
+        assert!(
+            matches!(
+                loader.probe_for_migration(&dll),
+                Err(LoadError::Library { .. })
+            ),
+            "probe_for_migration 该放行到 dlopen"
+        );
+    }
+
+    /// `scan_dir` 走 `plugin_entries`：bundle 在前（按 id）、legacy 在后，
+    /// 单个失败不中断其余的。
+    #[test]
+    fn scan_dir_walks_entries_in_contract_order() {
+        let root = temp("scan-entries");
+        package(&root, "com.example.weather", "com.example.weather");
+        package(&root, "some-dir-name", "com.example.alpha");
+        // 假平铺库：探测会在 dlopen 处失败，但它必须出现在结果里（不能悄悄消失）。
+        let legacy = root.join(format!("legacy.{DLL_EXTENSION}"));
+        std::fs::write(&legacy, b"not a real library").unwrap();
+
+        let adapters = loader()
+            .scan_dir(&root, |probe| format!("{{\"name\":\"{}\"}}", probe.name))
+            .expect("扫目录不该失败");
+        assert_eq!(adapters.len(), 3, "两个包 + 一个平铺库");
+
+        let names: Vec<&str> = adapters
+            .iter()
+            .filter_map(|adapter| adapter.as_ref().ok())
+            .map(|adapter| adapter.name())
+            .collect();
+        assert_eq!(
+            names,
+            ["com.example.alpha", "com.example.weather"],
+            "bundle 按 id 字典序"
+        );
+        assert!(
+            matches!(adapters[2], Err(LoadError::Library { .. })),
+            "平铺库的失败要留住原因"
+        );
+    }
+
+    /// `load_dir` 对包要打开**包内入口**：入口是纯文本时，错误来自 dlopen 而不是
+    /// 「路径是个目录」。
+    #[test]
+    fn load_dir_resolves_the_bundle_entry() {
+        let root = temp("load-dir-bundle");
+        let dir = package(&root, "com.example.weather", "com.example.weather");
+
+        let results = loader().load_dir(&root).expect("扫目录不该失败");
+        assert_eq!(results.len(), 1);
+        let (shown, outcome) = &results[0];
+        assert_eq!(shown, &dir, "展示路径是包目录");
+        match outcome {
+            Err(LoadError::Library { path, .. }) => {
+                assert_eq!(path, &dir.join("bin").join("plugin.dll"), "真去开的是入口")
+            }
+            other => panic!("纯文本入口该在 dlopen 处失败，实际 {other:?}"),
+        }
+    }
+
+    /// 编一个真 cdylib 出来（demo 插件的 `plugin_init` 自报名是 `fuyubot.demo`）。
+    ///
+    /// 和 `tests/plugins.rs` 的做法一致：测试自己建 fixture，不依赖「先跑过 cargo build」。
+    fn build_demo_fixture() -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        // MSVC 的 link.exe 要在 TEMP 里建临时文件，受限环境里指向系统 TEMP 会编不出来。
+        let cargo_temp = root.join("target/test-tmp/cargo-temp");
+        std::fs::create_dir_all(&cargo_temp).unwrap();
+        let status = std::process::Command::new(env!("CARGO"))
+            .args(["build", "--offline", "-p", "fuyubot-plugin-demo"])
+            .current_dir(&root)
+            .env("TEMP", &cargo_temp)
+            .env("TMP", &cargo_temp)
+            .status()
+            .expect("启动 cargo 失败");
+        assert!(status.success(), "构建 demo fixture 失败");
+
+        let file = if cfg!(target_os = "windows") {
+            "fuyubot_plugin_demo.dll".to_owned()
+        } else if cfg!(target_os = "macos") {
+            "libfuyubot_plugin_demo.dylib".to_owned()
+        } else {
+            "libfuyubot_plugin_demo.so".to_owned()
+        };
+        let path = root.join("target").join("debug").join(file);
+        assert!(path.is_file(), "没找到产物 {}", path.display());
+        path
+    }
+
+    /// 目录包的自报名必须等于清单 id（AGENTS 约束 59）：不一致就拒绝加载，并说清改哪边。
+    #[test]
+    fn a_bundle_rejects_a_plugin_whose_name_differs_from_the_manifest_id() {
+        let demo = build_demo_fixture();
+        let root = temp("bundle-name-mismatch");
+        let dir = root.join("com.example.wrong");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::copy(&demo, dir.join("bin").join("demo.dll")).unwrap();
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "id": "com.example.wrong",
+            "name": "Wrong",
+            "version": "1.0.0",
+            "kind": "native",
+            "entry": "bin/demo.dll",
+        });
+        std::fs::write(dir.join(BUNDLE_MANIFEST), manifest.to_string()).unwrap();
+
+        let loader = loader();
+        let adapter = DylibPlugin::probe(&loader, &dir, "").expect("静态探测照旧成功");
+        match adapter.apply(&Context::new()) {
+            Err(fuyubot_core::KernelError::PluginApplyFailed { reason, .. }) => {
+                assert!(
+                    reason.contains("com.example.wrong") && reason.contains("fuyubot.demo"),
+                    "错误要说清两边各是什么：{reason}"
+                );
+            }
+            Ok(_) => panic!("自报名与清单 id 不一致时不该加载成功"),
+            Err(other) => panic!("该报「名字不一致」，实际 {other}"),
+        }
+
+        // 便捷 API（`load_dir`）也必须拦下：装上了但名字不对 = 没装上。
+        let results = loader.load_dir(&root).expect("扫目录不该失败");
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0].1, Err(LoadError::BundleNameMismatch { .. })),
+            "load_dir 也要做同一套身份校验：{:?}",
+            results[0].1
+        );
+    }
+
+    /// 迁移探测必须把 Go 的库**留到进程结束**：`ProbeLibrary` 的 guard 管所有出口，
+    /// 不只是成功那条（失败分支同样会 drop 局部 `Library`）。
+    ///
+    /// 判定手法：Windows 上**已映射**的 DLL 删不掉（共享冲突），删得掉就说明它被 dlclose 了
+    /// ——对 Go 的 c-shared 那正是会让进程崩的那一步。
+    #[test]
+    fn a_migration_probe_keeps_a_go_library_mapped() {
+        // 把一个真 cdylib 伪装成 Go 的 c-shared：Go 的构建信息魔数在 PE 尾部不影响加载。
+        let demo = build_demo_fixture();
+        let root = temp("go-keep-mapped");
+        let path = root.join(format!("go-like.{DLL_EXTENSION}"));
+        let mut bytes = std::fs::read(&demo).unwrap();
+        bytes.extend_from_slice(b"\xff Go buildinf:");
+        bytes.extend_from_slice(&[0_u8; 32]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let loader = loader();
+        // ① 普通探测：读到魔数就拒，连 dlopen 都不做。
+        assert!(matches!(
+            loader.probe(&path),
+            Err(LoadError::GoRequiresManifest { .. })
+        ));
+
+        // ② 迁移探测：允许加载，并且不许在返回时卸载它。
+        let probe = loader.probe_for_migration(&path).expect("迁移探测该成功");
+        assert!(probe.go_runtime, "魔数判定为 Go");
+        assert_eq!(probe.name, "fuyubot.demo");
+
+        #[cfg(windows)]
+        {
+            // 对照：同一目录里没被加载的文件删得掉——所以下面的失败只能是「还在映射」。
+            let control = root.join("control.dll");
+            std::fs::write(&control, b"x").unwrap();
+            assert!(
+                std::fs::remove_file(&control).is_ok(),
+                "对照组：没被加载的文件该删得掉"
+            );
+            assert!(
+                std::fs::remove_file(&path).is_err(),
+                "迁移探测之后 Go 的库必须还映射着（删得掉 = 已经 dlclose 了）"
+            );
+        }
     }
 }

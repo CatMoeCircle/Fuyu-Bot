@@ -28,6 +28,9 @@ dir = "plugins"
 # 低于它的日志既不进宿主留档也不写 stderr——插件刷 Debug 是实打实的系统调用。
 # 排查插件时调成 "debug" 或 "trace"。写错级别名会**报错**，不会静默当默认。
 log_level = "info"
+# TUI 插件商店的索引地址（静态 JSON）。不配置 = 商店页显示「未配置」，不影响其它功能。
+# 商城地址还没定，先留空；拿到索引 URL 之后取消下面这行的注释并填进去。
+# registry_url = "https://…/index.json"
 
 [tdlib]
 # 留空 = 按 fuyubot-tdlib 的四级优先级自动找（环境变量 → 自带 → 系统库 → 裸库名）。

@@ -4,9 +4,11 @@
 //!   四个机制 crate 彼此不依赖，把它们组合起来的地方只能有一个，就是这里。
 //! - [`UpdatePipeline`]：`td_receive` 的原始 JSON → 六个中间件阶段 → 插件监听器。
 //! - [`PluginLoader`]：dlopen 一个 cdylib，走 `plugin_init` / `plugin_start` / `plugin_stop`。
+//! - [`bundle`]：插件分发格式 v1（`plugin.json` + 目录包），静态列举 / 校验，**不 dlopen**。
 //!
 //! 这里是本仓库唯一的「宿主层」：机制 crate 之间不许互相依赖，组合与桥接都发生在本 crate。
 
+mod bundle;
 mod loader;
 mod pipeline;
 mod runtime;
@@ -15,12 +17,17 @@ mod script;
 /// 插件作者写 cdylib 时直接对着 ABI crate 编程。
 pub use fuyubot_abi as abi;
 
+pub use bundle::{
+    BUNDLE_MANIFEST, BundleError, BundleManifest, DISABLED_DIR, PluginEntry, PluginKind,
+    SCRIPTS_DIR, current_platform, disabled_bundles, is_bundle_dir, plugin_entries, script_bundles,
+};
 pub use loader::{
-    DLL_EXTENSION, DylibPlugin, LoadError, LoadedPlugin, PluginLoader, Probe, plugin_files,
+    DISABLED_SUFFIX, DLL_EXTENSION, DylibPlugin, LoadError, LoadedPlugin, PluginLoader, Probe,
+    disabled_path, enabled_path, is_disabled, plugin_files,
 };
 pub use pipeline::{PipelineError, UpdateOutcome, UpdatePipeline};
 pub use runtime::{
     DEFAULT_LOG_VERBOSITY, HOST_TOOL_OWNER, HostRuntime, LogLevel, RESPONSE_EVENT, SentRequest,
-    TD_FUNCTIONS_TOOL, UPDATE_EVENT,
+    TD_FUNCTIONS_TOOL, TdRequestError, UPDATE_EVENT,
 };
 pub use script::{SCRIPT_EXTENSIONS, find_script};

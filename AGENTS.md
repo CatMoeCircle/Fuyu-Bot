@@ -24,9 +24,11 @@ TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` �
 | `fuyubot-core` | Cordis 内核：`Context`（按**名字**寻址的服务表）/ `Effect` / `Plugin`（含 `inject`）/ `PluginManager`（Fiber 生命周期与依赖跟踪）。不认识 Telegram |
 | `fuyubot-abi` | C ABI：`HostApiVTable`（2 个 u32 + `host_ctx` + 23 个函数指针）、`PluginHandle`、`define_plugin!`、cbindgen 头文件 |
 | `fuyubot-tdlib-sys` | 绑定层：`td_api.tl` → 类型 + 元数据 + FFI 声明（无 tokio / 无网络） |
-| `fuyubot-tdlib` | `loader`（四级定位）+ `client`（`td_receive` 循环、`ReceiveLoop`）+ `authorize`（授权状态机） |
+| `fuyubot-tdlib` | `loader`（四级定位）+ `client`（`td_receive` 循环、`ReceiveLoop`）+ `authorize`（授权状态机）+ `session`（建客户端 / 登录 / `getMe` / 关会话） |
 | `fuyubot-event` / `service` / `tool` / `middleware` | 四个机制 crate，只依赖 `core`，彼此不依赖 |
 | `fuyubot-loader` | 唯一宿主层：VTable 桥、更新管线、插件加载、注册回滚 |
+| `fuyubot-app` | 宿主编排层：把「内核 → 宿主 → 接 TDLib → 装插件 → 登录 → 分发 → 收摊」写在一处；交互全走 `AppHost` trait。CLI 与 Android JNI 共用 |
+| `fuyubot-android` | Android 的 JNI 运行时（`cdylib`，`libfuyubotjni.so`）：只交付 `.so`，不出 APK / UI；保活归 APK 作者 |
 | `fuyubot-simplify` | TDLib 便捷封装（发消息 / 编辑 / Markdown → entities / 命令解析）；`ops` 模块是它的 JSON 操作表，宿主 ABI v5 的 `simplify_invoke*` 就跑它 |
 | `plugins/` · `examples/` · `tests/` | 按角色分目录：`plugins/` = 三个内置插件（`/start`、`/help`、`/plugins`）；`examples/fuyubot-plugin-demo` = 最小示例（也是加载器夹具）；`tests/` = ABI / 清单 / 作用域夹具（`badabi`、`manifest-fixture`、`scope-fixture`） |
 
@@ -94,6 +96,8 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 7. **tdjson 运行时加载**：禁止 `#[link(name = ...)]`，符号一律走 `ffi::TdApi` + `loader::resolve_symbols`。
 8. **加载优先级不要重排**：`TDLIB_TDJSON_PATH` → vendored → exe 同级目录 → Linux 带版本系统库 → 裸库名。
 9. `tar`/`flate2`/`sha2` 只服务 vendored；`ureq` 是常开 build-dependency；**运行时依赖图里不许出现它们**（`cargo tree -p fuyubot-tdlib -e normal` 只有 sys / libloading / serde_json / thiserror / tokio）。
+   ⚠️ 2026 起例外只有一处：`fuyubot-cli` 的 **TUI 商店**（`panel/store.rs`）可以依赖
+   `ureq` / `sha2` / `zip`——它们是 CLI 的依赖，不在 `fuyubot-tdlib` 的 normal 树里，不算违反本条。
 10. **`Context` 只暴露 `&self`**：注册走 `provide` 并**持有** `Effect`，不加 `&mut` 接口。
     ⚠️ **2026 P1 起它有了作用域链**：`Context::new()` 永远造**根**（68 个调用点都靠这个），
     子作用域必须显式 `child()`。查找**沿父链**走（自己这层 → 父 → …），注册**只写自己那层**；
@@ -129,8 +133,14 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 27. **转换失败 = 构建失败**（读不了 / 解析不了 / 没分区标记都 panic）。
 28. 生成器规则：类字段 `Option<Box<T>>`、认不出的类型降级 `serde_json::Value`、类 enum 变体字段不写 `pub`、函数 struct 字段写 `pub`。
 29. **tdjson 只用 per-client 那套符号**；`TdExecuteFn` 是两参数；往 `TdApi` 加字段要同步 `size_of` 断言。
+    **加载之后不卸载**：`TdClient::drop` 只发 `destroy`，`Library` 故意 `forget` 到进程结束——
+    TDLib 在第一次 `create` 时就起了自己的 manager / scheduler 线程、活到进程结束，
+    `dlclose` 之后它们再跑一步就是访问违例（Android 上表现为「stop 之后整个 App 崩」，2026 定位）。
 30. **加载动态库走 `loader::open_library`**（Windows `LOAD_WITH_ALTERED_SEARCH_PATH`），它先查库自己所在目录；插件加载也走它。
-31. **`attach_tdlib` 先、`spawn_dispatch` 后**；停止位必须显式持有并 `stop()`，drop 不会停。
+31. **`attach_tdlib` 先、`spawn_dispatch` 后**；停止位必须显式持有并 `stop()` + `join().await`
+    （正常收摊的唯一正路）。`ReceiveLoop` 的 `Drop` 只做**兜底置位**：把手在错误路径 / panic 里被丢掉时，
+    那个 `spawn_blocking` 任务最迟 1s 后自己退出——否则 `tokio::runtime::Runtime::drop` 会**无限期**
+    等它，进程卡死在退出那一刻（2026 实测）。别把 `Drop` 当收摊：它不会 join、也不刷盘。
 32. **公开 ABI 类型不许用 `macro_rules!` 生成**（cbindgen 不展开宏）。
 33. cbindgen 的 `after_includes` 只放宏与注释；用到 ABI 类型的代码放 `config.trailer`。
 34. **`Option<fn>` 的签名要内联写**，不能走类型别名（会退化成不完整结构体）。
@@ -172,6 +182,23 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     `simplify_invoke_result`，回调里安全，传异步 op 返回 `code:"async_op"`。
     ⚠️ op 工作线程的归属是**宿主自己**（`owner = 0`），它顺手发出的 TDLib 请求的中间响应只到
     全局订阅者——插件只该收到最后那一条 `simplifyResult`。
+
+59. **插件分发格式 v1（bundle）**：一个插件 = `plugins/<id>/`（脚本插件仍在
+    `plugins/scripts/<id>/`），根上的 `plugin.json` 是**权威静态元数据**；契约见
+    `docs/plugin-format-v1.md`。`plugin_entries` 只扫一层：bundle 按 id 在前、旧形态
+    平铺 dll 按文件名在后；`.disabled/` / `<id>.disable` 一律不当候选。
+    加载器必须能**不 dlopen** 就拿到 `id/version/kind/entry/depends`（`probe_bundle`），
+    真正 `dlopen` 只发生在 `DylibPlugin::apply`；`plugin_files` 只服务旧形态，
+    新代码不要再用它扫插件目录。bundle 的 `plugin_init` 名字与清单 id 不一致要拒绝加载。
+60. **Go 的 c-shared 没有 `plugin.json` 就拒绝**：`PluginLoader::probe` 在读文件魔数阶段
+    直接返回 `GoRequiresManifest`，**不 dlopen**——它一旦映射就永远不能卸载，必须在
+    映射前就知道依赖。唯一例外是 `probe_for_migration`（`plugin migrate` 用，进程即将退出），
+    调用方必须提示「本次迁移进程会永久映射」。bundle 里的 Go 允许，但
+    `App::load_plugins` 必须把它排在队列最后；同进程别放多个会装信号处理器的 Go 插件。
+61. **商店边界**：`fuyubot-loader` / 运行时**永不**下载、解压、读索引——这些只在 CLI 的
+    TUI 商店层（`crates/fuyubot-cli/src/panel/store.rs`），且**不单独建 crate**（用户 2026
+    拍板：完整功能只集成在 TUI）。其它宿主（APK 等）自己做商店，只复用 bundle 契约。
+    `plugin install` 的 CLI 只装本地目录/包，不认 zip。
 
 ## 文档
 
