@@ -107,6 +107,36 @@ pub fn qr(link: &str) {
     });
 }
 
+/// `Callback.onPlugins(String)`——插件装载结果（JSON：清单 + 计数 + 跳过原因）。
+///
+/// **可选回调**：老的 Java 回调类没有这个方法时，`call_method` 会失败并留下
+/// `NoSuchMethodError`，这里就地清掉并记一条日志——不能带着 pending 异常继续调 Java，
+/// 也不该把「宿主没写这个可选方法」当成启动失败（与 `onState` / `onAsk` 的硬契约不同）。
+pub fn plugin_report(json: &str) {
+    let _ = with_env(|env| {
+        let Some(callback) = callback() else {
+            return;
+        };
+        let Ok(text) = env.new_string(json) else {
+            return;
+        };
+        let text: &JObject = text.as_ref();
+        let called = env.call_method(
+            callback.as_obj(),
+            "onPlugins",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(text)],
+        );
+        if called.is_err() {
+            let _ = env.exception_clear();
+            tracing::info!(
+                target: "fuyubot::jni",
+                "宿主没有实现 onPlugins（可选回调）：插件报告只留在日志与 nativePlugins() 里"
+            );
+        }
+    });
+}
+
 /// 工作线程退出前调一次。
 ///
 /// `attach_current_thread_permanently` 不会自己摘；ART 对「attach 了就直接退出」的线程

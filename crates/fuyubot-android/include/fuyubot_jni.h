@@ -9,11 +9,11 @@
  * 两条铁律：
  *   1. 这些函数都**立即返回**（start 只负责起线程）；真正跑起来 / 失败看 `last_error()` 与日志。
  *      唯一的例外是 `fuyubot_td_request`：它按调用方给的预算等 TDLib 的响应。
- *   2. `last_error()` 与四个返回 JSON 的函数返回的都是**线程局部**缓冲，下次在**同一线程**
+ *   2. `last_error()` 与三个返回 JSON 的函数返回的都是**线程局部**缓冲，下次在**同一线程**
  *      调用本库前有效，不能存、不能跨线程传、不能 free。
  *
  * 线程：`start` / `stop` / `is_running` / `answer` / `plugins` / `plugin_info` /
- * `plugins` / `plugin_info` 可从任意线程调用；`stop` 最多等 8 秒（内部走优雅收摊），
+ * `td_request` / `last_error` 可从任意线程调用；`stop` 最多等 8 秒（内部走优雅收摊），
  * 超时返回 FUYUBOT_TIMEOUT。
  * `td_request` **阻塞**到响应回来或超时——从专门的工作线程调，别在 UI 线程上调。
  *
@@ -44,8 +44,8 @@ extern "C" {
 
 /* 运行时 ABI 版本：**运行时判定**，别在编译期假设。
  *
- * 1 → 首个发布版本：六个生命周期/问答方法 + 插件列表、插件详情、TDLib JSON 请求、
- *     本线程最后一次错误，共十个。（开发期试过的内存接口没进 v1。）
+ * 1 → 六个生命周期/问答方法 + 插件列表、插件详情、TDLib JSON 请求、本线程最后一次错误，
+ *     共十个 native 方法。
  */
 #define FUYUBOT_JNI_ABI 1
 
@@ -62,7 +62,7 @@ int32_t fuyubot_abi_version(void);
 /* 起运行时；立即返回。成功 = FUYUBOT_OK（不代表已登录，看日志 / onState）。 */
 int32_t fuyubot_start(const char *options_json);
 
-/* 优雅停车：停接收循环 → 关 TDLib 会话（刷盘）→ 卸插件。上限 8 秒。
+/* 优雅停车：停接收循环 → 卸插件 → 关 TDLib 会话（刷盘）。上限 8 秒。
  * 超时返回 FUYUBOT_TIMEOUT，并**把卡住的那一步写进 last_error()**：
  *   "stop 等收摊超时（8s）：worker 线程还在跑（kernel 停在这一步：TDLib 关会话（等数据库刷盘））……"
  * 同样的阶段名也会经 onState(STOPPING, …) 逐段推给 Java，App 可以边收边显示。 */
@@ -81,14 +81,21 @@ const char *fuyubot_last_error(void);
 /* ---- 运行时查询 -------------------------------------------------- */
 
 /*
- * 当前插件列表（JSON）：
+ * 当前插件列表 + 计数（JSON）：
  *
  *   {
- *     "count": 2,
+ *     "count": 2,            // 交给内核的插件数（= plugins 数组长度）
+ *     "scanned": 3,          // 目录里扫到的候选数（= count + skipped）
+ *     "active": 1,           // 五个状态计数，加起来恒等于 count
+ *     "pending": 0,
+ *     "activating": 0,
+ *     "failed": 1,
+ *     "unknown": 0,
+ *     "skipped": 1,          // 没进内核的候选数（探测失败 / 位置不对的脚本）
  *     "plugins": [
  *       {
  *         "name": "fuyubot.start",           // 插件名（点分；plugin_init 报的）
- *         "version": "0.1.2",                // 插件 manifest 的版本；老插件是空串
+ *         "version": "0.1.2",                // 插件 manifest 的版本；未写版本时为空串
  *         "abi_version": 5,                  // 插件编进去的 ABI 版本
  *         "state": "active",                 // active / pending / activating / failed / unknown
  *         "inject": ["fuyubot.host.td"],     // 硬依赖
@@ -98,12 +105,15 @@ const char *fuyubot_last_error(void);
  *         "missing": ["…"],                  // 仅 state = pending：还缺哪些能力
  *         "reason": "…"                      // 仅 state = failed：apply 报的错
  *       }
+ *     ],
+ *     "skipped_plugins": [                 // 连内核都没进的候选，附原因
+ *       {"path": "/data/…/plugins/libbroken.so", "reason": "打开动态库失败 …"}
  *     ]
  *   }
  *
- * 运行时没起来 = {"count":0,"plugins":[]}（不是错误，也不是 NULL）。
- * 注意「起来」指 `start` 的工作线程已经走完启动 + 登录：登录期间视图还没装上，
- * 这期间查也是空表。
+ * 运行时没起来 = 同一份形状的空表（count/scanned/… 全是 0，两个数组是 []），
+ * 不是 NULL、也不是错误。
+ * **可用时机**：插件装好就有（登录**之前**）——登录窗口弹出时就能查。
  * 返回线程局部缓冲：下次同线程调本库前有效。
  */
 const char *fuyubot_plugins(void);
@@ -131,14 +141,6 @@ const char *fuyubot_plugin_info(const char *name);
 const char *fuyubot_td_request(const char *request_json, int32_t timeout_ms);
 
 /*
- * 内存采集**不在本库**：框架只交付 .so，进程是 APK 的进程，内存归属由宿主决定。
- * 需要的话在 APK 侧自己做——单进程用 `Debug.MemoryInfo` / `ActivityManager`，
- * 想量「除 APK 本体之外」就把框架放进 `android:process=":fuyubot"`，再读
- * `/proc/<pid>/smaps|status`（同 UID 可读）。v1 里没有 `fuyubot_memory` /
- * `fuyubot_memory_of`。
- */
-
-/*
  * ---- JNI 契约 ----
  *
  * 绑定在**运行期**做：`JNI_OnLoad` 里用 `RegisterNatives` 把十个方法绑到
@@ -146,8 +148,8 @@ const char *fuyubot_td_request(const char *request_json, int32_t timeout_ms);
  * `FUYUBOT_JNI_CLASS=com/你的/包/Native` 就能换包名——**必须是 `/` 分隔的内部名**，
  * 且换完不用改任何函数名（导出符号里根本没有 `Java_...`）。
  * 类名 / 方法名 / 签名必须照下面写：写错同样在第一次调用时报 `UnsatisfiedLinkError`。
- * ⚠️ 绑定是**逐个方法注册**的：类里没有的方法（旧版 Java 类）只会让那一个方法绑不上
- * （`JNI_OnLoad` 日志里列出名字），其它方法照常可用。
+ * 绑定是**逐个方法注册**的：某个方法在类里缺失只会让那一个绑不上（`JNI_OnLoad` 日志里
+ * 列出名字），其它方法照常可用。
  *
  * public final class Native {
  *     public Native(Callback cb)               // 构造里先 loadLibrary("tdjson")，再 loadLibrary("fuyubotjni")
@@ -166,14 +168,19 @@ const char *fuyubot_td_request(const char *request_json, int32_t timeout_ms);
  * }
  *
  * `nativeRegister` 在 JNI 层是 `(Ljava/lang/Object;)I`：回调只按**方法名 + 签名**调
- * （onState / onAsk / onQr），不认具体接口——所以 `Callback` 放哪个包都行，
+ * （onState / onAsk / onQr / onPlugins），不认具体接口——所以 `Callback` 放哪个包都行，
  * Kotlin 里把参数声明成 `Any` 即可：
  *
  * public interface Callback {
  *     void onState(int state, String detail);   // 0 STARTING 1 READY 2 STOPPING 3 STOPPED 4 ERROR
  *     void onAsk(int id, int kind, String prompt);  // 回答走 Native.nativeAnswer(id, text)
  *     void onQr(String link);                       // 只展示，不需要回答
+ *     void onPlugins(String reportJson);            // 可选：插件清单 + 计数 + 跳过原因
  * }
+ *
+ * `onPlugins` 是**可选**回调：装完插件、登录**之前**调一次，参数就是 `fuyubot_plugins()`
+ * 那份 JSON（见上）；不需要时不必在 `Callback` 里声明。任何时候也都可以用
+ * `nativePlugins()` 主动拉取。
  *
  * kind 取值：0 bot token / 1 手机号 / 2 验证码 / 3 两步密码 / 4 登录方式（回 "phone" 或 "qr"）/
  * 5 其它（把 prompt 原样显示给用户即可）。prompt 一律是给人看的中文整句。

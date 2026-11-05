@@ -28,7 +28,7 @@ mod prompt;
 
 pub use app::{App, AppError, AppOptions, TdlibSettings};
 pub use host::{AppHost, AppState, AskKind, SilentHost};
-pub use live::{LiveView, PluginInfo};
+pub use live::{LiveView, PluginInfo, PluginLoadReport, PluginSkip, empty_plugins_json};
 pub use prompt::{HostPrompter, kind_of};
 
 // 宿主要用的那几个类型，从这里拿就够——不必为了 `LogLevel` 再直接依赖 loader。

@@ -35,7 +35,7 @@ use fuyubot_tdlib::{AccountType, ReceiveLoop, Session, SessionError, TdClient, T
 use serde_json::Value;
 
 use crate::host::{AppHost, AppState};
-use crate::live::{LiveView, PluginInfo};
+use crate::live::{LiveView, PluginInfo, PluginLoadReport};
 use crate::prompt::HostPrompter;
 
 /// 编排这一路可能出的错。
@@ -104,6 +104,8 @@ pub struct App {
     pipeline: Arc<UpdatePipeline>,
     session: Option<Session>,
     plugins: Vec<Arc<DylibPlugin>>,
+    /// 这次扫描的结果（扫到几个 / 哪些没进内核）。`live_view` 与上报共用同一份。
+    load: PluginLoadReport,
     /// 生命周期桥的守卫：drop 就退订（约束 11 同一条道理）。
     _lifecycle: Effect,
     host: Arc<dyn AppHost>,
@@ -195,6 +197,7 @@ impl App {
             pipeline,
             session,
             plugins: Vec::new(),
+            load: PluginLoadReport::default(),
             _lifecycle: lifecycle,
             host,
             settings: tdlib,
@@ -203,12 +206,20 @@ impl App {
     }
 
     /// ⑤ 装插件：扫目录 → 探测 → 交给内核的 Fiber 状态机。返回装上的个数。
+    ///
+    /// 扫描结果（扫到几个、哪些没进内核、为什么）记进 [`Self::load_report`]，并在
+    /// 交给内核之后经 [`AppHost::plugin_report`] 一次性上报——**登录之前**，
+    /// 所以登录窗口里 / 登录失败时，宿主也已经拿到了清单与失败原因。
     pub fn load_plugins(&mut self) -> Result<usize, AppError> {
         let dir = self.plugin_dir().to_path_buf();
         let scripts_dir = dir.join("scripts");
         // 目录包与旧形态平铺动态库都在这里；`plugin.json` 存在时**不 dlopen**。
         let entries =
             plugin_entries(&dir).map_err(|error| AppError::PluginDir(dir.clone(), error))?;
+        let mut report = PluginLoadReport {
+            scanned: entries.len(),
+            ..PluginLoadReport::default()
+        };
 
         let mut adapters: Vec<Arc<DylibPlugin>> = Vec::new();
         // Go 的 c-shared 一旦映射就永远不能卸载：放到队列最后，让能卸载的先 settle。
@@ -219,6 +230,7 @@ impl App {
                 PluginEntry::Bundle(path) | PluginEntry::Legacy(path) => path.clone(),
             };
             // 探测失败只跳过这一个，原因打出来——文件在那儿却悄悄消失是最难查的那类事。
+            // 同时记进报告：日志在 Android 上只落文件，宿主要能经 `onPlugins` 看到它。
             let probe = match self.loader.probe_entry(&entry) {
                 Ok(probe) => probe,
                 Err(error) => {
@@ -227,6 +239,7 @@ impl App {
                         "跳过插件 {}：{error}",
                         shown.display()
                     );
+                    report.skip(shown, error.to_string());
                     continue;
                 }
             };
@@ -238,6 +251,10 @@ impl App {
                     "跳过脚本插件 {}：脚本插件应放在 plugins/scripts/ 下（kind={}）",
                     shown.display(),
                     probe.kind
+                );
+                report.skip(
+                    shown,
+                    format!("脚本插件应放在 plugins/scripts/ 下（kind={}）", probe.kind),
                 );
                 continue;
             }
@@ -280,10 +297,14 @@ impl App {
         self.loader
             .runtime()
             .install_plugin_reporter(self.kernel.reporter());
-        self.report_plugins();
 
         let count = adapters.len();
         self.plugins = adapters;
+        self.load = report;
+        self.report_plugins();
+        // 登录之前就把装载结果交给宿主：登录要等用户输入，甚至可能失败，
+        // 那之后才「能查」等于最需要它的时候没有。
+        self.host.plugin_report(&self.plugin_report_json());
         tracing::info!(target: "fuyubot::app", "插件已交给内核：{count} 个");
         Ok(count)
     }
@@ -412,8 +433,21 @@ impl App {
         LiveView::new(
             Arc::clone(self.runtime()),
             self.plugin_infos(),
+            self.load.clone(),
             self.client().cloned(),
         )
+    }
+
+    /// 此刻的插件报告 JSON（形状与 [`LiveView::plugins_json`] 同一份）。
+    ///
+    /// 装完插件、登录之前就可用——`AppHost::plugin_report` 收的就是它。
+    pub fn plugin_report_json(&self) -> String {
+        self.live_view().plugins_json()
+    }
+
+    /// 这次扫描的结果：扫到几个、哪些没进内核。
+    pub fn load_report(&self) -> &PluginLoadReport {
+        &self.load
     }
 
     /// 已装插件的静态自描述（名字 / 版本 / ABI / 依赖 / 文件路径），按扫描顺序。
@@ -441,16 +475,28 @@ impl App {
     }
 
     fn report_plugins(&mut self) {
-        for (name, missing) in self.kernel.plugins().pending() {
+        let pending = self.kernel.plugins().pending();
+        let failed = self.kernel.plugins().failed();
+        for (name, missing) in &pending {
             tracing::warn!(
                 target: "fuyubot::app",
                 "插件 {name} 的依赖还没齐，先不启动：缺 {}",
                 missing.join(", ")
             );
         }
-        for (name, reason) in self.kernel.plugins().failed() {
+        for (name, reason) in &failed {
             tracing::error!(target: "fuyubot::app", "插件 {name} 启动失败：{reason}");
         }
+        let active = self.kernel.plugins().active().len();
+        tracing::info!(
+            target: "fuyubot::app",
+            "插件：扫到 {} 个，交给内核 {} 个（active {active} / pending {} / failed {}），跳过 {} 个",
+            self.load.scanned,
+            self.plugins.len(),
+            pending.len(),
+            failed.len(),
+            self.load.skipped.len()
+        );
     }
 }
 
@@ -458,12 +504,14 @@ impl App {
 mod tests {
     use super::*;
     use crate::host::{AppHost, AppState, AskKind};
+    use fuyubot_loader::DLL_EXTENSION;
     use std::sync::Mutex;
 
-    /// 只记录状态、不提供交互的宿主。
+    /// 只记录状态 / 插件报告、不提供交互的宿主。
     #[derive(Default)]
     struct Recorder {
         states: Mutex<Vec<(AppState, String)>>,
+        reports: Mutex<Vec<String>>,
     }
 
     impl AppHost for Recorder {
@@ -479,17 +527,87 @@ mod tests {
         }
 
         fn qr(&self, _link: &str) {}
+
+        fn plugin_report(&self, report: &str) {
+            self.reports
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(report.to_owned());
+        }
+    }
+
+    /// 一个空的临时目录（每个测试一个，互不打扰）。
+    fn scratch(name: &str) -> PathBuf {
+        // 临时目录放 `target/test-tmp/`：`std::env::temp_dir()` 会被 MSYS 改成 `/tmp`，
+        // 在 Windows 上解析到盘根、建目录直接被拒（pitfalls 第 70 条）。
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp/fuyubot-app")
+            .join(name)
+            .join(std::process::id().to_string())
+    }
+
+    /// 装插件的结果必须**在登录之前**交给宿主，而且扫不动的文件要带着原因记下来——
+    /// Android 上日志只落文件，APK 拿不到 `tracing`，只有这一条 `onPlugins` 能看见。
+    #[tokio::test]
+    async fn load_plugins_reports_scanned_skipped_and_counts_before_login() {
+        let dir = scratch("report");
+        let plugins = dir.join("plugins");
+        std::fs::create_dir_all(&plugins).expect("建插件目录失败");
+        // 一个不是动态库的 `.so`：探测必然失败 → 进 `skipped_plugins`，而不是悄悄消失。
+        let broken = plugins.join(format!("broken.{DLL_EXTENSION}"));
+        std::fs::write(&broken, b"definitely not a shared library").expect("写坏插件失败");
+
+        let recorder = Arc::new(Recorder::default());
+        let host: Arc<dyn AppHost> = recorder.clone();
+        let mut app = App::boot(AppOptions {
+            data_dir: dir.join("data"),
+            plugin_dir: plugins,
+            log_level: LogLevel::Info,
+            log_plugins: Vec::new(),
+            config: serde_json::json!({}),
+            config_path: None,
+            tdjson_path: None,
+            tdlib: None,
+            host,
+        })
+        .await
+        .expect("没接 TDLib 的 boot 应该能起来");
+
+        assert_eq!(app.load_plugins().expect("装插件不该整批失败"), 0);
+
+        let reports = recorder
+            .reports
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        assert_eq!(reports.len(), 1, "装一次插件只上报一次");
+        let report: Value = serde_json::from_str(&reports[0]).expect("上报的必须是合法 JSON");
+        assert_eq!(report["count"], serde_json::json!(0));
+        assert_eq!(report["scanned"], serde_json::json!(1));
+        assert_eq!(report["skipped"], serde_json::json!(1));
+        assert_eq!(report["failed"], serde_json::json!(0));
+        let skipped = &report["skipped_plugins"][0];
+        assert_eq!(skipped["path"], serde_json::json!(broken.to_string_lossy()));
+        assert!(
+            skipped["reason"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "跳过必须带原因：{skipped}"
+        );
+
+        // 同一份数据走查询接口（`nativePlugins()`）也拿得到，形状一致。
+        let live: Value =
+            serde_json::from_str(&app.plugin_report_json()).expect("查询接口也必须是合法 JSON");
+        assert_eq!(live["skipped"], serde_json::json!(1));
+        assert_eq!(app.load_report().scanned, 1);
+        assert_eq!(app.live_view().plugins_json(), reports[0]);
     }
 
     /// 收摊必须**逐段上报**：Android 的 `nativeStop` 超时后，`last_error` 就靠
     /// 这些阶段名说清「卡在哪一步」。顺序也是契约（停循环 → 卸插件 → 关会话）。
     #[tokio::test]
     async fn shutdown_reports_every_stage_in_order() {
-        // 临时目录放 `target/test-tmp/`：`std::env::temp_dir()` 会被 MSYS 改成 `/tmp`，
-        // 在 Windows 上解析到盘根、建目录直接被拒（pitfalls 第 70 条）。
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/test-tmp/fuyubot-app/shutdown")
-            .join(std::process::id().to_string());
+        let dir = scratch("shutdown");
         let plugins = dir.join("plugins");
         std::fs::create_dir_all(&plugins).expect("建插件目录失败");
 

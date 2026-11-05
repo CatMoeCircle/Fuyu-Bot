@@ -76,6 +76,20 @@ pub trait AppHost: Send + Sync {
 
     /// 展示二维码 / 登录链接（`authStateWaitOtherDeviceConfirmation`），**不需要回答**。
     fn qr(&self, link: &str);
+
+    /// 插件装载结果，一次性上报（发生在登录**之前**）。
+    ///
+    /// `report` 是 JSON，形状就是 [`crate::LiveView::plugins_json`] 那一份：
+    /// `{"count":…, "scanned":…, "active":…, "pending":…, "activating":…,
+    /// "failed":…, "unknown":…, "skipped":…, "plugins":[…], "skipped_plugins":[…]}`。
+    ///
+    /// **默认什么都不做**：`fuyubot::app` 的日志里已经有一条汇总（「插件：扫到 … 个，
+    /// 交给内核 … 个，跳过 … 个」）。Android 把它转成 `Callback.onPlugins(String)`，
+    /// 让 APK 在登录窗口弹出**之前**就拿到列表与失败原因；CLI 用不上。
+    ///
+    /// 这是**可选**回调：实现方忽略它不影响启动；Java 类没有 `onPlugins` 方法时
+    /// 也只记一条日志（见 `fuyubot-android`）。
+    fn plugin_report(&self, _report: &str) {}
 }
 
 /// 什么都不做的宿主：只把状态打进日志。
@@ -115,6 +129,10 @@ impl AppHost for Arc<dyn AppHost> {
 
     fn qr(&self, link: &str) {
         (**self).qr(link);
+    }
+
+    fn plugin_report(&self, report: &str) {
+        (**self).plugin_report(report);
     }
 }
 

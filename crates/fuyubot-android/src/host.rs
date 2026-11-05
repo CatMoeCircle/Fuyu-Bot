@@ -32,4 +32,9 @@ impl AppHost for JniHost {
     fn qr(&self, link: &str) {
         callback::qr(link);
     }
+
+    /// 装完插件、登录**之前**上报一次：APK 在登录窗口弹出前就能显示清单 / 计数 / 失败。
+    fn plugin_report(&self, report: &str) {
+        callback::plugin_report(report);
+    }
 }

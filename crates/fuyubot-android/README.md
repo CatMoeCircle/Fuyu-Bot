@@ -16,11 +16,12 @@ ABI **v1** 一共十个方法：六个生命周期/问答，加上 `nativePlugin
 `nativePluginInfo(name)`（单个插件）、`nativeTdRequest(json, timeoutMs)`（原始 td_api
 JSON 进、响应 JSON 出，阻塞）、`nativeLastError()`（本线程最后一次错误）。
 对应的 C 符号是 `fuyubot_plugins` / `fuyubot_plugin_info` / `fuyubot_td_request`。
-（本 crate 此前从未发布过，所以编号从 1 起；开发期试过的内存接口没进 v1。）
 
-**内存不归框架报**（v1 就没有内存接口）：
-进程是 APK 的进程，内存口径由宿主决定。要量就自己在 APK 侧做——单进程用
-`Debug.MemoryInfo` / `ActivityManager`；想量「除 APK 本体之外」就把框架放进
-`android:process=":fuyubot"`，再读那个进程的 `/proc/<pid>/smaps|status`（同 UID 可读）。
+**插件加载结果会主动上报**：装完插件、**登录之前**调一次回调
+`Callback.onPlugins(String)`，参数与 `nativePlugins()` 同一份 JSON——
+`count` / `scanned` / `active` / `pending` / `activating` / `failed` / `unknown` /
+`skipped` 八个计数，`plugins` 清单（失败的带 `reason`），以及连内核都没进的
+`skipped_plugins`（探测失败 / 位置不对的脚本，带原因）。`onPlugins` 是可选的；
+`nativePlugins()` 从插件装好那一刻起就能查，登录窗口里也拿得到。
 
 对外头文件是 [`include/fuyubot_jni.h`](include/fuyubot_jni.h)，它同时也是宿主契约。

@@ -50,14 +50,26 @@ async fn run_async(options: &Options, root: PathBuf) -> Result<(), String> {
     let host: Arc<dyn AppHost> = Arc::new(JniHost);
     let app_options = options.app_options(host);
 
-    // `App::start` = boot + 装插件 + 登录；状态经 `JniHost::state` → `onState`。
-    let app = App::start(app_options)
+    // 与 CLI 同一条顺序：boot（内核 + 宿主 + 接 TDLib）→ 装插件 → 登录。
+    // 拆开三段的唯一原因在中间：视图要**赶在登录之前**装上——登录要等人回答，
+    // 甚至可能失败，那期间 Java 也得能查插件列表 / 数量 / 跳过原因。
+    let mut app = App::boot(app_options)
         .await
+        .map_err(|error| format!("启动失败：{error}"))?;
+
+    // 装插件：`AppHost::plugin_report` 在这里把清单 + 计数 + 跳过原因投给
+    // `Callback.onPlugins`，登录窗口弹出之前 APK 就拿到了（日志里另有一条汇总）。
+    app.load_plugins()
         .map_err(|error| format!("启动失败：{error}"))?;
 
     // 三个查询接口（插件列表 / 详情 / TDLib JSON）从 Java 调用线程访问这份视图；
     // 守卫保证收摊、报错、panic 都会摘掉它（视图不能比运行时活得久）。
     let _live = crate::live::LiveGuard::install(app.live_view());
+
+    // 登录（阻塞；期间没有接收循环）。还没登录时 `nativePlugins()` 已经有内容了。
+    if app.should_login() {
+        app.login().map_err(|error| format!("启动失败：{error}"))?;
+    }
 
     let receive = app.dispatch();
     while !state::stop_requested() {

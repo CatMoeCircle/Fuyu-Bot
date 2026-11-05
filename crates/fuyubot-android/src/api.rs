@@ -4,8 +4,8 @@
 //! 好在没有 JVM 的机器上直接测——本仓的 Android 单测本来就跑在桌面。
 //!
 //! 三个接口共用一条纪律：**运行时没起来不报错，返回空结果**。`plugins` 是空表，
-//! `plugin_info` 是 `None`，`td_request` 带一句可读的原因。这样 Java 侧在
-//! `onState(READY)` 之前随手调一下也不会崩。
+//! `plugin_info` 是 `None`，`td_request` 带一句可读的原因。这样 Java 侧在启动过程中
+//! 随手调一下也不会崩。
 
 use std::time::Duration;
 
@@ -15,14 +15,15 @@ use crate::live;
 pub const DEFAULT_TD_TIMEOUT: Duration = Duration::from_secs(30);
 /// `timeout_ms` 的上限：再长也只是把调用线程焊在那儿（TDLib 的慢请求也不该等这么久）。
 pub const MAX_TD_TIMEOUT: Duration = Duration::from_secs(600);
-/// 运行时没起来时的插件列表（形状与正常返回一致，客户端不用特判）。
-pub const EMPTY_PLUGINS: &str = r#"{"count":0,"plugins":[]}"#;
 
 /// 插件列表 JSON。没在跑 = 空表（**不是错误**）。
+///
+/// 空表与正常返回**同一份形状**（含全部计数字段）：形状由 `fuyubot-app` 的
+/// `empty_plugins_json()` 生成，客户端不用为「还没起来」写第二套解析。
 pub fn plugins_json() -> String {
     match live::get() {
         Some(view) => view.plugins_json(),
-        None => EMPTY_PLUGINS.to_owned(),
+        None => fuyubot_app::empty_plugins_json(),
     }
 }
 
@@ -42,7 +43,7 @@ pub fn td_request(request: &str, timeout_ms: i64) -> Result<String, String> {
         );
     }
     let Some(view) = live::get() else {
-        return Err("运行时还没起来（先 start，等 onState(READY)）".to_owned());
+        return Err("运行时还没起来（先 start）".to_owned());
     };
     view.td_request(request, timeout_from_ms(timeout_ms))
 }
@@ -66,6 +67,13 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&plugins_json()).unwrap();
         assert_eq!(parsed["count"], serde_json::json!(0));
         assert_eq!(parsed["plugins"], serde_json::json!([]));
+        assert_eq!(parsed["scanned"], serde_json::json!(0));
+        assert_eq!(parsed["skipped"], serde_json::json!(0));
+        // 空表就是「零个插件的报告」，不是另一种形状。
+        assert_eq!(
+            parsed,
+            serde_json::from_str::<serde_json::Value>(&fuyubot_app::empty_plugins_json()).unwrap()
+        );
         assert!(plugin_json("fuyubot.demo").is_none());
         let error = td_request(r#"{"@type":"getMe"}"#, 1000).unwrap_err();
         assert!(error.contains("还没起来"), "{error}");

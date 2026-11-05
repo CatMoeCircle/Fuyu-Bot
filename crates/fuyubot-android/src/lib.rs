@@ -264,10 +264,15 @@ pub extern "C" fn fuyubot_last_error() -> *const c_char {
 
 // ── 运行时查询 ────────────────────────────────────────────────────
 
-/// 当前插件列表（JSON：`{"count":n,"plugins":[…]}`）。没在跑 = 空表。
+/// 当前插件列表（JSON：清单 + 计数 + 跳过原因）。没在跑 = 空表（同样的形状）。
 ///
-/// 每项的字段见 `include/fuyubot_jni.h`。返回的是**线程局部缓冲**：
-/// 下次在**同一线程**调本库前有效——别 free、别存、别跨线程传。
+/// ```json
+/// {"count":2,"scanned":3,"active":1,"pending":0,"activating":0,"failed":1,"unknown":0,
+///  "skipped":1,"plugins":[…],"skipped_plugins":[{"path":"…","reason":"…"}]}
+/// ```
+///
+/// 从「插件装好」那一刻起可用（**登录之前**）；每项的字段见 `include/fuyubot_jni.h`。
+/// 返回的是**线程局部缓冲**：下次在**同一线程**调本库前有效——别 free、别存、别跨线程传。
 #[unsafe(no_mangle)]
 pub extern "C" fn fuyubot_plugins() -> *const c_char {
     match catch_unwind(AssertUnwindSafe(api::plugins_json)) {
@@ -592,7 +597,7 @@ fn read_string(env: &mut JNIEnv<'_>, value: JString<'_>) -> Result<String, Strin
         .map_err(|error| format!("不是合法 UTF-8：{error}"))
 }
 
-/// 当前插件列表 JSON。运行时没起来 = 空表（**不是** `null`）。
+/// 当前插件列表 JSON。运行时没起来 = 空表（与正常返回同一份形状，**不是** `null`）。
 extern "system" fn native_plugins(mut env: JNIEnv<'_>, _this: JObject<'_>) -> jstring {
     match catch_unwind(AssertUnwindSafe(api::plugins_json)) {
         Ok(json) => new_java_string(&mut env, &json),
@@ -949,6 +954,30 @@ mod tests {
                 "头文件缺 {symbol} 的声明"
             );
         }
+    }
+
+    /// 插件报告是对外契约：计数字段与可选回调 `onPlugins` 必须写在头文件里，
+    /// 否则 APK 作者只会看到旧的 `{"count":n,"plugins":[…]}`，继续猜「失败在哪」。
+    #[test]
+    fn the_header_documents_the_plugin_report_contract() {
+        let header = include_str!("../include/fuyubot_jni.h");
+        for token in [
+            "onPlugins",
+            "skipped_plugins",
+            "\"scanned\"",
+            "\"failed\"",
+            "\"skipped\"",
+        ] {
+            assert!(header.contains(token), "头文件缺 {token} 的说明");
+        }
+    }
+
+    /// `onPlugins` 是**可选**回调：没有 JVM（本仓单测就是这样）时调一次不能 panic，
+    /// 没注册回调（纯 C 宿主）时也一样。
+    #[test]
+    fn plugin_report_without_a_jvm_is_a_no_op() {
+        use fuyubot_app::AppHost;
+        crate::host::JniHost.plugin_report(r#"{"count":0,"plugins":[]}"#);
     }
 
     /// `FindClass` 只认 `/` 分隔的内部名；写成点分名会在真机上找不到类。
