@@ -6,13 +6,14 @@
 插件是 cdylib（`.dll` / `.so` / `.dylib`），只认四个导出符号与一张 `HostApiVTable`（ABI 版本 5）。
 TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` 在**编译期**转成 Rust 类型与可校验元数据。
 
-三个仓库（本仓只放运行时）：
+四个仓库（本仓只放运行时）：
 
 | 仓库 | 放什么 |
 | --- | --- |
 | **Fuyu-Bot**（本仓） | 运行时全部 + `fuyubot-abi` + `fuyubot-tdlib-sys`（后两个发 crates.io） |
 | FuyuBot-Script | 一个脚本插件宿主 `fuyubot-script`（Python + JS/TS 同一个 dll）+ 两个薄 SDK（PyPI / npm）。没有 CLI、没有示例 |
 | FuyuBot-Docs | 文档站（<https://catmoecircle.github.io/FuyuBot-Docs/>，源在 `content/docs/**`） |
+| [FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android) | Android 图形客户端（fuyuTD，Kotlin + Compose）。**不含内核**：APK 由本仓 `release-bot.yml` 编出来 |
 
 跨仓依赖只有一条、单向：FuyuBot-Script 通过 crates.io 依赖本仓的 `fuyubot-abi`。
 **crates.io 上本仓发 `fuyubot-abi` 与 `fuyubot-tdlib-sys` 两个包**；SDK 时代的其余 crate 已删除（仓库内移除 + crates.io yank）。
@@ -202,6 +203,25 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     TUI 商店层（`crates/fuyubot-cli/src/panel/store.rs`），且**不单独建 crate**（用户 2026
     拍板：完整功能只集成在 TUI）。其它宿主（APK 等）自己做商店，只复用 bundle 契约。
     `plugin install` 的 CLI 只装本地目录/包，不认 zip。
+
+62. **APK 在 `release-bot.yml` 的 `build-apk` job 里编，壳不在本仓**：
+    壳是 [FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android)（Kotlin + Compose），
+    按 `main` 取；内核就是同一版本编出来的 `fuyubot-<版本>-android-jni-<abi>.zip`。
+    契约有三条，改之前先看 `.github/scripts/build-android-apk.sh`：
+    - **指定目录是 `app/src/main/assets/fuyubot-kernel/`**（不是 `jniLibs/`）。它被上游
+      `.gitignore` 排除，缺了也照样编得出 APK——只是装到设备上首次启动报「资产中缺少内核目录」。
+      所以判据只能是「APK 里真有 `assets/fuyubot-kernel/lib*.so`」，不能只看 `assembleRelease` 绿了。
+    - **版本要注入进去**：上游 `CURRENT_KERNEL_VERSION`（`KernelManager` 拿它决定要不要重装内核，
+      相等就跳过）与 `versionCode` / `versionName` 都得按本仓的 tag 改写。漏改的症状是
+      「APK 更新了但还在跑旧内核」，且**不会报错**。
+    - **资产名是 `fuyubot-<版本>-<abi>.apk`**（例 `fuyubot-v0.1.3-arm64-v8a.apk`）。两个 ABI 的 `.so`
+      文件名完全相同，**不能装进同一个 APK**，所以必须分开发、文件名里带 abi。
+      不加 `-android-` 段不撞名：zip 那批是 `fuyubot-<版本>-android-<平台>.zip` /
+      `fuyubot-<版本>-android-jni-<abi>.zip`。⚠️ publish 的下载表因此要**按扩展名分派**标签，
+      只按基名匹配的话 `.apk` 与 `.zip` 的 `-x86_64` 会串味。
+    签名走 `apksigner`（不用 AGP 的 injected signing——那要四个 `-P` 属性齐全，缺一个就**静默不签**）。
+    keystore 从 Secrets 还原，四个都要在：`ANDROID_KEYSTORE_BASE64` / `ANDROID_KEYSTORE_PASSWORD` /
+    `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD`。**同一个 keystore 不能换**，换了老用户装不上新 APK。
 
 ## 文档
 

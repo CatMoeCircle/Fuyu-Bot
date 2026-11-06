@@ -33,8 +33,16 @@ Telegram 连接，每个插件都是独立编译的动态库，按需加载、�
 | Linux（x86_64） | `fuyubot-<版本>-linux-x86_64.zip` |
 | Linux（ARM64） | `fuyubot-<版本>-linux-aarch64.zip` |
 | macOS（Apple Silicon） | `fuyubot-<版本>-macos-aarch64.zip` |
+| Android（arm64-v8a，真机） | `fuyubot-<版本>-arm64-v8a.apk` |
+| Android（x86_64，模拟器） | `fuyubot-<版本>-x86_64.apk` |
 
 `<版本>` 就是 Release 的版本号（如 `v0.1.0`），资产名里带它，方便一眼看出下的是哪个版本。
+
+**Android 的 APK 是开箱即用的图形客户端**，界面在
+[FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android) 仓库，
+内核（`libfuyubotjni.so` + TDLib）由本仓构建后随包打进 `assets/`，第一次启动自动释放到应用私有目录。
+同一页 Release 里还挂着 `fuyubot-<版本>-android-jni-<abi>.zip`——那是**只含 `.so` 的内核包**，
+给想自己在 APK 里集成内核的开发者用，普通用户直接下 `.apk` 即可。
 
 **解压出来就是本体**，zip 里没有额外的一层目录——建议先建一个空目录再往里解压。
 `tdjson` 必须和可执行文件待在一起，别单独删掉：
@@ -181,6 +189,7 @@ fuyubot plugin install <插件工程目录> --plugin-dir <插件目录>
 | --- | --- |
 | [FuyuBot-Docs](https://github.com/CatMoeCircle/FuyuBot-Docs) | **使用文档站**：安装、配置、运行、回放、排错 |
 | [FuyuBot-Script](https://github.com/CatMoeCircle/FuyuBot-Script) | 脚本插件宿主（Python / JS / TS）+ 两个薄 SDK |
+| [FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android) | Android 图形客户端（fuyuTD）：Kotlin + Compose 壳，内核随 APK 内置 |
 | [架构与数据流](https://catmoecircle.github.io/FuyuBot-docs/docs/dev/architecture/) | 内核、更新管线、绑定层与数据流 |
 | [调用 TDLib](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/tdlib/) | `td_invoke`、响应通道、`fuyubot-simplify` 全量对照 |
 
