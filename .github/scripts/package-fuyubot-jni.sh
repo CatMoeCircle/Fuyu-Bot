@@ -188,7 +188,9 @@ if loads == 0:
 symbols = [
     "fuyubot_abi_version", "fuyubot_start", "fuyubot_stop",
     "fuyubot_is_running", "fuyubot_answer", "fuyubot_last_error",
-    "fuyubot_plugins", "fuyubot_plugin_info", "fuyubot_td_request",
+    "fuyubot_plugins", "fuyubot_plugin_info",
+    "fuyubot_auth_state", "fuyubot_connection_state",
+    "fuyubot_td_request",
     "JNI_OnLoad",
 ]
 missing = [name for name in symbols if (name.encode() + b"\0") not in data]
@@ -196,7 +198,7 @@ if missing:
     raise SystemExit("导出符号缺失：" + "、".join(missing))
 
 # JNI 方法走 `RegisterNatives`，**不再有 `Java_...` 导出符号**。能查的只有类名：
-# 六个方法名（"nativeVersion" 之类，13~15 字节）在 x86_64 上会被 LLVM 拆成
+# 方法名（"nativeVersion" 之类，13~17 字节）在 x86_64 上会被 LLVM 拆成
 # `mov` 指令的立即数，**不一定以连续字节出现**（aarch64 上才是连续的），按字节找会误报。
 # 方法名 + 签名由 `cargo test -p fuyubot-android` 的 `jni_method_table_matches_the_documented_contract` 钉住；
 # 这里只确认「包名没配错」和「名字绑定已清干净」。
@@ -208,17 +210,26 @@ if binding not in data:
         "找不到 JNI 绑定类名（FindClass 的入参）：" + jni_class
         + "（构建时的 FUYUBOT_JNI_CLASS 必须与打包时一致）"
     )
-for banned in (b"libssl.so", b"libcrypto.so", b"libc++_shared.so"):
-    if banned in data:
-        raise SystemExit(
-            f"依赖了 Android 上没有的库：{banned.decode()}（静态合并失效？）"
-        )
+
+# ⚠️ **不要**在这里按字节搜 `libc++_shared.so` / `libcrypto.so` / `libssl.so` 来断言
+# 「静态合并失效」。这三个名字是 loader 里**正常的字符串字面量**：
+#   crates/fuyubot-tdlib/src/loader.rs 的 siblings_to_preload 拿它们挑要预加载的同级 .so
+#   （`name == "libc++_shared.so"` / `starts_with("libcrypto.so")` …）。
+# 所以它们**必然**出现在 .so 的字符串表里，按字节搜永远是假阳性。
+# 2026 踩过：aarch64 上这些 13~16 字节的字面量被 LLVM 拆成 `mov` 立即数、恰好不连续，
+# 检查「通过」；x86_64 上连续存放，同一个产物直接报「依赖了 Android 上没有的库」——
+# 差异只在架构，不在产物对不对，白白让 x86_64 的 JNI 包 + APK 挂了一轮。
+#
+# 真正的判据是下面的 `llvm-readelf -d`：读 **DT_NEEDED**（真实动态依赖），
+# 白名单只放 bionic 的 libc / libm / libdl / liblog。没有 llvm-readelf 时**跳过**，
+# 不做字节兜底——宁可少一条检查，也不要一条恒假的检查。
 
 print(f"OK ELF64 {arch} e_type={e_type} e_machine={e_machine} PT_LOAD={loads}"
       f" 符号={len(symbols)} 类名={jni_class}")
 PY
 
-# 有 llvm-readelf 就精确读 DT_NEEDED，没有就只做前面的字符串兜底。
+# 有 llvm-readelf 就精确读 DT_NEEDED（真实动态依赖），没有就跳过。
+# ⚠️ 跳过时**不做**按字节搜库名的兜底：那三个名字是 loader 的正常字符串字面量，见上面的注释。
 # NDK 的 prebuilt 目录名跟宿主走：CI 是 linux-x86_64，本机 Windows 是 windows-x86_64。
 NDK_HOST="linux-x86_64"
 case "$(uname -s)" in
@@ -236,7 +247,7 @@ if [[ -x "$READELF" ]]; then
     exit 1
   fi
 else
-  echo "warning: 没找到 llvm-readelf（ANDROID_NDK_HOME 没设？），跳过 DT_NEEDED 精确检查" >&2
+  echo "warning: 没找到 llvm-readelf（ANDROID_NDK_HOME 没设？），跳过 DT_NEEDED 检查" >&2
 fi
 
 # ── 打包：zip 里没有外层目录 ───────────────────────────────────────

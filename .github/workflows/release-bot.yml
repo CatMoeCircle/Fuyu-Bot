@@ -448,7 +448,13 @@ jobs:
   build-apk:
     name: apk ${{ matrix.abi }}
     needs: [plan, build-android]
-    if: needs.plan.outputs.apk_count != '0' && needs.build-android.result == 'success'
+    # ⚠️ 不要求 `build-android` **整体**成功：那两个 ABI 是各自独立的矩阵行，一个挂了不该把
+    #    另一个的 APK 也连坐（2026-11 踩过：x86_64 的 JNI 包因一条恒假的校验挂掉，
+    #    arm64 明明编好了，两个 APK 却全被跳过）。这里按 abi 逐个看结果。
+    #    `gh run download` 找不到 artifact 时会自己退回 Release，丢了哪一边也还有得救。
+    if: >-
+      needs.plan.outputs.apk_count != '0' && !cancelled() &&
+      (needs.build-android.result == 'success' || needs.build-android.result == 'failure')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
