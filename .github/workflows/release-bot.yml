@@ -17,6 +17,14 @@
 #   （`aarch64-linux-android` / `x86_64-linux-android` 的 ELF，不是 apk），
 #   包结构与桌面一致（`fuyubot` + 同级 `libtdjson.so` + `plugins/`），
 #   只是 tdjson 需要应用期交叉编译，而 loader 的 `ASSETS` 表不含 android。
+#   同一个 job 还顺手打一个 JNI 包（`*-android-jni-<abi>.zip`，只有 `.so`）。
+#
+# **APK** 又是一条线（`build-apk` job）：把上面那个 JNI 包解压到
+#   [FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android) 的
+#   `app/src/main/assets/fuyubot-kernel/`（上游约定的**指定目录**），跑
+#   `./gradlew :app:assembleRelease`，再用 Secrets 里的 keystore 签名，产出
+#   `fuyubot-<版本>-<abi>.apk`。壳的代码不在本仓，按 `main` 取。
+#   不加 `-android-` 段也不撞名：zip 那批是 `fuyubot-<版本>-android-<平台>.zip`。
 #
 # 用户视角（`README.md` 与文档站的「使用」就是这么写的）：
 #   下载 `fuyubot-<版本>-<OS>-<平台>.zip` → 解压 → `./fuyubot init` / `./fuyubot run`。
@@ -75,6 +83,8 @@ jobs:
       android_matrix: ${{ steps.plan.outputs.android_matrix }}
       android_plan: ${{ steps.plan.outputs.android_plan }}
       android_count: ${{ steps.plan.outputs.android_count }}
+      apk_matrix: ${{ steps.plan.outputs.apk_matrix }}
+      apk_count: ${{ steps.plan.outputs.apk_count }}
     steps:
       - name: Compute the enabled platform matrices
         id: plan
@@ -100,6 +110,13 @@ jobs:
               {"os": "ubuntu-22.04", "asset": "fuyubot-android-aarch64", "tdlib": "TDLib-android-aarch64", "abi": "arm64-v8a", "arch": "aarch64", "target": "aarch64-linux-android", "bin": "fuyubot", "enabled": True},
               {"os": "ubuntu-22.04", "asset": "fuyubot-android-x86_64", "tdlib": "TDLib-android-x86_64", "abi": "x86_64", "arch": "x86_64", "target": "x86_64-linux-android", "bin": "fuyubot", "enabled": True},
           ]
+          # APK：**同一个 JNI 包**，塞进 FuyuBot-for-Android 的壳里再编一次。
+          # `abi` 决定取哪个 `fuyubot-<版本>-android-jni-<abi>.zip`，也是 APK 文件名的那一段。
+          # `enabled` 与上面两张表各自独立：内核没成时这一批会因缺包失败，那是对的信号。
+          apk = [
+              {"os": "ubuntu-latest", "abi": "arm64-v8a", "arch": "aarch64", "enabled": True},
+              {"os": "ubuntu-latest", "abi": "x86_64", "arch": "x86_64", "enabled": True},
+          ]
 
           def pack(rows, placeholder):
               rows = [row for row in rows if row.get("enabled")]
@@ -107,6 +124,7 @@ jobs:
 
           desktop_placeholder = {"os": "ubuntu-latest", "asset": "fuyubot-none-none", "tdlib": "TDLib-none-none", "platform_dir": "none-none", "bin": "fuyubot"}
           android_placeholder = {"os": "ubuntu-22.04", "asset": "fuyubot-none-none", "tdlib": "TDLib-none-none", "abi": "none", "arch": "none", "target": "aarch64-linux-android", "bin": "fuyubot"}
+          apk_placeholder = {"os": "ubuntu-latest", "abi": "none", "arch": "none"}
 
           print("matrix=" + json.dumps(pack(platforms, desktop_placeholder), separators=(",", ":")))
           print("plan=" + json.dumps({"include": platforms}, separators=(",", ":")))
@@ -114,6 +132,8 @@ jobs:
           print("android_matrix=" + json.dumps(pack(android, android_placeholder), separators=(",", ":")))
           print("android_plan=" + json.dumps({"include": android}, separators=(",", ":")))
           print("android_count=" + str(len([row for row in android if row.get("enabled")])))
+          print("apk_matrix=" + json.dumps(pack(apk, apk_placeholder), separators=(",", ":")))
+          print("apk_count=" + str(len([row for row in apk if row.get("enabled")])))
           PY
 
   build:
@@ -408,14 +428,142 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # ---------------- Android APK（把上面的 JNI 包塞进上游壳里再编一次）----------------
+  # 上游仓库 [FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android)
+  # 只有 Kotlin + Compose 的壳，**不含内核**；它的构建前提就是
+  #   app/src/main/assets/fuyubot-kernel/   ← 本仓产的 JNI 包解压到这里
+  # 缺了这个目录 gradle 照样编得出 APK，只是装到设备上第一次启动就报「资产中缺少内核目录」。
+  # 所以这里的判据是「APK 里真的有 assets/fuyubot-kernel/lib*.so」（见打包脚本第 6 步）。
+  #
+  # 内核与壳**同版本发**：APK 版本号取自本仓的 tag，不跟上游仓库的 Release 走。
+  # 这样同一个 Release 页上，`fuyubot-<版本>-<abi>.apk` 里装的内核就是
+  # 同一个 tag 编出来的 `fuyubot-<版本>-android-jni-<abi>.zip`。
+  #
+  # 签名用 Secrets（缺一个就整条失败——宁可不发 APK，也不要发一个装不上的包）：
+  #   ANDROID_KEYSTORE_BASE64      keystore 文件的 base64（单行）
+  #   ANDROID_KEYSTORE_PASSWORD    store 口令
+  #   ANDROID_KEY_ALIAS            key 别名
+  #   ANDROID_KEY_PASSWORD         key 口令
+  # 覆盖升级要求**同一个 keystore**：换了它，老用户装新 APK 会报签名冲突，只能先卸载。
+  build-apk:
+    name: apk ${{ matrix.abi }}
+    needs: [plan, build-android]
+    if: needs.plan.outputs.apk_count != '0' && needs.build-android.result == 'success'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.apk_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 壳仓库用自己的 checkout：它不进本仓的 history，也不该被 submodule 绑死版本。
+      - uses: actions/checkout@v4
+        with:
+          repository: CatMoeCircle/FuyuBot-for-Android
+          ref: main
+          path: android-app
+
+      - name: Make scripts executable
+        shell: bash
+        run: chmod +x .github/scripts/*.sh
+
+      # 用 JDK 21：壳仓库的 `app/build.gradle.kts` 把 sourceCompatibility / targetCompatibility
+      # 与 Kotlin `jvmTarget` 都钉在 21，用 17 编不过（AGP 9.2 自称「最低 17」救不了这一点）。
+      # ⚠️ 别依赖 runner 的默认 JDK：`ubuntu-latest` 正在 24.04→26.04 迁移，
+      #    前者默认 17、后者默认 25，同一周不同 job 可能拿到不同版本。
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # 壳的 compileSdk 是 37.1，比 AGP 9.2 官方支持的 37.0 高一个 minor，会报
+      # `COMPILE_SDK_VERSION_TOO_HIGH` **警告**——不是错误，不影响产出，所以这里不压它
+      # （压掉 `android.suppressUnsupportedCompileSdk` 会把真正值得看的告警一起藏起来）。
+      # 别在这里写死 build-tools 版本：脚本会取 SDK 里最新的那一份。
+      - name: Ensure the Android platform used by the shell is installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d "$ANDROID_HOME/platforms/android-37.1" ]]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-37.1" > /dev/null
+          fi
+          echo "JAVA_HOME=$JAVA_HOME ($(java -version 2>&1 | head -1))"
+          ls "$ANDROID_HOME/platforms"
+          ls "$ANDROID_HOME/build-tools"
+
+      - name: Download the matching JNI bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist jni
+          # 版本口径与桌面 / Android job 一致：tag 推送用 tag 名，分支上手动跑用短 sha。
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="dev-${GITHUB_SHA:0:7}"
+          fi
+          echo "FUYUBOT_APK_VERSION=$version" >> "$GITHUB_ENV"
+          name="fuyubot-${version}-android-jni-${{ matrix.abi }}"
+          echo "==> 取 ${name}.zip"
+          # 优先从**本次运行**的 artifact 拿：不发版的分支构建也能出 APK。
+          # 拿不到才去 Release（从 Release 页重跑这一条 job、或独立重试时会走这里）。
+          if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+                 --name "fuyubot-android-${{ matrix.arch }}" --dir jni 2>/dev/null; then
+            echo "warning: 本次运行里没有 fuyubot-android-${{ matrix.arch }} 的 artifact，退回 Release" >&2
+            gh release download "$version" --repo "$GITHUB_REPOSITORY" --pattern "${name}.zip" --dir jni
+          fi
+          zip_path="$(find jni -name "${name}.zip" | head -n1)"
+          [[ -n "$zip_path" ]] || { echo "error: 没找到 ${name}.zip" >&2; find jni -type f | head -20 >&2; exit 1; }
+          mv "$zip_path" "jni/${name}.zip"
+          ls -lh jni/
+
+      - name: Build and sign the APK
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          # keystore 从 Secrets 还原到临时目录：绝不进 workspace（免得被 upload-artifact 带上）。
+          ks="$(mktemp -d)/release-keystore"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ks"
+          export FUYUBOT_ANDROID_KEYSTORE="$ks"
+          export FUYUBOT_ANDROID_KEYSTORE_PASSWORD="$ANDROID_KEYSTORE_PASSWORD"
+          export FUYUBOT_ANDROID_KEY_ALIAS="$ANDROID_KEY_ALIAS"
+          export FUYUBOT_ANDROID_KEY_PASSWORD="$ANDROID_KEY_PASSWORD"
+          .github/scripts/build-android-apk.sh \
+            "jni/fuyubot-${FUYUBOT_APK_VERSION}-android-jni-${{ matrix.abi }}.zip" \
+            android-app \
+            "${{ matrix.abi }}" \
+            "$FUYUBOT_APK_VERSION" \
+            dist
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fuyubot-apk-${{ matrix.abi }}
+          path: dist/*.apk
+          if-no-files-found: error
+
   publish:
     name: publish release
-    needs: [build, build-android]
+    needs: [build, build-android, build-apk]
     # 只发 tag：在分支上 `workflow_dispatch`（验证构建用）时 `ref_name` 是 `master`，
     # 照旧发版会创建 / 覆盖一个叫 master 的 Release。
     # 桌面那批被 `enabled: False` 停掉时（那批 job 全 skip），只要 Android 成功就照样发，
-    # 所以不能用默认的「needs 全成功」，得显式看两个 job 的结果。
-    if: startsWith(github.ref, 'refs/tags/v') && !cancelled() && (needs.build.result == 'success' || needs.build-android.result == 'success')
+    # 所以不能用默认的「needs 全成功」，得显式看各 job 的结果。
+    # ⚠️ APK 失败**不拦**整页发布（zip 那批是独立的交付物），但没有 APK 时下面的表格与说明
+    #    会自动少掉那两行——别让「APK 没编出来」变成「整个 Release 都没了」。
+    if: startsWith(github.ref, 'refs/tags/v') && !cancelled() && (needs.build.result == 'success' || needs.build-android.result == 'success' || needs.build-apk.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -430,6 +578,8 @@ jobs:
         run: |
           set -euo pipefail
           out="$PWD/dist"
+          # nullglob：一个 tar.gz 都没有时别把字面量 `dist/fuyubot-*.tar.gz` 当文件名（桌面全停时）。
+          shopt -s nullglob
           for bundle in dist/fuyubot-*.tar.gz; do
             pkg="$(basename "$bundle" .tar.gz)"
             stage="$(mktemp -d)"
@@ -437,7 +587,8 @@ jobs:
             ( cd "$stage/$pkg" && zip -q -r -X "$out/$pkg.zip" . )
             rm -rf "$stage"
           done
-          ls -lh dist/*.zip
+          shopt -u nullglob
+          ls -lh dist/*.zip dist/*.apk 2>/dev/null || true
 
       - name: Publish
         env:
@@ -446,23 +597,31 @@ jobs:
         run: |
           set -euo pipefail
           ls -lh dist
+          shopt -s nullglob
           # 下载表从实际产物生成——别手抄 matrix，加平台时它自己会多一行（AGENTS 约束 46 的教训）。
+          # ⚠️ 标签必须**按扩展名分派**：APK 叫 `fuyubot-<版本>-<abi>.apk`，而可执行文件包叫
+          #    `fuyubot-<版本>-android-<平台>.zip`，两者基名不撞；但同一张 case 里若只按基名匹配，
+          #    `-x86_64` 会把 `…-android-x86_64` 与 APK 的 `…-x86_64` 混成一个标签。
           table="$(
-            for zipfile in dist/fuyubot-*.zip; do
-              name="$(basename "$zipfile" .zip)"
-              case "$name" in
-                *-windows-x86_64)  label="Windows 10/11（x64）" ;;
-                *-windows-aarch64) label="Windows 11（ARM64）" ;;
-                *-linux-x86_64)    label="Linux（x86_64）" ;;
-                *-linux-aarch64)   label="Linux（ARM64）" ;;
-                *-macos-aarch64)   label="macOS（Apple Silicon）" ;;
-                *-android-jni-arm64-v8a) label="Android（arm64-v8a，JNI 库，给 APK 用）" ;;
-                *-android-jni-x86_64)    label="Android（x86_64，JNI 库，给 APK 用）" ;;
-                *-android-aarch64) label="Android（arm64-v8a，可执行文件）" ;;
-                *-android-x86_64)  label="Android（x86_64，模拟器 / 可执行文件）" ;;
-                *)                 label="$name" ;;
+            for file in dist/fuyubot-*.apk dist/fuyubot-*.zip; do
+              name="$(basename "$file")"
+              ext="${name##*.}"
+              name="${name%.*}"
+              case "$ext:$name" in
+                apk:*-arm64-v8a)   label="Android（arm64-v8a，**APK**，开箱即用）" ;;
+                apk:*-x86_64)      label="Android（x86_64，**APK**，模拟器）" ;;
+                zip:*-windows-x86_64)  label="Windows 10/11（x64）" ;;
+                zip:*-windows-aarch64) label="Windows 11（ARM64）" ;;
+                zip:*-linux-x86_64)    label="Linux（x86_64）" ;;
+                zip:*-linux-aarch64)   label="Linux（ARM64）" ;;
+                zip:*-macos-aarch64)   label="macOS（Apple Silicon）" ;;
+                zip:*-android-jni-arm64-v8a) label="Android（arm64-v8a，JNI 内核库，给 APK 用）" ;;
+                zip:*-android-jni-x86_64)    label="Android（x86_64，JNI 内核库，给 APK 用）" ;;
+                zip:*-android-aarch64) label="Android（arm64-v8a，可执行文件）" ;;
+                zip:*-android-x86_64)  label="Android（x86_64，模拟器 / 可执行文件）" ;;
+                *)                 label="$name.$ext" ;;
               esac
-              printf '| %s | `%s.zip` |\n' "$label" "$name"
+              printf '| %s | `%s.%s` |\n' "$label" "$name" "$ext"
             done
           )"
           notes=$(printf '%s\n' \
@@ -470,6 +629,11 @@ jobs:
             "" \
             "每个平台一个 zip：**解压出来就是本体**（没有额外的一层目录），" \
             "TDLib 动态库与可执行文件同级，内置插件（/start、/help、/plugins）在 \`plugins/\` 里。" \
+            "" \
+            "\`*-<abi>.apk\`（如 \`fuyubot-v0.1.3-arm64-v8a.apk\`）是**可直接安装的 Android 图形客户端**（界面在" \
+            "[FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android)，" \
+            "内核就是本页的 \`*-android-jni-*\`，同版本编出来的）。" \
+            "真机用 \`arm64-v8a\`，模拟器用 \`x86_64\`；两个 APK 只能装一个（包名相同）。" \
             "" \
             "\`*-android-jni-*.zip\` 是**给 APK 用的 JNI 库**（\`libfuyubotjni.so\` + \`libtdjson.so\`），" \
             "不是可执行文件、也不是 apk——装法与契约见压缩包里的 \`README.txt\` 与 \`include/fuyubot_jni.h\`。" \
@@ -479,9 +643,21 @@ jobs:
             "$table" \
             "" \
             "脚本插件宿主（\`fuyubot-script\`）在 FuyuBot-Script 仓库的 Release 里单独发布。")
+          # 资产表从实际产物拼，所以这里也按实际文件上传：没有 APK 的构建不该塞一个空通配符。
+          # ⚠️ 别写成 `[[ ... ]] && assets+=(...)`：条件为假时整条 AND 列表返回 1，
+          #    `set -e` 会当场把 publish 打死（这是 bash 的经典坑）。
+          assets=(dist/*.zip)
+          apks=(dist/*.apk)
+          if [[ ${#apks[@]} -gt 0 ]]; then
+            assets+=("${apks[@]}")
+          fi
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "warning: 没有任何产物可发（dist/ 是空的）" >&2
+            exit 1
+          fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.zip --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit "$TAG" --notes "$notes" --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG" dist/*.zip --title "fuyubot $TAG" --notes "$notes" --repo "$GITHUB_REPOSITORY"
+            gh release create "$TAG" "${assets[@]}" --title "fuyubot $TAG" --notes "$notes" --repo "$GITHUB_REPOSITORY"
           fi
