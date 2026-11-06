@@ -9,12 +9,12 @@
  * 两条铁律：
  *   1. 这些函数都**立即返回**（start 只负责起线程）；真正跑起来 / 失败看 `last_error()` 与日志。
  *      唯一的例外是 `fuyubot_td_request`：它按调用方给的预算等 TDLib 的响应。
- *   2. `last_error()` 与三个返回 JSON 的函数返回的都是**线程局部**缓冲，下次在**同一线程**
+ *   2. `last_error()` 与五个返回 JSON 的函数返回的都是**线程局部**缓冲，下次在**同一线程**
  *      调用本库前有效，不能存、不能跨线程传、不能 free。
  *
  * 线程：`start` / `stop` / `is_running` / `answer` / `plugins` / `plugin_info` /
- * `td_request` / `last_error` 可从任意线程调用；`stop` 最多等 8 秒（内部走优雅收摊），
- * 超时返回 FUYUBOT_TIMEOUT。
+ * `auth_state` / `connection_state` / `td_request` / `last_error` 可从任意线程调用；
+ * `stop` 最多等 8 秒（内部走优雅收摊），超时返回 FUYUBOT_TIMEOUT。
  * `td_request` **阻塞**到响应回来或超时——从专门的工作线程调，别在 UI 线程上调。
  *
  * options JSON（`start` 的参数，UTF-8、NUL 结尾）：
@@ -44,8 +44,11 @@ extern "C" {
 
 /* 运行时 ABI 版本：**运行时判定**，别在编译期假设。
  *
- * 1 → 六个生命周期/问答方法 + 插件列表、插件详情、TDLib JSON 请求、本线程最后一次错误，
- *     共十个 native 方法。
+ * 1 → 六个生命周期/问答方法 + 插件列表、插件详情、两个 TDLib 状态查询
+ *     （`nativeAuthState()` / `nativeConnectionState()`）、TDLib JSON 请求、
+ *     本线程最后一次错误，共十二个 native 方法。
+ *
+ * 本库从未发布过，所以首个版本就是 1：十二个方法是同一个 v1 契约，没有历史 v2。
  */
 #define FUYUBOT_JNI_ABI 1
 
@@ -126,6 +129,41 @@ const char *fuyubot_plugins(void);
 const char *fuyubot_plugin_info(const char *name);
 
 /*
+ * 当前 TDLib **授权状态**（登录走到哪一步）的 JSON：
+ *
+ *   {"known":true,"state":"authorizationStateReady","ready":true,"needs_re_login":false}
+ *
+ * - `state`：TDLib 的构造器名（`authorizationStateWaitCode` / `authorizationStateReady` …），
+ *   原样转述，不翻译；认不出的新状态也照实给名字。
+ * - `ready`：是不是 `authorizationStateReady`。
+ * - `needs_re_login`：是不是「要用户再出一次凭据」（手机号 / 验证码 / 两步密码 / 扫码确认）。
+ *   登录窗口里它本来就是 `true`（正常步骤）；**已经 ready 之后**又变 `true` 才是被下线 / 封禁。
+ * - `known`：有没有收到过授权状态。运行时没起来 / 还没收到 = `false`，此时 `state` 是 **null**，
+ *   其余字段都是 `false`（同一份形状，不是 NULL、也不是错误）。
+ *
+ * 登录窗口里的状态也查得到：`log_in_with` 把 `updateAuthorizationState` 自己消费掉了，
+ * 本库在它调 `Prompter::auth_state` 时就把状态记下来（不必等登录完成）。
+ * 返回线程局部缓冲。
+ */
+const char *fuyubot_auth_state(void);
+
+/*
+ * 当前 TDLib **连接状态**（到 Telegram 的链路）的 JSON：
+ *
+ *   {"known":true,"state":"connectionStateReady","ready":true}
+ *
+ * - `state`：`connectionStateWaitingForNetwork` / `connectionStateConnectingToProxy` /
+ *   `connectionStateConnecting` / `connectionStateUpdating` / `connectionStateReady`。
+ * - `ready`：是不是 `connectionStateReady`。`connectionStateUpdating`（连上了、正在同步）
+ *   不算 ready——别拿它当「可以发请求」的依据。
+ * - `known`：有没有收到过 `updateConnectionState`。没收到过 = `false`，`state` 是 null。
+ *
+ * TDLib **没有** `getConnectionState` 这样的方法，本库在启动时（登录之前）就订阅了更新，
+ * 所以登录窗口里连不上 / 正在连也能如实反映。返回线程局部缓冲。
+ */
+const char *fuyubot_connection_state(void);
+
+/*
  * 发一条**原始 td_api JSON** 并等它自己的响应，返回响应 JSON（原样，
  * `{"@type":"error",…}` 也算响应，不是 NULL）。
  *
@@ -143,7 +181,7 @@ const char *fuyubot_td_request(const char *request_json, int32_t timeout_ms);
 /*
  * ---- JNI 契约 ----
  *
- * 绑定在**运行期**做：`JNI_OnLoad` 里用 `RegisterNatives` 把十个方法绑到
+ * 绑定在**运行期**做：`JNI_OnLoad` 里用 `RegisterNatives` 把十二个方法绑到
  * `com.catmoecircle.fuyubot.runtime.Native`（默认值）。构建时给
  * `FUYUBOT_JNI_CLASS=com/你的/包/Native` 就能换包名——**必须是 `/` 分隔的内部名**，
  * 且换完不用改任何函数名（导出符号里根本没有 `Java_...`）。
@@ -163,6 +201,8 @@ const char *fuyubot_td_request(const char *request_json, int32_t timeout_ms);
  *     // ---- 运行时查询 ----
  *     public native String nativePlugins();                 // 插件列表 JSON；没起来 = 空表
  *     public native String nativePluginInfo(String name);   // 单个插件；没有 = null
+ *     public native String nativeAuthState();               // 授权状态 JSON；没起来 = known:false
+ *     public native String nativeConnectionState();         // 连接状态 JSON；没起来 = known:false
  *     public native String nativeTdRequest(String requestJson, long timeoutMs); // 阻塞
  *     public native String nativeLastError();               // 本线程最后一次错误
  * }
@@ -186,10 +226,17 @@ const char *fuyubot_td_request(const char *request_json, int32_t timeout_ms);
  * 5 其它（把 prompt 原样显示给用户即可）。prompt 一律是给人看的中文整句。
  *
  * `nativeTdRequest` **阻塞**（按 timeoutMs 等 TDLib 响应，建议 `Dispatchers.IO`）；
- * `nativePlugins` 只是一次 JSON 序列化。它们返回 null / 空时，用 `nativeLastError()`
+ * `nativePlugins` / `nativeAuthState` / `nativeConnectionState` 都只是一次 JSON 序列化，
+ * 可以在任意线程（包括主线程）调。它们返回 null / 空时，用 `nativeLastError()`
  * 看原因——注意它是**线程局部**的：要在同一个线程上紧接着读。
  * ⚠️ `onState` / `onAsk` 回调都在**工作线程**上：在回调里同步调 `nativeTdRequest`
- * 等于让收响应的人等自己，会立刻拿到 null（`nativeLastError()` 里写明原因）。
+ * 等于让收响应的人等自己，会立刻拿到 null（`nativeLastError()` 里写明原因）；
+ * 两个状态查询没有这个限制（读的是内存里的快照，不发 TDLib 请求）。
+ *
+ * 两个状态查询的**时机**：授权状态从登录窗口弹出那一刻起就有（`log_in_with` 消费掉
+ * `updateAuthorizationState`，本库通过 `Prompter::auth_state` 钩子记下来）；连接状态从
+ * `start` 起就在记（订阅早于登录）。`known:false` 只表示「这条更新还没来过」，
+ * 不是错误——`start` 刚返回时两个状态都可能是 `known:false`，过一会儿再看。
  *
  * R8 / ProGuard：**必须 keep 这个类**——绑定是运行期按名字做的，混淆后类名/方法名一变
  * 就绑不上（要到第一次调用才报 UnsatisfiedLinkError）：

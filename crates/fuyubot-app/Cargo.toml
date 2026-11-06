@@ -9,7 +9,11 @@ publish = false
 
 [dependencies]
 fuyubot-core.workspace = true
+# 授权 / 连接状态的订阅（事件总线的订阅句柄）。
+fuyubot-event.workspace = true
 fuyubot-loader.workspace = true
+# 只借它的 `ConnectionState`（五个连接状态与解析）：CLI 与 JNI 用的是同一张表。
+fuyubot-simplify.workspace = true
 fuyubot-tdlib.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

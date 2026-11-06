@@ -44,14 +44,16 @@ use state::{ARG, BUSY, INTERNAL, OK, PANIC, TIMEOUT};
 
 /// 运行时 ABI 版本。头文件里的 `FUYUBOT_JNI_ABI` 必须与它相同。
 ///
-/// **这个 crate 从来没有发布过**（既没进过 Release 资产，也没在 crates.io 上），
-/// 所以编号从 1 起：v1 就是首个对外版本，包含下面全部 10 个方法
-/// （六个生命周期/问答 + `nativePlugins` / `nativePluginInfo` /
-/// `nativeTdRequest` / `nativeLastError`）。
+/// **v1**：六个生命周期/问答方法 + 插件列表、插件详情、两个 TDLib 状态查询
+/// （授权 / 连接）、TDLib JSON 请求、本线程最后一次错误，共十二个。
+///
+/// 这个 crate 从来没有发布过（既没进过 Release 资产，也没在 crates.io 上），
+/// 所以编号一直从 1 起：**v1 就是首个对外版本**，包含下面全部 12 个方法；
+/// 新增的两个状态查询属于 v1，不单独占一个版本号。
 ///
 /// 开发期短暂存在过的内存接口（`nativeMemory` / `nativeMemoryOf`）**没进 v1**：
 /// 内存采集不归框架，宿主（APK）自己用 `Debug.MemoryInfo` 或读
-/// `/proc/<pid>/smaps`。以后再加方法按「只加不改」升 v2。
+/// `/proc/<pid>/smaps`。以后真发过版再加方法，才按「只加不改」升 v2。
 const ABI_VERSION: i32 = 1;
 
 /// JNI 绑定类的**内部名**（`/` 分隔，不是点分名）。
@@ -313,6 +315,46 @@ pub unsafe extern "C" fn fuyubot_plugin_info(name: *const c_char) -> *const c_ch
     }
 }
 
+/// TDLib **授权状态**（登录走到哪一步）的 JSON。
+///
+/// ```json
+/// {"known":true,"state":"authorizationStateReady","ready":true,"needs_re_login":false}
+/// ```
+///
+/// 运行时没起来 / 一次更新都还没收到 = 同一份形状的 `known:false`、`state:null`。
+/// 返回线程局部缓冲：下次在**同一线程**调本库前有效——别 free、别存、别跨线程传。
+#[unsafe(no_mangle)]
+pub extern "C" fn fuyubot_auth_state() -> *const c_char {
+    match catch_unwind(AssertUnwindSafe(api::auth_state_json)) {
+        Ok(json) => state::store_output(&json),
+        Err(_) => {
+            state::fail("fuyubot_auth_state 里 panic（已兜住）");
+            std::ptr::null()
+        }
+    }
+}
+
+/// TDLib **连接状态**（到 Telegram 的链路）的 JSON。
+///
+/// ```json
+/// {"known":true,"state":"connectionStateReady","ready":true}
+/// ```
+///
+/// 五种状态：`connectionStateWaitingForNetwork` / `connectionStateConnectingToProxy` /
+/// `connectionStateConnecting` / `connectionStateUpdating` / `connectionStateReady`。
+/// 运行时没起来 / 一次更新都还没收到 = 同一份形状的 `known:false`、`state:null`。
+/// 返回线程局部缓冲，纪律同上。
+#[unsafe(no_mangle)]
+pub extern "C" fn fuyubot_connection_state() -> *const c_char {
+    match catch_unwind(AssertUnwindSafe(api::connection_state_json)) {
+        Ok(json) => state::store_output(&json),
+        Err(_) => {
+            state::fail("fuyubot_connection_state 里 panic（已兜住）");
+            std::ptr::null()
+        }
+    }
+}
+
 /// 发一条原始 td_api JSON 并等它自己的响应，返回响应 JSON。
 ///
 /// `timeout_ms <= 0` = 默认 30s，上限 600s。**阻塞**：在专门的工作线程上调。
@@ -357,7 +399,7 @@ pub unsafe extern "C" fn fuyubot_td_request(
 
 // ── JNI 绑定（RegisterNatives）──────────────────────────────────────
 
-/// `JNI_OnLoad`：缓存 `JavaVM`，并把十个 native 方法绑到 [`NATIVE_CLASS`]。
+/// `JNI_OnLoad`：缓存 `JavaVM`，并把十二个 native 方法绑到 [`NATIVE_CLASS`]。
 ///
 /// 绑定失败**不阻止加载**（照样返回 1.6）：第一次调 native 方法时 Java 会抛
 /// `UnsatisfiedLinkError`，消息里带类名与方法名——比 `JNI_OnLoad` 返回 `JNI_ERR`
@@ -373,12 +415,12 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut c_void) -> jint {
     JNI_VERSION_1_6
 }
 
-/// 十个 native 方法的「名字 + 签名 + 函数指针」。
+/// 十二个 native 方法的「名字 + 签名 + 函数指针」。
 ///
 /// `nativeRegister` 的参数是 `Ljava/lang/Object;`：回调只按**方法名 + 签名**调
-/// （`onState` / `onAsk` / `onQr`），不认具体接口——所以 `Callback` 可以放在 APK
+/// （`onState` / `onAsk` / `onQr` / `onPlugins`），不认具体接口——所以 `Callback` 可以放在 APK
 /// 自己的包里，Kotlin 侧把参数声明成 `Any` 即可（契约见头文件）。
-fn jni_methods() -> [jni::NativeMethod; 10] {
+fn jni_methods() -> [jni::NativeMethod; 12] {
     [
         jni::NativeMethod {
             name: "nativeVersion".into(),
@@ -421,6 +463,16 @@ fn jni_methods() -> [jni::NativeMethod; 10] {
             fn_ptr: native_plugin_info as *const () as *mut c_void,
         },
         jni::NativeMethod {
+            name: "nativeAuthState".into(),
+            sig: "()Ljava/lang/String;".into(),
+            fn_ptr: native_auth_state as *const () as *mut c_void,
+        },
+        jni::NativeMethod {
+            name: "nativeConnectionState".into(),
+            sig: "()Ljava/lang/String;".into(),
+            fn_ptr: native_connection_state as *const () as *mut c_void,
+        },
+        jni::NativeMethod {
             name: "nativeTdRequest".into(),
             sig: "(Ljava/lang/String;J)Ljava/lang/String;".into(),
             fn_ptr: native_td_request as *const () as *mut c_void,
@@ -436,7 +488,7 @@ fn jni_methods() -> [jni::NativeMethod; 10] {
 /// 逐个注册（**不是**整表注册）。
 ///
 /// `RegisterNatives` 遇到类里没有的方法（名字 / 签名不符）会失败；整表注册时，
-/// **新版 `.so` + 旧版 Java 类**（比如只对接了 v2、类里没有 `nativeTdRequest` 声明）
+/// **新版 `.so` + 旧版 Java 类**（比如类里没有 `nativeTdRequest` 声明）
 /// 会连 `nativeLastError` 都绑不上。逐个注册把影响收窄到「少的那几个方法」，
 /// 其余照常可用；没绑上的会在 `JNI_OnLoad` 的日志里列出来。
 fn register_natives(vm: &JavaVM) -> Result<(), String> {
@@ -626,6 +678,28 @@ extern "system" fn native_plugin_info(
         Ok(None) => std::ptr::null_mut(),
         Err(_) => {
             state::fail("nativePluginInfo 里 panic（已兜住）");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// TDLib 授权状态 JSON；运行时没起来 = `known:false`（同形状，不是 `null`）。
+extern "system" fn native_auth_state(mut env: JNIEnv<'_>, _this: JObject<'_>) -> jstring {
+    match catch_unwind(AssertUnwindSafe(api::auth_state_json)) {
+        Ok(json) => new_java_string(&mut env, &json),
+        Err(_) => {
+            state::fail("nativeAuthState 里 panic（已兜住）");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// TDLib 连接状态 JSON；运行时没起来 = `known:false`（同形状，不是 `null`）。
+extern "system" fn native_connection_state(mut env: JNIEnv<'_>, _this: JObject<'_>) -> jstring {
+    match catch_unwind(AssertUnwindSafe(api::connection_state_json)) {
+        Ok(json) => new_java_string(&mut env, &json),
+        Err(_) => {
+            state::fail("nativeConnectionState 里 panic（已兜住）");
             std::ptr::null_mut()
         }
     }
@@ -874,7 +948,7 @@ fn stop_runtime() -> c_int {
 mod tests {
     use super::*;
 
-    /// 绑定表必须与头文件 / 文档里的**十个**方法一一对应：名字或签名写错，
+    /// 绑定表必须与头文件 / 文档里的**十二个**方法一一对应：名字或签名写错，
     /// `RegisterNatives` 在真机上才会失败（本机没有 JVM，只能静态对齐）。
     #[test]
     fn jni_method_table_matches_the_documented_contract() {
@@ -909,6 +983,14 @@ mod tests {
                 (
                     "nativePluginInfo".to_owned(),
                     "(Ljava/lang/String;)Ljava/lang/String;".to_owned()
+                ),
+                (
+                    "nativeAuthState".to_owned(),
+                    "()Ljava/lang/String;".to_owned()
+                ),
+                (
+                    "nativeConnectionState".to_owned(),
+                    "()Ljava/lang/String;".to_owned()
                 ),
                 (
                     "nativeTdRequest".to_owned(),
@@ -947,6 +1029,8 @@ mod tests {
             "fuyubot_last_error",
             "fuyubot_plugins",
             "fuyubot_plugin_info",
+            "fuyubot_auth_state",
+            "fuyubot_connection_state",
             "fuyubot_td_request",
         ] {
             assert!(
@@ -967,6 +1051,24 @@ mod tests {
             "\"scanned\"",
             "\"failed\"",
             "\"skipped\"",
+        ] {
+            assert!(header.contains(token), "头文件缺 {token} 的说明");
+        }
+    }
+
+    /// 两个状态查询的 JSON 契约必须写在头文件里：APK 作者只看得到头文件，
+    /// 少一个字段名就只能靠猜（`known` / `needs_re_login` 尤其容易漏）。
+    #[test]
+    fn the_header_documents_the_td_state_contract() {
+        let header = include_str!("../include/fuyubot_jni.h");
+        for token in [
+            "fuyubot_auth_state",
+            "fuyubot_connection_state",
+            "nativeAuthState",
+            "nativeConnectionState",
+            "\"needs_re_login\"",
+            "connectionStateUpdating",
+            "authorizationStateReady",
         ] {
             assert!(header.contains(token), "头文件缺 {token} 的说明");
         }

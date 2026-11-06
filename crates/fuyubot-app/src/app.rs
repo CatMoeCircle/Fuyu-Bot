@@ -37,6 +37,7 @@ use serde_json::Value;
 use crate::host::{AppHost, AppState};
 use crate::live::{LiveView, PluginInfo, PluginLoadReport};
 use crate::prompt::HostPrompter;
+use crate::tdstate::{TdState, TdStateWatch};
 
 /// 编排这一路可能出的错。
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +109,10 @@ pub struct App {
     load: PluginLoadReport,
     /// 生命周期桥的守卫：drop 就退订（约束 11 同一条道理）。
     _lifecycle: Effect,
+    /// TDLib 的授权 / 连接状态（登录期走 `Prompter::auth_state`，运行期走事件总线）。
+    td_state: TdState,
+    /// 两条状态订阅的守卫：drop 就退订。
+    _td_state_watch: TdStateWatch,
     host: Arc<dyn AppHost>,
     settings: Option<TdlibSettings>,
     plugin_dir: PathBuf,
@@ -173,6 +178,11 @@ impl App {
         let loader = PluginLoader::new(kernel.context().clone())?;
         let pipeline = Arc::new(loader.pipeline());
 
+        // ③′ 授权 / 连接状态：**必须早于登录**——连接状态只在变化时来一条，
+        // 等登录完再订阅就漏掉 `connectionStateReady`（与 CLI 同一条理由）。
+        let td_state = TdState::new();
+        let td_state_watch = td_state.watch(loader.runtime());
+
         // ④ 配置 / 日志门槛 / 生命周期桥
         let lifecycle = loader.runtime().install_lifecycle_bridge(kernel.plugins());
         loader.runtime().install_config(config_path, config);
@@ -199,6 +209,8 @@ impl App {
             plugins: Vec::new(),
             load: PluginLoadReport::default(),
             _lifecycle: lifecycle,
+            td_state,
+            _td_state_watch: td_state_watch,
             host,
             settings: tdlib,
             plugin_dir,
@@ -318,10 +330,13 @@ impl App {
 
         let pipeline = Arc::clone(&self.pipeline);
         let host = Arc::clone(&self.host);
+        // 登录窗口里的授权状态经 `Prompter::auth_state` 落到这里（事件总线看不到那一条）。
+        let td_state = self.td_state.clone();
         let session = self.session.as_mut().ok_or(AppError::NoSession)?;
 
         self.host.state(AppState::Starting, "插件已就位，开始登录");
-        let mut prompter = HostPrompter::new(host.as_ref(), bot_token.as_deref());
+        let mut prompter =
+            HostPrompter::new(host.as_ref(), bot_token.as_deref()).with_state(td_state);
         // 登录窗口里 TDLib 已经在发东西（还有插件 start 期的响应）：一律转给管线，别吞。
         let mut bypass = |routed| pipeline.dispatch(routed);
         session.login(&parameters, account, budget, &mut prompter, &mut bypass)?;
@@ -435,7 +450,16 @@ impl App {
             self.plugin_infos(),
             self.load.clone(),
             self.client().cloned(),
+            self.td_state.clone(),
         )
+    }
+
+    /// TDLib 的授权 / 连接状态（`live_view` 给的也是同一份）。
+    ///
+    /// 登录期由 `Prompter::auth_state` 更新，运行期由事件总线更新；`--no-tdlib` /
+    /// 回放时永远是 `None`（读出来是 `known:false`）。
+    pub fn td_state(&self) -> &TdState {
+        &self.td_state
     }
 
     /// 此刻的插件报告 JSON（形状与 [`LiveView::plugins_json`] 同一份）。

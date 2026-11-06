@@ -9,8 +9,9 @@
 //! 文本以后改了也不会坏，只是输入框的提示语没那么贴心。
 
 use crate::host::{AppHost, AskKind};
+use crate::tdstate::TdState;
 
-use fuyubot_tdlib::{LoginError, LoginMethod, Prompter};
+use fuyubot_tdlib::{AuthState, LoginError, LoginMethod, Prompter};
 
 /// 提问文本 → 种类。前缀是在 `fuyubot-tdlib` 的 `authorize::ask_and_send` 里写死的。
 pub fn kind_of(question: &str) -> AskKind {
@@ -32,15 +33,33 @@ pub struct HostPrompter<'a> {
     host: &'a dyn AppHost,
     /// 宿主**已经给过**的 bot token：这一类问题不弹 UI，直接用（与 CLI 读 `TG_BOT_TOKEN` 同一条路）。
     bot_token: Option<&'a str>,
+    /// 授权状态的落点：登录窗口里的 `updateAuthorizationState` 只从这里出去。
+    state: Option<TdState>,
 }
 
 impl<'a> HostPrompter<'a> {
     pub fn new(host: &'a dyn AppHost, bot_token: Option<&'a str>) -> Self {
-        Self { host, bot_token }
+        Self {
+            host,
+            bot_token,
+            state: None,
+        }
+    }
+
+    /// 把授权状态记进 [`TdState`]（Android 的 `nativeAuthState()` 读它）。
+    pub fn with_state(mut self, state: TdState) -> Self {
+        self.state = Some(state);
+        self
     }
 }
 
 impl Prompter for HostPrompter<'_> {
+    fn auth_state(&mut self, state: &AuthState) {
+        if let Some(slot) = &self.state {
+            slot.set_auth(state);
+        }
+    }
+
     fn ask(&mut self, question: &str) -> Result<String, LoginError> {
         let kind = kind_of(question);
         if kind == AskKind::BotToken
@@ -177,5 +196,39 @@ mod tests {
             prompter.choose_login_method().unwrap(),
             LoginMethod::PhoneNumber
         );
+    }
+
+    /// 登录窗口里的授权状态必须经钩子落到 `TdState`：事件总线看不到
+    /// `log_in_with` 自己消费掉的那一条，Android 的 `nativeAuthState()` 就靠这里。
+    #[test]
+    fn auth_state_goes_into_the_shared_slot() {
+        let host = RecordingHost::default();
+        let state = crate::tdstate::TdState::new();
+        let mut prompter = HostPrompter::new(&host, None).with_state(state.clone());
+
+        prompter.auth_state(&AuthState::WaitCode {
+            phone_number: "+8613800138000".to_owned(),
+            length: Some(5),
+            code_type: "authenticationCodeTypeSms".to_owned(),
+        });
+        assert_eq!(
+            state.auth(),
+            Some(AuthState::WaitCode {
+                phone_number: "+8613800138000".to_owned(),
+                length: Some(5),
+                code_type: "authenticationCodeTypeSms".to_owned(),
+            })
+        );
+
+        prompter.auth_state(&AuthState::Ready);
+        assert_eq!(state.auth(), Some(AuthState::Ready));
+    }
+
+    /// 没给 `TdState`（CLI 那种用法）时钩子必须是 no-op，不能 panic。
+    #[test]
+    fn auth_state_hook_is_a_no_op_without_a_slot() {
+        let host = RecordingHost::default();
+        let mut prompter = HostPrompter::new(&host, None);
+        prompter.auth_state(&AuthState::Ready);
     }
 }

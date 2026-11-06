@@ -12,10 +12,24 @@ JNI 绑定是**运行期**的：`JNI_OnLoad` 用 `RegisterNatives` 绑到
 没有 `Java_...`，换包名不用改库。因为绑定按名字做，**开了 R8 / ProGuard 要 keep 这个类**：
 `-keep class com.catmoecircle.fuyubot.runtime.Native { *; }`。
 
-ABI **v1** 一共十个方法：六个生命周期/问答，加上 `nativePlugins()`（插件列表 JSON）、
-`nativePluginInfo(name)`（单个插件）、`nativeTdRequest(json, timeoutMs)`（原始 td_api
-JSON 进、响应 JSON 出，阻塞）、`nativeLastError()`（本线程最后一次错误）。
-对应的 C 符号是 `fuyubot_plugins` / `fuyubot_plugin_info` / `fuyubot_td_request`。
+ABI **v1** 一共十二个方法：六个生命周期/问答，加上 `nativePlugins()`（插件列表 JSON）、
+`nativePluginInfo(name)`（单个插件）、`nativeAuthState()`（TDLib 授权状态 JSON）、
+`nativeConnectionState()`（TDLib 连接状态 JSON）、`nativeTdRequest(json, timeoutMs)`
+（原始 td_api JSON 进、响应 JSON 出，阻塞）、`nativeLastError()`（本线程最后一次错误）。
+对应的 C 符号是 `fuyubot_plugins` / `fuyubot_plugin_info` / `fuyubot_auth_state` /
+`fuyubot_connection_state` / `fuyubot_td_request`。
+
+**两个 TDLib 状态都是「订阅后记最新一条」**（TDLib 没有可查询的方法）：
+
+- 授权状态：`{"known":true,"state":"authorizationStateReady","ready":true,"needs_re_login":false}`。
+  登录窗口里的中间态（`authorizationStateWaitCode` 等）也查得到——`log_in_with` 把
+  `updateAuthorizationState` 自己消费掉了，本库在 `Prompter::auth_state` 钩子里记下来。
+- 连接状态：`{"known":true,"state":"connectionStateReady","ready":true}`，
+  五种状态（等网络 / 连代理 / 连接中 / 同步中 / 就绪）。订阅在登录**之前**装好，
+  所以登录窗口里连不上也如实反映。
+
+运行时没起来 / 一条更新都还没收到时，两个接口返回同形状的 `known:false`、`state:null`
+（合法 JSON，不是 `null`、也不是错误）。两个查询都只做一次 JSON 序列化，任意线程可调。
 
 **插件加载结果会主动上报**：装完插件、**登录之前**调一次回调
 `Callback.onPlugins(String)`，参数与 `nativePlugins()` 同一份 JSON——

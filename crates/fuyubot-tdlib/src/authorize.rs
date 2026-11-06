@@ -445,6 +445,14 @@ pub trait Prompter {
     /// 不阻塞的提示（状态变化、TDLib 报错等）。
     fn notify(&mut self, message: &str);
 
+    /// 授权状态每变一次就调一次（`Ready` / `Closed` 也算）。
+    ///
+    /// 登录窗口里的 `updateAuthorizationState` 由 [`log_in_with`] **自己消费**，
+    /// 事件总线看不到，所以「现在登录到哪一步」只能从这里拿。默认什么都不做：
+    /// CLI 只靠 [`notify`](Self::notify) 打日志；Android 用它把状态存下来供
+    /// `nativeAuthState()` 查询（见 `fuyubot-app` 的 `TdState`）。
+    fn auth_state(&mut self, _state: &AuthState) {}
+
     /// 展示二维码/链接。
     ///
     /// **默认只把链接打出来**：真正的终端二维码要引一个 QR 编码依赖（那件事定了再补，
@@ -622,6 +630,9 @@ pub fn log_in_with(
                     continue;
                 }
                 let state = AuthState::from_update(&update.payload);
+                // 先交给宿主的钩子：登录窗口里的状态**只有这一条路**能出去
+                // （下面的 `notify` 只管日志，事件总线收不到被消费掉的授权更新）。
+                prompter.auth_state(&state);
                 prompter.notify(&format!("授权状态：{}", state.name()));
                 match state {
                     AuthState::Ready => return Ok(LoginOutcome::Ready),

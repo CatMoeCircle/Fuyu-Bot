@@ -25,11 +25,15 @@ mod app;
 mod host;
 mod live;
 mod prompt;
+mod tdstate;
 
 pub use app::{App, AppError, AppOptions, TdlibSettings};
 pub use host::{AppHost, AppState, AskKind, SilentHost};
 pub use live::{LiveView, PluginInfo, PluginLoadReport, PluginSkip, empty_plugins_json};
 pub use prompt::{HostPrompter, kind_of};
+pub use tdstate::{
+    AUTH_UPDATE, TdState, TdStateWatch, empty_auth_state_json, empty_connection_state_json,
+};
 
 // 宿主要用的那几个类型，从这里拿就够——不必为了 `LogLevel` 再直接依赖 loader。
 pub use fuyubot_loader::LogLevel;

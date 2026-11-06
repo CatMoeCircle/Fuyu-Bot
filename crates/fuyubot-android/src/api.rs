@@ -1,11 +1,12 @@
-//! 三个「运行时查询」接口的实现：插件列表 / 插件详情 / TDLib JSON 请求。
+//! 五个「运行时查询」接口的实现：插件列表 / 插件详情 / TDLib 授权状态 / TDLib 连接状态 /
+//! TDLib JSON 请求。
 //!
 //! C 符号与 JNI 方法都只是薄壳（见 [`crate::lib`] 里的导出）；逻辑放这儿，
 //! 好在没有 JVM 的机器上直接测——本仓的 Android 单测本来就跑在桌面。
 //!
-//! 三个接口共用一条纪律：**运行时没起来不报错，返回空结果**。`plugins` 是空表，
-//! `plugin_info` 是 `None`，`td_request` 带一句可读的原因。这样 Java 侧在启动过程中
-//! 随手调一下也不会崩。
+//! 五个接口共用一条纪律：**运行时没起来不报错，返回空结果**。`plugins` 是空表，
+//! `plugin_info` 是 `None`，两个状态是 `known:false` 的同形状 JSON，`td_request` 带一句
+//! 可读的原因。这样 Java 侧在启动过程中随手调一下也不会崩。
 
 use std::time::Duration;
 
@@ -30,6 +31,26 @@ pub fn plugins_json() -> String {
 /// 单个插件的信息；没在跑或没这个插件 = `None`。
 pub fn plugin_json(name: &str) -> Option<String> {
     live::get()?.plugin_json(name)
+}
+
+/// TDLib 授权状态 JSON（`known` / `state` / `ready` / `needs_re_login`）。
+///
+/// 运行时没起来 = 同形状的 `known:false`（不是错误，也**不猜** `Ready`）。
+pub fn auth_state_json() -> String {
+    match live::get() {
+        Some(view) => view.auth_state_json(),
+        None => fuyubot_app::empty_auth_state_json(),
+    }
+}
+
+/// TDLib 连接状态 JSON（`known` / `state` / `ready`）。
+///
+/// 运行时没起来 = 同形状的 `known:false`；「还没收到过更新」也算没连上。
+pub fn connection_state_json() -> String {
+    match live::get() {
+        Some(view) => view.connection_state_json(),
+        None => fuyubot_app::empty_connection_state_json(),
+    }
 }
 
 /// 发一条原始 td_api JSON 并等响应。返回响应 JSON 文本（`@type: "error"` 也是它）。
@@ -75,6 +96,15 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&fuyubot_app::empty_plugins_json()).unwrap()
         );
         assert!(plugin_json("fuyubot.demo").is_none());
+        // 两个 TDLib 状态同样是「合法、同形状的空状态」，不是 null。
+        let auth: serde_json::Value = serde_json::from_str(&auth_state_json()).unwrap();
+        assert_eq!(auth["known"], serde_json::json!(false));
+        assert_eq!(auth["state"], serde_json::Value::Null);
+        assert_eq!(auth["ready"], serde_json::json!(false));
+        let connection: serde_json::Value = serde_json::from_str(&connection_state_json()).unwrap();
+        assert_eq!(connection["known"], serde_json::json!(false));
+        assert_eq!(connection["state"], serde_json::Value::Null);
+        assert_eq!(connection["ready"], serde_json::json!(false));
         let error = td_request(r#"{"@type":"getMe"}"#, 1000).unwrap_err();
         assert!(error.contains("还没起来"), "{error}");
     }

@@ -3,7 +3,7 @@
 # 文档站在第三个仓库（FuyuBot-Docs）；这里不再编任何 SDK。
 # 按角色分目录，别再把插件和库混在一起：
 #   crates/    运行时库（含发 crates.io 的 abi）
-#   plugins/   内置插件（随发布包分发）
+#   plugins/   三个内置插件（/start、/help、/plugins）
 #   examples/  示例插件；replay/ 是回放数据不是 crate，所以示例 crate 单独点名
 #   tests/     测试夹具插件（集成测试用 `cargo build -p` 编它们）
 members = ["crates/*", "plugins/*", "examples/fuyubot-plugin-demo", "tests/*"]
@@ -15,7 +15,10 @@ resolver = "3"
 # 0.1.0 是首次公开版本（crates.io 上之前一个版本都没有）。
 # 0.1.1 给 `HostApiVTable` 尾部加了 `provide_service_shared`（服务作用域）。
 # 0.1.2 加了 `simplify_invoke` / `simplify_invoke_result`（ABI 4 → 5，simplify 下沉到宿主）。
-version = "0.1.2"
+# 0.1.3 是宿主层的一轮：`fuyubot-app` 编排层 + Android JNI 运行时、插件分发格式 v1（bundle）、
+# `run --tui` 终端面板与插件商店；**ABI 仍是 v5，这次没动契约**。
+# sqlite 服务插件不在这里：它随 0.1.3 挪到独立仓库 FuyuBot-SQLite（可选服务，不进发布包）。
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -23,19 +26,19 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/CatMoeCircle/Fuyu-Bot"
 
 [workspace.dependencies]
-fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.2" }
+fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.3" }
 # 宿主编排层：CLI 与 Android JNI 共用同一条启动顺序。
-fuyubot-app = { path = "crates/fuyubot-app", version = "0.1.2" }
-fuyubot-cli = { path = "crates/fuyubot-cli", version = "0.1.2" }
-fuyubot-core = { path = "crates/fuyubot-core", version = "0.1.2" }
-fuyubot-event = { path = "crates/fuyubot-event", version = "0.1.2" }
-fuyubot-loader = { path = "crates/fuyubot-loader", version = "0.1.2" }
-fuyubot-middleware = { path = "crates/fuyubot-middleware", version = "0.1.2" }
-fuyubot-service = { path = "crates/fuyubot-service", version = "0.1.2" }
-fuyubot-simplify = { path = "crates/fuyubot-simplify", version = "0.1.2" }
-fuyubot-tdlib = { path = "crates/fuyubot-tdlib", version = "0.1.2" }
-fuyubot-tdlib-sys = { path = "crates/fuyubot-tdlib-sys", version = "0.1.2" }
-fuyubot-tool = { path = "crates/fuyubot-tool", version = "0.1.2" }
+fuyubot-app = { path = "crates/fuyubot-app", version = "0.1.3" }
+fuyubot-cli = { path = "crates/fuyubot-cli", version = "0.1.3" }
+fuyubot-core = { path = "crates/fuyubot-core", version = "0.1.3" }
+fuyubot-event = { path = "crates/fuyubot-event", version = "0.1.3" }
+fuyubot-loader = { path = "crates/fuyubot-loader", version = "0.1.3" }
+fuyubot-middleware = { path = "crates/fuyubot-middleware", version = "0.1.3" }
+fuyubot-service = { path = "crates/fuyubot-service", version = "0.1.3" }
+fuyubot-simplify = { path = "crates/fuyubot-simplify", version = "0.1.3" }
+fuyubot-tdlib = { path = "crates/fuyubot-tdlib", version = "0.1.3" }
+fuyubot-tdlib-sys = { path = "crates/fuyubot-tdlib-sys", version = "0.1.3" }
+fuyubot-tool = { path = "crates/fuyubot-tool", version = "0.1.3" }
 
 cbindgen = "0.29.4"
 clap = { version = "4.6.7", features = ["derive"] }

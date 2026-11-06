@@ -1,10 +1,11 @@
 //! 运行期只读视图：`App` 留在 worker 线程上，**别的线程**（JNI 调用方、TUI）用它
-//! 查插件、发 TDLib JSON 请求。
+//! 查插件、收 TDLib 的状态、发 TDLib JSON 请求。
 //!
 //! 为什么不直接把 `App` 摊出去：`App` 攥着内核（`PluginManager` 要 `&mut`）、
 //! 接收循环把手和收摊的所有权。把它共享给任意线程，等于把「谁在什么时候能做什么」
-//! 搞糊。这份视图只包三样**本来就线程安全**的东西：
-//! `Arc<HostRuntime>`、插件静态元信息（不可变）与 `Arc<TdClient>`。
+//! 搞糊。这份视图只包四样**本来就线程安全**的东西：
+//! `Arc<HostRuntime>`、插件静态元信息（不可变）、`Arc<TdClient>` 与
+//! 授权 / 连接状态的快照（[`TdState`]）。
 //!
 //! 插件状态是**现算**的：`HostRuntime` 里装着内核的 `PluginReporter`（弱引用），
 //! 所以这里拿到的是这一刻的真实状态，而不是装插件那一刻的快照。
@@ -16,6 +17,8 @@ use std::time::Duration;
 use fuyubot_loader::HostRuntime;
 use fuyubot_tdlib::TdClient;
 use serde_json::{Value, json};
+
+use crate::tdstate::TdState;
 
 /// 一个已装插件的**静态**自描述（探测 / manifest 阶段就有，之后不会变）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +88,7 @@ pub struct LiveView {
     plugins: Arc<Vec<PluginInfo>>,
     load: Arc<PluginLoadReport>,
     client: Option<Arc<TdClient>>,
+    td_state: TdState,
 }
 
 impl LiveView {
@@ -93,12 +97,14 @@ impl LiveView {
         plugins: Vec<PluginInfo>,
         load: PluginLoadReport,
         client: Option<Arc<TdClient>>,
+        td_state: TdState,
     ) -> Self {
         Self {
             runtime,
             plugins: Arc::new(plugins),
             load: Arc::new(load),
             client,
+            td_state,
         }
     }
 
@@ -169,6 +175,20 @@ impl LiveView {
             .td_request(value, timeout)
             .map_err(|error| error.to_string())?;
         Ok(response.to_string())
+    }
+
+    /// TDLib 授权状态 JSON（Android 的 `nativeAuthState()` 就是它）。
+    ///
+    /// 形状见 [`TdState::auth_json`]：`known` / `state` / `ready` / `needs_re_login`。
+    pub fn auth_state_json(&self) -> String {
+        self.td_state.auth_json()
+    }
+
+    /// TDLib 连接状态 JSON（Android 的 `nativeConnectionState()` 就是它）。
+    ///
+    /// 形状见 [`TdState::connection_json`]：`known` / `state` / `ready`。
+    pub fn connection_state_json(&self) -> String {
+        self.td_state.connection_json()
     }
 
     /// 插件数（静态表；与 `plugins_json` 的 `count` 一致）。
@@ -306,7 +326,7 @@ mod tests {
 
     fn view_with(plugins: Vec<PluginInfo>, load: PluginLoadReport) -> LiveView {
         let runtime = HostRuntime::new(Context::new()).expect("运行时应该建得起来");
-        LiveView::new(runtime, plugins, load, None)
+        LiveView::new(runtime, plugins, load, None, TdState::new())
     }
 
     #[test]
