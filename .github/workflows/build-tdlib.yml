@@ -123,7 +123,11 @@ jobs:
           desktop = [
               {"platform": "linux", "arch": "x86_64", "runner": "ubuntu-22.04", "asset": "TDLib-linux-x86_64", "enabled": True},
               {"platform": "linux", "arch": "arm64", "runner": "ubuntu-24.04-arm", "asset": "TDLib-linux-aarch64", "enabled": True},
-              {"platform": "macos", "arch": "arm64", "runner": "macos-14", "asset": "TDLib-macos-aarch64", "enabled": True},
+              # ⚠️ `macos-14` 已于 2026-11-02 从 GitHub Actions **退役**（runner 会直接
+              # 报「不支持配置」）。`macos-15` 是当前可用的 arm64 稳定标签；别写
+              # `macos-latest`——它会随大版本静默漂移（macOS 26 起默认 OpenSSL 从 3 变 4，
+              # 会改变 tdjson 的链接结果）。
+              {"platform": "macos", "arch": "arm64", "runner": "macos-15", "asset": "TDLib-macos-aarch64", "enabled": True},
               {"platform": "windows", "arch": "x86_64", "runner": "windows-latest", "asset": "TDLib-windows-x86_64", "enabled": True},
               {"platform": "windows", "arch": "arm64", "runner": "windows-11-vs2026-arm", "asset": "TDLib-windows-aarch64", "enabled": True},
           ]

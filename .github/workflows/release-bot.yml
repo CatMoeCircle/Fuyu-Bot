@@ -100,8 +100,11 @@ jobs:
               {"os": "windows-11-vs2026-arm", "asset": "fuyubot-windows-aarch64", "tdlib": "TDLib-windows-aarch64", "platform_dir": "windows-aarch64", "bin": "fuyubot.exe", "enabled": True},
               {"os": "ubuntu-latest", "asset": "fuyubot-linux-x86_64", "tdlib": "TDLib-linux-x86_64", "platform_dir": "linux-x86_64", "bin": "fuyubot", "enabled": True},
               {"os": "ubuntu-24.04-arm", "asset": "fuyubot-linux-aarch64", "tdlib": "TDLib-linux-aarch64", "platform_dir": "linux-aarch64", "bin": "fuyubot", "enabled": True},
-              # macOS 只出 aarch64（Intel Mac 没有 runner；与 ASSETS 表一致）
-              {"os": "macos-14", "asset": "fuyubot-macos-aarch64", "tdlib": "TDLib-macos-aarch64", "platform_dir": "macos-aarch64", "bin": "fuyubot", "enabled": True},
+              # macOS 只出 aarch64（Intel Mac 没有 runner；与 ASSETS 表一致）。
+              # ⚠️ `macos-14` 已于 2026-11-02 退役，用户实际会看到
+              # 「不支持配置 macos-14-arm64-us-default」。用 `macos-15`，别用 `macos-latest`
+              # （后者随大版本静默漂移）。
+              {"os": "macos-15", "asset": "fuyubot-macos-aarch64", "tdlib": "TDLib-macos-aarch64", "platform_dir": "macos-aarch64", "bin": "fuyubot", "enabled": True},
           ]
           # Android：**交叉编译**，不在上面那张表里（那张表的 `tdlib` 都是从 Release 下的
           # `TDLib-<os>-<arch>`）。这边的 `tdlib` 先试 Release 上的 `TDLib-android-<arch>`，
