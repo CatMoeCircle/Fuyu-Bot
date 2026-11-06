@@ -520,6 +520,8 @@ jobs:
           echo "==> 取 ${name}.zip"
           # 优先从**本次运行**的 artifact 拿：不发版的分支构建也能出 APK。
           # 拿不到才去 Release（从 Release 页重跑这一条 job、或独立重试时会走这里）。
+          # `gh run download --dir jni` 会把 artifact 里的文件**平铺**进 jni/（只有单个 artifact
+          # 时不再套一层目录），所以下面按文件名找就行——别假设有子目录。
           if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
                  --name "fuyubot-android-${{ matrix.arch }}" --dir jni 2>/dev/null; then
             echo "warning: 本次运行里没有 fuyubot-android-${{ matrix.arch }} 的 artifact，退回 Release" >&2
@@ -527,7 +529,10 @@ jobs:
           fi
           zip_path="$(find jni -name "${name}.zip" | head -n1)"
           [[ -n "$zip_path" ]] || { echo "error: 没找到 ${name}.zip" >&2; find jni -type f | head -20 >&2; exit 1; }
-          mv "$zip_path" "jni/${name}.zip"
+          # 只在名字/位置真的不一样时才挪（`mv a a` 在 GNU mv 下是错误，直接打死 job）。
+          if [[ "$zip_path" != "jni/${name}.zip" ]]; then
+            mv "$zip_path" "jni/${name}.zip"
+          fi
           ls -lh jni/
 
       - name: Build and sign the APK
