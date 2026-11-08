@@ -312,7 +312,7 @@ mod tests {
         PluginInfo {
             name: name.to_owned(),
             version: version.to_owned(),
-            abi_version: 5,
+            abi_version: fuyubot_loader::abi::ABI_VERSION,
             inject: vec!["fuyubot.host.td".to_owned()],
             soft_inject: Vec::new(),
             path: PathBuf::from("/data/user/0/com.example.bot/files/plugins/libdemo.so"),
@@ -341,7 +341,10 @@ mod tests {
         let first = &parsed["plugins"][0];
         assert_eq!(first["name"], json!("fuyubot.demo"));
         assert_eq!(first["version"], json!("0.2.0"));
-        assert_eq!(first["abi_version"], json!(5));
+        assert_eq!(
+            first["abi_version"],
+            json!(fuyubot_loader::abi::ABI_VERSION)
+        );
         // 没有内核报告时**不编造状态**，如实说 unknown。
         assert_eq!(first["state"], json!("unknown"));
         assert_eq!(first["inject"], json!(["fuyubot.host.td"]));

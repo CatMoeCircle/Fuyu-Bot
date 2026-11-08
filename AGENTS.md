@@ -3,7 +3,7 @@
 ## 这是什么
 
 基于 TDLib 的 Telegram bot / user 框架：**一个宿主进程 + N 个动态库插件**。
-插件是 cdylib（`.dll` / `.so` / `.dylib`），只认四个导出符号与一张 `HostApiVTable`（ABI 版本 5）。
+插件是 cdylib（`.dll` / `.so` / `.dylib`），只认四个导出符号与一张 `HostApiVTable`（ABI 版本 6）。
 TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` 在**编译期**转成 Rust 类型与可校验元数据。
 
 四个仓库（本仓只放运行时）：
@@ -24,7 +24,7 @@ TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` �
 | --- | --- |
 | `fuyubot-cli` | 二进制 `fuyubot`：`init` / `run` / `status` / `stop` / `config` / `plugin`（clap） |
 | `fuyubot-core` | Cordis 内核：`Context`（按**名字**寻址的服务表）/ `Effect` / `Plugin`（含 `inject`）/ `PluginManager`（Fiber 生命周期与依赖跟踪）。不认识 Telegram |
-| `fuyubot-abi` | C ABI：`HostApiVTable`（2 个 u32 + `host_ctx` + 23 个函数指针）、`PluginHandle`、`define_plugin!`、cbindgen 头文件 |
+| `fuyubot-abi` | C ABI：`HostApiVTable`（2 个 u32 + `host_ctx` + 25 个函数指针）、`PluginHandle`、`define_plugin!`、cbindgen 头文件 |
 | `fuyubot-tdlib-sys` | 绑定层：`td_api.tl` → 类型 + 元数据 + FFI 声明（无 tokio / 无网络） |
 | `fuyubot-tdlib` | `loader`（四级定位）+ `client`（`td_receive` 循环、`ReceiveLoop`）+ `authorize`（授权状态机）+ `session`（建客户端 / 登录 / `getMe` / 关会话） |
 | `fuyubot-event` / `service` / `tool` / `middleware` | 四个机制 crate，只依赖 `core`，彼此不依赖 |
@@ -156,7 +156,8 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     `api_id` / `api_hash` 是**例外**：它们**每次冷启动**都要随 `setTdlibParameters` 发出去
     （session 有效也一样），不记住就得每次手输——`run` 交互问过之后**明文写回**
     `fuyubot.toml` 的 `[telegram]` 段（`api_hash` 不进 `Config` 树，插件 `get_config` 读不到；
-    插件 `set_config` 的全量重写由 `persist_toml` 补回）。写回只发生在「这次真问过」时。
+    插件写配置只动 `plugin-config/`，**用户配置文件运行时永不重写**，所以不必也不许再补回凭据）。
+    写回只发生在「这次真问过」时。
 42. **TDLib 字段路径先问真库**（如 `file.id`；`user` 没有 `is_bot` / `username`）。
 43. **TDLib 方法名 ≠ Bot API**：发送一律 `sendMessage` + `input_message_content`；参数名以 `td_api.tl` 为准，并留一条 `check_request` 测试。
 44. **插件导出表只静态读、绝不 dlopen**：ABI 版本只能由 `plugin_init` 返回的 handle 在运行时判定（静态检查工具已随 SDK 仓删除）。
@@ -170,7 +171,10 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 50. **Go 的 c-shared 插件不能卸载**：识别 `Go buildinf` 魔数并故意不卸载；同进程重复加载不可靠。
 51. **发布顺序**：本仓发 `fuyubot-abi` / `fuyubot-tdlib-sys` →
     FuyuBot-Script 发各平台 dll 资产（不进 crates.io）。不要把 patch 写进下游的 `Cargo.toml`。
-52. **插件配置段是 `[plugin.<插件名>]`**（ABI v4）：插件名点分 → TOML 嵌套表，宿主把插件名当**点路径**在 `plugin` 表里下钻（`fuyubot.manage` → `plugin.fuyubot.manage`）。`get_config(section, key)` 读**任意**段（自己 + 别人）；`set_config(key, value)` **没有 section 参数**，只写调用者自己那段（靠 `owner_names` 映射判定，插件无法伪造）。`set_config` 落盘是 `toml::to_string_pretty` **全量重写**（注释会丢），写盘失败要还原内存。脚本插件侧同步入口是 `plugin_config()` / `pluginConfig()`（中间插件在 spawn 前把自己的段塞进 `config` 的 `plugin_config` 键）。
+52. **插件配置段是 `[plugin.<插件名>]`**（ABI v4）：插件名点分 → TOML 嵌套表，宿主把插件名当**点路径**在 `plugin` 表里下钻（`fuyubot.manage` → `plugin.fuyubot.manage`）。`get_config(section, key)` 读**任意**段（自己 + 别人）；`set_config(key, value)` **没有 section 参数**，只写调用者自己那段（靠 `owner_names` 映射判定，插件无法伪造）。
+    **配置是三层叠出来的**（后者只填前者的缺失键）：包默认（`plugin.json` 的 `config`，`fuyubot-loader` 在 `DylibPlugin::new` 里合并）< 运行时落盘（`<root>/plugin-config/<插件名>.toml`）< 用户配置（`fuyubot.toml` 的 `[plugin.<名>]`，**最高**）。
+    **`set_config` 只写自己那一个文件**：段级、原子替换（同目录 `.toml.tmp` → `rename`）、只落这次改的键；`fuyubot.toml` **运行时永不重写**（注释与 `api_hash` 不会被卷走，`persist_toml` 已删除）。用户配置里钉住的键**拒绝写**（返回错误），不许「写完下次启动被静默盖回去」；没有配置文件（`config_path = None`）时同样报错，不许静默只写内存。写盘失败要还原内存。
+    脚本插件侧同步入口是 `plugin_config()` / `pluginConfig()`（中间插件在 spawn 前把自己的段塞进 `config` 的 `plugin_config` 键）。
 53. **依赖声明以 `plugin_manifest` 为准**：`DylibPlugin::inject()` / `soft_inject()` 先读 manifest（probe 阶段 `read_manifest` 拿到，`plugin_free_string` 归还），为空才退回 `[plugin.<名>].inject` / `.soft_inject`。别把配置当唯一来源——那会让「换台机器忘了抄」变成静默的加载顺序错误。
 54. **`reconcile` 不许在 `apply` 期间递归推进**：`apply` 里注册服务会同步触发服务变更钩子；若钩子就地递归，提供者还在 `Activating`（`start` 没跑完）依赖方就被激活，软依赖「基础设施先起来」直接作废、硬依赖也会提前放人。钩子只置 `Progress::needed` 并返回，由外层 `reconcile_loop` 接着推进（`Progress::running` 是闸门，`RunningGuard` 保证 panic 也不焊死）。
 55. **新增插件导出符号要两处同步**：`fuyubot-abi` 的 `SYM_*` 常量、`build.rs` 的 `TRAILER`（手写声明）。约束 18 只管**类型**（`export.include`），不管函数声明——ABI v4 的 `plugin_manifest` / `fuyubot_abi_version` / `plugin_free_handle` 就漏在头文件外过一轮，C 作者据此**根本不知道要写**。`TRAILER` 里用到 ABI 类型的声明必须留在 trailer（`after_includes` 在所有类型定义之前，放那儿 `-fsyntax-only` 直接报错，约束 33）。
@@ -207,7 +211,10 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 62. **APK 在 `release-bot.yml` 的 `build-apk` job 里编，壳不在本仓**：
     壳是 [FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android)（Kotlin + Compose），
     按 `main` 取；内核就是同一版本编出来的 `fuyubot-<版本>-android-jni-<abi>.zip`。
-    契约有三条，改之前先看 `.github/scripts/build-android-apk.sh`：
+    契约有四条，改之前先看 `.github/scripts/build-android-apk.sh`：
+    - **运行期调日志不用加 JNI 方法**：壳写 `<root>/.fuyubot/log-level`（一行级别名），
+      `run` 每 500ms 轮询，与 CLI 同一个控制文件协议。订阅者**不许再挂级别过滤**——
+      `tracing_subscriber::fmt()` 默认上限是 `INFO`，会把 `debug` / `trace` 在格式化前丢掉。
     - **指定目录是 `app/src/main/assets/fuyubot-kernel/`**（不是 `jniLibs/`）。它被上游
       `.gitignore` 排除，缺了也照样编得出 APK——只是装到设备上首次启动报「资产中缺少内核目录」。
       所以判据只能是「APK 里真有 `assets/fuyubot-kernel/lib*.so`」，不能只看 `assembleRelease` 绿了。
@@ -222,6 +229,13 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     签名走 `apksigner`（不用 AGP 的 injected signing——那要四个 `-P` 属性齐全，缺一个就**静默不签**）。
     keystore 从 Secrets 还原，四个都要在：`ANDROID_KEYSTORE_BASE64` / `ANDROID_KEYSTORE_PASSWORD` /
     `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD`。**同一个 keystore 不能换**，换了老用户装不上新 APK。
+
+63. **服务调用经过宿主（ABI v6）**：`HostApi::call_service` 走 VTable 尾部的 `call_service` 桥，
+    不再由插件自己取 vtable 直调。宿主在调用期间压一张**调用者栈**（值取自调用方那份
+    `PluginHost.owner`，与线程无关），`current_plugin` 优先读它、其次才退回线程作用域栈——
+    所以插件在自己的线程上调服务也认得出调用方，且无法自报。`set_config` 仍按**线程作用域栈**
+    （执行者）判定「谁的段」，两张栈别混。v5 → v6 的迁移说明在文档站
+    [ABI v5 → v6 迁移](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/abi-v6/)。
 
 ## 文档
 

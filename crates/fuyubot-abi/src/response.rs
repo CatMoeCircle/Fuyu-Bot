@@ -153,6 +153,21 @@ impl ResponseRouter {
         self.invoke_with(|host| host.td_invoke_simplified(method, params_json))
     }
 
+    /// ABI v5 `simplify_invoke`（op JSON）的 async 版。
+    ///
+    /// 与 [`invoke_simplified`](Self::invoke_simplified) 的区别只在**下发通道**：
+    /// 这个走 [`HostApi::simplify_invoke`]，响应是
+    /// `{"@type":"simplifyResult","op":…,"ok":…,"result"|"error":…,"request_id":N}`；
+    /// 那个走 `td_invoke_simplified`，响应是 TDLib 方法的原始响应。
+    ///
+    /// ⚠️ 宿主侧 op 工作线程**不压作用域栈**：请求的归属在下发那一刻就记下了。
+    /// 所以在插件自己的 executor 线程上必须经由本方法（它会先 enter 本插件的子作用域）；
+    /// 直接调 `host.simplify_invoke` 会把归属记成宿主（owner 0），结果只投给全局订阅者、
+    /// 本插件收不到。
+    pub fn invoke_op(&self, op_json: &str) -> Result<(RequestId, ResponseFuture), AbiError> {
+        self.invoke_with(|host| host.simplify_invoke(op_json))
+    }
+
     /// 等一条匹配的更新（`wait_for_update` 的 async 版，**不阻塞**）。
     ///
     /// 过滤条件与阻塞版同形：`{"event_type": "updateNewMessage", "message.chat.id": -100…}`。
@@ -647,6 +662,12 @@ mod tests {
     unsafe extern "C" fn noop_list(_: *mut core::ffi::c_void) -> *const core::ffi::c_char {
         core::ptr::null()
     }
+    /// 测试桩：宿主自己（没有调用者插件）返回 NULL。
+    unsafe extern "C" fn noop_current_plugin(
+        _: *mut core::ffi::c_void,
+    ) -> *const core::ffi::c_char {
+        core::ptr::null()
+    }
     unsafe extern "C" fn noop_provide(
         _: *mut core::ffi::c_void,
         _: *const core::ffi::c_char,
@@ -711,14 +732,37 @@ mod tests {
     ) -> i32 {
         -1
     }
-    unsafe extern "C" fn noop_simplify_invoke(
-        _: *mut core::ffi::c_void,
-        _: *const core::ffi::c_char,
+    unsafe extern "C" fn fake_simplify_invoke(
+        _host: *mut core::ffi::c_void,
+        _op: *const core::ffi::c_char,
     ) -> crate::RequestId {
-        crate::RequestId::INVALID
+        let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        if FIRE_ON_SEND.load(Ordering::SeqCst) != 0 {
+            fire(
+                RESPONSE_EVENT,
+                serde_json::json!({
+                    "@type": "simplifyResult",
+                    "op": "send_message",
+                    "ok": true,
+                    "result": { "id": 5 },
+                    "request_id": id,
+                }),
+            );
+        }
+        RequestId { id }
     }
     unsafe extern "C" fn noop_simplify_invoke_result(
         _: *mut core::ffi::c_void,
+        _: *const core::ffi::c_char,
+    ) -> *const core::ffi::c_char {
+        core::ptr::null()
+    }
+    /// 测试替身没有服务表：桥一律失败，`ResponseRouter` 因此拿到 `scope: None`
+    /// （与「老宿主没有 scope service」同一条退化路径）。
+    unsafe extern "C" fn noop_call_service(
+        _: *mut core::ffi::c_void,
+        _: *const core::ffi::c_char,
+        _: *const core::ffi::c_char,
         _: *const core::ffi::c_char,
     ) -> *const core::ffi::c_char {
         core::ptr::null()
@@ -749,8 +793,10 @@ mod tests {
             get_config: Some(noop_get_config),
             set_config: Some(noop_set_config),
             provide_service_shared: Some(noop_provide_shared),
-            simplify_invoke: Some(noop_simplify_invoke),
+            simplify_invoke: Some(fake_simplify_invoke),
             simplify_invoke_result: Some(noop_simplify_invoke_result),
+            current_plugin: Some(noop_current_plugin),
+            call_service: Some(noop_call_service),
         }
     }
 
@@ -819,6 +865,30 @@ mod tests {
         match poll_once(&mut future) {
             Poll::Ready(Ok(value)) => assert_eq!(value["value"], "early"),
             other => panic!("竞态响应应该从缓冲补上，得到 {other:?}"),
+        }
+        FIRE_ON_SEND.store(0, Ordering::SeqCst);
+    }
+
+    /// ABI v5 的 op 通道（`simplify_invoke`）也要能 async 等：
+    /// 插件在自己的 tokio 任务里 await 结果，而不是在宿主回调里阻塞。
+    #[test]
+    fn simplify_ops_are_awaited_through_the_router() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        FIRE_ON_SEND.store(1, Ordering::SeqCst);
+        reset_fake();
+
+        let (_vtable, api) = host();
+        let router = ResponseRouter::new(api).expect("注册响应订阅");
+        let (_id, mut future) = router
+            .invoke_op(r#"{"op":"send_message","args":{}}"#)
+            .expect("下发 op");
+        match poll_once(&mut future) {
+            Poll::Ready(Ok(value)) => {
+                assert_eq!(value["@type"], "simplifyResult");
+                assert_eq!(value["ok"], true);
+                assert_eq!(value["result"]["id"], 5);
+            }
+            other => panic!("op 响应应该从缓冲补上，得到 {other:?}"),
         }
         FIRE_ON_SEND.store(0, Ordering::SeqCst);
     }

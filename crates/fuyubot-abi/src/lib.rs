@@ -27,7 +27,16 @@ pub use response::{ResponseFuture, ResponseRouter, UpdateFuture};
 /// - v5：`simplify_invoke` / `simplify_invoke_result`——把 `fuyubot-simplify` 的
 ///   **语义**（发消息等结局、超时撤回、bot 与用户号挑不同方法、Markdown → entities）
 ///   下沉到宿主，用 **op JSON 分发**，所有语言的插件都能用。
-pub const ABI_VERSION: u32 = 5;
+///   同一次 v5 里还**尾部追加**了 `current_plugin`（服务方法回问「当前调用者是谁」）：
+///   纯追加不改语义，靠 `size` 协商——老插件（size 更小）照常加载，新插件在旧 v5 宿主上
+///   会被 [`AbiError::VTableTooSmall`] 明确拒绝，所以不再为它跳版本号。
+/// - v6：尾部追加 `call_service`——服务调用从「插件自己走 vtable」改成**经过宿主**。
+///   宿主因此在调用期间能维护一张「调用者栈」，[`HostApi::current_plugin`] 在服务方法里
+///   返回的是**真正的调用方**（插件在自己的线程上调进来也认得，名字由宿主判定、不可自报）。
+///   **语义变了**（v5 的 `current_plugin` 只读线程作用域栈，跨线程就是 NULL），
+///   所以这次跳版本号：v5 插件在 v6 宿主上、v6 插件在 v5 宿主上都会被
+///   [`AbiError::VersionMismatch`] 明确拒绝，不会带着旧语义静默跑。
+pub const ABI_VERSION: u32 = 6;
 
 /// `simplify_invoke` 的 op JSON 里「要跑哪个操作」的键名。
 pub const SIMPLIFY_OP_KEY: &str = "op";
@@ -458,9 +467,59 @@ pub struct HostApiVTable {
     /// 传了异步操作会返回 `{"@type":"simplifyResult","ok":false,"error":{…}}`。
     pub simplify_invoke_result:
         Option<unsafe extern "C" fn(host: *mut c_void, op_json: *const c_char) -> *const c_char>,
+    /// 当前**调用者**是谁：宿主自己返回 NULL，插件返回它的名字（NUL 结尾 UTF-8，
+    /// 宿主持有，读完即弃）。
+    ///
+    /// 身份取自宿主维护的**调用者栈**（见 [`Self::call_service`]），查的是
+    /// `owner → 插件名` 这张表——与 `set_config` 判定「这是谁的段」用的是**同一份**
+    /// 映射，所以插件伪造不了。典型用法是**服务方**在方法里回问一句「谁在调我」，
+    /// 把权威来源写进自己的返回（`/help` 命令归属就是这么来的）：
+    ///
+    /// ```text
+    /// A: host.call_service("fuyubot.help.commands", "register", …)
+    /// B(help): host.current_plugin()  →  Some("A")   ← 由宿主判定，A 无法自报
+    /// ```
+    ///
+    /// 不在服务调用里时（回调、`start`、插件自己的线程）退回「本线程作用域栈顶」，
+    /// 也就是宿主最后一次把控制权交给的那个插件——在宿主的线程上等于自己，
+    /// 在插件自建的线程上是 NULL。想要「我是谁」请用
+    /// [`Self::log`] 之外的语义别混用：这条回答的始终是**调用者**。
+    ///
+    /// 追加在尾部：老插件（`size` 更小）不受影响；新插件在旧宿主上会被
+    /// [`AbiError::VTableTooSmall`] 明确拒绝，不会读到错位的指针。
+    /// 这是 ABI **v5 内**的纯尾部追加（当时靠 `size` 协商、不跳版本号）；
+    /// **v6 改了它的取值来源**（调用者栈优先，见 [`Self::call_service`]），
+    /// 所以那次才真正跳了版本号。
+    pub current_plugin: Option<unsafe extern "C" fn(host: *mut c_void) -> *const c_char>,
+    /// **经过宿主**调一个 service 的方法（ABI v6）：`service` 是服务名，`method` 是方法名，
+    /// `input_json` 原样交给对方。返回对方给的 JSON 文本（宿主线程局部缓冲，读完即弃）。
+    ///
+    /// 与「插件自己 `get_service` 然后调函数指针」的唯一区别是**宿主在这条路径上**：
+    /// 它知道是谁在调（这份 vtable 属于哪个插件），于是能在调用期间压一张调用者栈，
+    /// 让被调方用 [`Self::current_plugin`] 问出**真实调用方**——跨线程也成立。
+    /// 插件侧不需要传任何自我介绍，[`HostApi::call_service`] 的用法一个字都不用改。
+    ///
+    /// 返回约定：
+    /// - **NULL = 失败**（服务不存在 / 没这个方法 / 入参含 NUL）；失败原因由宿主记日志；
+    /// - 指向**空串**的指针 = 成功但没有输出（对方的函数返回了 NULL）；
+    /// - 其余 = 成功，对方返回的 JSON 文本。
+    ///
+    /// 这条路径是**同步直调**（宿主当场调对方函数），不排队、不给请求号；
+    /// 因此被调方不能在方法里等 TDLib 应答（调用方多半站在投递更新的线程上）。
+    ///
+    /// 追加在尾部并跳版本号（v6）：v5 宿主没有这张表项，`current_plugin` 的语义也不同，
+    /// 混用就是「归属静默为空」，所以两边必须一起升。
+    pub call_service: Option<
+        unsafe extern "C" fn(
+            host: *mut c_void,
+            service: *const c_char,
+            method: *const c_char,
+            input_json: *const c_char,
+        ) -> *const c_char,
+    >,
 }
 
-/// VTable 就是「两个 u32 + 23 个指针」；布局一改，这里立刻编译不过。
+/// VTable 就是「两个 u32 + 25 个指针」；布局一改，这里立刻编译不过。
 const _: () = {
     use core::mem::{offset_of, size_of};
 
@@ -468,9 +527,9 @@ const _: () = {
     assert!(offset_of!(HostApiVTable, size) == 4);
     assert!(offset_of!(HostApiVTable, host_ctx) == 8);
     assert!(size_of::<Option<unsafe extern "C" fn()>>() == size_of::<*const c_void>());
-    // 23 = 2 个 u32 之后的函数指针个数。**加 VTable 字段必须同步改这个数**：
+    // 25 = 2 个 u32 之后的函数指针个数。**加 VTable 字段必须同步改这个数**：
     // 它是「结构没被悄悄改动」的唯一守卫，比 offset 断言更能发现加/删字段。
-    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 23 * size_of::<*const c_void>());
+    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 25 * size_of::<*const c_void>());
 
     // 句柄要能按值跨 ABI：必须恰好一个 u64。
     assert!(size_of::<SubscriptionHandle>() == size_of::<u64>());
@@ -567,6 +626,13 @@ pub struct HostApi {
     set_config: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> i32,
     simplify_invoke: unsafe extern "C" fn(*mut c_void, *const c_char) -> RequestId,
     simplify_invoke_result: unsafe extern "C" fn(*mut c_void, *const c_char) -> *const c_char,
+    current_plugin: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    call_service: unsafe extern "C" fn(
+        *mut c_void,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+    ) -> *const c_char,
 }
 
 impl std::fmt::Debug for HostApi {
@@ -642,6 +708,8 @@ impl HostApi {
             set_config: required!(set_config),
             simplify_invoke: required!(simplify_invoke),
             simplify_invoke_result: required!(simplify_invoke_result),
+            current_plugin: required!(current_plugin),
+            call_service: required!(call_service),
         })
     }
 
@@ -767,6 +835,24 @@ impl HostApi {
         unsafe { cstr_to_string(raw) }
     }
 
+    /// 现在是谁在调我：返回**调用者插件名**，宿主自己 / 名字未登记时为 `None`。
+    ///
+    /// 权威来源由宿主按本线程作用域栈顶判定（与 `set_config` 的越权判定同一份映射），
+    /// 插件无法伪造。服务方把它写进返回，调用方就能看到真实归属。
+    ///
+    /// 返回的字符串当场拷成 `String`——调用方拿到自己的一份，不受下一次调用的
+    /// 线程局部缓冲影响。
+    pub fn current_plugin(&self) -> Option<String> {
+        // SAFETY: 同 log；宿主保证返回的指针在读完之前有效。
+        let raw = unsafe { (self.current_plugin)(self.host_ctx) };
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: 同上。
+        let name = unsafe { cstr_to_string(raw) };
+        (!name.is_empty()).then_some(name)
+    }
+
     /// 注册一个服务，**落在调用者自己的作用域里**（默认私有）。
     ///
     /// 兄弟插件看不见它（查找只沿父链向上，兄弟之间没有边），但根上的公共服务
@@ -812,59 +898,43 @@ impl HostApi {
 
     /// 按名字 + 方法名调一个 service，返回它给的 JSON 文本。
     ///
-    /// 这是 [`get_service`](Self::get_service) 的安全封装：那条路给出的是裸
-    /// `*const ServiceVTable`，插件作者得自己走指针、自己处理 null——而九成用法
-    /// 就是「查个方法、喂入参、拿结果」。**不新增 ABI 桥**，纯 Rust 侧便利；
-    /// C / Go / Python 侧照旧自己走 vtable（它们的绑定本来就是这样生成的）。
+    /// **走宿主**（ABI v6 的 `call_service` 桥）：宿主在这条路径上知道调用者是谁，
+    /// 于是被调方的 [`current_plugin`](Self::current_plugin) 能问出**真实的调用方**——
+    /// 包括「插件在自己的线程上调进来」这种宿主没有压过作用域栈的场合。
+    /// 调用方**不需要**传任何自我介绍，也不可能自称成别人。
     ///
-    /// 出错（服务不存在 / 没这个方法 / 返回 NULL）返回 `None`。
+    /// 出错（服务不存在 / 没这个方法 / 入参带 NUL）返回 `Err`；失败原因宿主会记日志，
+    /// 边界上只回 NULL（`AbiError::BadString` 是这条路径沿用下来的笼统错误）。
     ///
     /// # Safety 之外的前提
-    /// 返回的字符串由**提供方**持有、只在本线程下一次调用前有效——这里立刻拷成
-    /// `String`，所以调用方拿到的永远是自己的一份。
+    /// 返回的字符串由**提供方**持有、只在本线程下一次调用前有效——宿主在这里立刻
+    /// 拷成 `String` 交出去，所以调用方拿到的永远是自己的一份。
     pub fn call_service(
         &self,
         name: &str,
         method: &str,
         input_json: &str,
     ) -> Result<String, AbiError> {
-        let vtable = self.get_service(name);
-        if vtable.is_null() {
-            return Err(AbiError::BadString);
-        }
-        let Ok(method) = CString::new(method) else {
-            return Err(AbiError::BadString);
-        };
-        let wanted = method.to_string_lossy().into_owned();
+        let name = CString::new(name).map_err(|_| AbiError::BadString)?;
+        let method = CString::new(method).map_err(|_| AbiError::BadString)?;
         let input = CString::new(input_json).map_err(|_| AbiError::BadString)?;
-        // SAFETY: `get_service` 要么返回宿主校验过的 vtable，要么返回 null（上面挡住了）。
-        // 它的 `methods` / `method_count` 由注册方保证一致（见 `ServiceVTable` 文档）。
-        let table = unsafe { &*vtable };
-        for index in 0..table.method_count {
-            // SAFETY: 契约保证 methods 指向 method_count 个连续项。
-            let entry = unsafe { &*table.methods.add(index) };
-            if entry.name.is_null() {
-                continue;
-            }
-            // SAFETY: 方法名是 NUL 结尾 UTF-8。
-            if unsafe { CStr::from_ptr(entry.name) }.to_string_lossy() != wanted {
-                continue;
-            }
-            let Some(func) = entry.func else {
-                return Err(AbiError::BadString);
-            };
-            // SAFETY: 契约要求返回值由提供方持有、本线程下一次调用前有效——立刻拷走。
-            let raw = unsafe { func(table.context, input.as_ptr()) };
-            if raw.is_null() {
-                // 与宿主内部的约定一致：null = 成功但没有输出。
-                return Ok(String::new());
-            }
-            // SAFETY: raw 是提供方的 NUL 结尾字符串。
-            return Ok(unsafe { CStr::from_ptr(raw) }
-                .to_string_lossy()
-                .into_owned());
+        // SAFETY: 构造时已校验非空；host_ctx 由宿主保证有效，三个指针都活到调用结束。
+        let raw = unsafe {
+            (self.call_service)(
+                self.host_ctx,
+                name.as_ptr(),
+                method.as_ptr(),
+                input.as_ptr(),
+            )
+        };
+        if raw.is_null() {
+            // NULL 是**失败**（与「成功但没有输出」用空串区分），契约见 VTable 字段文档。
+            return Err(AbiError::BadString);
         }
-        Err(AbiError::BadString)
+        // SAFETY: 宿主保证返回值是 NUL 结尾、且在下次宿主调用前有效——这里立刻拷贝。
+        Ok(unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned())
     }
 
     pub fn td_invoke(&self, method_json: &str) -> Result<RequestId, AbiError> {
@@ -1366,6 +1436,10 @@ mod tests {
     unsafe extern "C" fn noop_list_plugins(_: *mut c_void) -> *const c_char {
         core::ptr::null()
     }
+    /// 测试桩：宿主自己（没有调用者插件）返回 NULL。
+    unsafe extern "C" fn noop_current_plugin(_: *mut c_void) -> *const c_char {
+        core::ptr::null()
+    }
     unsafe extern "C" fn noop_provide(
         _: *mut c_void,
         _: *const c_char,
@@ -1428,6 +1502,15 @@ mod tests {
     ) -> *const c_char {
         core::ptr::null()
     }
+    /// 桥的默认假实现：永远失败（NULL）。要成功的用例自己给一个。
+    unsafe extern "C" fn noop_call_service(
+        _: *mut c_void,
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+    ) -> *const c_char {
+        core::ptr::null()
+    }
 
     fn test_vtable() -> HostApiVTable {
         HostApiVTable {
@@ -1456,6 +1539,8 @@ mod tests {
             provide_service_shared: Some(noop_provide_shared),
             simplify_invoke: Some(noop_simplify_invoke),
             simplify_invoke_result: Some(noop_simplify_invoke_result),
+            current_plugin: Some(noop_current_plugin),
+            call_service: Some(noop_call_service),
         }
     }
 
@@ -1545,6 +1630,78 @@ mod tests {
         // SAFETY: 同上。
         let error = unsafe { HostApi::from_raw(&vtable) }.unwrap_err();
         assert!(matches!(error, AbiError::MissingFunction("log")), "{error}");
+
+        // 尾部追加的 `current_plugin` 同样是必需字段：新插件在漏了它的宿主上要明确拒绝。
+        let mut vtable = test_vtable();
+        vtable.current_plugin = None;
+        // SAFETY: 同上。
+        let error = unsafe { HostApi::from_raw(&vtable) }.unwrap_err();
+        assert!(
+            matches!(error, AbiError::MissingFunction("current_plugin")),
+            "{error}"
+        );
+
+        // v6 的 `call_service` 同理：没有桥，`call_service` 就没法走宿主，
+        // 归属会静默退化——所以宁可拒绝加载。
+        let mut vtable = test_vtable();
+        vtable.call_service = None;
+        // SAFETY: 同上。
+        let error = unsafe { HostApi::from_raw(&vtable) }.unwrap_err();
+        assert!(
+            matches!(error, AbiError::MissingFunction("call_service")),
+            "{error}"
+        );
+    }
+
+    thread_local! {
+        /// 桥的假宿主的返回缓冲（宿主侧真实实现用线程局部缓冲，这里照着来）。
+        static BRIDGE_REPLY: core::cell::RefCell<CString> =
+            core::cell::RefCell::new(CString::default());
+    }
+
+    /// 假桥：把「服务名 / 方法名 / 入参」原样拼回 JSON，证明插件侧一个字段都没少传，
+    /// 而且 `call_service` 确实是**经过宿主**的（而不是自己走 vtable）。
+    unsafe extern "C" fn bridge_echo(
+        _: *mut c_void,
+        service: *const c_char,
+        method: *const c_char,
+        input: *const c_char,
+    ) -> *const c_char {
+        // SAFETY: 三个入参都由本 crate 的 `call_service` 构造，活得比调用久。
+        let service = unsafe { CStr::from_ptr(service) }.to_string_lossy();
+        let method = unsafe { CStr::from_ptr(method) }.to_string_lossy();
+        let input = unsafe { CStr::from_ptr(input) }.to_string_lossy();
+        let text = format!(r#"{{"service":"{service}","method":"{method}","input":{input}}}"#);
+        BRIDGE_REPLY.with(|buffer| {
+            *buffer.borrow_mut() = CString::new(text).unwrap_or_default();
+            buffer.borrow().as_ptr()
+        })
+    }
+
+    /// v6：`call_service` 走宿主桥，返回值当场拷成 `String`；NULL 是失败。
+    #[test]
+    fn call_service_is_mediated_by_the_host() {
+        let mut vtable = test_vtable();
+        vtable.call_service = Some(bridge_echo);
+        // SAFETY: vtable 在调用期间存活。
+        let api = unsafe { HostApi::from_raw(&vtable) }.unwrap();
+        let reply = api
+            .call_service("B.svc", "m", r#"{"x":1}"#)
+            .expect("桥返回了非空指针");
+        assert_eq!(reply, r#"{"service":"B.svc","method":"m","input":{"x":1}}"#);
+
+        // 默认的 noop 桥返回 NULL：那就是失败，不是「成功但没有输出」。
+        let api = unsafe { HostApi::from_raw(&test_vtable()) }.unwrap();
+        assert!(api.call_service("B.svc", "m", "{}").is_err());
+    }
+
+    /// 宿主自己（没有调用者插件）时 `current_plugin` 是 `None`，不是空字符串。
+    #[test]
+    fn current_plugin_is_none_for_the_host_itself() {
+        let vtable = test_vtable();
+        // SAFETY: vtable 在调用期间存活。
+        let api = unsafe { HostApi::from_raw(&vtable) }.unwrap();
+        assert_eq!(api.current_plugin(), None);
     }
 
     /// 宏生成的导出确实能跑通：init → start（经 VTable 调 log）→ stop。
@@ -1650,6 +1807,9 @@ mod tests {
         assert!(PLUGIN_HEADER.contains("FUYUBOT_EXPORT"));
         // 内存所有权那段必须提到 manifest，否则「谁来 free」这件事没有落点。
         assert!(PLUGIN_HEADER.contains("plugin_manifest` 的返回值也归插件所有"));
+        // v6 的新桥必须在场：C 作者靠头文件知道「调服务要经宿主」，漏了就只能自己猜。
+        assert!(PLUGIN_HEADER.contains("call_service"));
+        assert!(PLUGIN_HEADER.contains(&format!("ABI_VERSION {ABI_VERSION}")));
     }
 
     #[test]
