@@ -239,8 +239,7 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
 ///
 /// ⚠️ **故意不进 [`Config`]**：`Config::to_json()` 的整棵树会交给宿主运行时，而插件经
 /// ABI 的 `get_config` 能读**任意**段——把凭据放进那棵树等于发给每个插件。所以这个键
-/// 只由 CLI 自己按文件读。代价是插件 `set_config` 的全量重写会冲掉它，那一侧在
-/// `fuyubot-loader` 的 `persist_toml` 里补回来。
+/// 只由 CLI 自己按文件读。插件写配置只动 `plugin-config/`、碰不到本文件，凭据因此安全。
 pub fn load_api_hash(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let saved: SavedCredentials = toml::from_str(&text).ok()?;

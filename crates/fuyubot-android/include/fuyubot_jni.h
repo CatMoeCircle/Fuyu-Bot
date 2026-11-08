@@ -27,11 +27,25 @@
  *     "api_id":     12345,                                  // 必填，int32
  *     "api_hash":   "…",                                    // 必填
  *     "bot_token":  "123456:ABC…",                          // 可选；有值就走 bot 登录，不问任何问题
+ *     "plugin_config": {                                    // 可选：插件自己的配置段
+ *       "fuyubot.manage": { "reply_prefix": "已安装：" }      // 插件名是点分的，等价于 TOML 的
+ *     },                                                    //   [plugin.fuyubot.manage]
  *     "lib_dir":    "/data/app/…/lib/arm64",                // 可选；缺省时要求宿主先 loadLibrary("tdjson")
  *     "tdlib_log_verbosity": 1                              // 可选；TDLib 自己的日志详细度（0 起）
  *   }
  *
  * 日志写到 <root>/logs/fuyubot.log（会自动追加、自动建目录）。
+ *
+ * **运行期调日志级别**（不需要新增 JNI 方法）：往 <root>/.fuyubot/log-level 写一行级别名
+ * （error / warn / info / debug / trace，大小写不敏感），库内每 500ms 看一次，变了立刻生效。
+ * 文件不存在 = 不改；内容写错 = 保持当前级别并留一条 warn。删掉文件**不会**回退——
+ * 要回退就写回 info，或下次 start 用 options 的 log_level。
+ * 级别只管**插件日志**（get_config 那条 VTable log 的门槛）；宿主与 TDLib 的日志不受它控制。
+ *
+ * 插件配置：`<root>/fuyubot.toml` 只是**可选**的用户配置层——存在时只读回 `[plugin.*]`
+ * 一段（其它段不参与解析，`telegram`/`plugins` 仍以这份 options JSON 为准）。
+ * 插件 `set_config` 写的是 `<root>/plugin-config/<插件名>.toml`（段级、原子替换），
+ * 启动时自动读回。三层优先级：options 的 `plugin_config` > fuyubot.toml > plugin-config > 包默认。
  */
 #ifndef FUYUBOT_JNI_H
 #define FUYUBOT_JNI_H

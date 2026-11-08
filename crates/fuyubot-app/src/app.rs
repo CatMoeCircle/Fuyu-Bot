@@ -74,7 +74,9 @@ pub struct AppOptions {
     ///
     /// ⚠️ **别放凭据**：`api_hash` / `bot_token` 不该出现在这里（约束 41 的精神）。
     pub config: Value,
-    /// `set_config` 要回写的配置文件；`None` = 只改内存（Android）。
+    /// 用户配置文件（启动时读；插件配置落盘到它旁边的 `plugin-config/`，不回写它）。
+    /// `None` = 这次启动没有配置根，**`set_config` 会报错**
+    /// （不再静默写内存：插件会以为已经保存，重启后又变回旧值）。
     pub config_path: Option<PathBuf>,
     /// `TDLIB_TDJSON_PATH` 的取值（在起客户端之前写一次）；`None` = 交给 loader 的优先级。
     pub tdjson_path: Option<PathBuf>,

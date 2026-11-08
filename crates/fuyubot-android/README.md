@@ -38,4 +38,10 @@ ABI **v1** 一共十二个方法：六个生命周期/问答，加上 `nativePlu
 `skipped_plugins`（探测失败 / 位置不对的脚本，带原因）。`onPlugins` 是可选的；
 `nativePlugins()` 从插件装好那一刻起就能查，登录窗口里也拿得到。
 
+**运行期调日志不用改 ABI**：往 `<root>/.fuyubot/log-level` 写一行级别名
+（`error` / `warn` / `info` / `debug` / `trace`），库内每 500ms 看一次、变了立刻生效；
+文件不存在 = 不改，写错 = 保持当前级别并留一条 warn。级别只管插件日志的门槛，
+删文件不会回退（写回 `info` 或下次 `start` 用 `options.log_level`）。
+日志本身在 `<root>/logs/fuyubot.log`。
+
 对外头文件是 [`include/fuyubot_jni.h`](include/fuyubot_jni.h)，它同时也是宿主契约。

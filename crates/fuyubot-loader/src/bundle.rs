@@ -136,6 +136,28 @@ pub enum BundleError {
     EntryMissing(PathBuf),
     #[error("entry {0} 解析后跑到包外了：插件包不许引用自己目录之外的文件")]
     EntryEscapes(PathBuf),
+    #[error("config {0:?} 不合法：必须是包内相对路径，禁止绝对路径、`..`、盘符与开头的分隔符")]
+    BadConfig(String),
+    #[error("config 指向的默认配置文件不存在：{0}（核对 plugin.json 的 config 与包内实际布局）")]
+    ConfigMissing(PathBuf),
+    #[error("默认配置文件 {path} 读不了：{source}")]
+    ConfigIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("默认配置文件 {path} 不是合法 TOML：{source}")]
+    ConfigToml {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("默认配置文件 {path} 转不成 JSON：{source}")]
+    ConfigJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error(
         "插件只支持 {want:?}，当前平台是 {host}：换对应平台的包，或把 platforms 写成 [\"any\"]"
     )]
@@ -200,6 +222,56 @@ impl BundleManifest {
             return Err(BundleError::EntryMissing(path));
         }
         Ok(path)
+    }
+
+    /// 读 `config` 指向的**默认配置**（包内相对路径的 TOML），转成一段 JSON。
+    ///
+    /// `None` = 清单没写 `config`。文件必须在包里（校验方式与 `entry` 相同：先挡语法，
+    /// 再 `canonicalize` 比前缀）——写了个不存在的文件名是插件作者的错，调用方应当
+    /// 告警，而不是让插件静默地拿不到默认值。
+    ///
+    /// 这里只负责「读出来」，**合并优先级在宿主运行时**：用户配置 > 运行时落盘 > 包默认。
+    pub fn config_defaults(&self, dir: &Path) -> Result<Option<serde_json::Value>, BundleError> {
+        let Some(relative) = &self.config else {
+            return Ok(None);
+        };
+        let parts =
+            entry_parts(relative).map_err(|_| BundleError::BadConfig(relative.to_owned()))?;
+        let path = parts.iter().fold(dir.to_path_buf(), |mut path, part| {
+            path.push(part);
+            path
+        });
+        // 与 `entry_path` 同一道关：落点必须真在包内（符号链接带不出去）。
+        if let (Ok(root), Ok(resolved)) = (std::fs::canonicalize(dir), std::fs::canonicalize(&path))
+        {
+            if !resolved.starts_with(&root) {
+                return Err(BundleError::BadConfig(relative.clone()));
+            }
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            // 文件不存在是「清单指错了」，要能指到那个路径。
+            Err(source) if source.kind() == ErrorKind::NotFound => {
+                return Err(BundleError::ConfigMissing(path));
+            }
+            Err(source) => {
+                return Err(BundleError::ConfigIo {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        };
+        let value =
+            toml::from_str::<toml::Value>(&text).map_err(|source| BundleError::ConfigToml {
+                path: path.clone(),
+                source,
+            })?;
+        // TOML 文档的顶层必然是表（`42` 这种在解析阶段就失败），所以这里直接转 JSON。
+        let json = serde_json::to_value(&value).map_err(|source| BundleError::ConfigJson {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(Some(json))
     }
 
     /// 装之前该确认的一切：平台、入口存在且是文件。
@@ -689,6 +761,70 @@ mod tests {
         assert_eq!(manifest.description, "天气");
         assert_eq!(manifest.license, "MIT");
         assert_eq!(manifest.homepage, "https://example.com/weather");
+    }
+
+    /// `config` 指向的文件要能读成「一段 JSON」；路径越界 / 文件缺失 / 不是表都报得清楚。
+    #[test]
+    fn config_defaults_are_read_from_the_bundle() {
+        let root = temp("config-defaults");
+        let dir = package(&root, "com.example.weather", "com.example.weather");
+        std::fs::write(
+            dir.join("config.default.toml"),
+            "city = \"上海\"\n\n[ui]\ntheme = \"dark\"\n",
+        )
+        .unwrap();
+
+        let manifest = BundleManifest::load(&dir).unwrap();
+        let defaults = manifest
+            .config_defaults(&dir)
+            .unwrap()
+            .expect("清单写了 config");
+        assert_eq!(defaults["city"], "上海");
+        assert_eq!(defaults["ui"]["theme"], "dark");
+
+        // 清单没写 config → None（不是错误）。
+        let mut without = valid();
+        without.as_object_mut().unwrap().remove("config");
+        let manifest = parse(&without).unwrap();
+        assert!(manifest.config_defaults(&dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_broken_config_default_is_reported_not_ignored() {
+        let root = temp("config-defaults-broken");
+        let dir = package(&root, "com.example.weather", "com.example.weather");
+        let manifest = BundleManifest::load(&dir).unwrap();
+
+        // 文件不存在：要指到那个路径。
+        match manifest.config_defaults(&dir) {
+            Err(BundleError::ConfigMissing(path)) => {
+                assert!(path.ends_with("config.default.toml"), "{path:?}");
+            }
+            other => panic!("该报 ConfigMissing，实际 {other:?}"),
+        }
+
+        // 不是 TOML。
+        std::fs::write(dir.join("config.default.toml"), "city = = 1").unwrap();
+        assert!(matches!(
+            manifest.config_defaults(&dir),
+            Err(BundleError::ConfigToml { .. })
+        ));
+
+        // TOML 文档的顶层必须是表：`42` 这种标量在解析阶段就失败。
+        std::fs::write(dir.join("config.default.toml"), "42").unwrap();
+        assert!(matches!(
+            manifest.config_defaults(&dir),
+            Err(BundleError::ConfigToml { .. })
+        ));
+
+        // 写出包外：语法层就拒绝。
+        let mut escape = valid();
+        escape["config"] = serde_json::json!("../secrets.toml");
+        let escape = parse(&escape).unwrap();
+        assert!(matches!(
+            escape.config_defaults(&dir),
+            Err(BundleError::BadConfig(_))
+        ));
     }
 
     #[test]

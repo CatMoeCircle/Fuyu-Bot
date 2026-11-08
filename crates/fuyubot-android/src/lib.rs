@@ -1074,6 +1074,29 @@ mod tests {
         }
     }
 
+    /// 插件配置的入口与落盘位置也要写在头文件里：APK 作者改 options 时只看得到它，
+    /// 少一个键名就只能猜（`plugin_config` 尤其容易被漏成 `plugins.config`）。
+    #[test]
+    fn the_header_documents_the_plugin_config_contract() {
+        let header = include_str!("../include/fuyubot_jni.h");
+        for token in ["\"plugin_config\"", "fuyubot.toml", "[plugin.*]"] {
+            assert!(header.contains(token), "头文件缺 {token} 的说明");
+        }
+    }
+
+    /// 运行期日志开关是壳唯一能调的通道（不新增 JNI 方法）：路径与写法必须写在头文件里。
+    #[test]
+    fn the_header_documents_the_runtime_log_level_switch() {
+        let header = include_str!("../include/fuyubot_jni.h");
+        for token in [
+            ".fuyubot/log-level",
+            "500ms",
+            "error / warn / info / debug / trace",
+        ] {
+            assert!(header.contains(token), "头文件缺 {token} 的说明");
+        }
+    }
+
     /// `onPlugins` 是**可选**回调：没有 JVM（本仓单测就是这样）时调一次不能 panic，
     /// 没注册回调（纯 C 宿主）时也一样。
     #[test]

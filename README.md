@@ -152,11 +152,13 @@ city = "上海"
 ```
 
 插件经 ABI 读写它：`get_config(section, key)` 能读**任意**段（自己 + 别人），
-`set_config(key, value)` 只能写**自己**那段（宿主按调用者身份判定，写完回写本文件）。
+`set_config(key, value)` 只能写**自己**那段（宿主按调用者身份判定）。
 Rust / C / Python / JS 四种写法见
 [配置文件](https://catmoecircle.github.io/FuyuBot-docs/docs/usage/config)。
 
-⚠️ `set_config` 回写是**全量重写**，本文件里手写的注释会丢。
+配置分三层（后者只填前者的缺失键）：插件包里的 `config.default.toml` <
+`plugin-config/<插件名>.toml`（插件 `set_config` 的落盘） < 本文件的 `[plugin.*]`（**你写的，最高**）。
+插件写配置**不会**改动本文件——注释和 `api_hash` 都安全。
 
 ## 插件
 

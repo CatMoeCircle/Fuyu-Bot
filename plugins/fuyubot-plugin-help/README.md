@@ -20,10 +20,16 @@
       vec!["fuyubot.help.commands".to_owned()]
   }
   ```
-- `list` 方法返回合并后的命令 JSON 数组（`[{"name":…,"description":…}, …]`），
-  即 `/help` 实际渲染的内容。
+- **归属由宿主判定**：`register` 会回问 `HostApi::current_plugin()`（宿主按本线程
+  作用域栈顶取调用者，与 `set_config` 的越权判定同一份映射），成功返回
+  `{"ok":true,"plugin":"fuyubot.start"}`；问不到身份时 `plugin` 是 `null`。
+  插件没法把自己冒充成别人。
+- `list` 方法返回合并后的命令 JSON 数组
+  （`[{"name":…,"description":…,"plugin":"…"}, …]`），即 `/help` 实际渲染的内容；
+  `/help` 文本会在说明后面标「（来自 start）」这样的短名。
 - 静态兜底 `BUILTIN_COMMANDS` 只兜住三个内置命令（`/start`、`/help`、`/plugins`），
-  其余命令由各插件自行为自己注册；渲染时静态与动态合并、**按名字去重**。
+  其余命令由各插件自行为自己注册；渲染时**动态优先**、静态只补缺（基线没有来源，
+  所以补位的那条不标归属）。
 - 产物随可执行文件一起打包，`fuyubot init` / `run` 会把它复制进项目的 `plugins/`。
 
 ## 相关

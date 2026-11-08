@@ -1168,7 +1168,22 @@ enum Slot {
 
 impl DylibPlugin {
     /// 包装一个已经探测过的插件，但**不启动它**。
+    ///
+    /// 顺手把插件包自带的默认配置（`plugin.json` 的 `config`）并进宿主配置树：
+    /// 优先级最低，只填用户配置与运行时落盘都没给的键。放在这里而不是 `apply`，
+    /// 是因为内核会先问 `inject` / `soft_inject`——默认值里的依赖也得能被看到。
     pub fn new(probe: Probe, config: impl Into<String>, runtime: Arc<HostRuntime>) -> Self {
+        if let Some(bundle) = probe.bundle.as_ref() {
+            match bundle.config_defaults(&probe.path) {
+                Ok(Some(defaults)) => runtime.apply_plugin_defaults(&probe.name, defaults),
+                Ok(None) => {}
+                // 默认配置坏了不该拦住整个插件：告警 + 当没有默认值。
+                Err(error) => runtime.warn(&format!(
+                    "插件 {} 的默认配置没读上（{error}），先按没有默认值加载",
+                    probe.name
+                )),
+            }
+        }
         Self {
             name: probe.name,
             path: probe.path,
@@ -1539,6 +1554,50 @@ mod bundle_probe_tests {
         assert_eq!(adapter.kind(), PluginKind::Native);
         assert!(adapter.bundle().is_some());
         assert_eq!(adapter.abi_version(), 5);
+    }
+
+    /// P1：`plugin.json` 的 `config` 默认值在**包装阶段**并进配置树，只填缺失键。
+    #[test]
+    fn bundle_defaults_are_merged_without_overriding_user_config() {
+        let root = temp("bundle-defaults");
+        let dir = package(&root, "com.example.weather", "com.example.weather");
+        std::fs::write(
+            dir.join("config.default.toml"),
+            "city = \"上海\"\nlang = \"zh\"\n",
+        )
+        .unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(BUNDLE_MANIFEST)).unwrap())
+                .unwrap();
+        manifest["config"] = serde_json::json!("config.default.toml");
+        std::fs::write(dir.join(BUNDLE_MANIFEST), manifest.to_string()).unwrap();
+
+        let loader = loader();
+        // 用户配置里已经写了 city：默认值不许覆盖它（用户配置最优先）。
+        loader.runtime().install_config(
+            None,
+            serde_json::json!({
+                "plugin": { "com": { "example": { "weather": { "city": "北京" } } } }
+            }),
+        );
+
+        // 静态探测 + 包装：不会 dlopen，但会把默认值并进来。
+        let _adapter = DylibPlugin::probe(&loader, &dir, "").expect("静态探测该成功");
+
+        assert_eq!(
+            loader
+                .runtime()
+                .plugin_config_value("com.example.weather", "city"),
+            Some(serde_json::json!("北京")),
+            "用户配置优先于包默认"
+        );
+        assert_eq!(
+            loader
+                .runtime()
+                .plugin_config_value("com.example.weather", "lang"),
+            Some(serde_json::json!("zh")),
+            "用户没给的键用包默认补"
+        );
     }
 
     /// 清单坏掉时错误要指到包上，而不是「打不开动态库」。

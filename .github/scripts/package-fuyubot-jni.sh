@@ -123,6 +123,8 @@ printf '%s\n' \
   "保活是 App 的事：本库不声明任何 Android 组件 / 权限 / 唤醒锁，" \
   "只提供幂等 start、必须被调的 stop、以及 onState 状态回调。" \
   "日志在 <root>/logs/fuyubot.log（应用进程的 stdout/stderr 是 /dev/null，只能落文件）。" \
+  "运行期调日志：往 <root>/.fuyubot/log-level 写一行 error/warn/info/debug/trace，" \
+  "库内每 500ms 看一次、最迟半秒生效（不用重启，也不用新增 JNI 方法）。" \
   "" \
   "需要 API ${ANDROID_API_LEVEL:-21}+；文档：https://catmoecircle.github.io/FuyuBot-docs/" \
   > "$STAGE/README.txt"

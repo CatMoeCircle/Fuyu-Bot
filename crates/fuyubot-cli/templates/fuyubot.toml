@@ -45,6 +45,12 @@ log_verbosity = 1
 # 运行时经 ABI 接口 `get_config` 读任意段（自己或别人的），经 `set_config`
 # 只能写**自己**这一段——写别的插件那段会被宿主拒绝。
 #
+# 三层优先级（后者只填前者的缺失键）：
+#   1. 本文件里的段（最高；插件写这些键会被拒绝）
+#   2. plugin-config/<插件名>.toml（插件 set_config 的落盘）
+#   3. 插件包里的 config.default.toml（包默认）
+# 插件写配置**不会**改动这个文件，所以注释和 api_hash 都安全。
+#
 # 例：
 # [plugin.fuyubot.manage]
 # reply_prefix = "已安装插件："

@@ -5,9 +5,14 @@
 //! 不必改这个插件半行代码。静态的 `BUILTIN_COMMANDS` 只兜住三个内置命令，
 //! 其余命令由各插件自行为自己注册。
 //!
+//! 每条命令还带**归属插件**：服务方法里回问宿主 `HostApi::current_plugin()`，
+//! 由宿主按本线程作用域栈判定（与 `set_config` 的越权判定同一份映射），所以是
+//! 权威来源、插件伪造不了。`register` 的返回与 `list` 数组里都带 `plugin` 字段。
+//!
 //! 这是插件之间「直接调用彼此能力」的标准桥（`provide_service_shared` +
 //! `call_service`，见 `fuyubot-abi` 的 `ServiceVTable`）：help 插件把命令注册表
-//! 暴露成一个服务，别的插件按名字调它的 `register` 方法，当场拿到 `{"ok":true}`。
+//! 暴露成一个服务，别的插件按名字调它的 `register` 方法，当场拿到
+//! `{"ok":true,"plugin":"…"}`。
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -21,32 +26,51 @@ use fuyubot_simplify::{
 };
 use serde_json::{Value, json};
 
-/// 动态命令注册表：名字 → 说明。`/help` 渲染时和静态基线合并去重后展示。
+/// 动态命令注册表。`/help` 渲染时和静态基线合并去重后展示。
 ///
 /// 它藏在 help 插件自己的动态库里（其它插件看不见这个符号），只通过下面的共享服务暴露出去。
-static REGISTRY: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+static REGISTRY: OnceLock<Mutex<Vec<CommandEntry>>> = OnceLock::new();
 
-fn registry() -> &'static Mutex<Vec<(String, String)>> {
+/// 注册表里的一条：命令名、说明，以及**登记它的插件名**。
+///
+/// `plugin` 是宿主判定的（[`caller`]），`None` 表示宿主自己 / 名字还没登记——
+/// 不是「插件自报为空」，两者都不该在 `/help` 里编造归属。
+struct CommandEntry {
+    name: String,
+    description: String,
+    plugin: Option<String>,
+}
+
+fn registry() -> &'static Mutex<Vec<CommandEntry>> {
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// 把一条命令塞进注册表（按名字去重：已存在就更新说明）。
-fn register_command(name: &str, description: &str) {
+/// 把一条命令塞进注册表（按名字去重：已存在就更新说明与归属）。
+fn register_command(name: &str, description: &str, plugin: Option<&str>) {
     if name.is_empty() {
         return;
     }
     let mut guard = registry().lock().expect("help 注册表被毒化");
-    match guard.iter_mut().find(|(n, _)| n == name) {
-        Some(entry) => entry.1 = description.to_owned(),
-        None => guard.push((name.to_owned(), description.to_owned())),
+    match guard.iter_mut().find(|entry| entry.name == name) {
+        Some(entry) => {
+            entry.description = description.to_owned();
+            entry.plugin = plugin.map(str::to_owned);
+        }
+        None => guard.push(CommandEntry {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            plugin: plugin.map(str::to_owned),
+        }),
     }
 }
 
 /// 进程级共享服务名：其它插件经它把自己的命令登记进 `/help`。
 const SERVICE_NAME: &str = "fuyubot.help.commands";
 
-/// 静态兜底的命令（内置三件套）。动态注册表里不该再出现这些名字，
-/// 但 `collect_commands` 会按名字去重，所以重复也无害。
+/// 静态兜底的命令（内置三件套），只在对应插件**没有**动态登记时补位。
+///
+/// 基线里没有来源（`plugin`），所以渲染时不标归属——这是「不知道就别编」，
+/// 而不是替 start / manage 声明它们。
 const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("start", "开始使用"),
     ("help", "这条帮助"),
@@ -73,11 +97,27 @@ fn reply(text: &str) -> *const c_char {
     })
 }
 
+/// 问宿主「现在是谁在调我」：`context` 是 `build_service` 存进去的那份 `HostApi`。
+///
+/// 返回的是**权威**来源（宿主按本线程作用域栈判定），不是入参里自报的字段。
+/// context 为空（老宿主 / 直接调用）时返回 `None`，`/help` 就不标归属。
+fn caller(context: *mut c_void) -> Option<String> {
+    if context.is_null() {
+        return None;
+    }
+    // SAFETY: `build_service` 把 `vtable.context` 指向 `HelpService` 自持的
+    // `Box<HostApi>`，只要 `HelpService` 活着就一直有效（宿主回滚注册先于它被放下）。
+    let host = unsafe { &*(context as *const HostApi) };
+    host.current_plugin()
+}
+
 /// 服务方法 `register`：入参 `{"name": "...", "description": "..."}`。
 ///
-/// 其它插件在自己的 `start()` 里调它登记命令；成功回 `{"ok":true}`，入参非法回 `{"error":"…"}`。
+/// 其它插件在自己的 `start()` 里调它登记命令；成功回
+/// `{"ok":true,"plugin":"登记者插件名"}`（宿主问不到身份时 `plugin` 是 `null`），
+/// 入参非法回 `{"error":"…"}`。
 unsafe extern "C" fn svc_register(
-    _context: *mut c_void,
+    context: *mut c_void,
     input_json: *const c_char,
 ) -> *const c_char {
     let input = match unsafe { CStr::from_ptr(input_json) }.to_str() {
@@ -97,32 +137,52 @@ unsafe extern "C" fn svc_register(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    register_command(name, &description);
-    reply(r#"{"ok":true}"#)
+    // 归属由宿主判，不看入参——插件没法伪造成别人。
+    let plugin = caller(context);
+    register_command(name, &description, plugin.as_deref());
+    let body = match &plugin {
+        Some(plugin) => json!({ "ok": true, "plugin": plugin }),
+        None => json!({ "ok": true, "plugin": Value::Null }),
+    };
+    reply(&body.to_string())
 }
 
-/// 服务方法 `list`：回 `[{"name":"…","description":"…"}, …]`（静态 + 动态合并去重）。
+/// 服务方法 `list`：回 `[{"name":"…","description":"…","plugin":"…"}, …]`。
+///
+/// 动态登记优先（带宿主判定的 `plugin`），静态基线只补缺（无 `plugin` 字段）。
 unsafe extern "C" fn svc_list(_context: *mut c_void, _input_json: *const c_char) -> *const c_char {
     let commands = collect_commands();
     let body = serde_json::to_string(&commands).unwrap_or_else(|_| "[]".to_owned());
     reply(&body)
 }
 
-/// 合并静态基线与动态注册表，按名字去重，静态优先、各自保持原顺序。
+/// 合并静态基线与动态注册表，按名字去重，**动态优先**、各自保持原顺序。
+///
+/// 动态优先的理由是来源：动态项带宿主判定的 `plugin`，比硬编码基线可信；
+/// 基线只补「插件没登记」的缺（比如某个内置插件没装）。
 fn collect_commands() -> Vec<Value> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    let mut push = |name: &str, description: &str| {
-        if seen.insert(name.to_owned()) {
+    {
+        let guard = registry().lock().expect("help 注册表被毒化");
+        for entry in guard.iter() {
+            if !seen.insert(entry.name.clone()) {
+                continue;
+            }
+            let mut value = json!({
+                "name": &entry.name,
+                "description": &entry.description,
+            });
+            if let Some(plugin) = &entry.plugin {
+                value["plugin"] = json!(plugin);
+            }
+            out.push(value);
+        }
+    }
+    for (name, description) in BUILTIN_COMMANDS {
+        if seen.insert((*name).to_owned()) {
             out.push(json!({ "name": name, "description": description }));
         }
-    };
-    for (name, description) in BUILTIN_COMMANDS {
-        push(name, description);
-    }
-    let guard = registry().lock().expect("help 注册表被毒化");
-    for (name, description) in guard.iter() {
-        push(name, description);
     }
     out
 }
@@ -133,6 +193,12 @@ fn collect_commands() -> Vec<Value> {
 /// 都指向同结构体里的 `names` 与 `methods` 缓冲——只要 `HelpService` 活着就有效。
 /// 插件卸载时 `stop()` 把 `Box` 放下，缓冲随之释放（届时宿主已回滚该服务注册）。
 struct HelpService {
+    /// 服务方法回问宿主「谁在调我」用的主机句柄；`vtable.context` 指向它。
+    ///
+    /// 单独 `Box` 一层是为了地址稳定：`HelpService` 本身会在 `Box` 里移动，
+    /// 但内部这个 `Box` 指向的堆地址不随外层移动改变。
+    #[allow(dead_code)]
+    host: Box<HostApi>,
     vtable: ServiceVTable,
     // 下面两个字段从不被代码「读」，但它们的缓冲被 `vtable` 的裸指针引用，
     // 必须随 `HelpService` 一起活着——靠持有而非读取来保持存活，故跳过 dead_code。
@@ -145,12 +211,14 @@ struct HelpService {
 // `ServiceVTable` / `ServiceMethod` 含裸指针，Rust 默认判为 `!Send + !Sync`。
 // 但这里它只是「指针 + 进程级只读数据（CString 缓冲、函数代码）」的打包，
 // 在进程内任意线程间移动 / 共享都安全——宿主经函数指针调 `svc_register` / `svc_list`，
-// 这两个函数只碰 `Mutex` 保护的 `REGISTRY`。手动标注。
+// 这两个函数只碰 `Mutex` 保护的 `REGISTRY` 与宿主的线程局部身份。手动标注。
 unsafe impl Send for HelpService {}
 unsafe impl Sync for HelpService {}
 
 /// 构造并自持有 `fuyubot.help.commands` 的服务表。
-fn build_service() -> Box<HelpService> {
+///
+/// `host` 存进 `context`：服务方法被调用时用它回问「当前调用者是谁」。
+fn build_service(host: HostApi) -> Box<HelpService> {
     let name_service = CString::new(SERVICE_NAME).expect("服务名不该含 NUL");
     let name_register = CString::new("register").expect("方法名不该含 NUL");
     let name_list = CString::new("list").expect("方法名不该含 NUL");
@@ -166,15 +234,18 @@ fn build_service() -> Box<HelpService> {
             func: Some(svc_list),
         },
     ];
+    // 先装箱再取地址：`Box<HostApi>` 的堆地址不会因为外层 `HelpService` 搬家而变。
+    let host = Box::new(host);
     let vtable = ServiceVTable {
         name: names[0].as_ptr(),
         version: 1,
         size: core::mem::size_of::<ServiceVTable>() as u32,
-        context: core::ptr::null_mut(),
+        context: (&*host as *const HostApi).cast_mut().cast::<c_void>(),
         methods: methods.as_ptr(),
         method_count: methods.len(),
     };
     Box::new(HelpService {
+        host,
         vtable,
         methods,
         names,
@@ -204,7 +275,8 @@ impl Plugin for HelpPlugin {
         let host = self.host;
 
         // 1) 把命令注册表暴露成进程级共享服务，让其它插件能 `call_service` 进来。
-        let service = build_service();
+        //    服务表带着 `host`：方法被调用时要回问宿主「谁在登记」。
+        let service = build_service(host);
         let handle = host.provide_service_shared(SERVICE_NAME, &service.vtable);
         if !handle.is_valid() {
             host.log(
@@ -214,10 +286,9 @@ impl Plugin for HelpPlugin {
         }
         self.service = Some(service);
 
-        // 2) 先把三个内置命令塞进注册表（避免「/help 不显示自己」这种自举真空）。
-        for (name, description) in BUILTIN_COMMANDS {
-            register_command(name, description);
-        }
+        // 2) 登记 /help 自己（其它命令由各插件经上面的服务登记）。来源写死自己：
+        //    这条不走服务调用，问不到「调用者」，但 help 确实就是它的提供方。
+        register_command("help", "这条帮助", Some("fuyubot.help"));
 
         // 3) 订阅 /help。
         let sending = Arc::clone(&self.sending);
@@ -268,9 +339,27 @@ fn help_text() -> String {
             .get("description")
             .and_then(Value::as_str)
             .unwrap_or("");
-        text.push_str(&format!("/{name} — {description}\n"));
+        match command.get("plugin").and_then(Value::as_str) {
+            // 归属显示短名（`fuyubot.start` → `start`），完整名留在 `list` 里给机器读。
+            Some(plugin) => {
+                let short = plugin.rsplit('.').next().unwrap_or(plugin);
+                text.push_str(&format!("/{name} — {description}（来自 {short}）\n"));
+            }
+            None => text.push_str(&format!("/{name} — {description}\n")),
+        }
     }
     text
 }
 
 define_plugin!(HelpPlugin, "fuyubot.help");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 没有 context（老宿主 / 宿主自己直接调）时，不去编造归属。
+    #[test]
+    fn caller_without_context_is_none() {
+        assert!(caller(core::ptr::null_mut()).is_none());
+    }
+}

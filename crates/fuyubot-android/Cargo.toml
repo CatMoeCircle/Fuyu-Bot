@@ -23,6 +23,8 @@ fuyubot-tdlib.workspace = true
 jni.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# 只用来把 `<root>/fuyubot.toml` 里的 `[plugin.*]` 段读回配置树（`set_config` 的落盘格式）。
+toml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

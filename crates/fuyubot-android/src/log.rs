@@ -48,8 +48,18 @@ pub fn redirect_stderr(path: &Path) {
 }
 
 /// 装全局订阅者。重复调用（测试、或者宿主自己已经装过）只保留第一个。
+///
+/// ⚠️ **必须放到 TRACE**：`tracing_subscriber::fmt()` 的默认上限是 `INFO`
+/// （`Subscriber::DEFAULT_MAX_LEVEL`），不放开的话 `log_level = "debug" / "trace"`
+/// 在插件侧被 `HostRuntime::set_log_verbosity` 放行了，却会在订阅者这层被丢掉，
+/// `fuyubot.log` 里永远看不到 DEBUG / TRACE。CLI 的 `logging::init` 同样不挂级别过滤
+/// （那边写明了「级别是 HostRuntime 的事」），这里对齐。
+///
+/// 噪音不用担心：宿主的 `trace` 事件只有 `--trace-updates` 打开时才有，Android 不开；
+/// 插件日志仍由运行时的门槛在**源头**挡。
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
         .with_ansi(false)
         .with_writer(std::io::stderr)
         .try_init();
