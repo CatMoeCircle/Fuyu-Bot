@@ -131,14 +131,26 @@ app = Path(sys.argv[1])
 version = sys.argv[2]
 
 # versionName 给用户看；versionCode 是 Android 比大小的整数。
-# 只有 `v1.2.3` 这种**以数字开头**的才算语义版本，拆成 major*10000+minor*100+patch；
+# 只有 `v1.2.3` / `v1.2.3-rc.1` 这种**以数字开头**的才算语义版本：
+#   - versionName 保留完整 tag（含 `-rc.1`，用户要看得见是候选版）；
+#   - versionCode 用 `(major*10000 + minor*100 + patch)*100 + 序数`：候选版取 rc 序号
+#     （rc.1 → +1，rc.2 → +2…），正式版固定 +99，所以正式版一定大于同版本的所有 rc，
+#     下一个 patch 的 rc 也一定大于上一个 patch 的正式版（+100）。
 # `dev-abc1234` 这类手动构建退回 1——反正 publish 只认 tag，这种包不会进 Release，
 # 而把 sha 里的数字当版本号会让 versionCode 变成一个毫无意义的巨大整数。
 name = version[1:] if version[:1] in ("v", "V") else version
-if re.match(r"\d+(\.\d+)*", name):
-    parts = [int(part) for part in name.split(".")[:3]]
+core, dash, pre = name.partition("-")
+if re.fullmatch(r"\d+(\.\d+)*", core):
+    parts = [int(part) for part in core.split(".")[:3]]
     parts += [0] * (3 - len(parts))
-    code = max(parts[0] * 10000 + parts[1] * 100 + parts[2], 1)
+    base = parts[0] * 10000 + parts[1] * 100 + parts[2]
+    if dash:
+        # prerelease 的序数：`rc.1` → 1，`beta2` → 2；没有数字就当第 1 个。
+        match = re.search(r"\d+", pre)
+        ordinal = int(match.group()) if match else 1
+        code = max(base * 100 + min(ordinal, 98), 1)
+    else:
+        code = max(base * 100 + 99, 1)
 else:
     code = 1
 
