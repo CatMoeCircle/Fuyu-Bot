@@ -25,11 +25,22 @@
   `{"ok":true,"plugin":"fuyubot.start"}`；问不到身份时 `plugin` 是 `null`。
   插件没法把自己冒充成别人。
 - `list` 方法返回合并后的命令 JSON 数组
-  （`[{"name":…,"description":…,"plugin":"…"}, …]`），即 `/help` 实际渲染的内容；
-  `/help` 文本会在说明后面标「（来自 start）」这样的短名。
+  （`[{"name":…,"description":…,"plugin":"…"}, …]`），**扁平**——这是给程序读的协议；
+  给 `list` 加分组会破坏调用方，所以分组只发生在 `/help` 的正文里。
+- `/help` 正文**按归属插件分组**：一个插件一段，组标题优先用宿主报告里的展示名
+  （`plugin_manifest` / `plugin.json` 的 `display_name`），缺了退回短名：
+  ```
+  *可用命令*
+
+  *帮助（help）*
+  /help — 这条帮助
+
+  *插件管理（manage）*
+  /plugins — 列出已安装和已禁用的插件
+  ```
 - 静态兜底 `BUILTIN_COMMANDS` 只兜住三个内置命令（`/start`、`/help`、`/plugins`），
   其余命令由各插件自行为自己注册；渲染时**动态优先**、静态只补缺（基线没有来源，
-  所以补位的那条不标归属）。
+  所以补位的那条收在最后的「其它」段，不去编造归属）。
 - 产物随可执行文件一起打包，`fuyubot init` / `run` 会把它复制进项目的 `plugins/`。
 
 ## 相关

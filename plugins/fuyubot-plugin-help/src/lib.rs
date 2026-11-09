@@ -9,12 +9,17 @@
 //! 由宿主按本线程作用域栈判定（与 `set_config` 的越权判定同一份映射），所以是
 //! 权威来源、插件伪造不了。`register` 的返回与 `list` 数组里都带 `plugin` 字段。
 //!
+//! **`/help` 的正文按插件分组**：一个插件一段，组标题用宿主报告里的展示名
+//! （`display_name`，缺了退回短名）。`list` 仍是**扁平数组**——它是给程序读的
+//! 协议，分组只发生在给人看的那一侧。
+//!
 //! 这是插件之间「直接调用彼此能力」的标准桥（`provide_service_shared` +
 //! `call_service`，见 `fuyubot-abi` 的 `ServiceVTable`）：help 插件把命令注册表
 //! 暴露成一个服务，别的插件按名字调它的 `register` 方法，当场拿到
 //! `{"ok":true,"plugin":"…"}`。
 
 use std::cell::RefCell;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -158,8 +163,8 @@ unsafe extern "C" fn svc_list(_context: *mut c_void, _input_json: *const c_char)
 ///
 /// 动态优先的理由是来源：动态项带宿主判定的 `plugin`，比硬编码基线可信；
 /// 基线只补「插件没登记」的缺（比如某个内置插件没装）。
-fn collect_commands() -> Vec<Value> {
-    let mut seen = std::collections::HashSet::new();
+fn collect_entries() -> Vec<CommandEntry> {
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     {
         let guard = registry().lock().expect("help 注册表被毒化");
@@ -167,22 +172,40 @@ fn collect_commands() -> Vec<Value> {
             if !seen.insert(entry.name.clone()) {
                 continue;
             }
-            let mut value = json!({
-                "name": &entry.name,
-                "description": &entry.description,
+            out.push(CommandEntry {
+                name: entry.name.clone(),
+                description: entry.description.clone(),
+                plugin: entry.plugin.clone(),
             });
-            if let Some(plugin) = &entry.plugin {
-                value["plugin"] = json!(plugin);
-            }
-            out.push(value);
         }
     }
     for (name, description) in BUILTIN_COMMANDS {
         if seen.insert((*name).to_owned()) {
-            out.push(json!({ "name": name, "description": description }));
+            out.push(CommandEntry {
+                name: (*name).to_owned(),
+                description: (*description).to_owned(),
+                plugin: None,
+            });
         }
     }
     out
+}
+
+/// `list` 服务方法要的 JSON 数组（与 `/help` 渲染共用同一份 `collect_entries`）。
+fn collect_commands() -> Vec<Value> {
+    collect_entries().iter().map(entry_json).collect()
+}
+
+/// 一条命令的 JSON 形状：`plugin` 只有宿主问得到身份时才写（缺字段 ≠ 空串）。
+fn entry_json(entry: &CommandEntry) -> Value {
+    let mut value = json!({
+        "name": &entry.name,
+        "description": &entry.description,
+    });
+    if let Some(plugin) = &entry.plugin {
+        value["plugin"] = json!(plugin);
+    }
+    value
 }
 
 /// 把 `ServiceVTable` 与其指向的名字 / 方法数组打包在一起，保证后者活得一样久。
@@ -295,7 +318,7 @@ impl Plugin for HelpPlugin {
                 return;
             }
             let params = SendMessageParams {
-                text: Some(Text::markdown(help_text())),
+                text: Some(Text::markdown(help_text(host))),
                 ..SendMessageParams::default()
             };
             // 命令回调跑在接收循环线程上：用 then（reply 会阻塞等 TDLib）。
@@ -337,24 +360,87 @@ impl Plugin for HelpPlugin {
 }
 
 /// 帮助文本（Markdown：命令用 `/x`，粗体是 `*x*`）。
-fn help_text() -> String {
-    let mut text = String::from("*可用命令*\n");
-    for command in collect_commands() {
-        let name = command.get("name").and_then(Value::as_str).unwrap_or("?");
-        let description = command
-            .get("description")
+///
+/// **按归属插件分组**：一个插件一段，组标题优先用宿主报告里的展示名
+/// （`plugin_manifest` 的 `display_name`），缺了退回短名。没有归属的静态基线
+/// 收在最后的「其它」里——不是「内置插件」，只是「不知道是谁登记的」。
+fn help_text(host: HostApi) -> String {
+    render_help(&collect_entries(), &plugin_display_names(host))
+}
+
+/// 问宿主「插件名 → 展示名」。读不到（老宿主 / 没装插件目录）就空表，渲染退回短名。
+///
+/// 只读宿主报告，**不 dlopen**：名字只是用来排版，不值得为它加载任何东西。
+fn plugin_display_names(host: HostApi) -> BTreeMap<String, String> {
+    let mut names = BTreeMap::new();
+    let Ok(report) = serde_json::from_str::<Value>(&host.list_plugins()) else {
+        return names;
+    };
+    let Some(plugins) = report.get("plugins").and_then(Value::as_array) else {
+        return names;
+    };
+    for plugin in plugins {
+        let Some(name) = plugin.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let display = plugin
+            .get("display_name")
             .and_then(Value::as_str)
-            .unwrap_or("");
-        match command.get("plugin").and_then(Value::as_str) {
-            // 归属显示短名（`fuyubot.start` → `start`），完整名留在 `list` 里给机器读。
-            Some(plugin) => {
-                let short = plugin.rsplit('.').next().unwrap_or(plugin);
-                text.push_str(&format!("/{name} — {description}（来自 {short}）\n"));
-            }
-            None => text.push_str(&format!("/{name} — {description}\n")),
+            .unwrap_or("")
+            .trim();
+        if !display.is_empty() {
+            names.insert(name.to_owned(), display.to_owned());
+        }
+    }
+    names
+}
+
+/// 把条目按插件分组渲染。组按插件名排序（稳定输出），「其它」永远在最后。
+fn render_help(entries: &[CommandEntry], display_names: &BTreeMap<String, String>) -> String {
+    let mut groups: BTreeMap<&str, Vec<&CommandEntry>> = BTreeMap::new();
+    let mut unknown = Vec::new();
+    for entry in entries {
+        match entry.plugin.as_deref() {
+            Some(plugin) => groups.entry(plugin).or_default().push(entry),
+            None => unknown.push(entry),
+        }
+    }
+
+    let mut text = String::from("*可用命令*\n");
+    for (plugin, commands) in groups {
+        text.push('\n');
+        text.push_str(&format!("*{}*\n", group_title(plugin, display_names)));
+        for command in commands {
+            push_command(&mut text, command);
+        }
+    }
+    if !unknown.is_empty() {
+        text.push_str("\n*其它*\n");
+        for command in unknown {
+            push_command(&mut text, command);
         }
     }
     text
+}
+
+/// 一行的格式：`/name — 说明`；没有说明就只写 `/name`（不留悬空的破折号）。
+fn push_command(text: &mut String, command: &CommandEntry) {
+    if command.description.is_empty() {
+        text.push_str(&format!("/{}\n", command.name));
+    } else {
+        text.push_str(&format!("/{} — {}\n", command.name, command.description));
+    }
+}
+
+/// 组标题：展示名 + 短名（`启动问候（start）`）；没有展示名就只写短名。
+///
+/// 展示名与短名相同时不重复写两遍。
+fn group_title(plugin: &str, display_names: &BTreeMap<String, String>) -> String {
+    let short = plugin.rsplit('.').next().unwrap_or(plugin);
+    match display_names.get(plugin) {
+        Some(display) if display.as_str() != short => format!("{display}（{short}）"),
+        _ => short.to_owned(),
+    }
 }
 
 define_plugin!(HelpPlugin, "fuyubot.help");
@@ -367,5 +453,50 @@ mod tests {
     #[test]
     fn caller_without_context_is_none() {
         assert!(caller(core::ptr::null_mut()).is_none());
+    }
+
+    fn entry(name: &str, description: &str, plugin: Option<&str>) -> CommandEntry {
+        CommandEntry {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            plugin: plugin.map(str::to_owned),
+        }
+    }
+
+    /// 按插件分组：组按插件名排序，组标题用展示名（带短名），「其它」在最后。
+    #[test]
+    fn render_help_groups_commands_by_plugin() {
+        let entries = vec![
+            entry("start", "开始使用", Some("fuyubot.start")),
+            entry("help", "这条帮助", Some("fuyubot.help")),
+            entry("ping", "探活", None),
+        ];
+        let names = BTreeMap::from([
+            ("fuyubot.help".to_owned(), "帮助".to_owned()),
+            ("fuyubot.start".to_owned(), "启动问候".to_owned()),
+        ]);
+
+        let text = render_help(&entries, &names);
+        assert_eq!(
+            text,
+            "*可用命令*\n\n*帮助（help）*\n/help — 这条帮助\n\n\
+             *启动问候（start）*\n/start — 开始使用\n\n*其它*\n/ping — 探活\n"
+        );
+    }
+
+    /// 没有展示名 / 展示名与短名相同：组标题只写短名，不重复。
+    #[test]
+    fn group_title_falls_back_to_short_name() {
+        let names = BTreeMap::from([("fuyubot.start".to_owned(), "start".to_owned())]);
+        assert_eq!(group_title("fuyubot.start", &names), "start");
+        assert_eq!(group_title("fuyubot.manage", &names), "manage");
+    }
+
+    /// 没有说明的命令不留悬空的破折号。
+    #[test]
+    fn push_command_omits_empty_description() {
+        let mut text = String::new();
+        push_command(&mut text, &entry("ping", "", None));
+        assert_eq!(text, "/ping\n");
     }
 }
