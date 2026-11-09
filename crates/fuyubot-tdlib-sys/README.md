@@ -16,7 +16,7 @@ TDLib 的类型与 FFI 绑定（发布于 [crates.io](https://crates.io/crates/f
 `build.rs` 在编译期需要它，按这个顺序找：
 
 1. `TDLIB_TD_API_TL` —— 显式指定（文件或目录，最高优先级）。想用别的 TDLib 版本就设它。
-2. **包内自带的 `vendor/<版本>/td_api.tl`** —— 1.8.69 已随包发布，所以从 crates.io
+2. **包内自带的 `vendor/<版本>/td_api.tl`** —— 1.8.70 已随包发布，所以从 crates.io
    装下来的下游（和 docs.rs）**不需要联网、也不需要先跑一次下载**。
 3. 本地缓存 —— `FUYUBOT_TDLIB_VENDORED_CACHE` → `$CARGO_HOME/fuyubot-tdlib-vendored`
    → 项目本地 `.tdlib-cache/`（`<缓存根>/<版本>/td_api.tl`）。

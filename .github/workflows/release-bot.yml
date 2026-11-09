@@ -65,7 +65,7 @@ env:
   # ⚠️ 必须与 `crates/fuyubot-tdlib/Cargo.toml` 的 `[package.metadata.fuyubot] tdlib-version`
   #    一致（也等于 `build-tdlib.yml` 里填的 tdlib_version）：Release tag 与 `.tdlib-cache`
   #    的目录名都按它拼，填错就是 404 / 找不到缓存。
-  TDLIB_VERSION: '1.8.69'
+  TDLIB_VERSION: '1.8.70'
   CARGO_TERM_COLOR: always
 
 jobs:

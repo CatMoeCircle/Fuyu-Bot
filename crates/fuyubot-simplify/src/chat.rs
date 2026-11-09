@@ -26,7 +26,7 @@ use crate::{Result, Simplify, SimplifyError, Topic};
 
 /// `chatAdministratorRights` 里的一个权限字段。
 ///
-/// 名字就是 TDLib JSON 里的字段名（1.8.69 的全表）：`status.rights.<key>`。
+/// 名字就是 TDLib JSON 里的字段名（1.8.70 的全表）：`status.rights.<key>`。
 /// 传 `None` = 只看「是不是管理员」；传 `Some(某项)` = 还要求那一项为 `true`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdminRight {
