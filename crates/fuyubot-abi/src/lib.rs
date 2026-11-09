@@ -389,8 +389,9 @@ pub struct HostApiVTable {
     >,
     pub cancel_wait: Option<unsafe extern "C" fn(host: *mut c_void, handle: WaitHandle)>,
     pub log: Option<unsafe extern "C" fn(host: *mut c_void, level: u32, message: *const c_char)>,
-    /// 读全局配置。`section` 是配置段名（如 `"fuyubot.manage"`），`key` 是可选的点路径
-    /// （`"a.b"`），空串返回整段。`section` 为空串表示读顶层（`[bot]` / `[telegram]` 等）。
+    /// 读配置。`section` 是插件名（点路径，如 `"fuyubot.manage"`），`key` 是可选的点路径
+    /// （`"a.b"`），空串返回整段。**`section` 空串 = 读自己那段**（与 `set_config` 同一个默认）；
+    /// 读别人的段要把插件名写出来。顶层的 `[bot]` / `[telegram]` **不通过插件 API 暴露**。
     ///
     /// 返回宿主线程局部缓冲里的 JSON 字符串（读完即弃），找不到段 / 键时返回 NULL。
     pub get_config: Option<
@@ -1110,7 +1111,8 @@ impl HostApi {
         unsafe { (self.cancel_wait)(self.host_ctx, handle) };
     }
 
-    /// 读全局配置的一个段 / 键。`section` 空串 = 读顶层；`key` 空串 = 整段。
+    /// 读配置的一个段 / 键。`section` 空串 = **读自己那段**（与 `set_config` 同一个默认），
+    /// 给了插件名就读别人的段；`key` 空串 = 整段。顶层 `[bot]` / `[telegram]` 对插件不可见。
     ///
     /// 返回宿主线程局部缓冲里的 JSON，读完即弃；段 / 键不存在或宿主没装配置时是 `None`。
     pub fn get_config(&self, section: &str, key: &str) -> Option<String> {

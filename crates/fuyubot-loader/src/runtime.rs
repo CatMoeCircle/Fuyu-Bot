@@ -822,11 +822,7 @@ impl HostRuntime {
             Some(_) => return Err("目标插件名不能为空".to_owned()),
             // 没给目标：写执行者那段。名字没登记（宿主自己 / 还没走完 init）就不能写。
             None => self
-                .owner_names
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&executor)
-                .cloned()
+                .executor_name()
                 .ok_or_else(|| "当前执行者没有登记的插件名，不能写配置".to_owned())?,
         };
 
@@ -1369,6 +1365,19 @@ impl HostRuntime {
         }
         EXECUTOR_STACK.with(|stack| stack.borrow_mut().push(owner));
         Some(ExecutorGuard)
+    }
+
+    /// 当前执行者的插件名（没登记就是 `None`：宿主自己 / `init` 极早期）。
+    ///
+    /// 读配置的「空 section = 自己」与写配置的「写谁的段」共用这一处判定，
+    /// 两边不会各算一套。
+    fn executor_name(&self) -> Option<String> {
+        let owner = self.current_executor();
+        self.owner_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&owner)
+            .cloned()
     }
 
     /// 记下/清掉「上一次调用为什么失败」（本线程）。
@@ -3097,6 +3106,11 @@ unsafe extern "C" fn api_cancel_wait(host: *mut c_void, handle: WaitHandle) {
     }
 }
 
+/// 读配置：`section` 空 = **自己**那段（与 `set_config` 同一个默认），
+/// 非空 = 那个插件名（点路径，`fuyubot.manage` → `plugin.fuyubot.manage`）。
+///
+/// 顶层（`[bot]` / `[telegram]`）**不通过插件 API 暴露**：插件要的永远是插件自己的段，
+/// 读宿主凭据既不必要也不安全。宿主内部仍可直接 `read_config("")`。
 unsafe extern "C" fn api_get_config(
     host: *mut c_void,
     section: *const c_char,
@@ -3106,10 +3120,20 @@ unsafe extern "C" fn api_get_config(
     let Some(rt) = (unsafe { runtime(host) }) else {
         return core::ptr::null();
     };
-    // SAFETY: 同上；NULL 当空串（读顶层）。
+    // SAFETY: 同上；NULL 当空串（= 自己）。
     let section = unsafe { cstr(section) }.unwrap_or("");
     let key = unsafe { cstr(key) }.unwrap_or("");
-    match rt.read_config(section, key) {
+    // 空 section = 读自己：名字由宿主判定，插件没法借这个默认值读别人的段。
+    let section = if section.is_empty() {
+        match rt.executor_name() {
+            Some(name) => name,
+            // 宿主自己调、或名字还没登记：没有「自己」可指，按「找不到」处理。
+            None => return core::ptr::null(),
+        }
+    } else {
+        section.to_owned()
+    };
+    match rt.read_config(&section, key) {
         Some(value) => host_string(&value.to_string()),
         None => core::ptr::null(),
     }
@@ -3600,9 +3624,12 @@ mod tests {
         // SAFETY: rt 活着。
         let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
 
-        // 读顶层。
-        assert_eq!(api.get_config("", "bot.name").unwrap(), "\"demo\"");
-        // 读别人的段。
+        // 空 section = 自己：宿主没有「自己」那段，所以读不到（顶层不再对插件暴露）。
+        assert!(
+            api.get_config("", "bot.name").is_none(),
+            "插件 API 不暴露 [bot] / [telegram] 这类顶层配置"
+        );
+        // 读别人的段：显式给插件名。
         let whole = api.get_config("other.bot", "").unwrap();
         assert!(whole.contains("secret"), "{whole}");
         // 不存在的段 / 键返回 None。
@@ -3618,6 +3645,9 @@ mod tests {
             assert_eq!(api.get_config("a.bot", "greeting").unwrap(), "\"hi\"");
             assert_eq!(api.set_config("nested.k", "2").unwrap(), ());
             assert_eq!(api.get_config("a.bot", "nested.k").unwrap(), "2");
+            // 「默认读自己」：空 section 现在指自己那段，与 set_config 的默认一致。
+            assert_eq!(api.get_config("", "greeting").unwrap(), "\"hi\"");
+            assert_eq!(api.get_config("", "nested.k").unwrap(), "2");
 
             // 用户钉住的键：拒绝，不写。
             assert!(
