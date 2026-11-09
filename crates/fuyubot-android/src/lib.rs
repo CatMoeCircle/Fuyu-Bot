@@ -213,6 +213,38 @@ pub unsafe extern "C" fn fuyubot_start(options_json: *const c_char) -> c_int {
     }
 }
 
+/// 建 / 改 `<root>/fuyubot.toml`（与 CLI 的 `fuyubot init` 同一份模板与 schema）。
+///
+/// 不要求运行时在跑，也不影响正在跑的实例；`start` 之前先调它一次即可。
+///
+/// # Safety
+/// `json` 必须是 NUL 结尾的 UTF-8 C 字符串（空指针 → 返回 [`ARG`]）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fuyubot_config_init(json: *const c_char) -> c_int {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if json.is_null() {
+            state::set_last_error("config_init 的 json 是空指针");
+            return ARG;
+        }
+        // SAFETY: 调用方保证指针是 NUL 结尾的 C 字符串；只在本次调用里用。
+        let text = unsafe { CStr::from_ptr(json) };
+        match text.to_str() {
+            Ok(text) => config_init_with_json(text),
+            Err(_) => {
+                state::set_last_error("config_init 的 json 不是合法 UTF-8");
+                ARG
+            }
+        }
+    }));
+    match outcome {
+        Ok(code) => code,
+        Err(_) => {
+            state::fail("fuyubot_config_init 里 panic（已兜住）");
+            PANIC
+        }
+    }
+}
+
 /// 优雅停车，最多等 8 秒。没在跑 = 直接 [`OK`]（幂等）。
 #[unsafe(no_mangle)]
 pub extern "C" fn fuyubot_stop() -> c_int {
@@ -415,12 +447,15 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut c_void) -> jint {
     JNI_VERSION_1_6
 }
 
-/// 十二个 native 方法的「名字 + 签名 + 函数指针」。
+/// 十三个 native 方法的「名字 + 签名 + 函数指针」。
 ///
 /// `nativeRegister` 的参数是 `Ljava/lang/Object;`：回调只按**方法名 + 签名**调
 /// （`onState` / `onAsk` / `onQr` / `onPlugins`），不认具体接口——所以 `Callback` 可以放在 APK
 /// 自己的包里，Kotlin 侧把参数声明成 `Any` 即可（契约见头文件）。
-fn jni_methods() -> [jni::NativeMethod; 12] {
+///
+/// `nativeInitConfig` 是**尾部追加的可选方法**：旧 Java 类里没有它，逐个注册只让这一个
+/// 绑不上（见 [`register_natives`]），其余照常；那种情况下壳自己写 `fuyubot.toml` 也一样。
+fn jni_methods() -> [jni::NativeMethod; 13] {
     [
         jni::NativeMethod {
             name: "nativeVersion".into(),
@@ -431,6 +466,11 @@ fn jni_methods() -> [jni::NativeMethod; 12] {
             name: "nativeRegister".into(),
             sig: "(Ljava/lang/Object;)I".into(),
             fn_ptr: native_register as *const () as *mut c_void,
+        },
+        jni::NativeMethod {
+            name: "nativeInitConfig".into(),
+            sig: "(Ljava/lang/String;)I".into(),
+            fn_ptr: native_init_config as *const () as *mut c_void,
         },
         jni::NativeMethod {
             name: "nativeStart".into(),
@@ -561,6 +601,28 @@ extern "system" fn native_start(
         Ok(code) => code,
         Err(_) => {
             state::fail("nativeStart 里 panic（已兜住）");
+            PANIC
+        }
+    }
+}
+
+/// 建 / 改 `fuyubot.toml`。**不要求运行时在跑**；`start` 之前先调它。
+extern "system" fn native_init_config(
+    mut env: JNIEnv<'_>,
+    _this: JObject<'_>,
+    options: JString<'_>,
+) -> jint {
+    let outcome = catch_unwind(AssertUnwindSafe(|| match read_string(&mut env, options) {
+        Ok(json) => config_init_with_json(&json),
+        Err(error) => {
+            state::set_last_error(&format!("config_init {error}"));
+            ARG
+        }
+    }));
+    match outcome {
+        Ok(code) => code,
+        Err(_) => {
+            state::fail("nativeInitConfig 里 panic（已兜住）");
             PANIC
         }
     }
@@ -753,6 +815,96 @@ extern "system" fn native_last_error(mut env: JNIEnv<'_>, _this: JObject<'_>) ->
     new_java_string(&mut env, &text)
 }
 
+/// `config_init` 的入参（`fuyubot_config_init` / `nativeInitConfig` 共用）。
+#[derive(serde::Deserialize)]
+struct ConfigInit {
+    /// 项目根（必填、绝对路径）：配置写到 `<root>/fuyubot.toml`。
+    root: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    api_id: Option<i64>,
+    #[serde(default)]
+    api_hash: Option<String>,
+    #[serde(default)]
+    account_type: Option<String>,
+    #[serde(default)]
+    data_dir: Option<String>,
+    #[serde(default)]
+    plugin_dir: Option<String>,
+    #[serde(default)]
+    log_level: Option<String>,
+    #[serde(default)]
+    tdlib_log_verbosity: Option<i32>,
+    #[serde(default)]
+    tdlib_path: Option<String>,
+    /// `true` = 整份重写模板（会丢注释与 `[plugin.*]` 段）。
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// 建 / 改 `<root>/fuyubot.toml`。**不需要先 start**，也不碰正在跑的实例。
+///
+/// 文件不存在 → 按模板渲染；已存在 → 文本级只改给了的键（保留注释与其它段）。
+/// 参数错走 [`ARG`]，写盘失败走 [`INTERNAL`]，细节都在 `last_error`。
+fn config_init_with_json(json: &str) -> c_int {
+    let request: ConfigInit = match serde_json::from_str(json) {
+        Ok(request) => request,
+        Err(error) => {
+            state::set_last_error(&format!("config_init JSON 解析失败：{error}"));
+            return ARG;
+        }
+    };
+    let root = std::path::Path::new(&request.root);
+    if !root.is_absolute() {
+        state::set_last_error(&format!(
+            "config_init 的 root 必须是绝对路径（Android 上 cwd 是 `/`），收到 {:?}",
+            request.root
+        ));
+        return ARG;
+    }
+    // 先自己验一遍：写盘失败是 INTERNAL，值写错是 ARG——壳据此决定「弹回来重填」还是「报错」。
+    if let Some(raw) = request.log_level.as_deref() {
+        if let Err(error) = fuyubot_app::config::parse_log_level(raw) {
+            state::set_last_error(&error);
+            return ARG;
+        }
+    }
+    if let Some(raw) = request.account_type.as_deref() {
+        let probe = fuyubot_app::config::Telegram {
+            account_type: Some(raw.to_owned()),
+            ..Default::default()
+        };
+        if let Err(error) = probe.account_type() {
+            state::set_last_error(&error);
+            return ARG;
+        }
+    }
+
+    let init = fuyubot_app::config::InitRequest {
+        name: request.name,
+        api_id: request.api_id,
+        api_hash: request.api_hash,
+        account_type: request.account_type,
+        data_dir: request.data_dir,
+        plugin_dir: request.plugin_dir,
+        log_level: request.log_level,
+        tdlib_log_verbosity: request.tdlib_log_verbosity,
+        tdlib_path: request.tdlib_path,
+        overwrite: request.overwrite,
+    };
+    match fuyubot_app::config::init_config(root, &init) {
+        Ok(path) => {
+            tracing::info!(target: "fuyubot::jni", "配置文件已写好：{}", path.display());
+            OK
+        }
+        Err(error) => {
+            state::set_last_error(&error);
+            INTERNAL
+        }
+    }
+}
+
 fn start_with_json(json: &str) -> c_int {
     // 幂等：已经在跑就说忙，别起第二个线程去抢同一个 TDLib 数据库。
     if state::running() {
@@ -761,6 +913,18 @@ fn start_with_json(json: &str) -> c_int {
 
     let options = match Options::parse(json) {
         Ok(options) => options,
+        Err(error) => {
+            state::set_last_error(&error);
+            return ARG;
+        }
+    };
+
+    // 读 `<root>/fuyubot.toml` + 套覆盖 + 取凭据，**赶在起线程之前**做：
+    // 缺文件 / 缺 api_id / 缺 api_hash 是首启最常见的三种错，要作为参数错误直接返回，
+    // 而不是起完线程、再由 `onState(FAILED)` 说一句笼统的「启动失败」。
+    let host: std::sync::Arc<dyn fuyubot_app::AppHost> = std::sync::Arc::new(crate::host::JniHost);
+    let app_options = match options.app_options(host) {
+        Ok(app_options) => app_options,
         Err(error) => {
             state::set_last_error(&error);
             return ARG;
@@ -800,7 +964,7 @@ fn start_with_json(json: &str) -> c_int {
                         // 先登记自己：Java 在 onAsk / onState 回调里同步调 `nativeTdRequest`
                         // 时，得能认出「这是工作线程，等下去等于自己等自己」。
                         state::set_worker_thread(Some(std::thread::current().id()));
-                        match run::run(&options) {
+                        match run::run(&options, app_options) {
                             // `App::shutdown` 已经发过 `onState(STOPPED)`，这里不再重复。
                             Ok(()) => {}
                             Err(error) => state::fail(&error),
@@ -948,7 +1112,7 @@ fn stop_runtime() -> c_int {
 mod tests {
     use super::*;
 
-    /// 绑定表必须与头文件 / 文档里的**十二个**方法一一对应：名字或签名写错，
+    /// 绑定表必须与头文件 / 文档里的**十三个**方法一一对应：名字或签名写错，
     /// `RegisterNatives` 在真机上才会失败（本机没有 JVM，只能静态对齐）。
     #[test]
     fn jni_method_table_matches_the_documented_contract() {
@@ -968,6 +1132,10 @@ mod tests {
                 (
                     "nativeRegister".to_owned(),
                     "(Ljava/lang/Object;)I".to_owned()
+                ),
+                (
+                    "nativeInitConfig".to_owned(),
+                    "(Ljava/lang/String;)I".to_owned()
                 ),
                 ("nativeStart".to_owned(), "(Ljava/lang/String;)I".to_owned()),
                 ("nativeStop".to_owned(), "()I".to_owned()),
@@ -1074,12 +1242,19 @@ mod tests {
         }
     }
 
-    /// 插件配置的入口与落盘位置也要写在头文件里：APK 作者改 options 时只看得到它，
-    /// 少一个键名就只能猜（`plugin_config` 尤其容易被漏成 `plugins.config`）。
+    /// 配置走 `fuyubot.toml`：入口（C 函数 + Java 方法）、文件位置、`[plugin.*]` 段
+    /// 都要写在头文件里——APK 作者只看得到它。
     #[test]
-    fn the_header_documents_the_plugin_config_contract() {
+    fn the_header_documents_the_config_contract() {
         let header = include_str!("../include/fuyubot_jni.h");
-        for token in ["\"plugin_config\"", "fuyubot.toml", "[plugin.*]"] {
+        for token in [
+            "fuyubot_config_init",
+            "nativeInitConfig",
+            "fuyubot.toml",
+            "[plugin.*]",
+            "[telegram].api_id",
+            "\"overwrite\"",
+        ] {
             assert!(header.contains(token), "头文件缺 {token} 的说明");
         }
     }

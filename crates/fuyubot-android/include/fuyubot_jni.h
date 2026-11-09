@@ -13,7 +13,8 @@
  *      调用本库前有效，不能存、不能跨线程传、不能 free。
  *
  * 线程：`start` / `stop` / `is_running` / `answer` / `plugins` / `plugin_info` /
- * `auth_state` / `connection_state` / `td_request` / `last_error` 可从任意线程调用；
+ * `auth_state` / `connection_state` / `td_request` / `last_error` / `config_init`
+ * 可从任意线程调用；
  * `stop` 最多等 8 秒（内部走优雅收摊），超时返回 FUYUBOT_TIMEOUT。
  * `td_request` **阻塞**到响应回来或超时——从专门的工作线程调，别在 UI 线程上调。
  *
@@ -21,18 +22,29 @@
  *
  *   {
  *     "root":       "/data/user/0/com.example.bot/files",   // 必填、绝对路径、app 私有目录
- *     "plugin_dir": "plugins",                              // 可选，相对 root
- *     "data_dir":   "data",                                 // 可选，相对 root（TDLib 数据库）
- *     "log_level":  "info",                                 // 可选：error/warn/info/debug/trace
- *     "api_id":     12345,                                  // 必填，int32
- *     "api_hash":   "…",                                    // 必填
- *     "bot_token":  "123456:ABC…",                          // 可选；有值就走 bot 登录，不问任何问题
- *     "plugin_config": {                                    // 可选：插件自己的配置段
- *       "fuyubot.manage": { "reply_prefix": "已安装：" }      // 插件名是点分的，等价于 TOML 的
- *     },                                                    //   [plugin.fuyubot.manage]
- *     "lib_dir":    "/data/app/…/lib/arm64",                // 可选；缺省时要求宿主先 loadLibrary("tdjson")
- *     "tdlib_log_verbosity": 1                              // 可选；TDLib 自己的日志详细度（0 起）
+ *     "data_dir":   "data",                                 // 可选：覆盖 [telegram].data_dir
+ *     "plugin_dir": "plugins",                              // 可选：覆盖 [plugins].dir
+ *     "log_level":  "info",                                 // 可选：覆盖 [plugins].log_level
+ *     "bot_token":  "123456:ABC…",                          // 可选；凭据，不落盘（约束 41）
+ *     "lib_dir":    "/data/app/…/lib/arm64"                 // 可选；tdjson 目录，覆盖 [tdlib].path
  *   }
+ *
+ * **配置本身在 `<root>/fuyubot.toml`**（与 CLI 同一份 schema、同一个模板，也同一套解析）：
+ * `[telegram].api_id / api_hash / account_type`、`[command]`、`[tdlib]`、`[plugin.*]`
+ * 全从那里读，不再由壳传。那三个覆盖字段只影响这次运行（不写回文件）。
+ *
+ * 没有 `fuyubot.toml`、或 `[telegram].api_id / api_hash` 没填 → `start` 直接返回
+ * `FUYUBOT_ARG`，`last_error()` 里写明缺哪个。先用 `fuyubot_config_init`
+ * （Java: `nativeInitConfig`）写一份，JSON 形状：
+ *
+ *   {"root": "/data/…/files", "api_id": 12345, "api_hash": "…",
+ *    "account_type": "bot", "data_dir": "data", "plugin_dir": "plugins",
+ *    "log_level": "info", "tdlib_log_verbosity": 1, "tdlib_path": "",
+ *    "overwrite": false}
+ *
+ * 文件不存在 → 按模板渲染一份；已存在 → 只改给了的键（保留注释、顺序、其它段）；
+ * `overwrite = true` 才整份重写（**会丢注释与 `[plugin.*]`**）。字段都可省：
+ * 省了就是「不动那个键」。
  *
  * 日志写到 <root>/logs/fuyubot.log（会自动追加、自动建目录）。
  *
@@ -60,9 +72,12 @@ extern "C" {
  *
  * 1 → 六个生命周期/问答方法 + 插件列表、插件详情、两个 TDLib 状态查询
  *     （`nativeAuthState()` / `nativeConnectionState()`）、TDLib JSON 请求、
- *     本线程最后一次错误，共十二个 native 方法。
+ *     本线程最后一次错误，共十二个 native 方法；
+ *     另有 **`nativeInitConfig`**（v1 内追加的可选方法，写/改 fuyubot.toml）。
+ *     旧 Java 类里没有它只会让这一个绑不上，其余照常（逐个注册）。
  *
- * 本库从未发布过，所以首个版本就是 1：十二个方法是同一个 v1 契约，没有历史 v2。
+ * 本库从未发布过，所以首个版本就是 1：十二个方法 + 一个可选的配置初始化方法，
+ * 都是同一个 v1 契约，没有历史 v2。
  */
 #define FUYUBOT_JNI_ABI 1
 
@@ -75,6 +90,12 @@ extern "C" {
 #define FUYUBOT_INTERNAL 5  /* 内部错：TDLib 未就绪、登录失败…，细节看 last_error() */
 
 int32_t fuyubot_abi_version(void);
+
+/* 建 / 改 <root>/fuyubot.toml（与 CLI 的 `fuyubot init` 同一份模板与 schema）。
+ * 不要求运行时在跑，也不影响正在跑的实例；start 之前调一次即可。
+ * 参数错（JSON 非法 / root 不是绝对路径 / 级别名写错）= FUYUBOT_ARG；
+ * 写盘失败 = FUYUBOT_INTERNAL。细节都在 last_error()。失败原因见文件头的 JSON 说明。 */
+int32_t fuyubot_config_init(const char *json);
 
 /* 起运行时；立即返回。成功 = FUYUBOT_OK（不代表已登录，看日志 / onState）。 */
 int32_t fuyubot_start(const char *options_json);

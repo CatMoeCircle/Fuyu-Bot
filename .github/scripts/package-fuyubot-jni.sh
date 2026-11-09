@@ -101,8 +101,10 @@ printf '%s\n' \
   "" \
   "装法：" \
   "  1) 全部 .so → app/src/main/jniLibs/${ABI}/：" \
-  "     libfuyubotjni.so、libtdjson.so，以及 tdjson 的三个依赖 libc++_shared.so / libcrypto.so* / libssl.so*" \
-  "     （少了依赖，tdjson 在设备上会直接报 library not found）" \
+  "     libfuyubotjni.so、libtdjson.so" \
+  "     （本包的 tdjson 把 OpenSSL / libc++ 静态并进去了，不需要额外依赖；" \
+  "      若你的 tdjson 是动态版，还得一起拷 libc++_shared.so / libcrypto.so* / libssl.so*，" \
+  "      少了它们设备上会直接报 library not found）" \
   "  2) plugins/*.so（可选）→ 拷到你的 <root>/plugins/ 再 chmod 0444（targetSdk 34+ 的只读要求）" \
   "  3) 代码里**先加载依赖、再加载 tdjson、最后加载 fuyubotjni**：" \
   "     System.load(File(nativeLibraryDir, \"libc++_shared.so\").absolutePath)" \
@@ -115,7 +117,11 @@ printf '%s\n' \
   "必做（库管不着，得你在 App 里做）：" \
   "  - <root> 用 filesDir（/sdcard 是 noexec，TDLib 也写不进去）；" \
   "  - 前台 Service + WakeLock 兜住进程，onDestroy 里调 nativeStop()；" \
-  "  - options 里给 api_id / api_hash；bot 账号再给 bot_token（不给就走手机号/扫码登录）；" \
+  "  - 先调 fuyubot_config_init（Java: nativeInitConfig）写 <root>/fuyubot.toml：" \
+  "      {\"root\":\"<root>\",\"api_id\":12345,\"api_hash\":\"…\",\"account_type\":\"bot\"}" \
+  "    配置（api_id / api_hash / [command] / [plugin.*]）只从这个文件读，与 CLI 同一份 schema；" \
+  "  - 再 nativeStart({\"root\":\"<root>\",\"bot_token\":\"…\"})；bot 账号不给 token 就走手机号/扫码登录，" \
+  "    data_dir / plugin_dir / log_level 可以在 options 里覆盖（只影响这次运行）；" \
   "  - lib_dir 可不填（先 loadLibrary(\"tdjson\") 就行），填 nativeLibraryDir 更稳；" \
   "  - 开了 R8 / ProGuard 就 keep 绑定类，混淆会改类名/方法名，绑定是运行期按名字做的：" \
   "      -keep class ${JNI_CLASS_DOTTED} { *; }" \
@@ -188,7 +194,7 @@ if loads == 0:
     raise SystemExit("没有 PT_LOAD 段，这不像一个共享库")
 
 symbols = [
-    "fuyubot_abi_version", "fuyubot_start", "fuyubot_stop",
+    "fuyubot_abi_version", "fuyubot_config_init", "fuyubot_start", "fuyubot_stop",
     "fuyubot_is_running", "fuyubot_answer", "fuyubot_last_error",
     "fuyubot_plugins", "fuyubot_plugin_info",
     "fuyubot_auth_state", "fuyubot_connection_state",

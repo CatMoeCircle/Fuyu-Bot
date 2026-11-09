@@ -7,9 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fuyubot_app::{App, AppHost};
+use fuyubot_app::{App, AppOptions};
 
-use crate::host::JniHost;
 use crate::options::Options;
 use crate::state;
 
@@ -40,10 +39,14 @@ fn requested_log_level(root: &Path) -> Option<String> {
 }
 
 /// 在 worker 线程里跑完整条生命周期。返回 `Ok` = 正常收摊。
-pub fn run(options: &Options) -> Result<(), String> {
+///
+/// `app_options` 由 `lib.rs` 在**起线程之前**解析好（缺 `fuyubot.toml` / 缺凭据这类错
+/// 要能作为 `fuyubot_start` 的参数错误直接返回，而不是起完线程再在 `onState` 里报）。
+pub fn run(options: &Options, app_options: AppOptions) -> Result<(), String> {
     let root = options.root_path();
-    let data_dir = options.data_path();
-    let plugin_dir = options.plugin_path();
+    // 目录来自**生效的**配置（options 的覆盖已经合进去了），不是 options 原样。
+    let data_dir = app_options.data_dir.clone();
+    let plugin_dir = app_options.plugin_dir.clone();
     let logs = root.join("logs");
 
     for dir in [&root, &data_dir, &plugin_dir, &logs] {
@@ -64,13 +67,10 @@ pub fn run(options: &Options) -> Result<(), String> {
 
     let runtime =
         tokio::runtime::Runtime::new().map_err(|error| format!("建不了 tokio 运行时：{error}"))?;
-    runtime.block_on(run_async(options, root))
+    runtime.block_on(run_async(app_options, root))
 }
 
-async fn run_async(options: &Options, root: PathBuf) -> Result<(), String> {
-    let host: Arc<dyn AppHost> = Arc::new(JniHost);
-    let app_options = options.app_options(host);
-
+async fn run_async(app_options: AppOptions, root: PathBuf) -> Result<(), String> {
     // 与 CLI 同一条顺序：boot（内核 + 宿主 + 接 TDLib）→ 装插件 → 登录。
     // 拆开三段的唯一原因在中间：视图要**赶在登录之前**装上——登录要等人回答，
     // 甚至可能失败，那期间 Java 也得能查插件列表 / 数量 / 跳过原因。
@@ -92,7 +92,7 @@ async fn run_async(options: &Options, root: PathBuf) -> Result<(), String> {
             if let Some(raw) = requested_log_level(&log_root) {
                 // 只在内容变了时动作：同一个值每 500ms 重复解析 + 重复打日志没意义。
                 if applied.as_deref() != Some(raw.as_str()) {
-                    match crate::options::parse_log_level(&raw) {
+                    match fuyubot_app::config::parse_log_level(&raw) {
                         Ok(level) => {
                             log_runtime.set_log_verbosity(level);
                             tracing::info!(
@@ -185,12 +185,12 @@ mod tests {
 
         // 内容走 CLI 同一套解析：合法别名认，乱写要能报错（调用方会告警并保持当前级别）。
         assert_eq!(
-            crate::options::parse_log_level("Warning").unwrap(),
+            fuyubot_app::config::parse_log_level("Warning").unwrap(),
             LogLevel::Warn
         );
         std::fs::write(log_level_path(&dir), "verbose").unwrap();
         assert!(
-            crate::options::parse_log_level(&requested_log_level(&dir).unwrap()).is_err(),
+            fuyubot_app::config::parse_log_level(&requested_log_level(&dir).unwrap()).is_err(),
             "写错的级别要能被识别出来"
         );
     }
