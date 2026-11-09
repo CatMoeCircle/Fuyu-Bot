@@ -389,9 +389,9 @@ pub struct HostApiVTable {
     >,
     pub cancel_wait: Option<unsafe extern "C" fn(host: *mut c_void, handle: WaitHandle)>,
     pub log: Option<unsafe extern "C" fn(host: *mut c_void, level: u32, message: *const c_char)>,
-    /// 读配置。`section` 是插件名（点路径，如 `"fuyubot.manage"`），`key` 是可选的点路径
-    /// （`"a.b"`），空串返回整段。**`section` 空串 = 读自己那段**（与 `set_config` 同一个默认）；
-    /// 读别人的段要把插件名写出来。顶层的 `[bot]` / `[telegram]` **不通过插件 API 暴露**。
+    /// 读配置。`section` 用**配置文件里的段名**（`fuyubot.toml` 的 `[段]`）：`"plugin.fuyubot.manage"`、
+    /// `"[bot]"`、或是裸插件名 `"fuyubot.manage"` 都认。**空串 = 读自己那段**
+    /// （与 `set_config` 同一个默认）。`key` 是可选的点路径，空串返回整段。
     ///
     /// 返回宿主线程局部缓冲里的 JSON 字符串（读完即弃），找不到段 / 键时返回 NULL。
     pub get_config: Option<
@@ -532,11 +532,13 @@ pub struct HostApiVTable {
     /// `plugin` 是 `null` 表示宿主预置的服务（scope / plugins / identity）。
     /// 想「按能力找服务」就用它，别再靠约定硬编码名字。
     pub list_services: Option<unsafe extern "C" fn(host: *mut c_void) -> *const c_char>,
-    /// 写**指定插件**的配置段（ABI v6 内追加）：`section` 是插件名（点分，如 `fuyubot.music`），
+    /// 写**指定插件**的配置段（ABI v6 内追加）：`section` 用配置文件里的段名
+    /// （`plugin.fuyubot.music`、`[plugin.fuyubot.music]`，裸插件名也认；空串 = 自己），
     /// `key` 是点路径（空串 = 覆盖整段），`value_json` 是 JSON 值。
     ///
-    /// 与 [`Self::set_config`] 的区别只有一个：那个只写**自己**那段（`section` 由宿主判定），
-    /// 这个**显式指定**目标插件，因此可以替别的插件改配置（协作插件之间同步设置）。
+    /// 与 [`Self::set_config`] 的区别只有一个：那个的目标永远是**自己**（由宿主判定），
+    /// 这个**显式指定**目标，因此可以替别的插件改配置（协作插件之间同步设置）。
+    /// **只接受 `plugin.*`**——顶层 `[bot]` / `[telegram]` 归用户，写了会被拒。
     /// 两者共用同一套规则：用户配置里钉住的键照样拒绝，落盘照样只动
     /// `plugin-config/<目标插件>.toml`，`fuyubot.toml` 照样不重写。
     ///
@@ -1013,9 +1015,10 @@ impl HostApi {
 
     /// 写**指定插件**的配置段（跨插件写）。
     ///
-    /// `section` 是插件名（点分，如 `fuyubot.music`），`key` 空串表示覆盖整段。
-    /// 规则与 [`Self::set_config`] 相同：用户配置里钉住的键拒绝写、只落
-    /// `plugin-config/<目标插件>.toml`、`fuyubot.toml` 不重写。
+    /// `section` 用配置文件里的段名（`plugin.fuyubot.music` / `[plugin.fuyubot.music]`，
+    /// 裸插件名也认；空串 = 自己那段）。只接受 `plugin.*`：顶层段归用户，写不进去。
+    /// `key` 空串表示覆盖整段。其余规则与 [`Self::set_config`] 相同：用户配置里钉住的键
+    /// 拒绝写、只落 `plugin-config/<目标插件>.toml`、`fuyubot.toml` 不重写。
     ///
     /// 失败时错误里带宿主给的原因（见 [`Self::last_error`]）。
     pub fn set_config_for(
@@ -1111,8 +1114,8 @@ impl HostApi {
         unsafe { (self.cancel_wait)(self.host_ctx, handle) };
     }
 
-    /// 读配置的一个段 / 键。`section` 空串 = **读自己那段**（与 `set_config` 同一个默认），
-    /// 给了插件名就读别人的段；`key` 空串 = 整段。顶层 `[bot]` / `[telegram]` 对插件不可见。
+    /// 读配置的一个段 / 键。`section` 就是配置文件里的段名（`plugin.fuyubot.music` / `[bot]`，
+    /// 裸插件名也认）；**空串 = 读自己那段**（与 `set_config` 同一个默认）。`key` 空串 = 整段。
     ///
     /// 返回宿主线程局部缓冲里的 JSON，读完即弃；段 / 键不存在或宿主没装配置时是 `None`。
     pub fn get_config(&self, section: &str, key: &str) -> Option<String> {

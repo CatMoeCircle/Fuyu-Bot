@@ -784,16 +784,20 @@ impl HostRuntime {
             .cloned()
     }
 
-    /// 读配置：`section` 为空 = 读顶层；否则把 `section` 当**点路径**在 `plugin` 表里下钻
-    /// （插件名是点分的，如 `fuyubot.manage` → `plugin.fuyubot.manage`）。
-    /// `key` 为空 = 整段/整个顶层。命中返回 `Some(JSON)`，否则 `None`。
+    /// 读配置：`section` 用**配置文件里的段路径**，与 `fuyubot.toml` 的 `[段]` 一一对应。
+    ///
+    /// - `""` 由调用方先换算成「自己那段」（`plugin.<插件名>`）；
+    /// - `plugin.fuyubot.music`（或 `[plugin.fuyubot.music]`）= 那个插件的段；
+    /// - `bot` / `telegram` / `tdlib` / `plugins` / `plugin` = 顶层段；
+    /// - 其余裸名字按插件名处理（旧调用 `get_config("fuyubot.music", …)` 仍然有效）。
+    ///
+    /// `key` 为空 = 整段。命中返回 `Some(JSON)`，否则 `None`。
     fn read_config(&self, section: &str, key: &str) -> Option<Value> {
+        let section = parse_section(section)?;
         let config = self.config.lock().unwrap_or_else(|e| e.into_inner());
-        let node = if section.is_empty() {
-            &config.root
-        } else {
-            let plugin = config.root.get(CONFIG_PLUGIN_KEY)?;
-            lookup_path(plugin, section)?
+        let node = match section {
+            Section::Plugin(name) => lookup_path(config.root.get(CONFIG_PLUGIN_KEY)?, name)?,
+            Section::Top(path) => lookup_path(&config.root, path)?,
         };
         if key.is_empty() {
             return Some(node.clone());
@@ -801,11 +805,14 @@ impl HostRuntime {
         lookup_path(node, key).cloned()
     }
 
-    /// 写配置：默认只写「当前执行者」自己名下的段；`target = Some(名字)` 时写**指定插件**的段。
+    /// 写配置：默认写「当前执行者」自己那段；`target` 给了段路径就写那一段。
     ///
-    /// 越权判定：没有 `target` 时靠 [`HostRuntime::current_executor`] + `owner_names` 映射，
-    /// 插件无法伪造（`set_config` 根本没有 section 参数）。跨插件写是**显式**的
-    /// （`set_config_section`），调用方必须自己写出目标插件名，所以也谈不上冒充。
+    /// `target` 与读一样按**配置文件里的段**解析（`plugin.fuyubot.music` 或 `[plugin.fuyubot.music]`，
+    /// 裸插件名也认），但**只接受 `plugin.*`**：顶层 `[bot]` / `[telegram]` 归用户，插件不能写。
+    ///
+    /// 默认目标靠 [`HostRuntime::current_executor`] + `owner_names` 判定，插件无法伪造
+    /// （`set_config` 根本没有 section 参数）。跨插件写是**显式**的
+    /// （`set_config_section`），调用方必须自己写出目标，所以也谈不上冒充。
     ///
     /// 落盘只写**目标那一个文件**：`<root>/plugin-config/<插件名>.toml`。
     /// `fuyubot.toml` 运行时永不重写，所以用户写在里面的注释、其它段、`api_hash` 都安全。
@@ -816,10 +823,18 @@ impl HostRuntime {
         value_json: &str,
     ) -> Result<(), String> {
         let executor = self.current_executor();
-        let name = match target {
-            // 显式目标：跨插件写。名字为空等于「没指定」，拒绝比猜一个安全。
-            Some(section) if !section.is_empty() => section.to_owned(),
-            Some(_) => return Err("目标插件名不能为空".to_owned()),
+        let explicit = target.is_some_and(|section| !section.trim().is_empty());
+        let name = match target.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(section) => match parse_section(section) {
+                Some(Section::Plugin(name)) => name.to_owned(),
+                Some(Section::Top(path)) => {
+                    return Err(format!(
+                        "只能写插件段（plugin.<插件名>）：{path} 是顶层配置，归用户所有"
+                    ));
+                }
+                // 归一化之后空掉（比如只写了 `[]`）：当「没指定」处理会让人误以为写了自己。
+                None => return Err("目标段不能为空".to_owned()),
+            },
             // 没给目标：写执行者那段。名字没登记（宿主自己 / 还没走完 init）就不能写。
             None => self
                 .executor_name()
@@ -827,7 +842,7 @@ impl HostRuntime {
         };
 
         // 跨插件写留一笔：出问题时要能回答「是谁改了别人的配置」。
-        if target.is_some() {
+        if explicit {
             let who = self
                 .owner_name(executor)
                 .unwrap_or_else(|| "宿主".to_owned());
@@ -1785,6 +1800,40 @@ fn lookup_path<'a>(node: &'a Value, path: &str) -> Option<&'a Value> {
         current = current.get(part)?;
     }
     Some(current)
+}
+
+/// 配置段的寻址结果：与 `fuyubot.toml` 里的 `[段]` 一一对应。
+///
+/// 分两类是因为**读写权限不同**：插件可以按路径读顶层（`[bot]` 之类，它本来就在那儿），
+/// 但只能写 `plugin.<插件名>` 下的段——顶层配置归用户，插件碰不得。
+enum Section<'a> {
+    /// `[plugin.<名>]`：插件段。`name` 是去掉 `plugin.` 之后的部分（点分）。
+    Plugin(&'a str),
+    /// 顶层段（`bot` / `telegram` / `tdlib` / `plugins` / `plugin` 本身）。
+    Top(&'a str),
+}
+
+/// 把「配置文件里的段」解析成寻址结果。
+///
+/// 接受的写法（前后空白与 `[` `]` 都容错）：`plugin.fuyubot.music`、`[plugin.fuyubot.music]`、
+/// `bot`、`[bot]`，以及**裸插件名** `fuyubot.music`（旧调用就是这么写的，按插件段理解）。
+/// 空串返回 `None`：那是「自己」，由调用方换算成 `plugin.<执行者>`。
+fn parse_section(raw: &str) -> Option<Section<'_>> {
+    let trimmed = raw.trim();
+    let trimmed = trimmed.strip_prefix('[').unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix(']').unwrap_or(trimmed).trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("plugin.") {
+        return (!rest.is_empty()).then_some(Section::Plugin(rest));
+    }
+    // 顶层段：这些名字在 `fuyubot.toml` 里是顶层表，不是插件。
+    if matches!(trimmed, "bot" | "telegram" | "plugins" | "tdlib" | "plugin") {
+        return Some(Section::Top(trimmed));
+    }
+    // 其余按插件名（兼容 `get_config("fuyubot.music", …)` 这类旧写法）。
+    Some(Section::Plugin(trimmed))
 }
 
 /// 按点路径在 JSON 对象里写一个值（自动创建沿途对象）。`path` 为空由调用方处理。
@@ -3124,16 +3173,21 @@ unsafe extern "C" fn api_get_config(
     let section = unsafe { cstr(section) }.unwrap_or("");
     let key = unsafe { cstr(key) }.unwrap_or("");
     // 空 section = 读自己：名字由宿主判定，插件没法借这个默认值读别人的段。
-    let section = if section.is_empty() {
+    // 显式拼上 `plugin.` 前缀，避免插件名恰好叫 `bot` / `tdlib` 时被当成顶层段。
+    let owned;
+    let section = if section.trim().is_empty() {
         match rt.executor_name() {
-            Some(name) => name,
+            Some(name) => {
+                owned = format!("plugin.{name}");
+                owned.as_str()
+            }
             // 宿主自己调、或名字还没登记：没有「自己」可指，按「找不到」处理。
             None => return core::ptr::null(),
         }
     } else {
-        section.to_owned()
+        section
     };
-    match rt.read_config(&section, key) {
+    match rt.read_config(section, key) {
         Some(value) => host_string(&value.to_string()),
         None => core::ptr::null(),
     }
@@ -3624,14 +3678,22 @@ mod tests {
         // SAFETY: rt 活着。
         let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
 
-        // 空 section = 自己：宿主没有「自己」那段，所以读不到（顶层不再对插件暴露）。
+        // 空 section = 自己：宿主没有「自己」那段，所以读不到。
         assert!(
             api.get_config("", "bot.name").is_none(),
-            "插件 API 不暴露 [bot] / [telegram] 这类顶层配置"
+            "空 section 指自己，不是顶层"
         );
+        // 顶层段要显式写出来（就是配置文件里的段名），带方括号的原样写法也认。
+        assert_eq!(api.get_config("bot", "name").unwrap(), "\"demo\"");
+        assert_eq!(api.get_config("[bot]", "name").unwrap(), "\"demo\"");
         // 读别人的段：显式给插件名。
         let whole = api.get_config("other.bot", "").unwrap();
         assert!(whole.contains("secret"), "{whole}");
+        // 带 `plugin.` 前缀的段路径与裸插件名等价。
+        assert_eq!(
+            api.get_config("plugin.other.bot", "secret").unwrap(),
+            "\"x\""
+        );
         // 不存在的段 / 键返回 None。
         assert!(api.get_config("ghost", "").is_none());
         assert!(api.get_config("a.bot", "nope").is_none());
@@ -3745,8 +3807,25 @@ mod tests {
         assert!(stored.contains("extra = \"from-a\""), "{stored}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 
-        // 目标为空等于没指定：拒绝而不是猜。
-        assert!(api.set_config_for("", "k", "1").is_err());
+        // 两种写法等价：配置文件里的段路径 / 带方括号的原样写法。
+        {
+            let scope = rt.plugin_scope();
+            rt.register_owner_name(scope.owner(), "a.bot");
+            api.set_config_for("[plugin.b.bot]", "extra2", "2")
+                .expect("方括号写法也要认");
+            api.set_config_for("plugin.b.bot", "extra3", "3")
+                .expect("带 plugin. 前缀的段路径也要认");
+            // 顶层段归用户：写进去必须被拒，`[bot]` 一个字节都不会被插件改。
+            let error = api.set_config_for("bot", "name", "\"hacked\"").unwrap_err();
+            assert!(error.to_string().contains("顶层"), "{error}");
+            // 空目标 = 自己那段（与读的默认一致）。
+            api.set_config_for("", "mine", "\"ok\"").unwrap();
+            scope.commit();
+        }
+        assert_eq!(api.get_config("b.bot", "extra2").unwrap(), "2");
+        assert_eq!(api.get_config("b.bot", "extra3").unwrap(), "3");
+        assert_eq!(api.get_config("a.bot", "mine").unwrap(), "\"ok\"");
+        assert!(api.get_config("bot", "name").is_none(), "顶层不该被写");
     }
 
     /// 服务方法里写配置，写的是**提供方自己**的段，不是调用方的。
