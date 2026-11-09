@@ -41,8 +41,8 @@ Telegram 连接，每个插件都是独立编译的动态库，按需加载、�
 **Android 的 APK 是开箱即用的图形客户端**，界面在
 [FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android) 仓库，
 内核（`libfuyubotjni.so` + TDLib）由本仓构建后随包打进 `assets/`，第一次启动自动释放到应用私有目录。
-同一页 Release 里还挂着 `fuyubot-<版本>-android-jni-<abi>.zip`——那是**只含 `.so` 的内核包**，
-给想自己在 APK 里集成内核的开发者用，普通用户直接下 `.apk` 即可。
+JNI 内核包**不再单独作为 Release 资产发布**——它只在 CI 里作为中间产物喂给 APK job；
+要自己集成内核，用 `crates/fuyubot-android` 自己编。
 
 **解压出来就是本体**，zip 里没有额外的一层目录——建议先建一个空目录再往里解压。
 `tdjson` 必须和可执行文件待在一起，别单独删掉：

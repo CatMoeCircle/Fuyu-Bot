@@ -6,12 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-# 只随 Android 打包发布，不发 crates.io。
+# 只随 Android APK 打包发布，不发 crates.io；JNI zip 只作为 Actions artifact，不进 Release。
 publish = false
 
 [lib]
 # `libfuyubotjni.so` ← 宿主侧 `System.loadLibrary("fuyubotjni")`。
-# 名字里的 `jni` 与发布包 `fuyubot-<tag>-android-jni-<abi>.zip` 一致，别再改。
+# 名字里的 `jni` 与 CI 中间产物 `fuyubot-<tag>-android-jni-<abi>.zip` 一致，别再改。
 name = "fuyubotjni"
 crate-type = ["cdylib"]
 

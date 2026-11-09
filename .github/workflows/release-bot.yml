@@ -17,14 +17,15 @@
 #   （`aarch64-linux-android` / `x86_64-linux-android` 的 ELF，不是 apk），
 #   包结构与桌面一致（`fuyubot` + 同级 `libtdjson.so` + `plugins/`），
 #   只是 tdjson 需要应用期交叉编译，而 loader 的 `ASSETS` 表不含 android。
-#   同一个 job 还顺手打一个 JNI 包（`*-android-jni-<abi>.zip`，只有 `.so`）。
+#   同一个 job 还顺手打一个 JNI 包（`*-android-jni-<abi>.zip`，只有 `.so`）——
+#   它**只作为 Actions artifact** 喂给下面的 APK job，**不再作为 Release 资产发布**。
 #
-# **APK** 又是一条线（`build-apk` job）：把上面那个 JNI 包解压到
+# **APK** 又是一条线（`build-apk` job）：把本次运行产出的 JNI artifact 解压到
 #   [FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android) 的
 #   `app/src/main/assets/fuyubot-kernel/`（上游约定的**指定目录**），跑
 #   `./gradlew :app:assembleRelease`，再用 Secrets 里的 keystore 签名，产出
 #   `fuyubot-<版本>-<abi>.apk`。壳的代码不在本仓，按 `main` 取。
-#   不加 `-android-` 段也不撞名：zip 那批是 `fuyubot-<版本>-android-<平台>.zip`。
+#   不加 `-android-` 段也不撞名：可执行文件那批是 `fuyubot-<版本>-android-<平台>.zip`。
 #
 # 用户视角（`README.md` 与文档站的「使用」就是这么写的）：
 #   下载 `fuyubot-<版本>-<OS>-<平台>.zip` → 解压 → `./fuyubot init` / `./fuyubot run`。
@@ -400,8 +401,9 @@ jobs:
             ".tdlib-cache/${TDLIB_VERSION}/android-${{ matrix.arch }}" \
             "$pkg"
 
-      # JNI 运行时（只有 .so）：给 APK 用，**不是**可执行文件、也不是 apk。
+      # JNI 运行时（只有 .so）：给 APK job 用，**不是**可执行文件、也不是 apk。
       # 同一个 job、同一份交叉编译产物，只是多打一个 zip（`libfuyubotjni.so` + `libtdjson.so`）。
+      # ⚠️ 这个 zip **只走 Actions artifact**，publish 会跳过它，不挂 Release。
       - name: Package fuyubotjni (Android)
         shell: bash
         env:
@@ -440,7 +442,7 @@ jobs:
   #
   # 内核与壳**同版本发**：APK 版本号取自本仓的 tag，不跟上游仓库的 Release 走。
   # 这样同一个 Release 页上，`fuyubot-<版本>-<abi>.apk` 里装的内核就是
-  # 同一个 tag 编出来的 `fuyubot-<版本>-android-jni-<abi>.zip`。
+  # 同一个 tag 的 `build-android` job 编出来的 JNI artifact（该 zip 本身不进 Release）。
   #
   # 签名用 Secrets（缺一个就整条失败——宁可不发 APK，也不要发一个装不上的包）：
   #   ANDROID_KEYSTORE_BASE64      keystore 文件的 base64（单行）
@@ -521,15 +523,12 @@ jobs:
           echo "FUYUBOT_APK_VERSION=$version" >> "$GITHUB_ENV"
           name="fuyubot-${version}-android-jni-${{ matrix.abi }}"
           echo "==> 取 ${name}.zip"
-          # 优先从**本次运行**的 artifact 拿：不发版的分支构建也能出 APK。
-          # 拿不到才去 Release（从 Release 页重跑这一条 job、或独立重试时会走这里）。
+          # JNI 包**只作为本次运行的 Actions artifact**（不再挂 Release）：
+          # 它本来就不可能出现在 Release 里，别再加 Release 兜底。
           # `gh run download --dir jni` 会把 artifact 里的文件**平铺**进 jni/（只有单个 artifact
           # 时不再套一层目录），所以下面按文件名找就行——别假设有子目录。
-          if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-                 --name "fuyubot-android-${{ matrix.arch }}" --dir jni 2>/dev/null; then
-            echo "warning: 本次运行里没有 fuyubot-android-${{ matrix.arch }} 的 artifact，退回 Release" >&2
-            gh release download "$version" --repo "$GITHUB_REPOSITORY" --pattern "${name}.zip" --dir jni
-          fi
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "fuyubot-android-${{ matrix.arch }}" --dir jni
           zip_path="$(find jni -name "${name}.zip" | head -n1)"
           [[ -n "$zip_path" ]] || { echo "error: 没找到 ${name}.zip" >&2; find jni -type f | head -20 >&2; exit 1; }
           # 只在名字/位置真的不一样时才挪（`mv a a` 在 GNU mv 下是错误，直接打死 job）。
@@ -601,6 +600,12 @@ jobs:
             ( cd "$stage/$pkg" && zip -q -r -X "$out/$pkg.zip" . )
             rm -rf "$stage"
           done
+          # JNI 内核是 Actions artifact（APK job 自己取），会被 download-artifact 一并铺进
+          # dist/；它不进 Release，这里删掉，免得下面的 `dist/*.zip` 把它带上。
+          for jni in dist/fuyubot-*-android-jni-*.zip; do
+            echo "drop from Release (Actions artifact only): $(basename "$jni")"
+            rm -f "$jni"
+          done
           shopt -u nullglob
           ls -lh dist/*.zip dist/*.apk 2>/dev/null || true
 
@@ -629,8 +634,6 @@ jobs:
                 zip:*-linux-x86_64)    label="Linux（x86_64）" ;;
                 zip:*-linux-aarch64)   label="Linux（ARM64）" ;;
                 zip:*-macos-aarch64)   label="macOS（Apple Silicon）" ;;
-                zip:*-android-jni-arm64-v8a) label="Android（arm64-v8a，JNI 内核库，给 APK 用）" ;;
-                zip:*-android-jni-x86_64)    label="Android（x86_64，JNI 内核库，给 APK 用）" ;;
                 zip:*-android-aarch64) label="Android（arm64-v8a，可执行文件）" ;;
                 zip:*-android-x86_64)  label="Android（x86_64，模拟器 / 可执行文件）" ;;
                 *)                 label="$name.$ext" ;;
@@ -646,11 +649,8 @@ jobs:
             "" \
             "\`*-<abi>.apk\`（如 \`fuyubot-v0.1.3-arm64-v8a.apk\`）是**可直接安装的 Android 图形客户端**（界面在" \
             "[FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android)，" \
-            "内核就是本页的 \`*-android-jni-*\`，同版本编出来的）。" \
+            "内核由本仓同 tag 编出、随 APK 一起打包）。" \
             "真机用 \`arm64-v8a\`，模拟器用 \`x86_64\`；两个 APK 只能装一个（包名相同）。" \
-            "" \
-            "\`*-android-jni-*.zip\` 是**给 APK 用的 JNI 库**（\`libfuyubotjni.so\` + \`libtdjson.so\`），" \
-            "不是可执行文件、也不是 apk——装法与契约见压缩包里的 \`README.txt\` 与 \`include/fuyubot_jni.h\`。" \
             "" \
             "| 系统 | 资产 |" \
             "| --- | --- |" \

@@ -210,7 +210,8 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 
 62. **APK 在 `release-bot.yml` 的 `build-apk` job 里编，壳不在本仓**：
     壳是 [FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android)（Kotlin + Compose），
-    按 `main` 取；内核就是同一版本编出来的 `fuyubot-<版本>-android-jni-<abi>.zip`。
+    按 `main` 取；内核是同一 tag 的 `build-android` job 编出的 JNI 包。⚠️ **JNI 包只作为
+    Actions artifact 喂给 APK job，不再作为 Release 资产发布**（Release 只挂 `.apk`）。
     契约有四条，改之前先看 `.github/scripts/build-android-apk.sh`：
     - **运行期调日志不用加 JNI 方法**：壳写 `<root>/.fuyubot/log-level`（一行级别名），
       `run` 每 500ms 轮询，与 CLI 同一个控制文件协议。订阅者**不许再挂级别过滤**——
@@ -223,8 +224,8 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
       「APK 更新了但还在跑旧内核」，且**不会报错**。
     - **资产名是 `fuyubot-<版本>-<abi>.apk`**（例 `fuyubot-v0.1.3-arm64-v8a.apk`）。两个 ABI 的 `.so`
       文件名完全相同，**不能装进同一个 APK**，所以必须分开发、文件名里带 abi。
-      不加 `-android-` 段不撞名：zip 那批是 `fuyubot-<版本>-android-<平台>.zip` /
-      `fuyubot-<版本>-android-jni-<abi>.zip`。⚠️ publish 的下载表因此要**按扩展名分派**标签，
+      不加 `-android-` 段不撞名：可执行文件那批是 `fuyubot-<版本>-android-<平台>.zip`，
+      JNI 包不进 Release。⚠️ publish 的下载表因此要**按扩展名分派**标签，
       只按基名匹配的话 `.apk` 与 `.zip` 的 `-x86_64` 会串味。
     签名走 `apksigner`（不用 AGP 的 injected signing——那要四个 `-P` 属性齐全，缺一个就**静默不签**）。
     keystore 从 Secrets 还原，四个都要在：`ANDROID_KEYSTORE_BASE64` / `ANDROID_KEYSTORE_PASSWORD` /
