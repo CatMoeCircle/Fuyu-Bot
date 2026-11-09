@@ -4,7 +4,7 @@
 
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
-- 写法就是「插件作者从这儿抄」的最小样本：`fuyubot_simplify::on_command` 订阅 `updateNewMessage`，命中 `/start` 就把回复指向 `reply_to` 发回同一个会话。
+- 写法就是「插件作者从这儿抄」的最小样本：`fuyubot_simplify::on_command` 订阅 `updateNewMessage`，命中 `/start` 就调 `Command::reply_then`——宿主决定发新消息（bot / 白名单用户触发）还是编辑原命令消息（user 自己触发），回调拿到的就是最终 `Message`。
 - 只回**不带参数**的 `/start`；点名给别人的（`/start@别的Bot`）由 `on_command` 过滤掉，根本到不了插件。
 - 欢迎语用 TDLib 方言的 Markdown（粗体是 `*x*`，不是 `**x**`）。
 - 产物随可执行文件一起打包，`fuyubot init` / `run` 会把它复制进项目的 `plugins/`。

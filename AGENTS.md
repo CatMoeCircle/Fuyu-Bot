@@ -241,6 +241,25 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     `set_config_section`（跨插件写配置）。服务表里存的不再只是 vtable，还带**提供方 owner**：
     调用期间压一层「执行者」，所以服务方法里的 `set_config` 落提供方自己的段（约束 52）。
 
+64. **命令回复统一走宿主**：插件回复命令用 `Command::reply_then`（Rust）/ `fuyubot.host.command`
+    service（其它语言），**不要自己拼 `sendMessage`**。入参与 `SendMessageParams` 相同
+    （`text` / `media` / `reply_markup` / `link_preview` / `topic_id` / `timeout_ms`），
+    `reply_to_message_id` 由宿主覆盖成命令消息。宿主决定：bot 账户 / user 账户**白名单用户**
+    触发 → `sendMessage` + `reply_to`；user 账户**自己**触发 → 编辑原命令消息（文本
+    `editMessageText`、富媒体 `editMessageMedia`）。成功返回 TDLib 的最终 `Message`，失败返回
+    `{"@type":"error",…}`；`reply` **阻塞**，命令回调里必须用 `reply_then`（句柄在 `stop()`
+    里 join）。命令消息带 `ephemeral_message_id > 0`、当前账号是 bot（`getMe` 的
+    `userTypeBot`，不用配置兜底）、且**不是私聊**（群/频道 chat_id 为负）时，回复改走
+    `sendEphemeralMessage` + `inputMessageReplyToEphemeralMessage`，`receiver_user_id` =
+    命令发送者；任一条件不满足就退回普通消息/编辑，**不尝试 ephemeral**（退回普通消息时
+    也不 `reply_to` 那条 ephemeral 命令）。被拦下的命令只从
+    `updateNewMessage` 通道消失，`update` 通用通道照发。`[command].prefix` 是**数组**：
+    不写按账号默认（bot `/`、user `.`），写了就**整套替换**（bot 不再自动保留 `/`）；
+    user 账户下 `/` 即使写进数组也始终不生效。非 `/` 命令头放行后归一化成 `/`。
+    **user 账户默认白名单模式**（只认自己 + `whitelist`）；`[command].whitelist_only = false`
+    可关，但模板 / 文档的注释必须写明「⚠️ 不建议关闭」——关掉后任何人都能触发插件。
+    bot 账户的 `whitelist` 规则不受 `whitelist_only` 影响。
+
 ## 文档
 
 公开文档只在**文档站**（`FuyuBot-Docs/content/docs/**`）；改 ABI / CLI / 行为时同步那边。

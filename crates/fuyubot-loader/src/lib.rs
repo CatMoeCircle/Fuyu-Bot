@@ -9,6 +9,7 @@
 //! 这里是本仓库唯一的「宿主层」：机制 crate 之间不许互相依赖，组合与桥接都发生在本 crate。
 
 mod bundle;
+mod command;
 mod loader;
 mod pipeline;
 mod runtime;
@@ -27,7 +28,8 @@ pub use loader::{
 };
 pub use pipeline::{PipelineError, UpdateOutcome, UpdatePipeline};
 pub use runtime::{
-    DEFAULT_LOG_VERBOSITY, HOST_TOOL_OWNER, HostRuntime, LogLevel, RESPONSE_EVENT, SentRequest,
-    TD_FUNCTIONS_TOOL, TdRequestError, UPDATE_EVENT,
+    COMMAND_SERVICE, DEFAULT_LOG_VERBOSITY, HOST_TOOL_OWNER, HostRuntime, LogLevel,
+    PluginCatalogEntry, RESPONSE_EVENT, SentRequest, TD_FUNCTIONS_TOOL, TdRequestError,
+    UPDATE_EVENT,
 };
 pub use script::{SCRIPT_EXTENSIONS, find_script};

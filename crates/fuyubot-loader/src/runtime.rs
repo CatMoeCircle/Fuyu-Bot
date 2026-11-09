@@ -23,10 +23,12 @@ use fuyubot_middleware::{
     Stage as MwStage,
 };
 use fuyubot_service::{ServiceContextExt as _, ServiceHandle as SvcRegistration};
-use fuyubot_simplify::{Simplify, ops};
+use fuyubot_simplify::{Simplify, SimplifyError, ops};
 use fuyubot_tdlib::{TdClient, TdlibError, schema::TdApiSchema};
 use fuyubot_tool::{ToolDescriptor, ToolHandle as ToolRegistration, ToolHandlerFn, ToolRegistry};
 use serde_json::{Value, json};
+
+use crate::command::{self, AccountKind, CommandMeta, CommandPolicy, Gate};
 
 /// 插件日志级别。宿主调 [`HostRuntime::set_log_verbosity`] 时用它，
 /// CLI 也从这里取，省得为了一个枚举去依赖 `fuyubot-abi`。
@@ -60,6 +62,9 @@ pub const TD_FUNCTIONS_TOOL: &str = "fuyubot.td.functions";
 
 /// 已发出请求的留档上限。
 const REQUEST_LOG_CAPACITY: usize = 256;
+
+/// 命令上下文 / 宿主命令回复指纹的保留上限（有界，长跑不会一直涨）。
+const COMMAND_CONTEXT_CAPACITY: usize = 256;
 
 /// 没接 TDLib 时用的合成请求号起点：躲开 TDLib `@extra` 的低位区间。
 const SYNTHETIC_REQUEST_BASE: u64 = 1 << 48;
@@ -292,9 +297,18 @@ pub struct HostRuntime {
     scope_vtable: ServiceVTable,
     /// 内置「我是谁」service 的 vtable（同上）。
     identity_vtable: ServiceVTable,
+    /// 内置「命令回复」service 的 vtable（同上）。
+    command_vtable: ServiceVTable,
     /// `getMe` 的结果（登录成功后由 CLI 用 [`HostRuntime::set_self_user`] 写进来）。
     /// `fuyubot.host.identity` service 读它；没登录 / 没接 TDLib 时是 `None`。
     self_user: Mutex<Option<Value>>,
+    /// 命令闸门策略（`[command]` 段），[`HostRuntime::install_config`] 时解析好。
+    command_policy: Mutex<CommandPolicy>,
+    /// 最近放行的命令 `(chat, message)`：命令回复接口据此判断要不要编辑原消息。
+    command_contexts: Mutex<VecDeque<CommandMeta>>,
+    /// 宿主通过命令回复接口**发出去**的新消息 `(chat, text)`：同名出站更新不再触发命令，
+    /// 防止自己的回复变成新的命令（`update` 通用通道仍然发布）。
+    command_replies: Mutex<VecDeque<(i64, String)>>,
     vtable: HostApiVTable,
     /// 全局配置（路径 + JSON 树）。`get_config` / `set_config` 读写它。
     config: Mutex<ConfigState>,
@@ -313,6 +327,29 @@ pub struct HostRuntime {
     /// [`PluginReporter`] 两边都满足：它持 `Weak<Mutex<Vec<Fiber>>>`，管理器没了
     /// 就报空表，不会把内核吊住；而每次问都现算，**结构上不存在过期**。
     plugin_report: Mutex<Option<PluginReporter>>,
+    /// 插件**静态**元信息（展示名 / 介绍 / 版本），由宿主装插件时一次性写入。
+    ///
+    /// 内核的 [`Report`] 只有 name/state —— 它不认识 serde，也不该认识展示文案。
+    /// 但 `/plugins` 要显示「名称（id）— 介绍」，所以报告服务在序列化时把这张表
+    /// 按名字并进去。装插件的宿主（`fuyubot-app`）负责填；没填就是空表，
+    /// 报告退回只有 name/state 的旧形状。
+    plugin_catalog: Mutex<Vec<PluginCatalogEntry>>,
+}
+
+/// 一个插件的**静态**元信息，供 `/plugins` 一类展示用。
+///
+/// 它和运行时状态（active / pending / failed）分开：这些字段在插件探测阶段就定了，
+/// 整个进程生命周期不会变；状态才是每次现算的。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginCatalogEntry {
+    /// 插件名（内核里的点分 id）。
+    pub name: String,
+    /// 插件版本（`plugin_manifest` 的 `version`；老插件是空串）。
+    pub version: String,
+    /// 给人看的名字（空 = 由调用方回退到 `name`）。
+    pub display_name: String,
+    /// 一句话介绍（空 = 不显示）。
+    pub description: String,
 }
 
 /// 一条已经发出的请求。
@@ -574,12 +611,24 @@ impl HostRuntime {
                 methods: IDENTITY_METHODS.0.as_ptr(),
                 method_count: IDENTITY_METHODS.0.len(),
             },
+            command_vtable: ServiceVTable {
+                name: COMMAND_SERVICE_C.as_ptr(),
+                version: 1,
+                size: core::mem::size_of::<ServiceVTable>() as u32,
+                context: weak.as_ptr() as *mut c_void,
+                methods: COMMAND_METHODS.0.as_ptr(),
+                method_count: COMMAND_METHODS.0.len(),
+            },
             self_user: Mutex::new(None),
+            command_policy: Mutex::new(CommandPolicy::default()),
+            command_contexts: Mutex::new(VecDeque::new()),
+            command_replies: Mutex::new(VecDeque::new()),
             config: Mutex::new(ConfigState::default()),
             log_plugins: Mutex::new(None),
             owner_names: Mutex::new(HashMap::new()),
             owner_revision: AtomicU64::new(0),
             plugin_report: Mutex::new(None),
+            plugin_catalog: Mutex::new(Vec::new()),
             // `host_ctx` 指向这个 `Arc` 内部；地址稳定，插件活着期间一直有效。
             vtable: HostApiVTable {
                 version: ABI_VERSION,
@@ -617,6 +666,7 @@ impl HostRuntime {
         rt.provide_scope_service();
         rt.provide_plugins_service();
         rt.provide_identity_service();
+        rt.provide_command_service();
         Ok(rt)
     }
 
@@ -668,6 +718,20 @@ impl HostRuntime {
         }
     }
 
+    /// 把内置「命令回复」service 预置进服务表。
+    ///
+    /// 句柄同样故意 `forget`：它要活到进程结束。
+    fn provide_command_service(&self) {
+        let vtable = &self.command_vtable as *const ServiceVTable;
+        match self
+            .ctx
+            .provide_named(COMMAND_SERVICE, AbiService { vtable, owner: 0 })
+        {
+            Ok(effect) => std::mem::forget(effect),
+            Err(e) => self.warn(&format!("预置命令回复 service 失败: {e}")),
+        }
+    }
+
     /// 记下 `getMe` 的结果（CLI 在登录成功之后调）。
     ///
     /// 时机正好：插件早就加载好了，但接收循环还没开（`run` 的第 ⑦ 步），
@@ -699,6 +763,136 @@ impl HostRuntime {
             .unwrap_or_default()
     }
 
+    /// 自己的 user id（`getMe` 的 `user.id`）；没登录 / 身份未知时 `None`。
+    pub fn self_user_id(&self) -> Option<i64> {
+        let self_user = self.self_user.lock().unwrap_or_else(|e| e.into_inner());
+        self_user.as_ref()?.get("id")?.as_i64()
+    }
+
+    /// 登录的是不是机器人账号（TDLib 的 `user.type.@type == "userTypeBot"`）。
+    ///
+    /// 没登录 / 字段缺失时是 `None`——调用方退回配置里的账号类型，
+    /// 别把「不知道」当成 bot 或 user。
+    pub fn self_user_is_bot(&self) -> Option<bool> {
+        let self_user = self.self_user.lock().unwrap_or_else(|e| e.into_inner());
+        let kind = self_user.as_ref()?.get("type")?.get("@type")?.as_str()?;
+        Some(kind == "userTypeBot")
+    }
+
+    /// 命令回复能不能走 `sendEphemeralMessage`。
+    ///
+    /// 三个条件必须同时满足：命令消息带 `ephemeral_message_id > 0`、当前登录的是
+    /// **bot**（`getMe` 明确返回 `userTypeBot`，不用配置兜底）、且不是私聊
+    /// （TDLib 私聊 id 为正，群/频道为负）。再加一个硬前提：知道 `receiver_user_id`
+    /// （命令发送者）。任一条件不满足就返回 `None`，调用方直接走普通消息，
+    /// 不尝试 ephemeral、也不产生失败请求。
+    fn ephemeral_reply_target(
+        &self,
+        chat_id: i64,
+        meta: Option<CommandMeta>,
+        input: &Value,
+    ) -> Option<(i32, i64)> {
+        if self.self_user_is_bot() != Some(true) || chat_id >= 0 {
+            return None;
+        }
+        let ephemeral_id = input
+            .get("ephemeral_message_id")
+            .and_then(Value::as_i64)
+            .and_then(|id| i32::try_from(id).ok())
+            .filter(|id| *id > 0)
+            .or_else(|| meta.and_then(|meta| meta.ephemeral_message_id))?;
+        let receiver = input
+            .get("receiver_user_id")
+            .and_then(Value::as_i64)
+            .or_else(|| meta.and_then(|meta| meta.receiver_user_id))?;
+        Some((ephemeral_id, receiver))
+    }
+
+    /// 命令闸门：`Gate::Blocked` = 这条更新**不要**交给插件。
+    ///
+    /// 账号类型优先看活的 `getMe`，没登录时退回 `[telegram]`（见 `command` 模块）；
+    /// 放行的用户账户自定义命令头会被就地改写成 `/cmd`，既有插件不用改。
+    pub(crate) fn gate_command(&self, payload: &mut Value) -> Gate {
+        if payload.get("@type").and_then(Value::as_str) != Some("updateNewMessage") {
+            return Gate::Pass;
+        }
+        let policy = self
+            .command_policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let account = self.command_account(&policy);
+        let mut host_reply = |chat_id: i64, text: &str| self.take_command_reply(chat_id, text);
+        command::gate(
+            payload,
+            &policy,
+            account,
+            self.self_user_id(),
+            &mut host_reply,
+        )
+    }
+
+    /// 当前账号类型：活的 `getMe` 优先，身份未知时退回配置里的账号类型。
+    fn command_account(&self, policy: &CommandPolicy) -> AccountKind {
+        match self.self_user_is_bot() {
+            Some(true) => AccountKind::Bot,
+            Some(false) => AccountKind::User,
+            None if policy.fallback_is_bot => AccountKind::Bot,
+            None => AccountKind::User,
+        }
+    }
+
+    /// 记下一条放行的命令，供 `command.reply` 判断「要不要编辑原消息」。
+    pub(crate) fn remember_command(&self, meta: CommandMeta) {
+        let mut contexts = self
+            .command_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        contexts.push_back(meta);
+        while contexts.len() > COMMAND_CONTEXT_CAPACITY {
+            contexts.pop_front();
+        }
+    }
+
+    /// 查一条命令的上下文（最近的一条优先）。
+    fn find_command(&self, chat_id: i64, message_id: i64) -> Option<CommandMeta> {
+        self.command_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|meta| meta.chat_id == chat_id && meta.message_id == message_id)
+            .copied()
+    }
+
+    /// 记下宿主刚发出的一条命令回复（新消息），让它的出站 `updateNewMessage` 不再触发命令。
+    fn remember_command_reply(&self, chat_id: i64, text: &str) {
+        let mut replies = self
+            .command_replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        replies.push_back((chat_id, text.to_owned()));
+        while replies.len() > COMMAND_CONTEXT_CAPACITY {
+            replies.pop_front();
+        }
+    }
+
+    /// 命中并消费一条宿主回复指纹。
+    fn take_command_reply(&self, chat_id: i64, text: &str) -> bool {
+        let mut replies = self
+            .command_replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(index) = replies
+            .iter()
+            .position(|(seen_chat, seen_text)| *seen_chat == chat_id && seen_text == text)
+        else {
+            return false;
+        };
+        replies.remove(index);
+        true
+    }
+
     /// 装进全局配置：`path` 是用户配置文件（启动时读、运行时**不写**），
     /// `None` = 这次启动不可写（`set_config` 直接报错），
     /// `root` 是完整配置树的 JSON。必须在插件加载之前调（插件 `start` 里就可能读）。
@@ -720,9 +914,16 @@ impl HostRuntime {
         if let Some(dir) = store.as_ref() {
             merge_store_into(&mut root, dir, &mut warnings);
         }
+        // `[command]` 段：前缀与白名单。写错只回退默认值并告警，不影响启动。
+        let (command_policy, command_warnings) = CommandPolicy::from_config(&root);
+        warnings.extend(command_warnings);
         for warning in warnings {
             self.warn(&warning);
         }
+        *self
+            .command_policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = command_policy;
         let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
         config.store = store;
         config.root = root;
@@ -994,7 +1195,7 @@ impl HostRuntime {
                 "name": name,
                 "version": vtable.version,
                 "methods": methods,
-                // `null` = 宿主预置的服务（scope / plugins / identity）。
+                // `null` = 宿主预置的服务（scope / plugins / identity / command）。
                 "plugin": self.owner_name(entry.owner),
             }));
         }
@@ -1038,18 +1239,42 @@ impl HostRuntime {
         })
     }
 
+    /// 装上插件的**静态**元信息（展示名 / 介绍 / 版本），供
+    /// [`Self::plugin_report`] 与 `/plugins` 列表使用。
+    ///
+    /// 装插件的宿主（`fuyubot-app`）在探测完、交给内核之前调一次；之后整批替换。
+    /// 传空表 = 清空，报告退回只有 name/state 的旧形状。
+    pub fn install_plugin_catalog(&self, entries: Vec<PluginCatalogEntry>) {
+        *self
+            .plugin_catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = entries;
+    }
+
     /// 此刻的插件报告（JSON）。没装来源就是空表。
+    ///
+    /// 每项在 `name` / `state` 之外，若宿主装过静态目录（[`Self::install_plugin_catalog`]），
+    /// 还会带上 `version` / `display_name` / `description`——`/plugins` 靠它们显示
+    /// 「名称（id）— 介绍」，不必再去读插件目录。
     pub fn plugin_report(&self) -> String {
         let reporter = self
             .plugin_report
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let catalog = self
+            .plugin_catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         match reporter {
-            Some(reporter) => report_json(&reporter.report()),
-            None => report_json(&Report {
-                plugins: Vec::new(),
-            }),
+            Some(reporter) => report_json(&reporter.report(), &catalog),
+            None => report_json(
+                &Report {
+                    plugins: Vec::new(),
+                },
+                &catalog,
+            ),
         }
     }
 
@@ -1068,12 +1293,26 @@ impl HostRuntime {
     /// （`updateUser`），所以每条 `updateUser` 都先过一遍 [`Self::absorb_self_update`]，
     /// 广播出去的就是新值——[`IDENTITY_SERVICE`] 与面板看到的都不会是死的。
     pub fn publish_update(&self, payload: &Value) -> fuyubot_core::Result<usize> {
+        self.publish_update_channels(payload, true)
+    }
+
+    /// [`publish_update`](Self::publish_update) 的分通道版本。
+    ///
+    /// `include_specific = false` 时**只发 `update` 通用通道**：被闸门拦下的命令仍是
+    /// 一条普通更新（raw 监听器照常能看见），只是不进入 `updateNewMessage` 通道，
+    /// 所以 `on_command` 不会响应它。
+    pub(crate) fn publish_update_channels(
+        &self,
+        payload: &Value,
+        include_specific: bool,
+    ) -> fuyubot_core::Result<usize> {
         self.absorb_self_update(payload);
         let mut total = self.events.emit(UPDATE_EVENT, payload)?;
-        if let Some(update_type) = payload.get("@type").and_then(Value::as_str) {
-            if update_type != UPDATE_EVENT {
-                total += self.events.emit(update_type, payload)?;
-            }
+        if include_specific
+            && let Some(update_type) = payload.get("@type").and_then(Value::as_str)
+            && update_type != UPDATE_EVENT
+        {
+            total += self.events.emit(update_type, payload)?;
         }
         Ok(total)
     }
@@ -1816,7 +2055,7 @@ enum Section<'a> {
 /// 把「配置文件里的段」解析成寻址结果。
 ///
 /// 接受的写法（前后空白与 `[` `]` 都容错）：`plugin.fuyubot.music`、`[plugin.fuyubot.music]`、
-/// `bot`、`[bot]`，以及**裸插件名** `fuyubot.music`（旧调用就是这么写的，按插件段理解）。
+/// `bot`、`[bot]`、`command`，以及**裸插件名** `fuyubot.music`（旧调用就是这么写的，按插件段理解）。
 /// 空串返回 `None`：那是「自己」，由调用方换算成 `plugin.<执行者>`。
 fn parse_section(raw: &str) -> Option<Section<'_>> {
     let trimmed = raw.trim();
@@ -1829,7 +2068,10 @@ fn parse_section(raw: &str) -> Option<Section<'_>> {
         return (!rest.is_empty()).then_some(Section::Plugin(rest));
     }
     // 顶层段：这些名字在 `fuyubot.toml` 里是顶层表，不是插件。
-    if matches!(trimmed, "bot" | "telegram" | "plugins" | "tdlib" | "plugin") {
+    if matches!(
+        trimmed,
+        "bot" | "telegram" | "plugins" | "tdlib" | "plugin" | "command"
+    ) {
         return Some(Section::Top(trimmed));
     }
     // 其余按插件名（兼容 `get_config("fuyubot.music", …)` 这类旧写法）。
@@ -2377,6 +2619,53 @@ unsafe extern "C" fn api_identity_me(context: *mut c_void, _input: *const c_char
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     host_string(&me.clone().unwrap_or(Value::Null).to_string())
+}
+
+/// 内置「命令回复」service 的名字。插件经 ABI 的 `call_service` 调它；
+/// `fuyubot-simplify` 的 [`Command::reply`](fuyubot_simplify::Command::reply) 也走这里。
+pub const COMMAND_SERVICE: &str = "fuyubot.host.command";
+
+/// 同一个名字的 `CString` 版（`ServiceVTable.name` 要 NUL 结尾的指针）。
+const COMMAND_SERVICE_C: &core::ffi::CStr = c"fuyubot.host.command";
+
+/// 「命令回复」service 的方法表。
+///
+/// `reply`：入参是命令的 `chat_id` / `message_id` + 一个拼好的 `sendMessage`
+/// 参数（`SendMessageParams`）；宿主决定「发新消息」还是「编辑原命令消息」，
+/// **阻塞**等 TDLib，成功返回最终 `Message`、失败返回 `{"@type":"error",…}`。
+struct CommandMethods([ServiceMethod; 1]);
+
+// SAFETY: 与 `ScopeMethods` 同理：`name` 指向 `'static` 字面量，`func` 是纯函数指针。
+unsafe impl Sync for CommandMethods {}
+
+static COMMAND_METHODS: CommandMethods = CommandMethods([ServiceMethod {
+    name: c"reply".as_ptr(),
+    func: Some(api_command_reply),
+}]);
+
+/// `reply`：插件回复命令。成功回 TDLib 的 `Message`，失败回 `{"@type":"error",…}`
+/// （服务接口不返回 NULL，否则调用方只能拿到一句笼统的失败）。
+unsafe extern "C" fn api_command_reply(
+    context: *mut c_void,
+    input: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    // SAFETY: 输入是 NUL 结尾 JSON。
+    let input = unsafe { cstr(input) }.unwrap_or("");
+    match rt.command_reply(input) {
+        Ok(value) => host_string(&value.to_string()),
+        Err(error) => {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("命令回复失败");
+            rt.set_service_error(Some(format!("command.reply: {message}")));
+            host_string(&error.to_string())
+        }
+    }
 }
 
 // ── VTable 实现 ────────────────────────────────────────────────────
@@ -3279,7 +3568,170 @@ impl HostRuntime {
         self.simplify_workers.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// 处理插件发来的命令回复。
+    ///
+    /// - bot 账户 / user 账户里白名单用户触发的命令：`sendMessage` + `reply_to` 原命令；
+    /// - user 账户**自己**触发的命令：编辑原命令消息（文本 `editMessageText`，
+    ///   富媒体 `editMessageMedia`）。
+    ///
+    /// 入参 `payload` 是 [`SendMessageParams`](fuyubot_simplify::SendMessageParams)
+    /// 拼好的 `sendMessage` 参数；成功直接返回 TDLib 的最终 `Message`，失败返回
+    /// `{"@type":"error",…}`。**阻塞**等 TDLib（`reply_then` 会在工作线程上调它）。
+    fn command_reply(&self, input_json: &str) -> Result<Value, Value> {
+        let input: Value = serde_json::from_str(input_json)
+            .map_err(|e| error_value(format!("入参不是合法 JSON: {e}")))?;
+        let chat_id = input
+            .get("chat_id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| error_value("缺少 chat_id"))?;
+        let message_id = input
+            .get("message_id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| error_value("缺少 message_id"))?;
+        let payload = input
+            .get("payload")
+            .filter(|value| value.is_object())
+            .cloned()
+            .ok_or_else(|| error_value("缺少 payload"))?;
+        let timeout_ms = input
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000);
+        let meta = self.find_command(chat_id, message_id);
+        let has_ephemeral = input
+            .get("ephemeral_message_id")
+            .and_then(Value::as_i64)
+            .is_some_and(|id| id > 0)
+            || meta.is_some_and(|meta| meta.ephemeral_message_id.is_some());
+        // 只有 bot、非私聊、且命令消息真的带 ephemeral_message_id 时才走
+        // sendEphemeralMessage；否则直接普通消息，不尝试 ephemeral。
+        let ephemeral = self.ephemeral_reply_target(chat_id, meta, &input);
+        // ephemeral 命令永远发一条新的 ephemeral 回复，不编辑原命令。
+        let edit = ephemeral.is_none() && meta.is_some_and(|meta| meta.self_triggered);
+
+        let (method, request) = if let Some((ephemeral_id, receiver)) = ephemeral {
+            let content = payload
+                .get("input_message_content")
+                .ok_or_else(|| error_value("payload 缺 input_message_content"))?;
+            let mut request = json!({
+                "chat_id": chat_id,
+                "receiver_user_id": receiver,
+                "callback_query_id": 0,
+                "replace_callback_query_message": false,
+                "reply_to": {
+                    "@type": "inputMessageReplyToEphemeralMessage",
+                    "ephemeral_message_id": ephemeral_id,
+                },
+                "protect_content": false,
+                "sending_id": 0,
+                "only_preview": false,
+                "input_message_content": content,
+            });
+            if let Some(topic) = payload.get("topic_id").filter(|value| !value.is_null()) {
+                request["topic_id"] = topic.clone();
+            }
+            if let Some(markup) = payload.get("reply_markup").filter(|value| !value.is_null()) {
+                request["reply_markup"] = markup.clone();
+            }
+            ("sendEphemeralMessage", request)
+        } else if edit {
+            let content = payload
+                .get("input_message_content")
+                .ok_or_else(|| error_value("payload 缺 input_message_content"))?;
+            let mut request = json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "input_message_content": content,
+            });
+            if let Some(markup) = payload.get("reply_markup").filter(|value| !value.is_null()) {
+                request["reply_markup"] = markup.clone();
+            }
+            let method = if content.get("@type").and_then(Value::as_str) == Some("inputMessageText")
+            {
+                "editMessageText"
+            } else {
+                "editMessageMedia"
+            };
+            (method, request)
+        } else {
+            let mut request = payload;
+            request["chat_id"] = json!(chat_id);
+            if has_ephemeral {
+                // ephemeral 消息只能用 ephemeral 回复；退回普通消息时不要 reply_to 它，
+                // 否则 TDLib 会因为「不能回复 ephemeral 消息」拒绝。
+                if let Some(object) = request.as_object_mut() {
+                    object.remove("reply_to");
+                }
+            } else {
+                request["reply_to"] = json!({
+                    "@type": "inputMessageReplyToMessage",
+                    "message_id": message_id,
+                });
+            }
+            ("sendMessage", request)
+        };
+
+        // 离线（回放 / --no-tdlib）：请求照样留档，回一条合成 message；
+        // 不发出去、也不等 30s 超时。
+        if self.td.get().is_none() {
+            let mut recorded = request.clone();
+            recorded["@type"] = json!(method);
+            let _ = self.td_send_for(0, recorded);
+            if !edit {
+                self.remember_reply_fingerprint(chat_id, &request);
+            }
+            return Ok(synthetic_message(
+                chat_id,
+                message_id,
+                edit,
+                ephemeral.map(|(id, _)| id),
+                &request,
+            ));
+        }
+
+        let simplify = self.simplify();
+        let result = if method == "sendMessage" {
+            simplify.send_payload(request.clone(), timeout_ms)
+        } else {
+            simplify.invoke_payload(method, request.clone(), timeout_ms)
+        };
+        match result {
+            Ok(message) => {
+                if !edit {
+                    self.remember_reply_fingerprint(chat_id, &request);
+                }
+                Ok(message)
+            }
+            Err(error) => Err(simplify_error_value(&error)),
+        }
+    }
+
+    /// 回复文本以任一命令头开头时记指纹，防止它再触发命令。
+    fn remember_reply_fingerprint(&self, chat_id: i64, request: &Value) {
+        let Some(text) = reply_text(request) else {
+            return;
+        };
+        // 命令头随账号类型变化（bot `/`、user `.`，配了数组则整套替换），
+        // 所以按当前账号取一次再判断，锁只在这段里拿着。
+        let prefixes = {
+            let policy = self
+                .command_policy
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let account = self.command_account(&policy);
+            policy.prefixes_for(account).to_vec()
+        };
+        if command::looks_like_command(text, &prefixes) {
+            self.remember_command_reply(chat_id, text);
+        }
+    }
+
     fn td_send(&self, request: Value) -> RequestId {
+        self.td_send_for(self.current_owner(), request)
+    }
+
+    /// 以指定归属发一条请求（`owner = 0` = 宿主自己）。
+    fn td_send_for(&self, owner: u64, request: Value) -> RequestId {
         let method = request
             .get("@type")
             .and_then(Value::as_str)
@@ -3294,7 +3746,6 @@ impl HostRuntime {
                 "请求 {method} 没过 schema 校验（照发，真库会再判一次）: {reason}"
             ));
         }
-        let owner = self.current_owner();
 
         let id = match self.td.get() {
             Some(client) => match client.send(request.clone()) {
@@ -3396,16 +3847,19 @@ impl Drop for PluginScope<'_> {
 /// {
 ///   "count": 2,
 ///   "plugins": [
-///     {"name": "a", "state": "active"},
+///     {"name": "a", "state": "active",
+///      "version": "0.1.0", "display_name": "插件 A", "description": "一句话介绍"},
 ///     {"name": "b", "state": "pending", "missing": ["database"]}
 ///   ]
 /// }
 /// ```
 ///
-/// 只写有意义的字段：`missing` 只在 pending 时出现，`reason` 只在 failed 时出现。
+/// 只写有意义的字段：`missing` 只在 pending 时出现，`reason` 只在 failed 时出现；
+/// `version` / `display_name` / `description` 只在宿主装过静态目录且值非空时出现
+/// （老宿主 / 老插件没有这几项，读的一方必须按「字段可能不在」处理）。
 /// 空数组一律写出来（`"missing": []` 会被省掉）——调用方按 `state` 判断即可，
 /// 不必猜「字段不在」是什么意思。
-fn report_json(report: &Report) -> String {
+fn report_json(report: &Report, catalog: &[PluginCatalogEntry]) -> String {
     let plugins: Vec<Value> = report
         .plugins
         .iter()
@@ -3420,6 +3874,17 @@ fn report_json(report: &Report) -> String {
             }
             if let Some(reason) = &entry.reason {
                 object.insert("reason".to_owned(), json!(reason));
+            }
+            if let Some(meta) = catalog.iter().find(|meta| meta.name == entry.name) {
+                for (key, value) in [
+                    ("version", &meta.version),
+                    ("display_name", &meta.display_name),
+                    ("description", &meta.description),
+                ] {
+                    if !value.is_empty() {
+                        object.insert(key.to_owned(), json!(value));
+                    }
+                }
             }
             item
         })
@@ -3481,6 +3946,57 @@ fn td_functions_json() -> &'static Value {
 fn descriptor_from_json(text: &str) -> Result<ToolDescriptor, String> {
     let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
     ToolDescriptor::from_json(&value).map_err(|e| e.to_string())
+}
+
+/// 命令回复失败时回给插件的 TDLib 风格错误对象。
+fn error_value(message: impl Into<String>) -> Value {
+    json!({"@type": "error", "code": 0, "message": message.into()})
+}
+
+/// [`SimplifyError`] → TDLib 风格错误对象（`Tdlib` / `SendFailed` 保留 code）。
+fn simplify_error_value(error: &SimplifyError) -> Value {
+    match error {
+        SimplifyError::Tdlib { code, message } | SimplifyError::SendFailed { code, message } => {
+            json!({"@type": "error", "code": code, "message": message})
+        }
+        other => error_value(other.to_string()),
+    }
+}
+
+/// 回复内容里的原始文本（文本消息的 `text`，或媒体消息的 `caption`）。
+fn reply_text(request: &Value) -> Option<&str> {
+    let content = request.get("input_message_content")?;
+    content
+        .get("text")
+        .and_then(|text| text.get("text"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            content
+                .get("caption")
+                .and_then(|text| text.get("text"))
+                .and_then(Value::as_str)
+        })
+}
+
+/// 离线回放用的合成 `Message`（请求已经留档，只是没接 TDLib）。
+fn synthetic_message(
+    chat_id: i64,
+    message_id: i64,
+    edit: bool,
+    ephemeral_message_id: Option<i32>,
+    request: &Value,
+) -> Value {
+    let mut message = json!({
+        "@type": "message",
+        "id": if edit { message_id } else { 0 },
+        "chat_id": chat_id,
+        "is_outgoing": true,
+        "content": request.get("input_message_content").cloned().unwrap_or(Value::Null),
+    });
+    if let Some(ephemeral_id) = ephemeral_message_id {
+        message["ephemeral_message_id"] = json!(ephemeral_id);
+    }
+    message
 }
 
 #[cfg(test)]
@@ -5439,6 +5955,351 @@ mod tests {
         );
     }
 
+    /// `[command]` 段与活的 `getMe` 一起决定闸门策略。
+    #[test]
+    fn command_policy_reads_prefix_whitelist_and_account_kind() {
+        let rt = runtime();
+        rt.install_config(
+            None,
+            json!({
+                "telegram": {"account_type": "user"},
+                "command": {"prefix": ["!", "。"], "whitelist": [9], "whitelist_only": false}
+            }),
+        );
+        let policy = rt
+            .command_policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(policy.prefixes, Some(vec!['!', '。']));
+        assert_eq!(policy.prefixes_for(AccountKind::User), &['!', '。']);
+        assert!(policy.whitelist.contains(&9));
+        assert!(!policy.whitelist_only);
+        assert!(!policy.fallback_is_bot);
+
+        // 活的 `getMe` 覆盖配置里的账号类型。
+        rt.set_self_user(json!({"id": 7, "type": {"@type": "userTypeBot"}}));
+        assert_eq!(rt.self_user_is_bot(), Some(true));
+        assert_eq!(rt.self_user_id(), Some(7));
+        rt.set_self_user(json!({"id": 7, "type": {"@type": "userTypeRegular"}}));
+        assert_eq!(rt.self_user_is_bot(), Some(false));
+    }
+
+    /// 闸门接在运行时上：user 账户拦 `/`，`.` 前缀归一化成 `/`。
+    #[test]
+    fn gate_command_blocks_user_slash_and_rewrites_dot() {
+        let rt = runtime();
+        rt.install_config(None, json!({"telegram": {"account_type": "user"}}));
+        rt.set_self_user(json!({"id": 7, "type": {"@type": "userTypeRegular"}}));
+
+        let message = |text: &str| {
+            json!({
+                "@type": "updateNewMessage",
+                "message": {
+                    "id": 1,
+                    "chat_id": 7,
+                    "is_outgoing": true,
+                    "sender_id": {"@type": "messageSenderUser", "user_id": 7},
+                    "content": {
+                        "@type": "messageText",
+                        "text": {"@type": "formattedText", "text": text}
+                    }
+                }
+            })
+        };
+
+        let mut slash = message("/start");
+        assert_eq!(rt.gate_command(&mut slash), Gate::Blocked);
+
+        let mut dot = message(".start");
+        assert!(matches!(
+            rt.gate_command(&mut dot),
+            Gate::Command(CommandMeta {
+                chat_id: 7,
+                message_id: 1,
+                self_triggered: true,
+                ..
+            })
+        ));
+        assert_eq!(dot["message"]["content"]["text"]["text"], json!("/start"));
+        assert_eq!(dot["message"]["is_outgoing"], json!(false));
+    }
+
+    fn command_update(text: &str, outgoing: bool, sender: i64, chat_id: i64, id: i64) -> Value {
+        json!({
+            "@type": "updateNewMessage",
+            "message": {
+                "id": id,
+                "chat_id": chat_id,
+                "is_outgoing": outgoing,
+                "sender_id": {"@type": "messageSenderUser", "user_id": sender},
+                "content": {
+                    "@type": "messageText",
+                    "text": {"@type": "formattedText", "text": text}
+                }
+            }
+        })
+    }
+
+    fn reply_input(chat_id: i64, message_id: i64, text: &str) -> String {
+        json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "timeout_ms": 1000,
+            "payload": {
+                "chat_id": chat_id,
+                "input_message_content": {
+                    "@type": "inputMessageText",
+                    "text": {"@type": "formattedText", "text": text, "entities": []}
+                }
+            }
+        })
+        .to_string()
+    }
+
+    /// 命令回复接口：user 自己触发 → 编辑原命令，bot / 白名单用户触发 → 发新消息。
+    /// 返回的始终是 TDLib 的 `Message`（离线时是合成 message）。
+    #[test]
+    fn command_reply_edits_only_for_self_triggered_user_commands() {
+        assert_eq!(COMMAND_SERVICE, fuyubot_simplify::COMMAND_SERVICE);
+
+        // user 自己触发：编辑原命令消息。
+        let rt = runtime();
+        rt.install_config(None, json!({"telegram": {"account_type": "user"}}));
+        rt.set_self_user(json!({"id": 7, "type": {"@type": "userTypeRegular"}}));
+        let mut own = command_update(".help", true, 7, 7, 41);
+        let Gate::Command(meta) = rt.gate_command(&mut own) else {
+            panic!("自己发的 .help 应该放行");
+        };
+        rt.remember_command(meta);
+        let reply = rt
+            .call_service(COMMAND_SERVICE, "reply", &reply_input(7, 41, "hi"))
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["@type"], json!("message"));
+        assert_eq!(reply["id"], json!(41));
+        let sent = rt.sent_requests();
+        assert_eq!(sent.last().unwrap().method, "editMessageText");
+        assert_eq!(sent.last().unwrap().params["chat_id"], json!(7));
+        assert_eq!(sent.last().unwrap().params["message_id"], json!(41));
+
+        // bot 账户：照旧发一条新消息并 reply_to 原命令。
+        let rt = runtime();
+        rt.set_self_user(json!({"id": 1, "type": {"@type": "userTypeBot"}}));
+        let mut bot_command = command_update("/help", false, 9, 7, 42);
+        let Gate::Command(meta) = rt.gate_command(&mut bot_command) else {
+            panic!("bot 的 /help 应该放行");
+        };
+        assert!(!meta.self_triggered);
+        rt.remember_command(meta);
+        let reply = rt
+            .call_service(COMMAND_SERVICE, "reply", &reply_input(7, 42, "hi"))
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["@type"], json!("message"));
+        let sent = rt.sent_requests();
+        assert_eq!(sent.last().unwrap().method, "sendMessage");
+        assert_eq!(
+            sent.last().unwrap().params["reply_to"]["message_id"],
+            json!(42)
+        );
+
+        // user 账户里白名单中的别人触发：消息不是自己的，只能发新消息。
+        let rt = runtime();
+        rt.install_config(
+            None,
+            json!({"telegram": {"account_type": "user"}, "command": {"whitelist": [9]}}),
+        );
+        rt.set_self_user(json!({"id": 7, "type": {"@type": "userTypeRegular"}}));
+        let mut other = command_update(".help", false, 9, 7, 43);
+        let Gate::Command(meta) = rt.gate_command(&mut other) else {
+            panic!("白名单里的 .help 应该放行");
+        };
+        rt.remember_command(meta);
+        let reply = rt
+            .call_service(COMMAND_SERVICE, "reply", &reply_input(7, 43, "hi"))
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["@type"], json!("message"));
+        let sent = rt.sent_requests();
+        assert_eq!(sent.last().unwrap().method, "sendMessage");
+        assert_eq!(
+            sent.last().unwrap().params["reply_to"]["message_id"],
+            json!(43),
+            "白名单用户也应该像 bot 一样 reply_to 原命令"
+        );
+    }
+
+    /// bot 收到带 `ephemeral_message_id` 的命令：回复走 `sendEphemeralMessage`，
+    /// `receiver_user_id` 是命令发送者，`reply_to` 是 ephemeral id。
+    #[test]
+    fn ephemeral_bot_commands_reply_with_send_ephemeral_message() {
+        let rt = runtime();
+        rt.set_self_user(json!({"id": 1, "type": {"@type": "userTypeBot"}}));
+        // 必须是群 / 频道（chat_id < 0）；私聊不能发 ephemeral。
+        let mut update = command_update("/help", false, 9, -100, 61);
+        update["message"]["ephemeral_message_id"] = json!(555);
+        let Gate::Command(meta) = rt.gate_command(&mut update) else {
+            panic!("bot 的 ephemeral /help 应该放行");
+        };
+        assert_eq!(meta.ephemeral_message_id, Some(555));
+        assert_eq!(meta.receiver_user_id, Some(9));
+        rt.remember_command(meta);
+
+        let reply = rt
+            .call_service(COMMAND_SERVICE, "reply", &reply_input(-100, 61, "hi"))
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["@type"], json!("message"));
+        assert_eq!(reply["ephemeral_message_id"], json!(555));
+
+        let sent = rt.sent_requests();
+        let last = sent.last().unwrap();
+        assert_eq!(last.method, "sendEphemeralMessage");
+        assert_eq!(last.params["chat_id"], json!(-100));
+        assert_eq!(last.params["receiver_user_id"], json!(9));
+        assert_eq!(
+            last.params["reply_to"]["@type"],
+            json!("inputMessageReplyToEphemeralMessage")
+        );
+        assert_eq!(last.params["reply_to"]["ephemeral_message_id"], json!(555));
+    }
+
+    /// 私聊里的 ephemeral id 不尝试 ephemeral，直接走普通 sendMessage。
+    #[test]
+    fn ephemeral_in_a_private_chat_falls_back_to_send_message() {
+        let rt = runtime();
+        rt.set_self_user(json!({"id": 1, "type": {"@type": "userTypeBot"}}));
+        let mut update = command_update("/help", false, 9, 7, 63);
+        update["message"]["ephemeral_message_id"] = json!(777);
+        let Gate::Command(meta) = rt.gate_command(&mut update) else {
+            panic!("bot 的 /help 应该放行");
+        };
+        rt.remember_command(meta);
+
+        let reply = rt
+            .call_service(COMMAND_SERVICE, "reply", &reply_input(7, 63, "hi"))
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["@type"], json!("message"));
+
+        let sent = rt.sent_requests();
+        assert_eq!(sent.last().unwrap().method, "sendMessage");
+        assert!(
+            sent.last().unwrap().params.get("reply_to").is_none(),
+            "退回普通消息时不能 reply_to ephemeral 命令"
+        );
+    }
+
+    /// 没登录（`getMe` 还没写）时不能确认是 bot，退回普通 sendMessage。
+    #[test]
+    fn ephemeral_requires_a_logged_in_bot() {
+        let rt = runtime();
+        let mut update = command_update("/help", false, 9, -100, 64);
+        update["message"]["ephemeral_message_id"] = json!(888);
+        let Gate::Command(meta) = rt.gate_command(&mut update) else {
+            panic!("bot 的 /help 应该放行");
+        };
+        rt.remember_command(meta);
+
+        let reply = rt
+            .call_service(COMMAND_SERVICE, "reply", &reply_input(-100, 64, "hi"))
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["@type"], json!("message"));
+        assert_eq!(rt.sent_requests().last().unwrap().method, "sendMessage");
+        assert!(
+            rt.sent_requests()
+                .last()
+                .unwrap()
+                .params
+                .get("reply_to")
+                .is_none(),
+            "退回普通消息时不能 reply_to ephemeral 命令"
+        );
+    }
+
+    /// ephemeral 回复需要 receiver_user_id；发送者不是用户时退回普通 sendMessage。
+    #[test]
+    fn ephemeral_without_a_receiver_falls_back_to_send_message() {
+        let rt = runtime();
+        rt.set_self_user(json!({"id": 1, "type": {"@type": "userTypeBot"}}));
+        let mut update = command_update("/help", false, 9, -100, 65);
+        update["message"]["sender_id"] = json!({"@type": "messageSenderChat", "chat_id": -100});
+        update["message"]["ephemeral_message_id"] = json!(999);
+        let Gate::Command(meta) = rt.gate_command(&mut update) else {
+            panic!("bot 的 /help 应该放行");
+        };
+        assert_eq!(meta.receiver_user_id, None);
+        rt.remember_command(meta);
+
+        let reply = rt
+            .call_service(COMMAND_SERVICE, "reply", &reply_input(-100, 65, "hi"))
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["@type"], json!("message"));
+        assert_eq!(rt.sent_requests().last().unwrap().method, "sendMessage");
+        assert!(
+            rt.sent_requests()
+                .last()
+                .unwrap()
+                .params
+                .get("reply_to")
+                .is_none(),
+            "退回普通消息时不能 reply_to ephemeral 命令"
+        );
+    }
+
+    /// `sendEphemeralMessage` 只有 bot 能用：user 账户即使带了 ephemeral id 也不走它。
+    #[test]
+    fn user_accounts_never_use_send_ephemeral_message() {
+        let rt = runtime();
+        rt.install_config(None, json!({"telegram": {"account_type": "user"}}));
+        rt.set_self_user(json!({"id": 7, "type": {"@type": "userTypeRegular"}}));
+        let mut update = command_update(".help", true, 7, 7, 62);
+        update["message"]["ephemeral_message_id"] = json!(666);
+        let Gate::Command(meta) = rt.gate_command(&mut update) else {
+            panic!("自己发的 .help 应该放行");
+        };
+        rt.remember_command(meta);
+
+        let reply = rt
+            .call_service(COMMAND_SERVICE, "reply", &reply_input(7, 62, "hi"))
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["@type"], json!("message"));
+
+        let sent = rt.sent_requests();
+        assert_eq!(sent.last().unwrap().method, "editMessageText");
+    }
+
+    /// 命令回复本身就是以命令头开头的文本时，它的出站更新不再触发命令。
+    #[test]
+    fn a_command_reply_does_not_retrigger_the_command() {
+        let rt = runtime();
+        rt.install_config(
+            None,
+            json!({"telegram": {"account_type": "user"}, "command": {"whitelist": [9]}}),
+        );
+        rt.set_self_user(json!({"id": 7, "type": {"@type": "userTypeRegular"}}));
+
+        // 白名单里的别人触发 -> 宿主发新消息；回复文本故意以 `.` 开头。
+        let mut other = command_update(".help", false, 9, 7, 51);
+        let Gate::Command(meta) = rt.gate_command(&mut other) else {
+            panic!("白名单里的 .help 应该放行");
+        };
+        rt.remember_command(meta);
+        rt.call_service(COMMAND_SERVICE, "reply", &reply_input(7, 51, ".help"))
+            .unwrap();
+
+        // 宿主刚发出的那条 `.help`：出站、自己、文本相同 → 被当命令回复拦掉。
+        let mut echoed = command_update(".help", true, 7, 7, 52);
+        assert_eq!(rt.gate_command(&mut echoed), Gate::Blocked);
+        // 指纹只消费一次；用户之后自己再发同样的命令仍应正常触发。
+        let mut later = command_update(".help", true, 7, 7, 53);
+        assert!(matches!(rt.gate_command(&mut later), Gate::Command(_)));
+    }
+
     /// `getMe` 只是登录那一刻的快照：之后的 `updateUser`（id 是自己那条）要刷新它，
     /// 别人的 `updateUser` 一概不碰。
     #[test]
@@ -5651,5 +6512,52 @@ mod tests {
         assert!(!raw.is_null(), "list_plugins 该返回 JSON");
         let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy();
         assert!(text.contains("plugins"), "该是插件报告 JSON：{text}");
+    }
+
+    /// 宿主装了静态目录之后，报告里每个插件多出展示名 / 介绍 / 版本；
+    /// 没装（或字段为空）就保持旧形状——读的一方按「字段可能不在」处理。
+    #[test]
+    fn report_json_merges_the_static_catalog() {
+        use fuyubot_core::{ReportEntry, ReportState};
+
+        let report = Report {
+            plugins: vec![
+                ReportEntry {
+                    name: "fuyubot.demo".to_owned(),
+                    state: ReportState::Active,
+                    missing: Vec::new(),
+                    reason: None,
+                    seq: Some(1),
+                },
+                ReportEntry {
+                    name: "old.plugin".to_owned(),
+                    state: ReportState::Pending,
+                    missing: vec!["database".to_owned()],
+                    reason: None,
+                    seq: None,
+                },
+            ],
+        };
+        let catalog = vec![PluginCatalogEntry {
+            name: "fuyubot.demo".to_owned(),
+            version: "0.2.0".to_owned(),
+            display_name: "示例插件".to_owned(),
+            description: "最小的插件示例".to_owned(),
+        }];
+        let value: Value =
+            serde_json::from_str(&report_json(&report, &catalog)).expect("报告是 JSON");
+        let demo = &value["plugins"][0];
+        assert_eq!(demo["display_name"], json!("示例插件"));
+        assert_eq!(demo["description"], json!("最小的插件示例"));
+        assert_eq!(demo["version"], json!("0.2.0"));
+        // 目录里没有的插件保持旧形状：不编造展示字段。
+        let old = &value["plugins"][1];
+        assert!(old.get("display_name").is_none(), "{old}");
+        assert!(old.get("description").is_none(), "{old}");
+        assert_eq!(old["missing"], json!(["database"]));
+
+        // 空目录 = 旧形状（空字段不写出来）。
+        let bare: Value = serde_json::from_str(&report_json(&report, &[])).expect("报告是 JSON");
+        assert!(bare["plugins"][0].get("display_name").is_none(), "{bare}");
     }
 }

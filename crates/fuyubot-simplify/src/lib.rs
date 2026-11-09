@@ -124,6 +124,8 @@ pub enum SimplifyError {
     Abi(#[from] fuyubot_abi::AbiError),
     #[error("参数串里含 NUL 字节")]
     BadString,
+    #[error("请求参数不完整：{0}")]
+    BadParams(String),
     #[error("相册只能放 2–10 项，收到 {0} 项")]
     AlbumSize(usize),
     #[error("转发列表是空的")]
@@ -145,6 +147,9 @@ pub enum SimplifyError {
     /// 在 `timeout_ms` 里没等到结局。**已经尝试撤回**那条还没发出去的消息。
     #[error("等了 {0} ms 没等到结果，已尝试撤回未发出的消息")]
     Timeout(u64),
+    /// 命令回复接口拒绝了这次回复（入参不对 / 宿主没装服务）。
+    #[error("命令回复失败：{0}")]
+    CommandReply(String),
 }
 
 type Result<T> = std::result::Result<T, SimplifyError>;
@@ -206,6 +211,16 @@ pub enum ParseMode {
 }
 
 impl ParseMode {
+    /// 发给宿主命令回复接口的稳定名字（与配置里的 `parse_mode` 同一个词表）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Markdown => "markdown",
+            Self::MarkdownV2 => "markdown_v2",
+            Self::Html => "html",
+        }
+    }
+
     /// 转成 TDLib 的 `TextParseMode`；`Plain` 没有对应的构造器（不出请求）。
     fn to_td(self) -> Option<Value> {
         match self {
@@ -1967,6 +1982,16 @@ impl UpdateFilter {
 /// 判断「这条命令点名的是不是我」。
 pub const IDENTITY_SERVICE: &str = "fuyubot.host.identity";
 
+/// 宿主预置的「命令回复」service。方法 `reply` 接收命令的 `chat_id` / `message_id`
+/// 与回复文本，由**宿主**决定：bot / 别人触发的命令发新消息，user 账户自己触发的
+/// 命令编辑原命令消息。插件侧用 [`Command::reply`] 即可，不必自己拼 `sendMessage`。
+///
+/// `reply` 入参（JSON）：
+/// `{"chat_id":7,"message_id":42,"timeout_ms":30000,
+///   "payload": <sendMessage 参数，不含 @type，字段与 SendMessageParams 一致>}`。
+/// 返回：TDLib 的 `Message`（最终消息）；失败是 `{"@type":"error","code":…,"message":"…"}`。
+pub const COMMAND_SERVICE: &str = "fuyubot.host.command";
+
 /// 一条 `updateNewMessage` 里的命令：`/start`、`/help@SomeBot 参数`。
 ///
 /// 只认**文本消息**，并跳过自己发的（`is_outgoing`）——机器人不该响应自己。
@@ -1974,6 +1999,14 @@ pub const IDENTITY_SERVICE: &str = "fuyubot.host.identity";
 pub struct Command {
     pub chat_id: i64,
     pub message_id: i64,
+    /// `ephemeral_message_id`（TDLib `Message.ephemeral_message_id`，i32）；普通消息是 `None`。
+    ///
+    /// 有值时这条命令是 **ephemeral 消息**，回复必须走 `sendEphemeralMessage`
+    /// 的 `inputMessageReplyToEphemeralMessage`，而不是普通 `reply_to`。
+    pub ephemeral_message_id: Option<i32>,
+    /// 发送这条命令的用户 id（`sender_id.user_id`）；ephemeral 回复的
+    /// `receiver_user_id` 用它。
+    pub sender_user_id: Option<i64>,
     /// 命令名：去掉 `/` 与 `@BotName` 后缀，已转小写。
     pub name: String,
     /// `/cmd` 后面那一段（去首尾空白，可能为空）。
@@ -2014,9 +2047,60 @@ impl Command {
                 .any(|name| name.eq_ignore_ascii_case(target)),
         }
     }
+
+    /// 回复这条命令，由宿主决定「发新消息」还是「编辑原消息」。
+    ///
+    /// - bot 账户、或 user 账户里**白名单用户**触发的命令 → `sendMessage` + `reply_to`；
+    /// - user 账户**自己**触发的命令 → `editMessageText` 编辑这条命令消息。
+    ///
+    /// 入参与 [`Simplify::send_message`] 一样（[`SendMessageParams`]：文本 / 媒体、
+    /// `reply_markup`、`link_preview`、`topic_id`、`timeout_ms`）；`reply_to_message_id`
+    /// 会被宿主覆盖成这条命令。返回 TDLib 的最终 `Message`（与 `send_message` 一致）。
+    ///
+    /// ⚠️ **阻塞**当前线程。命令回调跑在接收循环线程上，回调里请用 [`Self::reply_then`]。
+    pub fn reply(&self, host: HostApi, params: &SendMessageParams) -> Result<Value> {
+        let simplify = Simplify::new(host);
+        let payload = send_params(self.chat_id, params, &|text: &Text| {
+            simplify.formatted(text)
+        });
+        let input = json!({
+            "chat_id": self.chat_id,
+            "message_id": self.message_id,
+            "ephemeral_message_id": self.ephemeral_message_id,
+            "receiver_user_id": self.sender_user_id,
+            "timeout_ms": params.timeout_ms,
+            "payload": payload,
+        });
+        let raw = host.call_service(COMMAND_SERVICE, "reply", &input.to_string())?;
+        let value: Value = serde_json::from_str(&raw)
+            .map_err(|e| SimplifyError::CommandReply(format!("接口返回的不是 JSON: {e}")))?;
+        if value.get("@type").and_then(Value::as_str) == Some("error") {
+            return Err(as_tdlib_error(&value));
+        }
+        Ok(value)
+    }
+
+    /// [`reply`](Self::reply) 的异步版：结果（`Ok(最终 Message)` / `Err(…)`）从另一个
+    /// 线程交给 `on_done`。命令回调里**必须**用这个，否则会卡死接收循环。
+    ///
+    /// 返回的句柄要收好：插件卸载前 `stop()` 里 join 掉（内置插件就是这么写的）。
+    pub fn reply_then(
+        &self,
+        host: HostApi,
+        params: &SendMessageParams,
+        on_done: impl FnOnce(Result<Value>) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let command = self.clone();
+        let params = params.clone();
+        spawn_then(move || command.reply(host, &params), on_done)
+    }
 }
 
 /// 从 `updateNewMessage` 的负载里认出一条命令；不是命令就 `None`。
+///
+/// 这里只认 `/`。宿主会把 `[command].prefix`（bot 默认 `/`、user 默认 `.`，可配多个）
+/// 里的非 `/` 命令头触发的命令**归一化成** `/…`，并把 `is_outgoing` 抹平，所以插件
+/// 拿到的仍然是 `/cmd`。
 ///
 /// 字段路径照真 `td_api.tl`：`updateNewMessage.message` →
 /// `content:messageText` → `text:formattedText` → `text:string`。
@@ -2046,9 +2130,21 @@ pub fn command_of(update: &Value) -> Option<Command> {
     if name.is_empty() {
         return None;
     }
+    let ephemeral_message_id = message
+        .get("ephemeral_message_id")
+        .and_then(Value::as_i64)
+        .and_then(|id| i32::try_from(id).ok())
+        .filter(|id| *id > 0);
+    let sender_user_id = message
+        .get("sender_id")
+        .filter(|sender| sender.get("@type").and_then(Value::as_str) == Some("messageSenderUser"))
+        .and_then(|sender| sender.get("user_id"))
+        .and_then(Value::as_i64);
     Some(Command {
         chat_id: message.get("chat_id")?.as_i64()?,
         message_id: message.get("id")?.as_i64()?,
+        ephemeral_message_id,
+        sender_user_id,
         name: name.to_ascii_lowercase(),
         args: trimmed[token.len()..].trim().to_owned(),
         // 空 `@`（`/start@`）不算点名别人：按裸命令处理。
@@ -2270,15 +2366,45 @@ impl Simplify {
     /// 超时会先 `deleteMessages(revoke = true)` 把那条还没发出去的消息撤回，再返回
     /// [`SimplifyError::Timeout`]。
     pub fn send_message(&self, chat_id: i64, params: &SendMessageParams) -> Result<Value> {
-        let request_id = self.invoke_send_message(chat_id, params)?;
-        let deadline = Instant::now() + Duration::from_millis(params.timeout_ms);
+        let payload = send_params(chat_id, params, &|text: &Text| self.formatted(text));
+        self.send_payload(payload, params.timeout_ms)
+    }
+
+    /// 发送一条**已经拼好**的 `sendMessage` 参数（不含 `@type`），等到最终 `Message`。
+    ///
+    /// 给「宿主决定怎么回」的场合用（例如 `Command::reply`）。⚠️ **阻塞**当前线程：
+    /// 在更新回调里调它会自己卡自己，回调里请用 `send_message_then` / `Command::reply_then`。
+    pub fn send_payload(&self, payload: Value, timeout_ms: u64) -> Result<Value> {
+        let chat_id = payload
+            .get("chat_id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| SimplifyError::BadParams("sendMessage 参数缺 chat_id".to_owned()))?;
+        let request_id = self
+            .host
+            .td_invoke_simplified(td_api::SendMessage::METHOD, &payload.to_string())?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
         // 1. 响应 = 临时消息（sendMessage = Message）
-        let pending = self.await_response(request_id, deadline, params.timeout_ms)?;
+        let pending = self.await_response(request_id, deadline, timeout_ms)?;
         let old_message_id = pending.get("id").and_then(Value::as_i64);
 
         // 2. 这条临时消息的结局：成功 / 失败
-        self.await_outcome(chat_id, old_message_id, deadline, params.timeout_ms)
+        self.await_outcome(chat_id, old_message_id, deadline, timeout_ms)
+    }
+
+    /// 调一个「发出去就等响应」的方法（`editMessageText` / `editMessageMedia`），
+    /// 返回 TDLib 的响应（编辑类方法是 `Message`）。
+    ///
+    /// ⚠️ **阻塞**当前线程；回调里请用 `edit_message_text_then` 这类异步版。
+    pub fn invoke_payload(&self, method: &str, payload: Value, timeout_ms: u64) -> Result<Value> {
+        let request_id = self
+            .host
+            .td_invoke_simplified(method, &payload.to_string())?;
+        self.await_response(
+            request_id,
+            Instant::now() + Duration::from_millis(timeout_ms),
+            timeout_ms,
+        )
     }
 
     /// 发一组相册（2–10 项，仅音频/文档/图片/视频可混）并**等到每一项的结局**。
@@ -2318,14 +2444,6 @@ impl Simplify {
     }
 
     // ── 发送的内部三步：发 → 等响应 → 等结局 ──────────────────────
-
-    /// 只发请求，不等结果（`sendMessage`）。
-    fn invoke_send_message(&self, chat_id: i64, params: &SendMessageParams) -> Result<RequestId> {
-        let payload = send_params(chat_id, params, &|text: &Text| self.formatted(text));
-        Ok(self
-            .host
-            .td_invoke_simplified(td_api::SendMessage::METHOD, &payload.to_string())?)
-    }
 
     /// 只发请求，不等结果（`sendMessageAlbum`）——顺带先验项数。
     fn invoke_send_album(&self, chat_id: i64, params: &SendAlbumParams) -> Result<RequestId> {
@@ -4630,6 +4748,64 @@ mod tests {
             },
         });
         assert!(command_of(&photo).is_none());
+
+        // ephemeral 消息：id 与发送者都要带出来，回复才能走 sendEphemeralMessage。
+        let ephemeral = json!({
+            "message": {
+                "id": 77,
+                "chat_id": 7,
+                "is_outgoing": false,
+                "ephemeral_message_id": 555,
+                "sender_id": { "@type": "messageSenderUser", "user_id": 9 },
+                "content": {
+                    "@type": "messageText",
+                    "text": { "@type": "formattedText", "text": "/start", "entities": [] },
+                },
+            },
+        });
+        let ephemeral = command_of(&ephemeral).expect("ephemeral 命令");
+        assert_eq!(ephemeral.ephemeral_message_id, Some(555));
+        assert_eq!(ephemeral.sender_user_id, Some(9));
+    }
+
+    /// `Command::reply` 走宿主预置的 `fuyubot.host.command` service，插件不用自己拼 `sendMessage`。
+    #[test]
+    fn command_reply_goes_through_the_host_service() {
+        assert_eq!(COMMAND_SERVICE, "fuyubot.host.command");
+        assert_eq!(ParseMode::Markdown.as_str(), "markdown");
+        assert_eq!(ParseMode::MarkdownV2.as_str(), "markdown_v2");
+        assert_eq!(ParseMode::Html.as_str(), "html");
+        assert_eq!(ParseMode::Plain.as_str(), "plain");
+
+        let rt = runtime();
+        // SAFETY: vtable 由活着的 runtime 持有，本函数期间一直有效。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.expect("vtable");
+        let update = json!({
+            "@type": "updateNewMessage",
+            "message": {
+                "id": 1,
+                "chat_id": 7,
+                "is_outgoing": false,
+                "content": {
+                    "@type": "messageText",
+                    "text": { "@type": "formattedText", "text": "/help" },
+                },
+            },
+        });
+        let command = command_of(&update).expect("这是一条命令");
+        let params = SendMessageParams {
+            text: Some(Text::markdown("*hi*")),
+            ..SendMessageParams::default()
+        };
+        let reply = command.reply(api, &params).expect("宿主该接受这次回复");
+        assert_eq!(reply["@type"], json!("message"), "返回的是 TDLib Message");
+        assert_eq!(reply["chat_id"], json!(7));
+
+        let sent = rt.sent_requests();
+        let last = sent.last().expect("应该记录了一条请求");
+        assert_eq!(last.method, "sendMessage");
+        assert_eq!(last.params["chat_id"], json!(7));
+        assert_eq!(last.params["reply_to"]["message_id"], json!(1));
     }
 
     /// `on_command` 只把「该由本插件响应的」命令交出去：点名别人的不交。

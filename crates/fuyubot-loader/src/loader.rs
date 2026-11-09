@@ -495,6 +495,13 @@ impl PluginLoader {
             version: manifest.version.clone(),
             inject: manifest.depends.clone(),
             soft_inject: manifest.optional_depends.clone(),
+            // 目录包的展示元数据在 `plugin.json` 里；清单没写 name 就用 id。
+            display_name: if manifest.name.is_empty() {
+                manifest.id.clone()
+            } else {
+                manifest.name.clone()
+            },
+            description: manifest.description.clone(),
         };
 
         Ok(Probe {
@@ -756,6 +763,12 @@ pub struct Manifest {
     pub inject: Vec<String>,
     /// 软依赖：缺了不阻塞，有了优先排前面。
     pub soft_inject: Vec<String>,
+    /// 给人看的名字（`plugin_manifest` 的 `display_name`；空 = 用 `name`）。
+    ///
+    /// 目录包取 `plugin.json` 的 `name`，旧形态取插件自报的字段；老插件没有就是空串。
+    pub display_name: String,
+    /// 一句话介绍（`plugin_manifest` 的 `description`；空 = 不显示）。
+    pub description: String,
 }
 
 type PluginManifestFn = unsafe extern "C" fn() -> *const c_char;
@@ -811,6 +824,9 @@ unsafe fn read_manifest(lib: &Library) -> Option<Manifest> {
         version: field("version"),
         inject: strings("inject"),
         soft_inject: strings("soft_inject"),
+        // 可选字段：老插件（v4/v5/v6 早期）没有这两个键，读成空串。
+        display_name: field("display_name"),
+        description: field("description"),
     })
 }
 
@@ -1374,6 +1390,7 @@ mod declared_tests {
             version: "0.1.0".to_owned(),
             inject: inject.iter().map(|s| (*s).to_owned()).collect(),
             soft_inject: soft.iter().map(|s| (*s).to_owned()).collect(),
+            ..Manifest::default()
         }
     }
 

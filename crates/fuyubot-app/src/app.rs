@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use fuyubot_core::{Effect, Kernel, KernelError, Plugin};
 use fuyubot_loader::{
-    DylibPlugin, HostRuntime, LoadError, LogLevel, PluginEntry, PluginLoader, UpdatePipeline,
-    find_script, plugin_entries,
+    DylibPlugin, HostRuntime, LoadError, LogLevel, PluginCatalogEntry, PluginEntry, PluginLoader,
+    UpdatePipeline, find_script, plugin_entries,
 };
 use fuyubot_tdlib::{AccountType, ReceiveLoop, Session, SessionError, TdClient, TdlibParameters};
 use serde_json::Value;
@@ -307,6 +307,11 @@ impl App {
             .iter()
             .map(|adapter| Arc::clone(adapter) as Arc<dyn fuyubot_core::Plugin>)
             .collect();
+        // 展示元数据先装进报告服务：插件在 `start` 里就可能查 `/plugins` 同款报告，
+        // 而且 `plugin_report_json()` 也靠它（内核报告只有 name/state）。
+        self.loader
+            .runtime()
+            .install_plugin_catalog(plugin_catalog(&adapters));
         self.kernel.plugins().load_all(plugins)?;
         self.loader
             .runtime()
@@ -476,22 +481,32 @@ impl App {
         &self.load
     }
 
-    /// 已装插件的静态自描述（名字 / 版本 / ABI / 依赖 / 文件路径），按扫描顺序。
+    /// 已装插件的静态自描述（名字 / 版本 / 展示名 / 介绍 / ABI / 依赖 / 文件路径），
+    /// 按扫描顺序。
     ///
     /// 只看**装上的**：探测失败的插件连 `DylibPlugin` 都没造出来，它们只出现在日志里。
     pub fn plugin_infos(&self) -> Vec<PluginInfo> {
         self.plugins
             .iter()
-            .map(|plugin| PluginInfo {
-                name: plugin.name().to_owned(),
-                version: plugin
-                    .manifest()
-                    .map(|manifest| manifest.version.clone())
-                    .unwrap_or_default(),
-                abi_version: plugin.abi_version(),
-                inject: plugin.inject(),
-                soft_inject: plugin.soft_inject(),
-                path: plugin.path().to_path_buf(),
+            .map(|plugin| {
+                let manifest = plugin.manifest();
+                PluginInfo {
+                    name: plugin.name().to_owned(),
+                    version: manifest
+                        .map(|manifest| manifest.version.clone())
+                        .unwrap_or_default(),
+                    // 空串是「没提供」：展示方回退到 name / 不显示介绍。
+                    display_name: manifest
+                        .map(|manifest| manifest.display_name.clone())
+                        .unwrap_or_default(),
+                    description: manifest
+                        .map(|manifest| manifest.description.clone())
+                        .unwrap_or_default(),
+                    abi_version: plugin.abi_version(),
+                    inject: plugin.inject(),
+                    soft_inject: plugin.soft_inject(),
+                    path: plugin.path().to_path_buf(),
+                }
             })
             .collect()
     }
@@ -524,6 +539,32 @@ impl App {
             self.load.skipped.len()
         );
     }
+}
+
+/// 把已探测插件的静态元信息收成宿主报告服务要用的表。
+///
+/// 内核的 `Report` 只有 name/state（`fuyubot-core` 不引 serde，也不该认识展示文案），
+/// 而 `/plugins` 要显示「名称（id）— 介绍」——所以在交给内核之前把这张表装进
+/// [`HostRuntime`]，序列化时按名字并进每一条。
+fn plugin_catalog(plugins: &[Arc<DylibPlugin>]) -> Vec<PluginCatalogEntry> {
+    plugins
+        .iter()
+        .map(|plugin| {
+            let manifest = plugin.manifest();
+            PluginCatalogEntry {
+                name: plugin.name().to_owned(),
+                version: manifest
+                    .map(|manifest| manifest.version.clone())
+                    .unwrap_or_default(),
+                display_name: manifest
+                    .map(|manifest| manifest.display_name.clone())
+                    .unwrap_or_default(),
+                description: manifest
+                    .map(|manifest| manifest.description.clone())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

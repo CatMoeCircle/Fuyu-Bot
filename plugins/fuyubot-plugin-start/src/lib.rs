@@ -1,7 +1,8 @@
 //! 内置插件：`/start` 回一句欢迎语。
 //!
 //! 写法就是「插件作者从这儿抄」的最小样板：`fuyubot_simplify::on_command` 订阅
-//! `updateNewMessage`，命中**不带参数的** `/start` 就把回复按 `reply_to` 发回同一个会话。
+//! `updateNewMessage`，命中**不带参数的** `/start` 就交给 `Command::reply_then`——由宿主决定
+//! 发新消息（bot 账户 / 白名单用户触发）还是编辑原命令消息（user 账户自己触发）。
 //! 带参数的 `/start`（如深链 `/start payload`）是别的用途，这里不回。
 //! 点名给别人的（`/start@别的Bot`）**根本到不了这里**——`on_command` 已经按
 //! 「裸命令所有人都响应、带 `@` 的只有被点名的响应」过滤过了。
@@ -12,9 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use fuyubot_abi::{HostApi, LogLevel, Plugin, define_plugin};
-use fuyubot_simplify::{
-    Command, CommandSubscription, SendMessageParams, Simplify, Text, on_command,
-};
+use fuyubot_simplify::{Command, CommandSubscription, SendMessageParams, Text, on_command};
 
 /// 欢迎语。Markdown 的语法以 TDLib 为准（粗体是 `*x*`，不是 `**x**`）。
 const WELCOME: &str = "👋 你好！我是 *FuyuBot*。\n\n发 /help 看看我能做什么。";
@@ -22,7 +21,7 @@ const WELCOME: &str = "👋 你好！我是 *FuyuBot*。\n\n发 /help 看看我�
 struct StartPlugin {
     host: HostApi,
     subscription: Option<CommandSubscription>,
-    /// 还在跑的异步发送：插件是动态库，卸载之后线程还在跑库里的代码就是 UB——
+    /// 还在跑的异步回复：插件是动态库，卸载之后线程还在跑库里的代码就是 UB——
     /// 所以 `stop()` 里要把它们 join 掉。
     sending: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
@@ -47,17 +46,14 @@ impl Plugin for StartPlugin {
             }
             let params = SendMessageParams {
                 text: Some(Text::markdown(WELCOME)),
-                reply_to_message_id: Some(command.message_id),
                 ..SendMessageParams::default()
             };
-            // 命令回调跑在接收循环那个线程上，所以用 **then**：等待版会把自己卡死。
-            // 结局（成功 / 失败 / 超时）由闭包接住，这里立刻返回。
-            let handle =
-                Simplify::new(host).send_message_then(command.chat_id, &params, move |result| {
-                    if let Err(error) = result {
-                        host.log(LogLevel::Error, &format!("start 插件回复失败: {error}"));
-                    }
-                });
+            // 命令回调跑在接收循环线程上：用 then（reply 会阻塞等 TDLib）。
+            let handle = command.reply_then(host, &params, move |result| {
+                if let Err(error) = result {
+                    host.log(LogLevel::Error, &format!("start 插件回复失败: {error}"));
+                }
+            });
             if let Ok(mut sending) = sending.lock() {
                 sending.push(handle);
             }
@@ -91,10 +87,20 @@ impl Plugin for StartPlugin {
         vec!["fuyubot.help.commands".to_owned()]
     }
 
+    /// `/plugins` 列表里显示的名字。
+    fn display_name() -> &'static str {
+        "启动问候"
+    }
+
+    /// `/plugins` 列表里那一行介绍。
+    fn description() -> &'static str {
+        "回复 /start 的欢迎语"
+    }
+
     fn stop(&mut self) {
         // 守卫 drop 就退订（宿主卸载时也会整批回滚，这里只是早一点松手）。
         self.subscription = None;
-        // 等异步发送收工：不能让它们在动态库卸载之后还在跑。
+        // 等异步回复收工：不能让它们在动态库卸载之后还在跑。
         let mut sending = self
             .sending
             .lock()

@@ -33,6 +33,9 @@ pub struct Config {
     pub bot: Bot,
     #[serde(default)]
     pub telegram: Telegram,
+    /// 命令头数组与触发者白名单（`[command]`）。不写命令头时 bot 认 `/`、user 认 `.`。
+    #[serde(default)]
+    pub command: Command,
     #[serde(default)]
     pub plugins: Plugins,
     #[serde(default)]
@@ -50,6 +53,7 @@ impl Default for Config {
         Self {
             bot: Bot::default(),
             telegram: Telegram::default(),
+            command: Command::default(),
             plugins: Plugins::default(),
             tdlib: Tdlib::default(),
             plugin: empty_table(),
@@ -111,6 +115,42 @@ impl Telegram {
     /// TDLib 的数据目录（配置里没写就 `<root>/data`）。
     pub fn data_dir(&self, root: &Path) -> PathBuf {
         root.join(self.data_dir.as_deref().unwrap_or("data"))
+    }
+}
+
+/// `[command]`：命令头数组、触发者白名单与白名单模式开关。
+///
+/// 真正的判定在宿主（`fuyubot-loader`）：没配命令头时 bot 认 `/`、user 认 `.`；
+/// user 账户下 `/xxx` 一律不交给插件（即使写进数组），其它命令头放行后归一化成 `/xxx`；
+/// `whitelist` 里的用户 id 也能触发。user 账户默认**白名单模式**（只认自己 + 表里的
+/// 用户），`whitelist_only = false` 可关，但**不建议**。
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+pub struct Command {
+    /// 命令头数组，例如 `["/", ".", "。"]`。没写 = 按账号类型取默认值
+    /// （bot `/`、user `.`）；每项必须是单个字符（不能是字母、数字或空白）。
+    pub prefix: Option<Vec<String>>,
+    /// 允许触发命令的用户 id（数字）。user 账户下自己始终算数；空表时
+    /// user 只认自己、bot 不限制。
+    #[serde(default)]
+    pub whitelist: Vec<i64>,
+    /// user 账户的白名单模式（默认 `true`）：只响应自己与 `whitelist` 里的用户。
+    ///
+    /// `Some(false)` = 关闭，任何人发的命令都能触发——**不建议**，模板与文档的注释
+    /// 必须写明这一点。bot 账户不受它影响。
+    pub whitelist_only: Option<bool>,
+}
+
+impl Command {
+    /// 配置里写的命令头；没写 / 空数组返回 `None`（宿主按账号类型取默认值）。
+    pub fn prefixes(&self) -> Option<&[String]> {
+        self.prefix
+            .as_deref()
+            .filter(|prefixes| !prefixes.is_empty())
+    }
+
+    /// user 账户的白名单模式；没写 = `true`。
+    pub fn whitelist_only(&self) -> bool {
+        self.whitelist_only.unwrap_or(true)
     }
 }
 
@@ -299,8 +339,10 @@ pub fn remember_credentials(
 /// 单个配置项写回：在 `[section]` 段里把 `key` 设成 TOML 字面量 `value`。
 ///
 /// 面板的「编辑单个配置项」走这里。和 [`remember_credentials`] 一样是**文本级替换**：
-/// 保留注释、顺序、CRLF，只改这一行（键/段不存在就补）。`value` 必须是**已校验并渲染好的
-/// TOML 字面量**（字符串带引号，数字原样），调用方负责类型校验。
+/// 保留注释、顺序、CRLF，只改这一段值（键/段不存在就补）。值可以跨行（多行数组 /
+/// 内联表）：整段折叠成一行，值里的注释原样搬到新值下面，绝不把后面的段吞掉。
+/// `value` 必须是**已校验并渲染好的 TOML 字面量**（字符串带引号，数字原样），
+/// 调用方负责类型校验。
 pub fn set_config_value(
     path: &Path,
     section: &str,
@@ -382,11 +424,20 @@ fn set_toml_key(lines: &mut Vec<String>, section: &str, key: &str, value: &str) 
         if !rest.trim_start().starts_with('=') {
             continue;
         }
-        let rendered = format!("{key} = {value}{}", trailing_comment(&lines[index]));
-        if lines[index] == rendered {
-            return false;
+        let span = value_span(&lines, index);
+        if span.last == index {
+            let rendered = format!("{key} = {value}{}", trailing_comment(&lines[index]));
+            if lines[index] == rendered {
+                return false;
+            }
+            lines[index] = rendered;
+            return true;
         }
-        lines[index] = rendered;
+        // 跨行值（多行数组 / 内联表）：整段换成一行，并把值里的注释**原样搬到下面**。
+        // 注释内容一个字不丢；位置只能变——元素数量一变，逐项对应就无从谈起了。
+        let mut replacement = vec![format!("{key} = {value}{}", span.first_comment)];
+        replacement.extend(span.comments);
+        lines.splice(index..=span.last, replacement);
         return true;
     }
 
@@ -429,6 +480,159 @@ fn trailing_comment(line: &str) -> String {
 /// 包成 TOML 基本字符串（只转义 `\` 与 `"`）。
 pub(crate) fn quote_toml_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// 一个键的**值**在文件里占的行范围，以及值里要保留的注释。
+struct ValueSpan {
+    /// 值结束所在的行（单行值 = 键所在行）。
+    last: usize,
+    /// 键所在行的行尾注释（含 `#` 前的一个空格）。
+    first_comment: String,
+    /// 值跨行时，后续行里的注释（整行注释保留缩进；行尾注释单独成行）。
+    comments: Vec<String>,
+}
+
+/// 从 `lines[start]` 的 `=` 之后扫到值的结尾。
+///
+/// TOML 的值可以跨行（多行数组 / 内联表 / 三引号字符串），而且元素之间允许写注释。
+/// 改这种键时只换掉第一行会把后面的元素和 `]` 留成孤儿、把配置弄坏——所以先把整段
+/// 找出来，注释一并收集，[`set_toml_key`] 再把它们搬回新值下面。
+///
+/// 字符串里的 `#` / `[` / `]` 不算注释、不参与括号配对。扫到文件尾还没闭合就当单行
+/// （文件本来就不是合法 TOML，面板也不会走到这里）。
+fn value_span(lines: &[String], start: usize) -> ValueSpan {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Basic,
+        Literal,
+        MultiBasic,
+        MultiLiteral,
+    }
+
+    let mut span = ValueSpan {
+        last: start,
+        first_comment: String::new(),
+        comments: Vec::new(),
+    };
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut depth = 0i32;
+
+    for (offset, line) in lines[start..].iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let mut index = if offset == 0 {
+            chars
+                .iter()
+                .position(|ch| *ch == '=')
+                .map_or(0, |at| at + 1)
+        } else {
+            0
+        };
+        let mut comment_at = None;
+        while index < chars.len() {
+            let ch = chars[index];
+            match quote {
+                Quote::None => match ch {
+                    '"' => {
+                        if chars.get(index + 1) == Some(&'"') && chars.get(index + 2) == Some(&'"')
+                        {
+                            quote = Quote::MultiBasic;
+                            index += 3;
+                            continue;
+                        }
+                        quote = Quote::Basic;
+                    }
+                    '\'' => {
+                        if chars.get(index + 1) == Some(&'\'')
+                            && chars.get(index + 2) == Some(&'\'')
+                        {
+                            quote = Quote::MultiLiteral;
+                            index += 3;
+                            continue;
+                        }
+                        quote = Quote::Literal;
+                    }
+                    '[' | '{' => depth += 1,
+                    ']' | '}' => depth -= 1,
+                    '#' => {
+                        comment_at = Some(index);
+                        break;
+                    }
+                    _ => {}
+                },
+                Quote::Basic => {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        quote = Quote::None;
+                    }
+                }
+                Quote::Literal => {
+                    if ch == '\'' {
+                        quote = Quote::None;
+                    }
+                }
+                Quote::MultiBasic => {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"'
+                        && chars.get(index + 1) == Some(&'"')
+                        && chars.get(index + 2) == Some(&'"')
+                    {
+                        quote = Quote::None;
+                        index += 3;
+                        continue;
+                    }
+                }
+                Quote::MultiLiteral => {
+                    if ch == '\''
+                        && chars.get(index + 1) == Some(&'\'')
+                        && chars.get(index + 2) == Some(&'\'')
+                    {
+                        quote = Quote::None;
+                        index += 3;
+                        continue;
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        if let Some(at) = comment_at {
+            let text: String = chars[at..].iter().collect();
+            if offset == 0 {
+                span.first_comment = format!(" {}", text.trim_end());
+            } else {
+                let before: String = chars[..at].iter().collect();
+                if before.trim().is_empty() {
+                    // 整行注释：连缩进一起原样留下。
+                    span.comments
+                        .push(format!("{before}{text}").trim_end().to_owned());
+                } else {
+                    // 值后面的行尾注释：单独成行，缩进跟这一行对齐。
+                    let indent: String =
+                        before.chars().take_while(|ch| ch.is_whitespace()).collect();
+                    span.comments.push(format!("{indent}{}", text.trim_end()));
+                }
+            }
+        }
+
+        span.last = start + offset;
+        if quote == Quote::None && depth <= 0 {
+            return span;
+        }
+    }
+
+    // 扫到文件尾都没闭合：文件本来就不是合法 TOML。按单行处理，绝不把后面的段吞掉。
+    span.last = start;
+    span.first_comment.clear();
+    span.comments.clear();
+    span
 }
 
 /// 从 `start` 往上找 `fuyubot.toml`。
@@ -478,6 +682,26 @@ pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<Str
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("自动（TDLIB_TDJSON_PATH → 自带 → exe 同级 → 系统库 → 裸库名）");
+    let whitelist = if config.command.whitelist.is_empty() {
+        "（空，不额外限制）".to_owned()
+    } else {
+        config
+            .command
+            .whitelist
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let prefixes = match config.command.prefixes() {
+        Some(prefixes) => prefixes.join(", "),
+        None => "按账号默认（bot \"/\"、user \".\"）".to_owned(),
+    };
+    let whitelist_only = if config.command.whitelist_only() {
+        "true（只认自己 + whitelist）".to_owned()
+    } else {
+        "false（⚠️ 已关闭：任何人都能触发，不建议）".to_owned()
+    };
     let mut lines = vec![
         format!("配置文件  {}{missing}", config_path.display()),
         format!("项目根    {}", root.display()),
@@ -502,6 +726,9 @@ pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<Str
             "[telegram]  data_dir     = {}",
             config.telegram.data_dir(root).display()
         ),
+        format!("[command]   prefix       = {prefixes}"),
+        format!("[command]   whitelist    = {whitelist}"),
+        format!("[command]   whitelist_only = {whitelist_only}"),
         format!(
             "[plugins]   dir          = {}",
             config.plugin_dir(root).display()
@@ -1754,6 +1981,102 @@ mod tests {
         assert!(lines.contains("[plugin.my.weather]"), "{lines}");
     }
 
+    /// `[command]` 段能解析、进配置树（宿主据此装闸门），也能在 `config` 里看到生效值。
+    #[test]
+    fn command_section_parses_and_round_trips() {
+        let root = temp("command-config");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(
+            &path,
+            "[command]\nprefix = [\"!\", \"。\"]\nwhitelist = [7, 8]\nwhitelist_only = false\n",
+        )
+        .unwrap();
+        let config = load_config(&path).unwrap();
+        assert_eq!(
+            config.command.prefixes(),
+            Some(&["!".to_owned(), "。".to_owned()][..])
+        );
+        assert_eq!(config.command.whitelist, vec![7, 8]);
+        assert!(!config.command.whitelist_only());
+
+        let json = config.to_json().unwrap();
+        assert_eq!(
+            json.pointer("/command/prefix/0")
+                .and_then(serde_json::Value::as_str),
+            Some("!")
+        );
+        assert_eq!(
+            json.pointer("/command/prefix/1")
+                .and_then(serde_json::Value::as_str),
+            Some("。")
+        );
+        assert_eq!(
+            json.pointer("/command/whitelist/1")
+                .and_then(serde_json::Value::as_i64),
+            Some(8)
+        );
+        assert_eq!(
+            json.pointer("/command/whitelist_only")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+
+        let lines = config_lines(&path, &root, &config).join("\n");
+        assert!(
+            lines.contains("[command]   prefix       = !, 。"),
+            "{lines}"
+        );
+        assert!(lines.contains("[command]   whitelist    = 7, 8"), "{lines}");
+        assert!(
+            lines.contains("whitelist_only = false（⚠️ 已关闭：任何人都能触发，不建议）"),
+            "{lines}"
+        );
+
+        // 没写时按账号默认（模板也必须说清楚）。模板**不能钉死** `prefix`：
+        // 一旦写进配置就是整套替换，bot 会连 `/` 都不认。
+        assert_eq!(Command::default().prefixes(), None);
+        assert!(
+            Command::default().whitelist_only(),
+            "user 账户默认白名单模式"
+        );
+        assert!(
+            TEMPLATE_CONFIG.contains("不建议关闭"),
+            "模板必须提醒不要关白名单模式：\n{TEMPLATE_CONFIG}"
+        );
+        assert!(
+            Config::default()
+                .to_json()
+                .unwrap()
+                .pointer("/command/prefix")
+                .is_none(),
+            "没写命令头时配置树里不该出现 prefix（宿主按账号默认）"
+        );
+        let lines = config_lines(&path, &root, &Config::default()).join("\n");
+        assert!(
+            lines.contains("按账号默认（bot \"/\"、user \".\"）"),
+            "{lines}"
+        );
+        let active_lines = TEMPLATE_CONFIG
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !active_lines.contains("prefix ="),
+            "模板不能把命令头钉死，否则账号默认值会被整套替换：\n{TEMPLATE_CONFIG}"
+        );
+    }
+
+    /// 旧写法（`prefix = "!"` 字符串）只接受数组，读配置时必须报错。
+    #[test]
+    fn a_string_prefix_is_rejected() {
+        let root = temp("command-string-prefix");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(&path, "[command]\nprefix = \"!\"\n").unwrap();
+        let error = load_config(&path).unwrap_err();
+        assert!(error.contains("prefix"), "{error}");
+    }
+
     /// 账号类型写错必须**报错指路**，不能静默当 bot——否则用户会拿着错的登录方式
     /// 一直等不到验证码，而错误信息完全不指向配置。
     #[test]
@@ -1909,6 +2232,112 @@ mod tests {
         assert!(text.contains("[tdlib]"), "{text:?}");
         assert!(text.contains("log_verbosity = 3"), "{text:?}");
         assert_eq!(load_config(&path).unwrap().tdlib.log_verbosity(), 3);
+    }
+
+    /// 跨行值（多行数组）也能改：整段换成一行，值里的注释一个字不丢，配置仍然合法。
+    #[test]
+    fn editing_a_multiline_array_keeps_every_comment() {
+        let root = temp("multiline-array-edit");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(
+            &path,
+            "[command]\n\
+             # 命令头说明\n\
+             prefix = [\n\
+             \x20 \".\",  # 点\n\
+             \x20 \"!\",  # 感叹\n\
+             ]  # 命令头\n\
+             whitelist = []  # 白名单\n",
+        )
+        .unwrap();
+
+        assert!(
+            set_config_value(&path, "command", "prefix", "[\"/\", \"。\"]").unwrap(),
+            "多行数组被折叠成一行也算改动"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        for comment in ["# 命令头说明", "# 点", "# 感叹", "# 命令头", "# 白名单"] {
+            assert!(text.contains(comment), "丢了注释 {comment}：\n{text}");
+        }
+        assert!(text.contains("prefix = [\"/\", \"。\"]"), "{text}");
+        assert_eq!(
+            load_config(&path).unwrap().command.prefix,
+            Some(vec!["/".to_owned(), "。".to_owned()]),
+            "{text}"
+        );
+
+        // 再写一次同样的值：现在已经是单行，不该再动文件。
+        assert!(!set_config_value(&path, "command", "prefix", "[\"/\", \"。\"]").unwrap());
+    }
+
+    /// 单行数组的行尾注释也不能丢。
+    #[test]
+    fn editing_a_single_line_array_keeps_the_trailing_comment() {
+        let root = temp("single-line-array-edit");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(
+            &path,
+            "[command]\nprefix = [\".\", \"!\"]  # 命令头\nwhitelist = []\n",
+        )
+        .unwrap();
+
+        assert!(set_config_value(&path, "command", "prefix", "[\"/\", \"。\"]").unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("prefix = [\"/\", \"。\"] # 命令头"),
+            "行尾注释要留在同一行：\n{text}"
+        );
+        assert_eq!(
+            load_config(&path).unwrap().command.prefix,
+            Some(vec!["/".to_owned(), "。".to_owned()])
+        );
+    }
+
+    /// 在**真模板**上改每一行可编辑的键：所有注释必须原样留下。
+    #[test]
+    fn editing_every_template_line_keeps_all_comments() {
+        let root = temp("template-line-edits");
+        let path = root.join(CONFIG_FILE);
+        let template = TEMPLATE_CONFIG
+            .replace("__NAME__", "demo")
+            .replace("__API_ID__", "1");
+        std::fs::write(&path, &template).unwrap();
+
+        let edits = [
+            ("bot", "name", "\"renamed\""),
+            ("telegram", "account_type", "\"user\""),
+            ("telegram", "api_id", "12345"),
+            ("telegram", "data_dir", "\"data2\""),
+            ("telegram", "api_hash", "\"hash\""),
+            ("plugins", "dir", "\"plugins2\""),
+            ("plugins", "log_level", "\"debug\""),
+            ("tdlib", "path", "\"tdjson\""),
+            ("tdlib", "log_verbosity", "3"),
+            ("command", "whitelist_only", "false"),
+        ];
+        let comments = template
+            .lines()
+            .filter(|line| line.trim_start().starts_with('#'))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        for (section, key, value) in edits {
+            assert!(
+                set_config_value(&path, section, key, value).unwrap(),
+                "[{section}].{key} 该有改动"
+            );
+            let text = std::fs::read_to_string(&path).unwrap();
+            for comment in &comments {
+                assert!(
+                    text.lines()
+                        .any(|line| line.trim_end() == comment.trim_end()),
+                    "改 [{section}].{key} 后丢了注释 {comment:?}：\n{text}"
+                );
+            }
+            load_config(&path).unwrap_or_else(|error| {
+                panic!("改 [{section}].{key} 后不再是合法 TOML：{error}\n{text}")
+            });
+        }
     }
 
     /// 回写凭据：**值要能读回来，注释一个字都不能丢**。

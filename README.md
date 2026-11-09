@@ -110,7 +110,8 @@ $env:TG_API_HASH = "…"
   `End` 回到最新；`F` 按级别与来源（插件 / 宿主 / 管道 / 更新 / TDLib）过滤，`c` 清空当前日志。
 - **调插件日志级别**：`l` 写 `.fuyubot/log-level`，运行中的实例下一圈生效，重启回到配置值。
 - **改配置**：配置页选中一行，`Enter` / `e` 编辑，文本 / 整数 / 枚举先校验，写回保留注释与 CRLF，
-  重启生效；`api_hash`、凭据与 `[plugin.*]` 段只读。
+  跨行值（多行数组 / 内联表）也能改（整段折叠，值里的注释搬到新值下面），重启生效；
+  `api_hash`、凭据与 `[plugin.*]` 段只读。
 - **窄终端自适应**：Termux 这类 40 列终端会自动收缩布局，完整按键见
   [文档站](https://catmoecircle.github.io/FuyuBot-docs/docs/usage/run)。
 
@@ -127,6 +128,11 @@ account_type = "bot"   # bot：Bot Token；user：手机号 / 扫码。写错会
 api_id = 12345         # 不是秘密
 data_dir = "data"      # TDLib 的 database 与 files 都放这儿
 
+[command]
+# prefix = ["/", "."]  # 命令头数组；不写按账号默认（bot "/"、user "."），写了整套替换
+whitelist = []         # 允许触发命令的用户 id；自己发的始终触发
+whitelist_only = true  # user 账户白名单模式；⚠️ 不建议关闭（false = 任何人都能触发）
+
 [plugins]
 dir = "plugins"
 
@@ -137,6 +143,21 @@ log_verbosity = 1      # 默认只留警告与错误；排查问题再调大
 
 **凭据规则**：`api_hash`、bot token、手机号、验证码**只**来自环境变量
 （`TG_API_ID` / `TG_API_HASH` / `TG_BOT_TOKEN`）或交互式输入，配置文件里写了也会被忽略。
+
+**命令头**：`[command].prefix` 是**数组**，可以配多个（每项单个字符，不能是字母 / 数字 /
+空白）。没配时按账号类型取默认值：bot 认 `/`（`/start`、`/help`…），user 认 `.`
+（`.help`）。配了就是**整套替换**——bot 不会额外保留 `/`，要用就写进数组；
+user 账户下 `/xxx` 始终不交给插件（自己发的也不认），即使写进数组。放行的自定义命令头
+会归一化成 `/xxx`，插件不用改。**user 账户默认白名单模式**：只有账号自己发的消息，
+或在 `[command].whitelist` 里的用户 id 才会触发，别人发的命令一律不触发；
+`[command].whitelist_only = false` 可以关掉这个模式，但**⚠️ 不建议**——关掉后任何人都能
+触发插件。`whitelist` 非空时 bot 也只响应表里的用户（bot 不受 `whitelist_only` 影响）。
+
+插件用 `Command::reply` / `Command::reply_then` 回命令（入参与 `send_message` 一样），
+宿主决定回复方式：bot 账户、或 user 账户里**白名单用户**触发的命令发一条新消息并
+`reply_to` 原命令；**user 账户自己触发的命令编辑原命令消息**（不再刷屏）。返回的是
+TDLib 的最终 `Message`。被拦下的命令仍然出现在 `update` 通用通道里，只是不会进入
+`updateNewMessage` 命令通道。
 
 ### 插件自己的配置段
 

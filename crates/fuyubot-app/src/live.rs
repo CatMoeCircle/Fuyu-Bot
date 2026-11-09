@@ -27,6 +27,10 @@ pub struct PluginInfo {
     pub name: String,
     /// 插件自己的版本（ABI v4 的 `plugin_manifest`；老插件是空串）。
     pub version: String,
+    /// 给人看的名字（`plugin_manifest` 的 `display_name` / 清单的 `name`；空 = 用 `name`）。
+    pub display_name: String,
+    /// 一句话介绍（`plugin_manifest` 的 `description` / 清单的 `description`；空 = 不显示）。
+    pub description: String,
     /// 插件编进去的 ABI 版本。
     pub abi_version: u32,
     /// 硬依赖：缺了不激活（manifest 优先，配置段兜底）。
@@ -140,7 +144,9 @@ impl LiveView {
     /// {
     ///   "name": "fuyubot.start",
     ///   "version": "0.1.0",
-    ///   "abi_version": 5,
+    ///   "display_name": "启动问候",
+    ///   "description": "回复 /start 的欢迎语",
+    ///   "abi_version": 6,
     ///   "state": "active",          // active / pending / activating / failed / unknown
     ///   "inject": ["fuyubot.host.td"],
     ///   "soft_inject": [],
@@ -150,6 +156,9 @@ impl LiveView {
     ///   "reason": "…"               // 仅 failed
     /// }
     /// ```
+    ///
+    /// `display_name` / `description` 空串表示插件没提供展示元数据（老插件），
+    /// 展示方应当回退到 `name`。
     ///
     /// `state` 为 `unknown` 只有一个原因：内核还没装 `PluginReporter`（比如测试里的
     /// 裸 `HostRuntime`）。真跑起来之后不会出现。
@@ -235,6 +244,8 @@ impl LiveView {
         let mut entry = json!({
             "name": info.name,
             "version": info.version,
+            "display_name": info.display_name,
+            "description": info.description,
             "abi_version": info.abi_version,
             "state": state
                 .and_then(|entry| entry.get("state"))
@@ -312,6 +323,8 @@ mod tests {
         PluginInfo {
             name: name.to_owned(),
             version: version.to_owned(),
+            display_name: String::new(),
+            description: String::new(),
             abi_version: fuyubot_loader::abi::ABI_VERSION,
             inject: vec!["fuyubot.host.td".to_owned()],
             soft_inject: Vec::new(),
@@ -349,7 +362,23 @@ mod tests {
         assert_eq!(first["state"], json!("unknown"));
         assert_eq!(first["inject"], json!(["fuyubot.host.td"]));
         assert_eq!(first["file"], json!("libdemo.so"));
+        // 老插件没有展示元数据：字段在场但是空串，展示方据此回退到 name。
+        assert_eq!(first["display_name"], json!(""));
+        assert_eq!(first["description"], json!(""));
         assert!(first.get("reason").is_none(), "没失败就不该有 reason");
+    }
+
+    /// 展示名与介绍要原样穿过 `PluginInfo` → JSON（`/plugins` 列表的 `名称（id）— 介绍`）。
+    #[test]
+    fn plugin_json_carries_display_name_and_description() {
+        let mut demo = info("fuyubot.demo", "0.2.0");
+        demo.display_name = "示例插件".to_owned();
+        demo.description = "最小的插件示例".to_owned();
+        let view = view(vec![demo]);
+
+        let parsed: Value = serde_json::from_str(&view.plugins_json()).unwrap();
+        assert_eq!(parsed["plugins"][0]["display_name"], json!("示例插件"));
+        assert_eq!(parsed["plugins"][0]["description"], json!("最小的插件示例"));
     }
 
     #[test]

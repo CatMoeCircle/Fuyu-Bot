@@ -414,6 +414,8 @@ pub struct HostApiVTable {
     /// 进程里加载了哪些插件（JSON 数组）。
     ///
     /// 每项：`{"name":"…","state":"active|pending|failed","missing":[…],"reason":"…"}`
+    /// 宿主若装了静态元信息，每项还会多出 `version` / `display_name` / `description`
+    /// （老宿主没有这几项，按「字段可能不在」处理）。
     /// 返回宿主线程局部缓冲里的字符串（读完即弃）。没插件就是空数组 `[]`。
     pub list_plugins: Option<unsafe extern "C" fn(host: *mut c_void) -> *const c_char>,
     /// **同步**调用工具，直接返回结果 JSON（缺口 13③ / 工具结果回投）。
@@ -1253,8 +1255,13 @@ pub type PluginAbiVersionFn = unsafe extern "C" fn() -> u32;
 
 /// `plugin_manifest`：返回自描述元数据 JSON（静态导出，不走 VTable）。
 ///
-/// 形状：`{"name":"…","version":"…","inject":[…],"soft_inject":[…]}`
-/// 宿主在 `plugin_init` 之前读它拿到依赖声明，不再依赖配置段。
+/// 形状：
+/// `{"name":"…","version":"…","inject":[…],"soft_inject":[…],`
+/// `"display_name":"…","description":"…"}`
+///
+/// `display_name` / `description` 是**可选追加字段**（可能缺省或为空串）：
+/// 前者是给人看的名字，后者是一句话介绍。宿主在 `plugin_init` 之前读它，
+/// 既拿到依赖声明，也拿到 `/plugins` 列表要显示的元数据。
 pub type PluginManifestFn = unsafe extern "C" fn() -> *const c_char;
 
 /// 工具处理器：`user_data` 是注册时传的不透明指针，`input_json` 是调用入参。
@@ -1284,6 +1291,22 @@ pub trait Plugin: Sized + Send + 'static {
     /// 软依赖：缺了照常加载，有了优先排前面。写进 `plugin_manifest`。
     fn soft_inject() -> Vec<String> {
         Vec::new()
+    }
+
+    /// 给人看的名字（`/plugins` 列表、面板、商店用），写进 `plugin_manifest` 的
+    /// `display_name`。留空就用 `plugin_init` 报的点分 id。
+    ///
+    /// 它是**静态**元数据：宿主在 `plugin_init` 之前就能读到，不依赖插件启动。
+    fn display_name() -> &'static str {
+        ""
+    }
+
+    /// 一句话介绍（`/plugins` 列表每条后面那段），写进 `plugin_manifest` 的
+    /// `description`。留空就不显示。
+    ///
+    /// 给终端用户看，别写成 changelog：一行、尽量不超过 60 个字。
+    fn description() -> &'static str {
+        ""
     }
 }
 
@@ -1397,7 +1420,8 @@ macro_rules! define_plugin {
             $crate::ABI_VERSION
         }
 
-        /// 自描述元数据（名字 / 版本 / 依赖），宿主在 `plugin_init` 之前读。
+        /// 自描述元数据（名字 / 版本 / 依赖 / 展示名 / 介绍），宿主在
+        /// `plugin_init` 之前读。
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn plugin_manifest() -> *const ::core::ffi::c_char {
             $crate::__macro_support::manifest_json(
@@ -1408,6 +1432,8 @@ macro_rules! define_plugin {
                 ::core::env!("CARGO_PKG_VERSION"),
                 <$ty as $crate::Plugin>::inject(),
                 <$ty as $crate::Plugin>::soft_inject(),
+                <$ty as $crate::Plugin>::display_name(),
+                <$ty as $crate::Plugin>::description(),
             )
         }
     };
@@ -1419,7 +1445,11 @@ macro_rules! define_plugin {
 /// 一个稳定的路径（约束 37：内部走 `$crate::__macro_support::…`，不额外要求插件
 /// 依赖别的 crate）。
 pub mod __macro_support {
-    /// 把名字、版本与依赖列表拼成 `plugin_manifest` 的 JSON。
+    /// 把名字、版本、依赖与展示元数据拼成 `plugin_manifest` 的 JSON。
+    ///
+    /// `display_name` / `description` 是**追加字段**（v6 之后加，不跳 ABI 版本）：
+    /// 老宿主按 `serde_json::Value` 读，多出来的键直接忽略；老插件没有这两个键，
+    /// 宿主按空串处理（回退到 id、不显示介绍）。
     ///
     /// 手写 JSON 拼接（不引 serde）：`fuyubot-abi` 是最底层的 crate，
     /// 依赖越少越好（约束 2/3）。**所有字符串都过 `quote()`**——插件名与依赖名
@@ -1433,6 +1463,8 @@ pub mod __macro_support {
         version: &str,
         inject: Vec<String>,
         soft_inject: Vec<String>,
+        display_name: &str,
+        description: &str,
     ) -> *const core::ffi::c_char {
         /// 加引号并转义：`"`、`\` 与全部 < 0x20 的控制字符。
         ///
@@ -1470,11 +1502,14 @@ pub mod __macro_support {
         }
 
         let json = format!(
-            "{{\"name\":{},\"version\":{},\"inject\":[{}],\"soft_inject\":[{}]}}",
+            "{{\"name\":{},\"version\":{},\"inject\":[{}],\"soft_inject\":[{}],\
+             \"display_name\":{},\"description\":{}}}",
             quote(name),
             quote(version),
             list(&inject),
-            list(&soft_inject)
+            list(&soft_inject),
+            quote(display_name),
+            quote(description)
         );
         // 返回的是 `CString::into_raw`——契约是「调用方读完用 `plugin_free_string` 释放」。
         // 每次调用都生成新串：manifest 只在加载时读一次，让调用方负责释放比
@@ -1697,6 +1732,15 @@ mod tests {
         fn soft_inject() -> Vec<String> {
             vec!["soft.beta".to_owned()]
         }
+
+        /// 展示名与介绍也要能穿过 `plugin_manifest`（`/plugins` 列表靠它）。
+        fn display_name() -> &'static str {
+            "测试插件"
+        }
+
+        fn description() -> &'static str {
+            "只用来验证自描述元数据"
+        }
     }
 
     define_plugin!(TestPlugin, "test.plugin");
@@ -1881,6 +1925,9 @@ mod tests {
             serde_json::json!(["dep.alpha", "依赖.中文"])
         );
         assert_eq!(value["soft_inject"], serde_json::json!(["soft.beta"]));
+        // 展示元数据（v6 之后追加的可选字段）：`/plugins` 列表靠它显示「名称 + 介绍」。
+        assert_eq!(value["display_name"], "测试插件");
+        assert_eq!(value["description"], "只用来验证自描述元数据");
 
         // SAFETY: 指针来自 `CString::into_raw`，只还一次。
         unsafe { plugin_free_string(raw as *mut c_char) };
@@ -1892,8 +1939,17 @@ mod tests {
         let name = "we\"ird\\name\n中\\文";
         let inject = vec!["a\"b".to_owned(), "c\\d".to_owned()];
         let soft = vec!["e\tf".to_owned()];
+        let display = "名\"字\\带\n换行";
+        let description = "介\t绍";
 
-        let raw = __macro_support::manifest_json(name, "1.2.3-rc.1", inject.clone(), soft.clone());
+        let raw = __macro_support::manifest_json(
+            name,
+            "1.2.3-rc.1",
+            inject.clone(),
+            soft.clone(),
+            display,
+            description,
+        );
         assert!(!raw.is_null());
         // SAFETY: 同上，契约是 NUL 结尾。
         let text = unsafe { CStr::from_ptr(raw) }
@@ -1908,6 +1964,8 @@ mod tests {
         assert_eq!(value["version"], "1.2.3-rc.1");
         assert_eq!(value["inject"], serde_json::json!(inject));
         assert_eq!(value["soft_inject"], serde_json::json!(soft));
+        assert_eq!(value["display_name"], display);
+        assert_eq!(value["description"], description);
 
         // SAFETY: 指针来自 manifest_json 内部的 `CString::into_raw`。
         unsafe { plugin_free_string(raw as *mut c_char) };

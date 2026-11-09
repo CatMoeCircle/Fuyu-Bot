@@ -34,6 +34,15 @@ impl Plugin for ManifestFixture {
     fn soft_inject() -> Vec<String> {
         vec!["demo.soft".to_owned()]
     }
+
+    /// 展示元数据：证明 `display_name` / `description` 也能穿过 ABI 的 JSON。
+    fn display_name() -> &'static str {
+        "清单夹具"
+    }
+
+    fn description() -> &'static str {
+        "只声明依赖的测试插件"
+    }
 }
 
 define_plugin!(ManifestFixture, "fuyubot.manifest-fixture");

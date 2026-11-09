@@ -21,9 +21,7 @@ use std::thread::JoinHandle;
 use std::thread_local;
 
 use fuyubot_abi::{HostApi, LogLevel, Plugin, ServiceMethod, ServiceVTable, define_plugin};
-use fuyubot_simplify::{
-    Command, CommandSubscription, SendMessageParams, Simplify, Text, on_command,
-};
+use fuyubot_simplify::{Command, CommandSubscription, SendMessageParams, Text, on_command};
 use serde_json::{Value, json};
 
 /// 动态命令注册表。`/help` 渲染时和静态基线合并去重后展示。
@@ -255,7 +253,7 @@ fn build_service(host: HostApi) -> Box<HelpService> {
 struct HelpPlugin {
     host: HostApi,
     subscription: Option<CommandSubscription>,
-    /// 还在跑的异步发送（`stop()` 里 join 掉：卸载之后不能再跑库里的代码）。
+    /// 还在跑的异步回复（`stop()` 里 join 掉：卸载之后不能再跑库里的代码）。
     sending: Arc<Mutex<Vec<JoinHandle<()>>>>,
     /// 持有的服务表；`stop()` 里放下即释放（与宿主回滚注册同步）。
     service: Option<Box<HelpService>>,
@@ -298,16 +296,14 @@ impl Plugin for HelpPlugin {
             }
             let params = SendMessageParams {
                 text: Some(Text::markdown(help_text())),
-                reply_to_message_id: Some(command.message_id),
                 ..SendMessageParams::default()
             };
-            // 命令回调跑在接收循环线程上：用 then，别在回调里等结果。
-            let handle =
-                Simplify::new(host).send_message_then(command.chat_id, &params, move |result| {
-                    if let Err(error) = result {
-                        host.log(LogLevel::Error, &format!("help 插件回复失败: {error}"));
-                    }
-                });
+            // 命令回调跑在接收循环线程上：用 then（reply 会阻塞等 TDLib）。
+            let handle = command.reply_then(host, &params, move |result| {
+                if let Err(error) = result {
+                    host.log(LogLevel::Error, &format!("help 插件回复失败: {error}"));
+                }
+            });
             if let Ok(mut sending) = sending.lock() {
                 sending.push(handle);
             }
@@ -327,6 +323,16 @@ impl Plugin for HelpPlugin {
         for handle in sending.drain(..) {
             let _ = handle.join();
         }
+    }
+
+    /// `/plugins` 列表里显示的名字。
+    fn display_name() -> &'static str {
+        "帮助"
+    }
+
+    /// `/plugins` 列表里那一行介绍。
+    fn description() -> &'static str {
+        "汇总并回复 /help 的命令表"
     }
 }
 

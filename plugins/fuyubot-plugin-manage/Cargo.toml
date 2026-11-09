@@ -1,6 +1,6 @@
 [package]
 name = "fuyubot-plugin-manage"
-description = "内置插件：/plugins 列出插件目录里装了哪些插件"
+description = "内置插件：/plugins 列出已安装 / 已禁用的插件（名称 + id + 介绍）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

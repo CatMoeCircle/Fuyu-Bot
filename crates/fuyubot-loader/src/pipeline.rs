@@ -24,6 +24,7 @@ use fuyubot_middleware::{MiddlewareContext, Stage};
 use fuyubot_tdlib::{ReceiveLoop, Routed, TdClient};
 use serde_json::Value;
 
+use crate::command::Gate;
 use crate::runtime::HostRuntime;
 
 /// 管线只在这一条更新根本没法处理时失败——中间件与监听器的报错都被吞成 warning。
@@ -145,7 +146,7 @@ impl UpdatePipeline {
     /// 处理一条已经解析好的更新。
     ///
     /// 接收循环手上本来就是 `Value`（[`Routed`]），走这条省掉「序列化回去再解析一遍」。
-    pub fn process_value(&self, payload: Value) -> Result<UpdateOutcome, PipelineError> {
+    pub fn process_value(&self, mut payload: Value) -> Result<UpdateOutcome, PipelineError> {
         if !payload.is_object() {
             return Err(PipelineError::NotObject);
         }
@@ -154,6 +155,20 @@ impl UpdatePipeline {
         // 放这里而不是 `dispatch`，是为了让 `--replay` 的离线路径也打得出来。
         if self.runtime.trace_updates() {
             tracing::trace!(target: "fuyubot::update", "{payload}");
+        }
+
+        // 命令闸门：用户账户下 `/xxx` 不进入 `updateNewMessage` 通道（`on_command` 不响应），
+        // 但仍然走中间件、仍然发 `update` 通用通道。放行的 `.` 前缀会被归一化成 `/xxx`。
+        let gate = self.runtime.gate_command(&mut payload);
+        if let Gate::Command(meta) = gate {
+            // 先登记上下文，插件在监听器里就能直接 `command.reply(...)`。
+            self.runtime.remember_command(meta);
+        }
+        if gate == Gate::Blocked {
+            tracing::trace!(
+                target: "fuyubot::command",
+                "命令被策略拦下：只发 update 通用通道"
+            );
         }
 
         let mut warnings = Vec::new();
@@ -175,7 +190,11 @@ impl UpdatePipeline {
         //    两条通道都发：具体的 @type 与兜底通道 "update"，订阅者按需选。
         // e. 每个监听器的调用在 InPlugin 之后、PostResponse 之前
         let payload = self.stage(Stage::InPlugin, payload, &mut warnings);
-        let listeners = match self.runtime.publish_update(&payload) {
+        // 被拦下的命令只走 `update` 通用通道；`updateNewMessage` 通道（on_command）看不到。
+        let listeners = match self
+            .runtime
+            .publish_update_channels(&payload, gate != Gate::Blocked)
+        {
             Ok(count) => count,
             Err(e) => {
                 // 某个监听器返回了 Err：记下来，但管线本身不算失败。
@@ -375,6 +394,150 @@ mod tests {
             *fx.received.lock().unwrap(),
             [json!({"@type":"updateNewMessage","message":{"id":1}})]
         );
+    }
+
+    fn message_update(text: &str, outgoing: bool, sender: i64) -> Value {
+        json!({
+            "@type": "updateNewMessage",
+            "message": {
+                "id": 1,
+                "chat_id": sender,
+                "is_outgoing": outgoing,
+                "sender_id": {"@type": "messageSenderUser", "user_id": sender},
+                "content": {
+                    "@type": "messageText",
+                    "text": {"@type": "formattedText", "text": text}
+                }
+            }
+        })
+    }
+
+    /// user 账户下 `/xxx` 在管线层就被拦下：监听器一个都收不到。
+    #[test]
+    fn d_user_account_slash_commands_never_reach_the_command_channel() {
+        let fx = fixture();
+        fx.runtime
+            .install_config(None, json!({"telegram": {"account_type": "user"}}));
+        fx.runtime
+            .set_self_user(json!({"id": 7, "type": {"@type": "userTypeRegular"}}));
+
+        let hits = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&hits);
+        let _listener = fx.pipeline.subscribe("updateNewMessage", None, move |_| {
+            *seen.lock().unwrap() += 1;
+            Ok(())
+        });
+
+        let outcome = fx
+            .pipeline
+            .process_value(message_update("/start", true, 7))
+            .unwrap();
+        assert_eq!(outcome.listeners, 0);
+        assert_eq!(*hits.lock().unwrap(), 0);
+
+        // 别人的 `/` 也一样。
+        let outcome = fx
+            .pipeline
+            .process_value(message_update("/help", false, 9))
+            .unwrap();
+        assert_eq!(outcome.listeners, 0);
+        assert_eq!(*hits.lock().unwrap(), 0);
+    }
+
+    /// 被拦下的命令仍然走 `update` 通用通道：raw 监听器看得到，只是 `on_command` 通道没有。
+    #[test]
+    fn d2_blocked_commands_still_reach_the_generic_update_channel() {
+        let fx = fixture();
+        fx.runtime
+            .install_config(None, json!({"telegram": {"account_type": "user"}}));
+        fx.runtime
+            .set_self_user(json!({"id": 7, "type": {"@type": "userTypeRegular"}}));
+
+        let generic = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&generic);
+        let _generic = fx
+            .pipeline
+            .subscribe(crate::runtime::UPDATE_EVENT, None, move |_| {
+                *seen.lock().unwrap() += 1;
+                Ok(())
+            });
+
+        let specific = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&specific);
+        let _specific = fx.pipeline.subscribe("updateNewMessage", None, move |_| {
+            *seen.lock().unwrap() += 1;
+            Ok(())
+        });
+
+        let outcome = fx
+            .pipeline
+            .process_value(message_update("/start", true, 7))
+            .unwrap();
+        assert_eq!(outcome.listeners, 1, "只有 update 通用通道的监听器");
+        assert_eq!(*generic.lock().unwrap(), 1);
+        assert_eq!(*specific.lock().unwrap(), 0);
+    }
+
+    /// user 账户下 `.xxx` 放行时会归一化成 `/xxx`，既有插件不用改。
+    #[test]
+    fn e_user_dot_commands_reach_plugins_as_slash() {
+        let fx = fixture();
+        fx.runtime
+            .install_config(None, json!({"telegram": {"account_type": "user"}}));
+        fx.runtime
+            .set_self_user(json!({"id": 7, "type": {"@type": "userTypeRegular"}}));
+
+        let seen_by_plugin = Arc::clone(&fx.received);
+        let _listener = fx
+            .pipeline
+            .subscribe("updateNewMessage", None, move |payload| {
+                seen_by_plugin.lock().unwrap().push(payload.clone());
+                Ok(())
+            });
+
+        let outcome = fx
+            .pipeline
+            .process_value(message_update(".help", true, 7))
+            .unwrap();
+        assert_eq!(outcome.listeners, 1);
+        let received = fx.received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["message"]["content"]["text"]["text"], "/help");
+        assert_eq!(received[0]["message"]["is_outgoing"], json!(false));
+    }
+
+    /// 别人的 `.xxx` 在 user 账户下也不触发；白名单里的用户例外。
+    #[test]
+    fn f_user_dot_commands_from_others_need_the_whitelist() {
+        let fx = fixture();
+        fx.runtime.install_config(
+            None,
+            json!({
+                "telegram": {"account_type": "user"},
+                "command": {"whitelist": [9]}
+            }),
+        );
+        fx.runtime
+            .set_self_user(json!({"id": 7, "type": {"@type": "userTypeRegular"}}));
+
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&hits);
+        let _listener = fx
+            .pipeline
+            .subscribe("updateNewMessage", None, move |payload| {
+                seen.lock().unwrap().push(payload.clone());
+                Ok(())
+            });
+
+        fx.pipeline
+            .process_value(message_update(".help", false, 8))
+            .unwrap();
+        assert!(hits.lock().unwrap().is_empty(), "8 不在白名单里");
+
+        fx.pipeline
+            .process_value(message_update(".help", false, 9))
+            .unwrap();
+        assert_eq!(hits.lock().unwrap().len(), 1, "9 在白名单里");
     }
 
     /// 验收：中间件改了更新之后，插件收到的是改过的版本。

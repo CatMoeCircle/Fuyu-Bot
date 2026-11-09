@@ -182,6 +182,9 @@ fn probe_reads_the_v4_manifest() {
     // 版本是真值，不是 ABI v4 早期那个硬编码的 `"0.0.0"`。
     assert!(!manifest.version.is_empty(), "{manifest:?}");
     assert_ne!(manifest.version, "0.0.0", "{manifest:?}");
+    // 没提供展示元数据时是空串（不是「字段缺失导致解析失败」）。
+    assert!(manifest.display_name.is_empty(), "{manifest:?}");
+    assert!(manifest.description.is_empty(), "{manifest:?}");
 }
 
 /// 作用域的端到端：插件在 `start` 里注册私有服务，能不能立刻取回来。
@@ -230,6 +233,9 @@ fn probe_reads_declared_dependencies_and_the_plugin_crate_version() {
     assert_eq!(manifest.version, "2.3.4");
     assert_eq!(manifest.inject, ["demo.dep"]);
     assert_eq!(manifest.soft_inject, ["demo.soft"]);
+    // 展示元数据同样要穿过 dlopen → JSON → `Manifest` 三层。
+    assert_eq!(manifest.display_name, "清单夹具");
+    assert_eq!(manifest.description, "只声明依赖的测试插件");
 }
 
 /// 中间件：往 payload 里塞一个标记，用来验证「改过的版本」能到插件手里。
@@ -645,6 +651,16 @@ fn plugins_can_read_the_report_through_a_host_service() {
 
     // 装一次活来源。之后**不再刷新**——这正是旧实现（存算好的快照）挂掉的地方。
     loader.runtime().install_plugin_reporter(kernel.reporter());
+    // 静态展示元信息由宿主在装插件时写入（`fuyubot-app` 的 `load_plugins` 就是这么做的）。
+    // 这里模拟一份，插件经 service 读到的就该是 `名称（id）— 介绍` 需要的字段。
+    loader
+        .runtime()
+        .install_plugin_catalog(vec![fuyubot_loader::PluginCatalogEntry {
+            name: "fuyubot.demo".to_owned(),
+            version: "9.9.9".to_owned(),
+            display_name: "示例插件".to_owned(),
+            description: "最小的插件示例".to_owned(),
+        }]);
 
     // 走宿主侧的方法调用（和插件经 vtable 调进去完全同一条路）。
     let json = loader
@@ -655,6 +671,9 @@ fn plugins_can_read_the_report_through_a_host_service() {
     assert_eq!(value["count"], 1);
     assert_eq!(value["plugins"][0]["name"], "fuyubot.demo");
     assert_eq!(value["plugins"][0]["state"], "active");
+    assert_eq!(value["plugins"][0]["display_name"], "示例插件");
+    assert_eq!(value["plugins"][0]["description"], "最小的插件示例");
+    assert_eq!(value["plugins"][0]["version"], "9.9.9");
 
     // 卸载之后报告要跟着变（不然这个 service 只会说谎）——**不需要谁再刷一次**。
     kernel.plugins().unload("fuyubot.demo").expect("卸载");
