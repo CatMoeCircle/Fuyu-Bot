@@ -563,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-abi"
-version = "0.1.4-rc.1"
+version = "0.1.3"
 dependencies = [
  "cbindgen",
  "serde_json",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "fuyubot-tdlib-sys"
-version = "0.1.4-rc.1"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",

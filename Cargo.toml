@@ -28,10 +28,12 @@ edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 # `fuyubot-abi` / `fuyubot-tdlib-sys` 会发到 crates.io。
+# ⚠️ 这两个包的**版本是独立版本线**，不跟上面 `version` 的 bot 版本走：清单里各自写死
+# （abi 0.1.3 = ABI v6 首发；sys 0.1.3 = 首个随包带 TDLib 1.8.70 schema 的版本）。
 repository = "https://github.com/CatMoeCircle/Fuyu-Bot"
 
 [workspace.dependencies]
-fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.4-rc.1" }
+fuyubot-abi = { path = "crates/fuyubot-abi", version = "0.1.3" }
 # 宿主编排层：CLI 与 Android JNI 共用同一条启动顺序。
 fuyubot-app = { path = "crates/fuyubot-app", version = "0.1.4-rc.1" }
 fuyubot-cli = { path = "crates/fuyubot-cli", version = "0.1.4-rc.1" }
@@ -42,7 +44,7 @@ fuyubot-middleware = { path = "crates/fuyubot-middleware", version = "0.1.4-rc.1
 fuyubot-service = { path = "crates/fuyubot-service", version = "0.1.4-rc.1" }
 fuyubot-simplify = { path = "crates/fuyubot-simplify", version = "0.1.4-rc.1" }
 fuyubot-tdlib = { path = "crates/fuyubot-tdlib", version = "0.1.4-rc.1" }
-fuyubot-tdlib-sys = { path = "crates/fuyubot-tdlib-sys", version = "0.1.4-rc.1" }
+fuyubot-tdlib-sys = { path = "crates/fuyubot-tdlib-sys", version = "0.1.3" }
 fuyubot-tool = { path = "crates/fuyubot-tool", version = "0.1.4-rc.1" }
 
 cbindgen = "0.29.4"

@@ -1,7 +1,9 @@
 [package]
 name = "fuyubot-abi"
 description = "HostApi VTable 定义与插件导出宏"
-version.workspace = true
+# ⚠️ 独立版本线：发 crates.io 的版本由本清单决定，**不跟** bot 的 [workspace.package].version。
+# 0.1.3 = ABI v6（服务调用经过宿主）首发。ABI 契约版本是另一个东西（`ABI_VERSION` 常量）。
+version = "0.1.3"
 edition.workspace = true
 rust-version.workspace = true
 # 这个 crate 会发到 crates.io：第三方 Rust 插件作者依赖它。
