@@ -429,7 +429,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          # 可执行文件包（.tar.gz）与 JNI 包（.zip）都从这里上传；publish 里再各按形态处理。
+          # 可执行文件包（.tar.gz）与 JNI 包（.zip）都从这里上传；
+          # JNI 包只给 APK job 用，publish 会把它从 dist 里剔掉，不进 Release。
           path: dist/*
           if-no-files-found: error
 
