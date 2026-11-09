@@ -212,7 +212,13 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     壳是 [FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android)（Kotlin + Compose），
     按 `main` 取；内核是同一 tag 的 `build-android` job 编出的 JNI 包。⚠️ **JNI 包只作为
     Actions artifact 喂给 APK job，不再作为 Release 资产发布**（Release 只挂 `.apk`）。
-    契约有四条，改之前先看 `.github/scripts/build-android-apk.sh`：
+    契约有五条，改之前先看 `.github/scripts/build-android-apk.sh`：
+    - **配置只从 `<root>/fuyubot.toml` 读**（与 CLI 同一份 schema / 模板 / 解析，实现在
+      `fuyubot-app` 的 `config` 模块）。`start` 的 options 只留 `root`（必填）+ `bot_token`
+      （凭据不落盘）+ `lib_dir`（设备路径）+ `data_dir` / `plugin_dir` / `log_level` 三个覆盖。
+      api_id / api_hash 缺了就是 `FUYUBOT_ARG`，别恢复「壳自己传配置」那条路。
+      首启由壳调 `fuyubot_config_init`（Java `nativeInitConfig`）生成文件，已存在时它是
+      文本级更新（保留注释），`overwrite = true` 才整份重写。
     - **运行期调日志不用加 JNI 方法**：壳写 `<root>/.fuyubot/log-level`（一行级别名），
       `run` 每 500ms 轮询，与 CLI 同一个控制文件协议。订阅者**不许再挂级别过滤**——
       `tracing_subscriber::fmt()` 默认上限是 `INFO`，会把 `debug` / `trace` 在格式化前丢掉。

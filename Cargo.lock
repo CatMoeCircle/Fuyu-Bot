@@ -595,9 +595,11 @@ dependencies = [
  "fuyubot-loader",
  "fuyubot-simplify",
  "fuyubot-tdlib",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "toml",
  "tracing",
 ]
 

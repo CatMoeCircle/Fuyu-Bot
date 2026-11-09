@@ -15,7 +15,10 @@ fuyubot-loader.workspace = true
 # 只借它的 `ConnectionState`（五个连接状态与解析）：CLI 与 JNI 用的是同一张表。
 fuyubot-simplify.workspace = true
 fuyubot-tdlib.workspace = true
+# 配置 schema（`fuyubot.toml`）：serde 派生 + toml 解析，CLI 与 Android 共用同一份。
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tokio.workspace = true
 tracing.workspace = true

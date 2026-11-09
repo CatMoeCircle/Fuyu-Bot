@@ -6,6 +6,10 @@
 它不认识 TUI、不认识 clap、不认识 JNI：交互全部走 [`AppHost`](src/host.rs) 这一个 trait
 （`state` / `ask` / `qr`），由各宿主自己实现——控制台弹问题、终端面板弹输入框、JNI 弹 Java 回调。
 
+它也是 `fuyubot.toml` 的**唯一 schema**（[`config`](src/config.rs)：`Config` / 模板 /
+`init_config` / 凭据回写）：CLI 与 Android 读同一个文件、用同一套解析，模板只有一份
+（`include_str!`，约束 39）。
+
 与上下层的关系：
 
 ```text
