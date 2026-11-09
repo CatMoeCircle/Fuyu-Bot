@@ -767,6 +767,14 @@ mod tests {
     ) -> *const core::ffi::c_char {
         core::ptr::null()
     }
+    unsafe extern "C" fn noop_set_config_section(
+        _: *mut core::ffi::c_void,
+        _: *const core::ffi::c_char,
+        _: *const core::ffi::c_char,
+        _: *const core::ffi::c_char,
+    ) -> i32 {
+        -1
+    }
 
     fn fake_vtable() -> HostApiVTable {
         HostApiVTable {
@@ -797,6 +805,9 @@ mod tests {
             simplify_invoke_result: Some(noop_simplify_invoke_result),
             current_plugin: Some(noop_current_plugin),
             call_service: Some(noop_call_service),
+            last_error: Some(noop_current_plugin),
+            list_services: Some(noop_list),
+            set_config_section: Some(noop_set_config_section),
         }
     }
 

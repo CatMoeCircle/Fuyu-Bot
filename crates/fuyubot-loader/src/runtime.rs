@@ -167,18 +167,26 @@ struct Waiter {
     ready: Condvar,
 }
 
-/// 存在服务容器里的裸 vtable 指针。
+/// 存在服务容器里的裸 vtable 指针 + 注册它的插件。
 ///
 /// SAFETY: vtable 是只读的，且 ABI 契约要求提供方让它活到注销为止。
+/// `owner` 用来在服务调用期间压一层「执行者」——被调方在方法里写配置时
+/// 应该写**自己**的段，而不是调用方的（`set_config` 的同一条规则）。
 #[derive(Clone, Copy)]
-struct AbiService(*const ServiceVTable);
+struct AbiService {
+    vtable: *const ServiceVTable,
+    owner: u64,
+}
 
 unsafe impl Send for AbiService {}
 unsafe impl Sync for AbiService {}
 
 impl std::fmt::Debug for AbiService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("AbiService").field(&self.0).finish()
+        f.debug_struct("AbiService")
+            .field("vtable", &self.vtable)
+            .field("owner", &self.owner)
+            .finish()
     }
 }
 
@@ -432,6 +440,33 @@ impl Drop for CallerGuard {
     }
 }
 
+// 执行者栈：「现在这段代码跑在哪个插件名下」。服务调用期间是**提供方**，
+// 其余时候等于线程作用域栈顶。
+//
+// 它和调用者栈是两个问题：`current_plugin` 要的是「谁在调我」，而
+// `set_config` / 日志要的是「这段代码算谁的」。服务方法里写配置必须写提供方自己的段，
+// 不然就会写进调用方的配置里（v5 一直如此，v6 有了服务表上的 owner 才能修）。
+thread_local! {
+    static EXECUTOR_STACK: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// 执行者守卫：drop 时弹出执行者栈。
+struct ExecutorGuard;
+
+impl Drop for ExecutorGuard {
+    fn drop(&mut self) {
+        EXECUTOR_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+// 「上一次调用为什么失败」：ABI 上 `call_service` 只能回 NULL，
+// 细节靠 VTable 的 `last_error` 带回去（线程局部，下一次失败前一直有效）。
+thread_local! {
+    static SERVICE_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 impl HostRuntime {
     /// 在给定的 [`Context`] 上装好四个机制，并生成 VTable。
     pub fn new(ctx: Context) -> Result<Arc<Self>, String> {
@@ -574,6 +609,9 @@ impl HostRuntime {
                 simplify_invoke_result: Some(api_simplify_invoke_result),
                 current_plugin: Some(api_current_plugin),
                 call_service: Some(api_call_service),
+                last_error: Some(api_last_error),
+                list_services: Some(api_list_services),
+                set_config_section: Some(api_set_config_section),
             },
         });
         rt.provide_scope_service();
@@ -589,7 +627,7 @@ impl HostRuntime {
         let vtable = &self.scope_vtable as *const ServiceVTable;
         match self.ctx.provide_named(
             SCOPE_SERVICE_NAME.to_str().unwrap_or_default(),
-            AbiService(vtable),
+            AbiService { vtable, owner: 0 },
         ) {
             Ok(effect) => std::mem::forget(effect),
             Err(e) => self.warn(&format!("预置 scope service 失败: {e}")),
@@ -605,7 +643,7 @@ impl HostRuntime {
         let vtable = &self.plugins_vtable as *const ServiceVTable;
         match self
             .ctx
-            .provide_named(PLUGIN_REPORT_SERVICE, AbiService(vtable))
+            .provide_named(PLUGIN_REPORT_SERVICE, AbiService { vtable, owner: 0 })
         {
             // 句柄故意 `forget`：它要活到进程结束，不能跟着谁 drop 就注销。
             Ok(effect) => std::mem::forget(effect),
@@ -620,7 +658,10 @@ impl HostRuntime {
     /// 插件在**命令回调里**就能读（纯内存，不是 TDLib 请求，不会卡接收循环）。
     fn provide_identity_service(&self) {
         let vtable = &self.identity_vtable as *const ServiceVTable;
-        match self.ctx.provide_named(IDENTITY_SERVICE, AbiService(vtable)) {
+        match self
+            .ctx
+            .provide_named(IDENTITY_SERVICE, AbiService { vtable, owner: 0 })
+        {
             // 句柄故意 `forget`：它要活到进程结束，不能跟着谁 drop 就注销。
             Ok(effect) => std::mem::forget(effect),
             Err(e) => self.warn(&format!("预置身份 service 失败: {e}")),
@@ -760,23 +801,44 @@ impl HostRuntime {
         lookup_path(node, key).cloned()
     }
 
-    /// 写配置：只能写「当前调用者」自己名下的段。返回错误消息（`Ok(())` = 成功并已落盘）。
+    /// 写配置：默认只写「当前执行者」自己名下的段；`target = Some(名字)` 时写**指定插件**的段。
     ///
-    /// 越权判定靠 [`HostRuntime::current_owner`] + `owner_names` 映射：插件无法伪造
-    /// `section`（这里根本没有 section 参数——它只写自己的段）。
+    /// 越权判定：没有 `target` 时靠 [`HostRuntime::current_executor`] + `owner_names` 映射，
+    /// 插件无法伪造（`set_config` 根本没有 section 参数）。跨插件写是**显式**的
+    /// （`set_config_section`），调用方必须自己写出目标插件名，所以也谈不上冒充。
     ///
-    /// 落盘只写**自己的那一个文件**：`<root>/plugin-config/<插件名>.toml`。
+    /// 落盘只写**目标那一个文件**：`<root>/plugin-config/<插件名>.toml`。
     /// `fuyubot.toml` 运行时永不重写，所以用户写在里面的注释、其它段、`api_hash` 都安全。
-    fn write_config(&self, key: &str, value_json: &str) -> Result<(), String> {
-        // 调用者是哪个插件？没登记名字（宿主自己、或还没走完 init）就不能写。
-        let owner = self.current_owner();
-        let name = self
-            .owner_names
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&owner)
-            .cloned()
-            .ok_or_else(|| "当前调用者没有登记的插件名，不能写配置".to_owned())?;
+    fn write_config(
+        &self,
+        target: Option<&str>,
+        key: &str,
+        value_json: &str,
+    ) -> Result<(), String> {
+        let executor = self.current_executor();
+        let name = match target {
+            // 显式目标：跨插件写。名字为空等于「没指定」，拒绝比猜一个安全。
+            Some(section) if !section.is_empty() => section.to_owned(),
+            Some(_) => return Err("目标插件名不能为空".to_owned()),
+            // 没给目标：写执行者那段。名字没登记（宿主自己 / 还没走完 init）就不能写。
+            None => self
+                .owner_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&executor)
+                .cloned()
+                .ok_or_else(|| "当前执行者没有登记的插件名，不能写配置".to_owned())?,
+        };
+
+        // 跨插件写留一笔：出问题时要能回答「是谁改了别人的配置」。
+        if target.is_some() {
+            let who = self
+                .owner_name(executor)
+                .unwrap_or_else(|| "宿主".to_owned());
+            if who != name {
+                self.info(&format!("{who} 改写插件 {name} 的配置"));
+            }
+        }
 
         let value: Value =
             serde_json::from_str(value_json).map_err(|e| format!("值不是合法 JSON: {e}"))?;
@@ -890,6 +952,42 @@ impl HostRuntime {
     /// 宿主侧不必再为一个专用容器留字段。
     pub fn service_names(&self) -> Vec<String> {
         self.ctx.names()
+    }
+
+    /// 当前调用者**看得见**的服务清单（JSON 数组）：名字、版本、方法名、提供方。
+    ///
+    /// 从调用方的作用域链查，所以私有服务也在里面；只报元数据、不交 vtable 指针
+    /// （想调还是走 `call_service`，那样才有身份与错误细节）。
+    fn service_catalog(&self) -> Value {
+        let scope = self.caller_context();
+        let mut out = Vec::new();
+        for name in scope.names() {
+            let Ok(entry) = scope.resolve::<AbiService>(&name) else {
+                continue;
+            };
+            // SAFETY: 表项活着（上面攥着 Arc），vtable 由提供方保证活到注销。
+            let vtable = unsafe { &*entry.vtable };
+            let mut methods = Vec::new();
+            for index in 0..vtable.method_count {
+                // SAFETY: method_count 由注册方保证，methods 指向同等数量的连续项。
+                let method = unsafe { &*vtable.methods.add(index) };
+                if method.name.is_null() {
+                    continue;
+                }
+                // SAFETY: 方法名是 NUL 结尾 UTF-8。
+                if let Ok(text) = unsafe { CStr::from_ptr(method.name) }.to_str() {
+                    methods.push(text.to_owned());
+                }
+            }
+            out.push(json!({
+                "name": name,
+                "version": vtable.version,
+                "methods": methods,
+                // `null` = 宿主预置的服务（scope / plugins / identity）。
+                "plugin": self.owner_name(entry.owner),
+            }));
+        }
+        Value::Array(out)
     }
 
     pub fn tools(&self) -> &Arc<ToolRegistry> {
@@ -1253,6 +1351,33 @@ impl HostRuntime {
         }
         CALLER_STACK.with(|stack| stack.borrow_mut().push(owner));
         Some(CallerGuard)
+    }
+
+    /// 当前「这段代码算谁的」：执行者栈顶 → 线程作用域栈顶。
+    ///
+    /// 服务方法里是**提供方**（`set_config` 因此写自己的段），其余时候是宿主交给的插件。
+    fn current_executor(&self) -> u64 {
+        EXECUTOR_STACK
+            .with(|stack| stack.borrow().last().copied())
+            .unwrap_or_else(|| self.current_owner())
+    }
+
+    /// 压一层执行者（服务调用期间用）；`owner == 0`（宿主预置服务）不压。
+    fn enter_executor(&self, owner: u64) -> Option<ExecutorGuard> {
+        if owner == 0 {
+            return None;
+        }
+        EXECUTOR_STACK.with(|stack| stack.borrow_mut().push(owner));
+        Some(ExecutorGuard)
+    }
+
+    /// 记下/清掉「上一次调用为什么失败」（本线程）。
+    fn set_service_error(&self, message: Option<String>) {
+        SERVICE_ERROR.with(|slot| *slot.borrow_mut() = message);
+    }
+
+    fn last_service_error(&self) -> Option<String> {
+        SERVICE_ERROR.with(|slot| slot.borrow().clone())
     }
 
     /// 当前子作用域（本线程作用域栈顶；0 = 插件根作用域 / 宿主根）。
@@ -2485,7 +2610,13 @@ unsafe extern "C" fn api_provide_service_shared(
         return ServiceHandle::INVALID;
     };
     // 故意写根：这就是「共享」的全部含义。同名会和别人撞，所以调用方得是真的想共享。
-    match rt.ctx.provide_service(name, AbiService(vtable)) {
+    match rt.ctx.provide_service(
+        name,
+        AbiService {
+            vtable,
+            owner: rt.current_owner(),
+        },
+    ) {
         Ok(handle) => ServiceHandle {
             id: rt.remember(RegistrationKind::Service(handle)),
         },
@@ -2513,10 +2644,13 @@ unsafe extern "C" fn api_provide_service(
     let Some(name) = (unsafe { cstr(name) }) else {
         return ServiceHandle::INVALID;
     };
-    match rt
-        .caller_context()
-        .provide_service(name, AbiService(vtable))
-    {
+    match rt.caller_context().provide_service(
+        name,
+        AbiService {
+            vtable,
+            owner: rt.current_owner(),
+        },
+    ) {
         Ok(handle) => ServiceHandle {
             id: rt.remember(RegistrationKind::Service(handle)),
         },
@@ -2540,7 +2674,7 @@ unsafe extern "C" fn api_get_service(
         return core::ptr::null();
     };
     match rt.caller_context().resolve::<AbiService>(name) {
-        Ok(service) => service.0,
+        Ok(service) => service.vtable,
         Err(_) => core::ptr::null(),
     }
 }
@@ -2587,7 +2721,9 @@ impl HostRuntime {
             return Err(format!("没有名为 {service} 的 service"));
         };
         // SAFETY: 表项活着（上面攥着 Arc），指针来自 provide_service 时校验过的 vtable。
-        let vtable = unsafe { &*entry.0 };
+        let vtable = unsafe { &*entry.vtable };
+        // 提供方的 owner：调用期间要拿它当「执行者」。
+        let provider = entry.owner;
         let input = CString::new(input_json).map_err(|_| "入参含 NUL".to_owned())?;
         for index in 0..vtable.method_count {
             // SAFETY: method_count 由注册方保证，methods 指向同等数量的连续项。
@@ -2605,6 +2741,8 @@ impl HostRuntime {
             // 调用期间把「谁在调」压在栈顶：被调方的 `current_plugin` 读它。
             // 守卫在这里建、在函数返回（含提前 return 与 panic）时弹，不会漏层。
             let _caller = caller.and_then(|owner| self.enter_caller(owner));
+            // 同时把「这段代码算谁的」切成提供方：服务方法里 `set_config` 要写自己的段。
+            let _executor = self.enter_executor(provider);
             // SAFETY: 契约要求返回字符串由提供方持有、本线程下一次调用前有效——
             // 这里立刻拷走，不把裸指针交出去。
             let raw = unsafe { func(vtable.context, input.as_ptr()) };
@@ -2652,12 +2790,41 @@ unsafe extern "C" fn api_call_service(
     // 查服务要用**调用方**的作用域链：插件的私有服务也对它自己可见。
     match rt.invoke_service(&rt.caller_context(), Some(caller), service, method, input) {
         // 注意 `host_string("")` 返回的是**非空**指针：空串 = 成功但没有输出。
-        Ok(text) => host_string(&text),
+        Ok(text) => {
+            rt.set_service_error(None);
+            host_string(&text)
+        }
         Err(error) => {
             rt.warn(&format!("call_service({service}.{method}) 失败: {error}"));
+            // 失败原因留给 `last_error`：插件侧因此能报出「哪一步不对」，而不是一句笼统的
+            // 「调用失败」。
+            rt.set_service_error(Some(format!("{service}.{method}: {error}")));
             core::ptr::null()
         }
     }
+}
+
+/// 上一次被拒绝的调用为什么失败（本线程、宿主线程局部缓冲，读完即弃）。
+unsafe extern "C" fn api_last_error(host: *mut c_void) -> *const c_char {
+    // SAFETY: ABI 契约保证 host 来自本运行时。
+    let Some(rt) = (unsafe { runtime(host) }) else {
+        return core::ptr::null();
+    };
+    match rt.last_service_error() {
+        Some(message) => host_string(&message),
+        None => core::ptr::null(),
+    }
+}
+
+/// 当前插件看得见的服务清单（JSON 数组；含自己的私有服务与整条父链）。
+///
+/// 只报**名字 + 方法名 + 版本 + 提供方**，不报 vtable 指针：想调还是走 `call_service`。
+unsafe extern "C" fn api_list_services(host: *mut c_void) -> *const c_char {
+    // SAFETY: ABI 契约保证 host 来自本运行时。
+    let Some(rt) = (unsafe { runtime(host) }) else {
+        return core::ptr::null();
+    };
+    host_string(&rt.service_catalog().to_string())
 }
 
 unsafe extern "C" fn api_td_invoke(host: *mut c_void, method_json: *const c_char) -> RequestId {
@@ -2960,10 +3127,46 @@ unsafe extern "C" fn api_set_config(
     // SAFETY: 同上；key 空串 = 覆盖整段。
     let key = unsafe { cstr(key) }.unwrap_or("");
     let value = unsafe { cstr(value_json) }.unwrap_or("null");
-    match rt.write_config(key, value) {
-        Ok(()) => 0,
+    match rt.write_config(None, key, value) {
+        Ok(()) => {
+            rt.set_service_error(None);
+            0
+        }
         Err(e) => {
             rt.warn(&format!("写配置被拒: {e}"));
+            rt.set_service_error(Some(format!("set_config: {e}")));
+            -1
+        }
+    }
+}
+
+/// 写**指定插件**的配置段（ABI v6 内追加）。
+///
+/// 与 `api_set_config` 的差别只有「目标是谁」：那个由宿主按执行者判定，这个由调用方
+/// 显式写出插件名。两条路共用同一套规则（用户钉住的键照样拒绝、只落
+/// `plugin-config/<目标>.toml`、`fuyubot.toml` 不重写）。
+unsafe extern "C" fn api_set_config_section(
+    host: *mut c_void,
+    section: *const c_char,
+    key: *const c_char,
+    value_json: *const c_char,
+) -> i32 {
+    // SAFETY: ABI 契约保证 host 来自本运行时。
+    let Some(rt) = (unsafe { runtime(host) }) else {
+        return -1;
+    };
+    // SAFETY: 同上；section 空串 = 没指定目标（拒绝，不猜）。
+    let section = unsafe { cstr(section) }.unwrap_or("");
+    let key = unsafe { cstr(key) }.unwrap_or("");
+    let value = unsafe { cstr(value_json) }.unwrap_or("null");
+    match rt.write_config(Some(section), key, value) {
+        Ok(()) => {
+            rt.set_service_error(None);
+            0
+        }
+        Err(e) => {
+            rt.warn(&format!("跨插件写配置被拒（目标 {section}）: {e}"));
+            rt.set_service_error(Some(format!("set_config_section({section}): {e}")));
             -1
         }
     }
@@ -3459,6 +3662,174 @@ mod tests {
 
         // 回到宿主根作用域（owner 0），没有名字 → 写失败。
         assert!(api.set_config("k", "1").is_err());
+    }
+
+    /// 跨插件写：`set_config_for` 显式点名目标，落到**对方**的段与文件；
+    /// 用户配置里钉住的键照样拒绝，`fuyubot.toml` 照样一个字节不动。
+    #[test]
+    fn a_plugin_can_write_another_plugins_section() {
+        let rt = runtime();
+        let dir = scratch("cross-write");
+        let path = dir.join("fuyubot.toml");
+        let original = "[plugin.a.bot]\ncity = \"上海\"\n\n[plugin.b.bot]\nmode = \"user\"\n";
+        std::fs::write(&path, original).unwrap();
+        rt.install_config(
+            Some(path.clone()),
+            serde_json::json!({
+                "plugin": {
+                    "a": { "bot": { "city": "上海" } },
+                    "b": { "bot": { "mode": "user" } }
+                }
+            }),
+        );
+
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+
+        {
+            let scope = rt.plugin_scope();
+            rt.register_owner_name(scope.owner(), "a.bot");
+
+            // 新键：写进 b.bot 的段。
+            api.set_config_for("b.bot", "extra", "\"from-a\"")
+                .expect("跨插件写应当成功");
+            // 用户钉住的键：跨插件也照样拒绝（这条规则不因为「换了个入口」就放松）。
+            let error = api
+                .set_config_for("b.bot", "mode", "\"hacked\"")
+                .unwrap_err();
+            assert!(error.to_string().contains("mode"), "{error}");
+
+            scope.commit();
+        }
+
+        assert_eq!(api.get_config("b.bot", "extra").unwrap(), "\"from-a\"");
+        assert_eq!(api.get_config("b.bot", "mode").unwrap(), "\"user\"");
+        assert!(
+            api.get_config("a.bot", "extra").is_none(),
+            "不该写进调用方那段"
+        );
+
+        // 落盘进**目标**的文件；用户配置原样不动。
+        let stored =
+            std::fs::read_to_string(dir.join(CONFIG_STORE_DIR).join("b.bot.toml")).unwrap();
+        assert!(stored.contains("extra = \"from-a\""), "{stored}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // 目标为空等于没指定：拒绝而不是猜。
+        assert!(api.set_config_for("", "k", "1").is_err());
+    }
+
+    /// 服务方法里写配置，写的是**提供方自己**的段，不是调用方的。
+    ///
+    /// v5 只能靠线程作用域栈判「谁的段」，于是 A 调 B 的服务、B 写配置会落进 A 的段。
+    /// v6 在服务表上记了提供方 owner，调用期间把执行者切成它。
+    #[test]
+    fn a_service_method_writes_its_own_config_section() {
+        let rt = runtime();
+        let dir = scratch("executor-config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fuyubot.toml");
+        std::fs::write(&path, "").unwrap();
+        rt.install_config(
+            Some(path),
+            serde_json::json!({ "plugin": { "a": { "bot": {} }, "b": { "bot": {} } } }),
+        );
+
+        unsafe extern "C" fn write_own(
+            context: *mut c_void,
+            _input: *const c_char,
+        ) -> *const c_char {
+            // SAFETY: 测试把 `context` 指向下面自持的 `HostApi`。
+            let api = unsafe { &*(context as *const fuyubot_abi::HostApi) };
+            match api.set_config("mark", "\"b\"") {
+                Ok(()) => host_string("ok"),
+                Err(error) => host_string(&format!("err:{error}")),
+            }
+        }
+
+        struct Methods([ServiceMethod; 1]);
+        // SAFETY: name 指向 'static 字面量，func 是纯函数指针。
+        unsafe impl Sync for Methods {}
+        static METHODS: Methods = Methods([ServiceMethod {
+            name: c"mark".as_ptr(),
+            func: Some(write_own),
+        }]);
+        let name = CString::new("demo.writer").unwrap();
+        // SAFETY: rt 活着；vtable / api 都比注册活得久。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+        let vtable = ServiceVTable {
+            name: name.as_ptr(),
+            version: 1,
+            size: core::mem::size_of::<ServiceVTable>() as u32,
+            context: (&api as *const fuyubot_abi::HostApi)
+                .cast_mut()
+                .cast::<c_void>(),
+            methods: METHODS.0.as_ptr(),
+            method_count: METHODS.0.len(),
+        };
+
+        // 由 b.bot 注册这个服务（owner 记在服务表上）。
+        let handle = {
+            let scope = rt.plugin_scope();
+            rt.register_owner_name(scope.owner(), "b.bot");
+            // SAFETY: 契约同上；写根，a.bot 才查得到。
+            let handle = unsafe { api.provide_service_shared("demo.writer", &vtable) };
+            assert!(handle.is_valid());
+            scope.commit();
+            handle
+        };
+
+        // a.bot 调它：执行者是 b.bot，配置就落 b.bot。
+        {
+            let scope = rt.plugin_scope();
+            rt.register_owner_name(scope.owner(), "a.bot");
+            assert_eq!(api.call_service("demo.writer", "mark", "{}").unwrap(), "ok");
+            scope.commit();
+        }
+
+        assert_eq!(api.get_config("b.bot", "mark").unwrap(), "\"b\"");
+        assert!(
+            api.get_config("a.bot", "mark").is_none(),
+            "提供方的写入不该跑到调用方段里"
+        );
+
+        drop(handle);
+    }
+
+    /// 服务发现：清单里有名字、版本、方法名与提供方；宿主预置的 `plugin` 是 `null`。
+    #[test]
+    fn plugins_can_list_the_services_they_can_see() {
+        let rt = runtime();
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&api.list_services()).unwrap();
+        let items = listed.as_array().expect("必须是数组");
+
+        let scope = items
+            .iter()
+            .find(|item| item["name"] == "fuyubot.host.scope")
+            .expect("宿主预置的 scope service 应当在清单里");
+        assert!(scope["plugin"].is_null(), "宿主预置的服务没有提供方插件");
+        let methods: Vec<&str> = scope["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|method| method.as_str())
+            .collect();
+        assert!(methods.contains(&"scope_create"), "{methods:?}");
+        assert!(methods.contains(&"scope_enter"), "{methods:?}");
+    }
+
+    /// 调用失败要能说出**为什么**，而不是一句笼统的「调用失败」。
+    #[test]
+    fn a_failed_service_call_reports_why() {
+        let rt = runtime();
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+        let error = api.call_service("nope.svc", "m", "{}").unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("nope.svc"), "{text}");
+        assert!(text.contains("没有名为"), "{text}");
     }
 
     /// 插件自己落盘的文件下次启动要读回来，但**用户配置优先**（只填缺失键）。

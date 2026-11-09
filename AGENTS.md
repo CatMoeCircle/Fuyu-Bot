@@ -24,7 +24,7 @@ TDLib 在**运行时**动态加载（`fuyubot-tdlib::loader`），`td_api.tl` �
 | --- | --- |
 | `fuyubot-cli` | 二进制 `fuyubot`：`init` / `run` / `status` / `stop` / `config` / `plugin`（clap） |
 | `fuyubot-core` | Cordis 内核：`Context`（按**名字**寻址的服务表）/ `Effect` / `Plugin`（含 `inject`）/ `PluginManager`（Fiber 生命周期与依赖跟踪）。不认识 Telegram |
-| `fuyubot-abi` | C ABI：`HostApiVTable`（2 个 u32 + `host_ctx` + 25 个函数指针）、`PluginHandle`、`define_plugin!`、cbindgen 头文件 |
+| `fuyubot-abi` | C ABI：`HostApiVTable`（2 个 u32 + `host_ctx` + 27 个函数指针）、`PluginHandle`、`define_plugin!`、cbindgen 头文件 |
 | `fuyubot-tdlib-sys` | 绑定层：`td_api.tl` → 类型 + 元数据 + FFI 声明（无 tokio / 无网络） |
 | `fuyubot-tdlib` | `loader`（四级定位）+ `client`（`td_receive` 循环、`ReceiveLoop`）+ `authorize`（授权状态机）+ `session`（建客户端 / 登录 / `getMe` / 关会话） |
 | `fuyubot-event` / `service` / `tool` / `middleware` | 四个机制 crate，只依赖 `core`，彼此不依赖 |
@@ -171,7 +171,7 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 50. **Go 的 c-shared 插件不能卸载**：识别 `Go buildinf` 魔数并故意不卸载；同进程重复加载不可靠。
 51. **发布顺序**：本仓发 `fuyubot-abi` / `fuyubot-tdlib-sys` →
     FuyuBot-Script 发各平台 dll 资产（不进 crates.io）。不要把 patch 写进下游的 `Cargo.toml`。
-52. **插件配置段是 `[plugin.<插件名>]`**（ABI v4）：插件名点分 → TOML 嵌套表，宿主把插件名当**点路径**在 `plugin` 表里下钻（`fuyubot.manage` → `plugin.fuyubot.manage`）。`get_config(section, key)` 读**任意**段（自己 + 别人）；`set_config(key, value)` **没有 section 参数**，只写调用者自己那段（靠 `owner_names` 映射判定，插件无法伪造）。
+52. **插件配置段是 `[plugin.<插件名>]`**（ABI v4）：插件名点分 → TOML 嵌套表，宿主把插件名当**点路径**在 `plugin` 表里下钻（`fuyubot.manage` → `plugin.fuyubot.manage`）。`get_config(section, key)` 读**任意**段（自己 + 别人）；`set_config(key, value)` **没有 section 参数**，只写**执行者**自己那段（靠 `owner_names` 映射判定，插件无法伪造）。要写别人的段走 `set_config_section(section, key, value)`（v6 尾部追加）：目标显式、规则相同、宿主记一行「谁改了谁」。
     **配置是三层叠出来的**（后者只填前者的缺失键）：包默认（`plugin.json` 的 `config`，`fuyubot-loader` 在 `DylibPlugin::new` 里合并）< 运行时落盘（`<root>/plugin-config/<插件名>.toml`）< 用户配置（`fuyubot.toml` 的 `[plugin.<名>]`，**最高**）。
     **`set_config` 只写自己那一个文件**：段级、原子替换（同目录 `.toml.tmp` → `rename`）、只落这次改的键；`fuyubot.toml` **运行时永不重写**（注释与 `api_hash` 不会被卷走，`persist_toml` 已删除）。用户配置里钉住的键**拒绝写**（返回错误），不许「写完下次启动被静默盖回去」；没有配置文件（`config_path = None`）时同样报错，不许静默只写内存。写盘失败要还原内存。
     脚本插件侧同步入口是 `plugin_config()` / `pluginConfig()`（中间插件在 spawn 前把自己的段塞进 `config` 的 `plugin_config` 键）。
@@ -233,9 +233,13 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 63. **服务调用经过宿主（ABI v6）**：`HostApi::call_service` 走 VTable 尾部的 `call_service` 桥，
     不再由插件自己取 vtable 直调。宿主在调用期间压一张**调用者栈**（值取自调用方那份
     `PluginHost.owner`，与线程无关），`current_plugin` 优先读它、其次才退回线程作用域栈——
-    所以插件在自己的线程上调服务也认得出调用方，且无法自报。`set_config` 仍按**线程作用域栈**
-    （执行者）判定「谁的段」，两张栈别混。v5 → v6 的迁移说明在文档站
+    所以插件在自己的线程上调服务也认得出调用方，且无法自报。`set_config` 按**执行者栈**
+    （服务调用期间是提供方，其余时候是线程作用域栈）判定「谁的段」，两张栈别混。v5 → v6 的迁移说明在文档站
     [ABI v5 → v6 迁移](https://catmoecircle.github.io/FuyuBot-docs/docs/plugin/abi-v6/)。
+    同一次 v6 里还尾部追加了三个入口（**不跳版本号**、靠 `size` 协商）：`last_error`（`call_service`
+    失败原因，插件侧已自动拼进错误）、`list_services`（看得见的服务清单：名字 / 版本 / 方法 / 提供方）、
+    `set_config_section`（跨插件写配置）。服务表里存的不再只是 vtable，还带**提供方 owner**：
+    调用期间压一层「执行者」，所以服务方法里的 `set_config` 落提供方自己的段（约束 52）。
 
 ## 文档
 

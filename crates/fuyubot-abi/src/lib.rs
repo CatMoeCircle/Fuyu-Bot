@@ -517,9 +517,40 @@ pub struct HostApiVTable {
             input_json: *const c_char,
         ) -> *const c_char,
     >,
+    /// 上一次**被拒绝**的宿主调用为什么失败（ABI v6 内追加；没有失败时是 `NULL`）。
+    ///
+    /// 目前只有 [`Self::call_service`] 会填它：那条桥在 ABI 上只能回 `NULL`，
+    /// 具体原因（服务不存在 / 没这个方法 / 入参非法）只能在日志里看。有了这一项，
+    /// 插件侧就能把原因原样转成错误文本（[`HostApi::call_service`] 已经这么做）。
+    ///
+    /// 读的是**本线程**最近一次失败：宿主持有、读完即弃。
+    pub last_error: Option<unsafe extern "C" fn(host: *mut c_void) -> *const c_char>,
+    /// 当前插件**看得见**的服务清单（JSON 数组，宿主持有、读完即弃）。
+    ///
+    /// 每一项：`{"name":"…","version":1,"methods":["register","list"],"plugin":"提供方插件名"}`。
+    /// `plugin` 是 `null` 表示宿主预置的服务（scope / plugins / identity）。
+    /// 想「按能力找服务」就用它，别再靠约定硬编码名字。
+    pub list_services: Option<unsafe extern "C" fn(host: *mut c_void) -> *const c_char>,
+    /// 写**指定插件**的配置段（ABI v6 内追加）：`section` 是插件名（点分，如 `fuyubot.music`），
+    /// `key` 是点路径（空串 = 覆盖整段），`value_json` 是 JSON 值。
+    ///
+    /// 与 [`Self::set_config`] 的区别只有一个：那个只写**自己**那段（`section` 由宿主判定），
+    /// 这个**显式指定**目标插件，因此可以替别的插件改配置（协作插件之间同步设置）。
+    /// 两者共用同一套规则：用户配置里钉住的键照样拒绝，落盘照样只动
+    /// `plugin-config/<目标插件>.toml`，`fuyubot.toml` 照样不重写。
+    ///
+    /// 返回 0 = 成功；非 0 = 失败（原因见 [`Self::last_error`] 或宿主日志）。
+    pub set_config_section: Option<
+        unsafe extern "C" fn(
+            host: *mut c_void,
+            section: *const c_char,
+            key: *const c_char,
+            value_json: *const c_char,
+        ) -> i32,
+    >,
 }
 
-/// VTable 就是「两个 u32 + 25 个指针」；布局一改，这里立刻编译不过。
+/// VTable 就是「两个 u32 + 28 个指针」；布局一改，这里立刻编译不过。
 const _: () = {
     use core::mem::{offset_of, size_of};
 
@@ -527,9 +558,9 @@ const _: () = {
     assert!(offset_of!(HostApiVTable, size) == 4);
     assert!(offset_of!(HostApiVTable, host_ctx) == 8);
     assert!(size_of::<Option<unsafe extern "C" fn()>>() == size_of::<*const c_void>());
-    // 25 = 2 个 u32 之后的函数指针个数。**加 VTable 字段必须同步改这个数**：
+    // 28 = 2 个 u32 之后的函数指针个数。**加 VTable 字段必须同步改这个数**：
     // 它是「结构没被悄悄改动」的唯一守卫，比 offset 断言更能发现加/删字段。
-    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 25 * size_of::<*const c_void>());
+    assert!(size_of::<HostApiVTable>() == 2 * size_of::<u32>() + 28 * size_of::<*const c_void>());
 
     // 句柄要能按值跨 ABI：必须恰好一个 u64。
     assert!(size_of::<SubscriptionHandle>() == size_of::<u64>());
@@ -563,6 +594,8 @@ pub enum AbiError {
     SubscriptionRejected,
     #[error("宿主拒绝了请求（返回无效请求号）")]
     RequestRejected,
+    #[error("服务调用失败：{0}")]
+    ServiceFailed(String),
     #[error("宿主的作用域服务不可用（scope_enter 失败）")]
     ScopeUnavailable,
     #[error("过滤条件不合法：{0}")]
@@ -633,6 +666,10 @@ pub struct HostApi {
         *const c_char,
         *const c_char,
     ) -> *const c_char,
+    last_error: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    list_services: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    set_config_section:
+        unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, *const c_char) -> i32,
 }
 
 impl std::fmt::Debug for HostApi {
@@ -710,6 +747,9 @@ impl HostApi {
             simplify_invoke_result: required!(simplify_invoke_result),
             current_plugin: required!(current_plugin),
             call_service: required!(call_service),
+            last_error: required!(last_error),
+            list_services: required!(list_services),
+            set_config_section: required!(set_config_section),
         })
     }
 
@@ -929,12 +969,79 @@ impl HostApi {
         };
         if raw.is_null() {
             // NULL 是**失败**（与「成功但没有输出」用空串区分），契约见 VTable 字段文档。
-            return Err(AbiError::BadString);
+            // 原因从宿主那条 `last_error` 拿：拿不到就退回笼统的 `BadString`。
+            return Err(self
+                .last_error()
+                .map(AbiError::ServiceFailed)
+                .unwrap_or(AbiError::BadString));
         }
         // SAFETY: 宿主保证返回值是 NUL 结尾、且在下次宿主调用前有效——这里立刻拷贝。
         Ok(unsafe { CStr::from_ptr(raw) }
             .to_string_lossy()
             .into_owned())
+    }
+
+    /// 上一次被拒绝的宿主调用为什么失败（本线程；没失败过就是 `None`）。
+    ///
+    /// 目前只覆盖 [`Self::call_service`]：那条桥在 ABI 上只能回 `NULL`，
+    /// 详情靠这一项带回来，所以失败时别只打「调用失败」，把原因一起打出来。
+    pub fn last_error(&self) -> Option<String> {
+        // SAFETY: 契约同 `current_plugin`。
+        let raw = unsafe { (self.last_error)(self.host_ctx) };
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: 宿主保证 NUL 结尾且在下次调用前有效。
+        let text = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// 当前插件**看得见**的服务清单（JSON 数组文本）。
+    ///
+    /// 每一项：`{"name":"…","version":1,"methods":[…],"plugin":"提供方插件名"}`；
+    /// `plugin` 为 `null` 表示宿主预置的服务。想按能力找服务时用它，
+    /// 别再硬编码别人的服务名。含自己作用域内的私有服务与整条父链。
+    pub fn list_services(&self) -> String {
+        // SAFETY: 契约同 `list_tools`。
+        let raw = unsafe { (self.list_services)(self.host_ctx) };
+        // SAFETY: 宿主返回 NUL 结尾字符串（或 NULL）。
+        unsafe { cstr_to_string(raw) }
+    }
+
+    /// 写**指定插件**的配置段（跨插件写）。
+    ///
+    /// `section` 是插件名（点分，如 `fuyubot.music`），`key` 空串表示覆盖整段。
+    /// 规则与 [`Self::set_config`] 相同：用户配置里钉住的键拒绝写、只落
+    /// `plugin-config/<目标插件>.toml`、`fuyubot.toml` 不重写。
+    ///
+    /// 失败时错误里带宿主给的原因（见 [`Self::last_error`]）。
+    pub fn set_config_for(
+        &self,
+        section: &str,
+        key: &str,
+        value_json: &str,
+    ) -> Result<(), AbiError> {
+        let section = CString::new(section).map_err(|_| AbiError::BadString)?;
+        let key = CString::new(key).map_err(|_| AbiError::BadString)?;
+        let value = CString::new(value_json).map_err(|_| AbiError::BadString)?;
+        // SAFETY: 同 `set_config`。
+        let code = unsafe {
+            (self.set_config_section)(
+                self.host_ctx,
+                section.as_ptr(),
+                key.as_ptr(),
+                value.as_ptr(),
+            )
+        };
+        if code == 0 {
+            return Ok(());
+        }
+        Err(self
+            .last_error()
+            .map(AbiError::ServiceFailed)
+            .unwrap_or(AbiError::HostCall(code)))
     }
 
     pub fn td_invoke(&self, method_json: &str) -> Result<RequestId, AbiError> {
@@ -1511,6 +1618,14 @@ mod tests {
     ) -> *const c_char {
         core::ptr::null()
     }
+    unsafe extern "C" fn noop_set_config_section(
+        _: *mut c_void,
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+    ) -> i32 {
+        -1
+    }
 
     fn test_vtable() -> HostApiVTable {
         HostApiVTable {
@@ -1541,6 +1656,10 @@ mod tests {
             simplify_invoke_result: Some(noop_simplify_invoke_result),
             current_plugin: Some(noop_current_plugin),
             call_service: Some(noop_call_service),
+            // 测试只验证「字段在场」：真正的语义在宿主侧（loader）测。
+            last_error: Some(noop_current_plugin),
+            list_services: Some(noop_list_tools),
+            set_config_section: Some(noop_set_config_section),
         }
     }
 
