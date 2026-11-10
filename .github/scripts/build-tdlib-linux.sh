@@ -99,13 +99,22 @@ done
 
 # 按 ldd 解析出来的**真实路径**收集（多架构目录、带版本号，别按名字猜），
 # 用它自己的文件名（= SONAME）落盘：加载器靠 soname 复用已加载的映射。
+#
+# ⚠️ 必须 `cp -L` 解引用：Debian/Ubuntu 上 `libz.so.1` 是**符号链接**
+# （→ `libz.so.1.2.11`），`cp -a` 只拷链接本身，包里就变成一个悬空链接——
+# 下游 `-f` 判断直接跳过、运行时 dlopen 找不到，而且**不报错**（2026 踩过）。
 RUNTIME_DEPS=()
 while read -r name arrow resolved rest; do
   case "$name" in
     libssl.so*|libcrypto.so*|libz.so*)
-      [[ "$arrow" == "=>" && -f "$resolved" ]] || continue
-      cp -a "$resolved" "$OUT_DIR/tdjson/$(basename "$resolved")"
-      RUNTIME_DEPS+=("$(basename "$resolved")")
+      [[ "$arrow" == "=>" && -e "$resolved" ]] || continue
+      dep_name="$(basename "$resolved")"
+      cp -aL "$resolved" "$OUT_DIR/tdjson/$dep_name"
+      if [[ ! -f "$OUT_DIR/tdjson/$dep_name" ]]; then
+        echo "error: $dep_name 拷贝后不是普通文件（解引用失败）" >&2
+        exit 1
+      fi
+      RUNTIME_DEPS+=("$dep_name")
       ;;
   esac
 done <<< "$ldd_out"

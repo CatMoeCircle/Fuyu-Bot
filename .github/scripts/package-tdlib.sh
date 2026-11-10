@@ -82,8 +82,14 @@ RUNTIME_DEPS=()
 shopt -s nullglob
 for pattern in 'libc++_shared.so*' 'libcrypto.so*' 'libssl.so*' 'libz.so*'; do
   for f in "$TDLIB_JSON_DIR/"$pattern; do
-    [[ -f "$f" ]] || continue
-    cp -a "$f" "$STAGE_DIR/"
+    # ⚠️ 悬空符号链接要**直接失败**：Debian/Ubuntu 的 `libz.so.1` 是链接，
+    # 上游脚本曾经用 `cp -a` 只拷了链接本身，于是 `-f` 判断静默跳过、
+    # 包里少一个依赖却照样「打包成功」（2026 踩过）。这里用 `-e`（跟随链接）。
+    if [[ ! -e "$f" ]]; then
+      echo "error: $f 是坏链接（指向的文件不存在），依赖会从包里消失" >&2
+      exit 1
+    fi
+    cp -aL "$f" "$STAGE_DIR/"
     RUNTIME_DEPS+=("$(basename "$f")")
   done
 done
