@@ -54,6 +54,17 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      targets:
+        description: "只建这些目标（逗号分隔：linux / linux-x86_64 / linux-aarch64 / windows / android / apk / 资产名）。留空 = 全部 enabled 的行"
+        required: false
+        type: string
+        default: ""
+      publish_tag:
+        description: "用它当版本号并发布到该 tag（例：v0.1.4 → 只替换这个 Release 上的同名 zip，其它资产与说明不动）。留空 = 不发布，只出 dev-<sha> 的 artifact"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -67,6 +78,9 @@ env:
   #    的目录名都按它拼，填错就是 404 / 找不到缓存。
   TDLIB_VERSION: '1.8.70'
   CARGO_TERM_COLOR: always
+  # 单平台重建用的版本号覆盖：留空就按 ref 推（tag 推送 → tag 名，分支 dispatch → dev-<sha7>）。
+  # 非空时既当 zip 里的版本段，也当发布目标 tag——所以「重建 Linux」只要传 v0.1.4。
+  FUYUBOT_VERSION_OVERRIDE: ${{ inputs.publish_tag }}
 
 jobs:
   # ⚠️ 为什么要有 plan：job 级 `if` **拿不到 `matrix` 上下文**（GitHub 在展开矩阵之前就求值，
@@ -89,10 +103,14 @@ jobs:
     steps:
       - name: Compute the enabled platform matrices
         id: plan
+        env:
+          INPUT_TARGETS: ${{ inputs.targets }}
         run: |
           set -euo pipefail
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
+          import os
+          import sys
 
           # 桌面每行都有 `enabled` 开关（默认全 True）：只想产某几个平台时把其余行改 False。
           platforms = [
@@ -122,9 +140,44 @@ jobs:
               {"os": "ubuntu-latest", "abi": "x86_64", "arch": "x86_64", "enabled": True},
           ]
 
+          targets = {t.strip().lower() for t in os.environ.get("INPUT_TARGETS", "").split(",") if t.strip()}
+
+          def arch_aliases(arch):
+              # runner 口径（arm64）与 cargo 口径（aarch64）混着用，两者等价。
+              return {"arm64", "aarch64"} if arch in ("arm64", "aarch64") else {arch}
+
+          def names_for(row):
+              names = set()
+              for key in ("asset", "platform_dir", "abi", "arch", "target"):
+                  value = str(row.get(key, "")).lower()
+                  if not value:
+                      continue
+                  names.add(value)
+                  head, _, tail = value.rpartition("-")
+                  for alias in arch_aliases(tail):
+                      names.add(f"{head}-{alias}" if head else alias)
+              platform_dir = str(row.get("platform_dir", ""))
+              if platform_dir:
+                  names.add(platform_dir.split("-")[0].lower())
+              if row.get("abi") or row.get("target"):
+                  names.add("android")
+              if not row.get("asset"):
+                  names.add("apk")
+              return names
+
+          def selected(row):
+              # `targets` 只做「收窄」：它不会把 enabled=False 的行重新打开。
+              if not row.get("enabled"):
+                  return False
+              return not targets or bool(names_for(row) & targets)
+
+          if targets and not any(selected(row) for row in platforms + android + apk):
+              print(f"error: targets={sorted(targets)} 没有匹配到任何 enabled 的矩阵行", file=sys.stderr)
+              sys.exit(1)
+
           def pack(rows, placeholder):
-              rows = [row for row in rows if row.get("enabled")]
-              return {"include": rows or [placeholder]}
+              kept = [row for row in rows if selected(row)]
+              return {"include": kept or [placeholder]}
 
           desktop_placeholder = {"os": "ubuntu-latest", "asset": "fuyubot-none-none", "tdlib": "TDLib-none-none", "platform_dir": "none-none", "bin": "fuyubot"}
           android_placeholder = {"os": "ubuntu-22.04", "asset": "fuyubot-none-none", "tdlib": "TDLib-none-none", "abi": "none", "arch": "none", "target": "aarch64-linux-android", "bin": "fuyubot"}
@@ -132,12 +185,12 @@ jobs:
 
           print("matrix=" + json.dumps(pack(platforms, desktop_placeholder), separators=(",", ":")))
           print("plan=" + json.dumps({"include": platforms}, separators=(",", ":")))
-          print("count=" + str(len([row for row in platforms if row.get("enabled")])))
+          print("count=" + str(len([row for row in platforms if selected(row)])))
           print("android_matrix=" + json.dumps(pack(android, android_placeholder), separators=(",", ":")))
           print("android_plan=" + json.dumps({"include": android}, separators=(",", ":")))
-          print("android_count=" + str(len([row for row in android if row.get("enabled")])))
+          print("android_count=" + str(len([row for row in android if selected(row)])))
           print("apk_matrix=" + json.dumps(pack(apk, apk_placeholder), separators=(",", ":")))
-          print("apk_count=" + str(len([row for row in apk if row.get("enabled")])))
+          print("apk_count=" + str(len([row for row in apk if selected(row)])))
           PY
 
   build:
@@ -193,8 +246,10 @@ jobs:
           bin="${{ matrix.bin }}"
           case "$bin" in *.exe) ext=".exe" ;; *) ext="" ;; esac
 
-          # 版本：tag 推送就直接用 tag 名（v0.1.0）；分支上的手动构建没有版本号，退回短 sha
-          if [[ "$GIT_REF" == refs/tags/* ]]; then
+          # 版本：显式指定（单平台重建）> tag 名 > 分支上的短 sha
+          if [[ -n "${FUYUBOT_VERSION_OVERRIDE:-}" ]]; then
+            version="$FUYUBOT_VERSION_OVERRIDE"
+          elif [[ "$GIT_REF" == refs/tags/* ]]; then
             version="$GIT_REF_NAME"
           else
             version="dev-${GIT_SHA:0:7}"
@@ -385,8 +440,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # 版本口径与桌面一致：tag 推送用 tag 名（v0.1.2），分支上手动跑用短 sha
-          if [[ "$GIT_REF" == refs/tags/* ]]; then
+          # 版本口径与桌面一致：显式指定 > tag 名（v0.1.2）> 分支上手动跑的短 sha
+          if [[ -n "${FUYUBOT_VERSION_OVERRIDE:-}" ]]; then
+            version="$FUYUBOT_VERSION_OVERRIDE"
+          elif [[ "$GIT_REF" == refs/tags/* ]]; then
             version="$GIT_REF_NAME"
           else
             version="dev-${GIT_SHA:0:7}"
@@ -515,8 +572,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist jni
-          # 版本口径与桌面 / Android job 一致：tag 推送用 tag 名，分支上手动跑用短 sha。
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          # 版本口径与桌面 / Android job 一致：显式指定 > tag 名 > 分支上手动跑的短 sha。
+          if [[ -n "${FUYUBOT_VERSION_OVERRIDE:-}" ]]; then
+            version="$FUYUBOT_VERSION_OVERRIDE"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
             version="$GITHUB_REF_NAME"
           else
             version="dev-${GITHUB_SHA:0:7}"
@@ -571,13 +630,14 @@ jobs:
   publish:
     name: publish release
     needs: [build, build-android, build-apk]
-    # 只发 tag：在分支上 `workflow_dispatch`（验证构建用）时 `ref_name` 是 `master`，
-    # 照旧发版会创建 / 覆盖一个叫 master 的 Release。
+    # 只发 tag；或者 dispatch 时显式给了 `publish_tag`（单平台重建，例如「只重建 Linux 并
+    # 替换 v0.1.4 上的同名 zip」）。分支 dispatch 不给 publish_tag 时 `ref_name` 是 `master`，
+    # 照旧发版会创建 / 覆盖一个叫 master 的 Release，所以那种情况保持不发。
     # 桌面那批被 `enabled: False` 停掉时（那批 job 全 skip），只要 Android 成功就照样发，
     # 所以不能用默认的「needs 全成功」，得显式看各 job 的结果。
     # ⚠️ APK 失败**不拦**整页发布（zip 那批是独立的交付物），但没有 APK 时下面的表格与说明
     #    会自动少掉那两行——别让「APK 没编出来」变成「整个 Release 都没了」。
-    if: startsWith(github.ref, 'refs/tags/v') && !cancelled() && (needs.build.result == 'success' || needs.build-android.result == 'success' || needs.build-apk.result == 'success')
+    if: ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_tag != '') && (needs.build.result == 'success' || needs.build-android.result == 'success' || needs.build-apk.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -613,7 +673,8 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.publish_tag || github.ref_name }}
+          PARTIAL: ${{ inputs.targets != '' }}
         run: |
           set -euo pipefail
           ls -lh dist
@@ -672,7 +733,13 @@ jobs:
           fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
-            gh release edit "$TAG" --notes "$notes" --repo "$GITHUB_REPOSITORY"
+            if [[ "${PARTIAL:-false}" == "true" ]]; then
+              # 部分重建（例如只重建 Linux）：现有说明是最近一次**全量**发布写的，
+              # 用这次的子集覆盖它会把别的平台从下载表里抹掉。资产已经 --clobber 覆盖过了。
+              echo "==> 部分重建：只替换资产，发布说明保持不动"
+            else
+              gh release edit "$TAG" --notes "$notes" --repo "$GITHUB_REPOSITORY"
+            fi
           else
             gh release create "$TAG" "${assets[@]}" --title "fuyubot $TAG" --notes "$notes" --repo "$GITHUB_REPOSITORY"
           fi
