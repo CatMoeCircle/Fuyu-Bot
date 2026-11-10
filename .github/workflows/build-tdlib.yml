@@ -167,7 +167,11 @@ jobs:
               {"platform": "android", "arch": "x86_64", "abi": "x86_64", "target": "x86_64-linux-android", "runner": "ubuntu-22.04", "artifact": "tdjson-android-x86_64", "asset": "TDLib-android-x86_64", "enabled": True},
           ]
 
-          targets = [t.strip() for t in os.environ.get("INPUT_TARGETS", "").split(",") if t.strip()]
+          targets = {t.strip().lower() for t in os.environ.get("INPUT_TARGETS", "").split(",") if t.strip()}
+
+          def arch_aliases(arch):
+              # CI 的 runner 口径（arm64）与 cargo 口径（aarch64）混着用，两者等价。
+              return {"arm64", "aarch64"} if arch in ("arm64", "aarch64") else {arch}
 
           def selected(row):
               # `targets` 只做「收窄」：它不会把 enabled=false 的行重新打开。
@@ -175,15 +179,14 @@ jobs:
                   return False
               if not targets:
                   return True
-              names = {
-                  row["platform"],
-                  row["platform"] + "-" + row["arch"],
-                  row["platform"] + "-" + row.get("abi", row["arch"]),
-                  row["arch"],
-                  row.get("abi", ""),
-                  row["asset"],
-              }
-              return bool(names & set(targets))
+              names = {row["platform"], row["asset"], row.get("abi", "").lower()}
+              for arch in arch_aliases(row["arch"]):
+                  names.add(arch)
+                  names.add(row["platform"] + "-" + arch)
+              for abi in arch_aliases(row.get("abi", "")):
+                  if abi:
+                      names.add(row["platform"] + "-" + abi)
+              return bool(names & targets)
 
           def enabled(rows):
               return [row for row in rows if selected(row)]
@@ -196,7 +199,7 @@ jobs:
 
           if targets and desktop_count + android_count == 0:
               print(
-                  f"error: targets={targets} 没有匹配到任何 enabled 的矩阵行",
+                  f"error: targets={sorted(targets)} 没有匹配到任何 enabled 的矩阵行",
                   file=sys.stderr,
               )
               sys.exit(1)
