@@ -1,9 +1,14 @@
 //! 「动态库的兄弟依赖要靠**库自己所在的目录**才找得到」——单独一个测试二进制。
 //!
-//! ⚠️ **样本得真的带兄弟依赖，负向对照才成立**：CI 产出的 tdjson 把 OpenSSL/zlib
+//! ⚠️ **样本得真的带兄弟依赖，负向对照才成立**：Windows / macOS 的 CI 产物把 OpenSSL/zlib
 //! 静态链进去了（`VERSION.json` 里 `linkage: static`，import 表只剩系统 DLL），
 //! 那种样本上 `Library::new` 本来就该成功。所以下面只在样本目录里带了别的 DLL 时
 //! 才断言负向对照，否则明确打印「跳过」——不静默当通过，也不拿静态样本硬造失败。
+//!
+//! ⚠️ **Linux 从 2026 起不是静态的**：`TDLib-linux-<arch>` 是 `linkage: shared`，
+//! 包里带着 `libssl` / `libcrypto` / `libz`（见 `build-tdlib-linux.sh` 文件头与
+//! pitfalls 坑 98）。所以拿 Linux 的发布资产当样本时，这条测试的负向对照是**有效**的；
+//! 拿 Windows/macOS 的资产当样本时它仍然只会打印「跳过」。
 //!
 //! ⚠️ **为什么不能和别的测试放同一个文件**：这条测试有个**负向对照**——
 //! 「`libloading::Library::new`（flags = 0）必须加载失败」。它的前提是进程里

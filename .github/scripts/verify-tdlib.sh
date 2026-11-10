@@ -70,10 +70,12 @@ if [[ ! -f "$(dirname "$LIB")/VERSION.json" ]]; then
   exit 1
 fi
 
-# 桌面平台的依赖必须静态并入（包里出现 openssl/zlib/c++_shared 就是打错了）。
-# **Android 是例外**：libc++_shared / libcrypto / libssl 是独立 .so，必须随包发。
+# 每个平台期望的链接形态是**契约**：
+#   - Windows / macOS：OpenSSL/zlib 静态并入 → 包里必须**没有**独立依赖；
+#   - Linux / Android：动态依赖，libssl / libcrypto（+ Linux 的 libz）必须随包、
+#     与 tdjson 同级（loader 会在 dlopen 之前预加载它们）。
 DIR="$(dirname "$LIB")"
-if [[ "$PLATFORM" != "android" ]]; then
+if [[ "$PLATFORM" != "android" && "$PLATFORM" != "linux" ]]; then
   for bad in libssl.so libssl.so.3 libcrypto.so libcrypto.so.3 libz.so \
     libssl.3.dylib libcrypto.3.dylib libssl-3-x64.dll libcrypto-3-x64.dll zlib.dll; do
     if [[ -f "$DIR/$bad" ]]; then
@@ -81,7 +83,7 @@ if [[ "$PLATFORM" != "android" ]]; then
       exit 1
     fi
   done
-else
+elif [[ "$PLATFORM" == "android" ]]; then
   [[ -f "$DIR/libc++_shared.so" ]] || {
     echo "error: Android 包缺 libc++_shared.so（tdjson 现在是动态依赖它）" >&2
     ls -la "$DIR" >&2 || true
@@ -90,6 +92,14 @@ else
   # libcrypto / libssl 的 SONAME 带版本号（libcrypto.so.3），按前缀找。
   compgen -G "$DIR/libcrypto.so*" >/dev/null || { echo "error: Android 包缺 libcrypto.so*" >&2; exit 1; }
   compgen -G "$DIR/libssl.so*" >/dev/null || { echo "error: Android 包缺 libssl.so*" >&2; exit 1; }
+elif [[ "$PLATFORM" == "linux" ]]; then
+  for need in 'libcrypto.so*' 'libssl.so*' 'libz.so*'; do
+    compgen -G "$DIR/$need" >/dev/null || {
+      echo "error: Linux 包缺 $need（tdjson 现在是动态依赖它；见 build-tdlib-linux.sh）" >&2
+      ls -la "$DIR" >&2 || true
+      exit 1
+    }
+  done
 fi
 
 echo "==> verifying $LIB"
@@ -114,18 +124,28 @@ if meta.get("platform") != platform:
     raise SystemExit(f"platform mismatch: {meta.get('platform')} vs {platform}")
 if meta.get("arch") != arch:
     raise SystemExit(f"arch mismatch: {meta.get('arch')} vs {arch}")
-# 桌面：linkage 必须是 static、runtime_deps 必须为空。
-# Android：linkage=shared，runtime_deps 非空，且每一项都真的在包里。
+# 链接形态按平台判定：
+#   Android：linkage=shared，runtime_deps 非空（libc++_shared / libcrypto / libssl）；
+#   Linux：linkage=shared，runtime_deps 非空（libcrypto / libssl / libz）；
+#   其余桌面：linkage=static、runtime_deps 必须为空。
 linkage = meta.get("linkage")
 deps = meta.get("runtime_deps") or []
-if platform == "android":
+if platform in ("android", "linux"):
     if linkage != "shared":
-        raise SystemExit(f"Android 期望 linkage=shared，实际 {linkage!r}")
+        raise SystemExit(f"{platform} 期望 linkage=shared，实际 {linkage!r}")
     if not deps:
-        raise SystemExit("Android 包的 runtime_deps 不能为空（应有 libc++_shared / libcrypto / libssl）")
+        raise SystemExit(f"{platform} 包的 runtime_deps 不能为空")
     for dep in deps:
         if not (lib.parent / dep).is_file():
             raise SystemExit(f"runtime_deps 里的 {dep} 不在包里")
+    required = (
+        ("libc++_shared.so", "libcrypto.so", "libssl.so")
+        if platform == "android"
+        else ("libcrypto.so", "libssl.so", "libz.so")
+    )
+    for prefix in required:
+        if not any(dep.startswith(prefix) for dep in deps):
+            raise SystemExit(f"{platform} 包缺 {prefix}*（runtime_deps={deps}）")
 else:
     if linkage and linkage != "static":
         raise SystemExit(f"expected linkage=static, got {linkage!r}")

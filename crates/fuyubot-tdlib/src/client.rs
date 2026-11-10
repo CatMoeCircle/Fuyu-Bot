@@ -196,10 +196,12 @@ impl TdClient {
         let resolved = loader::resolve()?;
         let location = resolved.target.display().to_string();
 
-        // Android：tdjson 的依赖（libc++_shared / libcrypto / libssl）是独立 .so，
-        // 和它放同一目录。先把它们加载好并钉住（永不 dlclose），再开 tdjson——
-        // 否则这些库里的 pthread key destructor 会跟着某次 dlclose 一起悬空。
-        #[cfg(target_os = "android")]
+        // Android / Linux：tdjson 的依赖是**独立 .so**（Android 是 libc++_shared /
+        // libcrypto / libssl，Linux 是 libcrypto / libssl / libz），和它放同一目录。
+        // 先把它们加载好并钉住（永不 dlclose），再开 tdjson——绝对路径的 `dlopen`
+        // **不会**把库自己所在的目录加进依赖搜索路径，不预加载就等于缺依赖；
+        // 这些库里的 pthread key destructor 也不能跟着某次 dlclose 一起悬空。
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         if let Some(dir) = resolved.target.parent() {
             loader::preload_runtime_deps(dir);
         }

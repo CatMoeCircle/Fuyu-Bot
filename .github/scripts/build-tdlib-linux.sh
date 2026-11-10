@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # TDLib on Linux — follow https://tdlib.github.io/td/build.html
 # Official flow: install deps → cmake Release → prepare_cross_compiling → tdjson
-# Additional on top: link OpenSSL/zlib statically into tdjson.
+#
+# ⚠️ 2026 起**不再**把 OpenSSL/zlib 静态并进 tdjson：改成动态依赖，并把
+#    libssl.so* / libcrypto.so* / libz.so* **随包发**（与 tdjson 同级）。
+#    两条理由：
+#      1. 静态并入的那份 OpenSSL 拿不到系统的安全更新，CVE 只能等我们重发资产；
+#      2. 宿主进程里若有别的 OpenSSL（插件、Python 的 `_ssl`…），静态并入的那份
+#         会把符号抢过去，出问题的地方离根因十万八千里。
+#    加载侧：`fuyubot-tdlib::loader::preload_runtime_deps` 在 `dlopen(tdjson)` 之前
+#    按 soname 把同目录的这几份钉住（绝对路径 dlopen 不会搜库自己所在的目录）。
 # Args: <tdlib-src-dir> <output-dir> <arch>
 set -euo pipefail
 
@@ -10,8 +18,8 @@ OUT_DIR="${2:?output dir}"
 ARCH="${3:?arch: x86_64 | arm64}"
 
 case "$ARCH" in
-  x86_64) CMAKE_PROCESSOR=x86_64;  SSL_LIB_GLOB='/usr/lib/x86_64-linux-gnu/libssl.a' ;;
-  arm64)  CMAKE_PROCESSOR=aarch64; SSL_LIB_GLOB='/usr/lib/aarch64-linux-gnu/libssl.a' ;;
+  x86_64) CMAKE_PROCESSOR=x86_64 ;;
+  arm64)  CMAKE_PROCESSOR=aarch64 ;;
   *)
     echo "unsupported arch: $ARCH" >&2
     exit 1
@@ -20,7 +28,7 @@ esac
 
 echo "==> Linux TDLib arch=${ARCH}"
 echo "==> Official build doc: https://tdlib.github.io/td/build.html"
-echo "==> Extra: static OpenSSL/zlib merged into tdjson"
+echo "==> OpenSSL/zlib stay dynamic (shipped next to libtdjson.so)"
 
 # Official deps (Ubuntu/Debian): gperf cmake clang/c++ zlib1g-dev libssl-dev
 sudo apt-get update -qq
@@ -36,43 +44,6 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-# Locate static system archives for the merge (official packages provide .a)
-find_static() {
-  local name="$1"
-  local candidate
-  for candidate in \
-    "$SSL_LIB_GLOB" \
-    /usr/lib/"$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)"/"${name}" \
-    /usr/lib/"${name}" \
-    /usr/lib64/"${name}" \
-    /usr/local/lib/"${name}"
-  do
-    if [[ -f "$candidate" ]]; then
-      echo "$candidate"
-      return 0
-    fi
-  done
-  # Fallback: any static libssl/libz on the system
-  candidate="$(find /usr/lib /usr/lib64 /usr/local/lib -name "${name}" 2>/dev/null | head -n1 || true)"
-  if [[ -n "$candidate" && -f "$candidate" ]]; then
-    echo "$candidate"
-    return 0
-  fi
-  return 1
-}
-
-SSL_LIB="$(find_static libssl.a || true)"
-CRYPTO_LIB="$(find_static libcrypto.a || true)"
-ZLIB_LIB="$(find_static libz.a || true)"
-
-if [[ -z "$SSL_LIB" || -z "$CRYPTO_LIB" || -z "$ZLIB_LIB" ]]; then
-  echo "error: static OpenSSL/zlib not found (need libssl.a/libcrypto.a/libz.a from libssl-dev/zlib1g-dev)" >&2
-  dpkg -L libssl-dev 2>/dev/null | grep -E 'libssl|libcrypto' || true
-  dpkg -L zlib1g-dev 2>/dev/null | grep 'libz' || true
-  exit 1
-fi
-echo "==> static libs: ssl=$SSL_LIB crypto=$CRYPTO_LIB zlib=$ZLIB_LIB"
-
 CMAKE_ARGS=(
   -DCMAKE_BUILD_TYPE=Release
   -DCMAKE_SYSTEM_PROCESSOR="$CMAKE_PROCESSOR"
@@ -85,16 +56,7 @@ if command -v clang >/dev/null 2>&1 && command -v clang++ >/dev/null 2>&1; then
   CMAKE_ARGS+=(-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++)
 fi
 
-# Extra: force static OpenSSL/zlib into tdjson
-CMAKE_ARGS+=(
-  -DOPENSSL_USE_STATIC_LIBS=TRUE
-  -DZLIB_USE_STATIC_LIBS=TRUE
-  -DOPENSSL_CRYPTO_LIBRARY="$CRYPTO_LIB"
-  -DOPENSSL_SSL_LIBRARY="$SSL_LIB"
-  -DZLIB_LIBRARY="$ZLIB_LIB"
-)
-
-echo "==> cmake -DCMAKE_BUILD_TYPE=Release .. (+ static merge)"
+echo "==> cmake -DCMAKE_BUILD_TYPE=Release .."
 cmake "${CMAKE_ARGS[@]}" "$TDLIB_SRC"
 
 # Official build sequence
@@ -123,24 +85,54 @@ fi
 cp -aL "$MAIN" "$OUT_DIR/tdjson/libtdjson.so"
 strip --strip-unneeded "$OUT_DIR/tdjson/libtdjson.so" 2>/dev/null || true
 
-echo "==> ldd (must NOT list libssl/libcrypto/libz)"
+# 依赖**必须是动态的**：静态并入会让「随包发的那几份 .so」形同虚设，
+# 也拿不到系统的安全更新。ldd 里看不到它们说明 OpenSSL/zlib 还被静态链着。
+echo "==> ldd (must list libssl/libcrypto/libz)"
 ldd_out="$(ldd "$OUT_DIR/tdjson/libtdjson.so" 2>&1 || true)"
 echo "$ldd_out"
-if echo "$ldd_out" | grep -E 'libssl|libcrypto|libz\.so|libz\.' >/dev/null; then
-  echo "error: tdjson still dynamically depends on openssl/zlib" >&2
-  exit 1
-fi
+for dep in libssl.so libcrypto.so libz.so; do
+  if ! grep -q "$dep" <<< "$ldd_out"; then
+    echo "error: $dep 不是动态依赖——OpenSSL/zlib 又被静态并进去了？" >&2
+    exit 1
+  fi
+done
+
+# 按 ldd 解析出来的**真实路径**收集（多架构目录、带版本号，别按名字猜），
+# 用它自己的文件名（= SONAME）落盘：加载器靠 soname 复用已加载的映射。
+RUNTIME_DEPS=()
+while read -r name arrow resolved rest; do
+  case "$name" in
+    libssl.so*|libcrypto.so*|libz.so*)
+      [[ "$arrow" == "=>" && -f "$resolved" ]] || continue
+      cp -a "$resolved" "$OUT_DIR/tdjson/$(basename "$resolved")"
+      RUNTIME_DEPS+=("$(basename "$resolved")")
+      ;;
+  esac
+done <<< "$ldd_out"
+for need in libssl.so libcrypto.so libz.so; do
+  found=0
+  for dep in "${RUNTIME_DEPS[@]}"; do
+    if [[ "$dep" == "$need"* ]]; then
+      found=1
+    fi
+  done
+  if [[ "$found" -eq 0 ]]; then
+    echo "error: 没收集到 $need*（拿到：${RUNTIME_DEPS[*]:-无}）" >&2
+    exit 1
+  fi
+done
+echo "==> runtime deps: ${RUNTIME_DEPS[*]}"
 
 {
   echo "platform=linux"
   echo "arch=${ARCH}"
   echo "doc=https://tdlib.github.io/td/build.html"
   echo "official_flow=cmake+prepare_cross_compiling+tdjson"
-  echo "linkage=static"
-  echo "openssl_lib=$SSL_LIB"
-  echo "zlib_lib=$ZLIB_LIB"
-  echo "note=OpenSSL+zlib merged into tdjson (official build + static merge)"
+  echo "linkage=shared"
+  echo "runtime_deps=${RUNTIME_DEPS[*]}"
+  echo "note=OpenSSL/zlib stay dynamic; libssl/libcrypto/libz shipped next to libtdjson.so"
 } > "$OUT_DIR/tdjson/build-info.txt"
 
 file "$OUT_DIR/tdjson/libtdjson.so" || true
+ls -lh "$OUT_DIR/tdjson"
 echo "==> Linux ${ARCH} tdjson ready"

@@ -123,9 +123,9 @@ fn stage_next_to_binary(vendored_dir: Option<&Path>, version: &str) {
                 );
             }
         }
-        // Android 的 tdjson 依赖是**独立 .so**（libc++_shared / libcrypto / libssl），
-        // 一起放到可执行文件旁边：从 target/<triple>/<profile>/ 直接跑也能加载。
-        if os == "android" {
+        // Android / Linux 的 tdjson 依赖是**独立 .so**，一起放到可执行文件旁边：
+        // 从 target/<triple>/<profile>/ 直接跑、或按「exe 同级」部署时都能加载。
+        if os == "android" || os == "linux" {
             let dir = if source.is_dir() {
                 source.clone()
             } else {
@@ -134,11 +134,11 @@ fn stage_next_to_binary(vendored_dir: Option<&Path>, version: &str) {
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    let android_dep = path
+                    let runtime_dep = path
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .is_some_and(is_android_runtime_dep);
-                    if android_dep {
+                        .is_some_and(is_staged_runtime_dep);
+                    if runtime_dep {
                         let _ = copy_library(&path, &dest_dir);
                     }
                 }
@@ -168,9 +168,17 @@ fn staging_sources(
     sources
 }
 
-/// Android 上 tdjson 的独立运行时依赖（见 `build-tdlib-android.sh`）。
-fn is_android_runtime_dep(name: &str) -> bool {
-    name == "libc++_shared.so" || name.starts_with("libcrypto.so") || name.starts_with("libssl.so")
+/// Android / Linux 上 tdjson 的独立运行时依赖（见 `build-tdlib-android.sh` /
+/// `build-tdlib-linux.sh`）。
+///
+/// Linux 从 2026 起不再把 OpenSSL/zlib 静态并进 tdjson，发布资产里带着
+/// `libssl.so.3` / `libcrypto.so.3` / `libz.so.1`，所以这里也要一起 stage——
+/// 否则从 `target/<profile>/` 直接跑（或按 exe 同级部署）时会缺依赖。
+fn is_staged_runtime_dep(name: &str) -> bool {
+    name == "libc++_shared.so"
+        || name.starts_with("libcrypto.so")
+        || name.starts_with("libssl.so")
+        || name.starts_with("libz.so")
 }
 
 /// 复制（大小一样就当已经拷过——每次构建搬 28MB 没必要）。

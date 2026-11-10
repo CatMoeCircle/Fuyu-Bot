@@ -395,18 +395,27 @@ pub unsafe fn open_library(target: &Path) -> Result<Library, libloading::Error> 
     unsafe { Library::new(target) }
 }
 
-/// Android：`libtdjson.so` 的运行时依赖是**独立 .so**（libc++_shared / libcrypto / libssl），
-/// 必须和它放在同一目录。这里在 `dlopen(tdjson)` 之前按依赖顺序把它们加载一遍，
-/// 并且**永不关闭**（`forget`）：这些库自己 `pthread_key_create` 注册的 TLS 析构
+/// Android / Linux：`libtdjson.so` 的运行时依赖是**独立 .so**，必须和它放在同一目录。
+///
+/// - Android：`libc++_shared` / `libcrypto` / `libssl`（见 `build-tdlib-android.sh`）；
+/// - Linux：`libcrypto` / `libssl` / `libz`（2026 起 `build-tdlib-linux.sh` **不再**把
+///   OpenSSL/zlib 静态并进 tdjson，改成随包发、由本函数在加载前钉住）。
+///
+/// 为什么必须自己加载：`dlopen` 一个**绝对路径**的库时，系统**不会**把它所在的目录
+/// 加进依赖搜索路径（那是 Windows `LOAD_WITH_ALTERED_SEARCH_PATH` 独有的行为）。
+/// 于是 tdjson 旁边的 `libssl.so.3` 默认根本找不到。这里按依赖顺序逐个 `dlopen` 并
+/// **永不关闭**（`forget`）：同 soname 的映射一旦存在，tdjson 的 `NEEDED` 就直接复用它。
+/// 另一条理由（Android 上实测过）：这些库自己 `pthread_key_create` 注册的 TLS 析构
 /// 不能跟着任何一次 `dlclose` 一起消失，否则线程退出时就会在
 /// `pthread_key_clean_all` 里跳到已解除映射的地址。
 ///
-/// 顺序固定：libc++_shared → libcrypto → libssl（libssl 依赖 libcrypto）。
-/// 找不到文件**不算错**：老包（静态并入的）本来就没有这些文件。
+/// 顺序固定：libc++_shared → libcrypto → libssl（libssl 依赖 libcrypto）→ libz。
+/// 找不到文件**不算错**：老包（静态并入的）本来就没有这些文件；系统里已经有同 soname
+/// 的库时 tdjson 照样能加载（preload 只是「优先用随包那份」）。
 ///
 /// 注意：宿主如果在 `start` 之前就 `System.load(tdjson)`，那一步仍然要靠
 /// `libtdjson.so` 的 `$ORIGIN` rpath 找到依赖；本函数只负责把已经能加载的钉住。
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 pub fn preload_runtime_deps(dir: &Path) {
     for path in siblings_to_preload(dir) {
         match unsafe { open_library(&path) } {
@@ -426,8 +435,8 @@ pub fn preload_runtime_deps(dir: &Path) {
 
 /// 同目录下要预加载的依赖，已按加载顺序排好。
 ///
-/// 单独拆出来是为了能在桌面上单测（Android 上跑不了单测）。
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+/// 单独拆出来是为了能在桌面上单测（真机上跑不了单测）。
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn siblings_to_preload(dir: &Path) -> Vec<PathBuf> {
     let mut found: Vec<(u8, String, PathBuf)> = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -447,6 +456,10 @@ fn siblings_to_preload(dir: &Path) -> Vec<PathBuf> {
             1
         } else if name.starts_with("libssl.so") {
             2
+        } else if name.starts_with("libz.so") {
+            // Linux 的系统 zlib（`libz.so.1`）：动态构建的 tdjson 的 NEEDED 里有它。
+            // Android 用系统自带的 libz，包里不会带，走不到这个分支。
+            3
         } else {
             continue;
         };
@@ -682,7 +695,8 @@ mod tests {
         assert_eq!(got.target, PathBuf::from("libtdjson.so"));
     }
 
-    /// Android 的依赖预加载：只挑那三个，且顺序必须是 c++ → crypto → ssl。
+    /// Android / Linux 的依赖预加载：只挑那三个（+ Linux 的 libz），
+    /// 且顺序必须是 c++ → crypto → ssl → z。
     #[test]
     fn siblings_are_picked_and_ordered() {
         let dir = tempdir();
@@ -690,6 +704,7 @@ mod tests {
             "libtdjson.so",
             "libssl.so.3",
             "libcrypto.so.3",
+            "libz.so.1",
             "libc++_shared.so",
             "fuyubot_plugin_help.so",
             "notes.txt",
@@ -703,8 +718,13 @@ mod tests {
             .collect();
         assert_eq!(
             picked,
-            ["libc++_shared.so", "libcrypto.so.3", "libssl.so.3"],
-            "顺序错了：libssl 依赖 libcrypto，libc++ 要先于两者"
+            [
+                "libc++_shared.so",
+                "libcrypto.so.3",
+                "libssl.so.3",
+                "libz.so.1"
+            ],
+            "顺序错了：libssl 依赖 libcrypto，libc++ 要先于两者，libz 没有依赖放最后"
         );
     }
 

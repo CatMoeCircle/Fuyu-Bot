@@ -64,10 +64,12 @@ STAGE_ROOT="$(mktemp -d)"
 STAGE_DIR="$STAGE_ROOT/$ASSET_NAME"
 mkdir -p "$STAGE_DIR"
 
-# 只带 tdjson 本身（+ Windows 的导入库）。桌面平台的 OpenSSL/zlib 是静态并进去的，
-# 没有独立运行时依赖；**Android 是例外**：libc++_shared / libcrypto / libssl 是
-# 独立 .so（见 build-tdlib-android.sh 文件头），必须和 tdjson 同级一起发，
-# 否则设备上 dlopen 直接报“library not found”。
+# 只带 tdjson 本身（+ Windows 的导入库），外加**目录里确实存在的**独立运行时依赖。
+# 现在有两种形态：
+#   - Windows / macOS：OpenSSL/zlib 静态并进去，没有独立依赖；
+#   - Linux / Android：libssl / libcrypto（+ Linux 的 libz）是独立 .so，必须和
+#     tdjson **同级**一起发，否则加载时直接报 library not found
+#     （见 build-tdlib-linux.sh / build-tdlib-android.sh 的文件头）。
 cp -a "$TDLIB_JSON_DIR/$LIB_NAME" "$STAGE_DIR/"
 if [[ -f "$TDLIB_JSON_DIR/tdjson.lib" ]]; then
   cp -a "$TDLIB_JSON_DIR/tdjson.lib" "$STAGE_DIR/"
@@ -78,7 +80,7 @@ fi
 
 RUNTIME_DEPS=()
 shopt -s nullglob
-for pattern in 'libc++_shared.so*' 'libcrypto.so*' 'libssl.so*'; do
+for pattern in 'libc++_shared.so*' 'libcrypto.so*' 'libssl.so*' 'libz.so*'; do
   for f in "$TDLIB_JSON_DIR/"$pattern; do
     [[ -f "$f" ]] || continue
     cp -a "$f" "$STAGE_DIR/"
@@ -150,13 +152,15 @@ cat > "$STAGE_DIR/README.md" <<EOF
 \`\`\`
 ${ASSET_NAME}/
   ${LIB_NAME}
+  libssl.so* / libcrypto.so* / libz.so*   ← 仅 Linux / Android（runtime_deps 里会列出来）
   VERSION.json
   README.md
 \`\`\`
 
 ## 备注
 
-- Linux：\`libtdjson.so\` 内含 OpenSSL/zlib；系统 libc/libstdc++ 仍然适用。
+- Linux：\`libtdjson.so\` **动态**依赖 OpenSSL/zlib——\`libssl.so*\` / \`libcrypto.so*\` /
+  \`libz.so*\` 与它**同目录**（loader 在 dlopen 之前预加载并钉住它们）；系统 libc/libstdc++ 仍然适用。
 - macOS：\`libtdjson.dylib\` 链的是静态 OpenSSL/zlib；带 \`@rpath\` id 与 ad-hoc codesign。
 - Windows：\`tdjson.dll\` 用 vcpkg **static** triplet 构建；可选的 \`tdjson.lib\` 只是导入库，
   **不是**运行时依赖。
