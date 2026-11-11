@@ -59,7 +59,13 @@ JNI 内核包**不再单独作为 Release 资产发布**——它只在 CI 里�
 
 ```powershell
 .\fuyubot.exe init --dir demo --name mybot --api-id 12345
+cd demo
+..\fuyubot.exe        # 开终端操作面板，按 s 登录并启动
 ```
+
+桌面 / 本机**推荐用 TUI**：不带子命令（或 `run --tui`）就是操作面板，登录、启停、日志、
+配置、插件和商店都在里面。`init --api-hash <HASH>` 也可以把 `api_hash` 一起明文写进配置；
+不写就等面板首次按 `s` 时问。
 
 ```
 2026-10-31 07:05:13 cli INFO  已安装 3 个内置插件到 demo\plugins
@@ -70,7 +76,8 @@ JNI 内核包**不再单独作为 Release 资产发布**——它只在 CI 里�
 `init` 建出项目骨架：`fuyubot.toml`、`plugins/`，并把三个内置插件复制进去。
 
 `api_id` 到 <https://my.telegram.org> 申请，它**不是**秘密，写进配置没问题。
-`api_hash` 是凭据，**不写配置文件**——用环境变量 `TG_API_HASH`，或者跑起来后按提示输入。
+`api_hash` 每次冷启动都要发给 TDLib：可以用 `init --api-hash` 或环境变量 `TG_API_HASH`，
+也可以等 `run` / 面板首次问过之后**明文写回** `fuyubot.toml` 的 `[telegram]`。
 
 ```powershell
 $env:TG_API_HASH = "…"
@@ -84,7 +91,8 @@ $env:TG_API_HASH = "…"
 
 | 命令 | 作用 |
 | --- | --- |
-| `fuyubot init --dir <目录> --name <名字> --api-id <id>` | 建项目：生成 `fuyubot.toml`、`plugins/`，并复制内置插件 |
+| `fuyubot`（不带参数） | **直接开终端操作面板**，等价于 `fuyubot run --tui`（双击 exe 就是这条） |
+| `fuyubot init --dir <目录> --name <名字> --api-id <id> [--api-hash <hash>]` | 建项目：生成 `fuyubot.toml`、`plugins/`，并复制内置插件 |
 | `fuyubot run --config <目录>/fuyubot.toml` | 前台跑（含登录） |
 | `fuyubot run … --background` | 后台跑，日志进 `<项目>/logs/fuyubot.log`（每次启动先清空旧日志） |
 | `fuyubot run --tui`（短写 `-t`） | 终端操作面板：顶部版本栏 + 导航/工作区 + 底部资源占用 |
@@ -99,11 +107,15 @@ $env:TG_API_HASH = "…"
 
 ### 终端面板
 
-`run --tui` 打开的是**操作面板**而不是前台 bot：面板自己不接 TDLib、不加载插件，只读
-`.fuyubot/status`、配置、插件目录与日志。面板里可以：
+`run --tui`（或直接 `fuyubot`）打开的是**操作面板**而不是前台 bot：面板不加载插件，
+平时也不接 TDLib，只读 `.fuyubot/status`、配置、插件目录与日志；`s` / `L` 的登录探测是唯一例外，
+跑完立刻关掉。面板里可以：
 
-- **启停实例**：`s` 派生 `run --background`，`x` 走与 `fuyubot stop` 相同的优雅停止。
+- **启停实例**：`s` 先自动检查登录（缺凭据先弹两步输入，缺登录弹授权框），成功后派生
+  `run --background`；`x` 走与 `fuyubot stop` 相同的优雅停止。`L` 只登录、不启动。
   退出面板（`q`）不会停掉已经起来的实例。
+- **导航**：概览 → 日志 → 配置 → 插件 → 商店 → 帮助；数字 `1`–`6` 直达。
+- **登录**：`s` / `L` 都会按授权状态弹 bot token / 手机号 / 验证码 / 两步验证密码输入框。
 - **开关插件**：插件页 `Space` 启用 / 禁用选中的 dylib——禁用即改名（`foo.dll` → `foo.dll.disable`），
   加载器只认扩展名为 `dll` 的文件；再按一次改回来，重启实例生效。
 - **看日志**：首屏读文件尾部，往回翻自动分段回读更早的日志（滑动窗口），翻在中间时窗口冻结，
@@ -127,6 +139,15 @@ name = "mybot"
 account_type = "bot"   # bot：Bot Token；user：手机号 / 扫码。写错会报错，不会静默当 bot
 api_id = 12345         # 不是秘密
 data_dir = "data"      # TDLib 的 database 与 files 都放这儿
+api_hash = ""          # 首次 run / 面板问过后明文写回；也可用 init --api-hash
+
+[roles]
+owners = []            # 主人 id；为空时 user 账户默认自己是主人
+admins = []            # 全局管理员 id
+
+[cache]
+enabled = true
+capacity = 100         # 每种 TDLib 对象类型的上限
 
 [command]
 # prefix = ["/", "."]  # 命令头数组；不写按账号默认（bot "/"、user "."），写了整套替换
@@ -141,8 +162,9 @@ path = ""              # 留空 = 自动找 tdjson（环境变量 → 自带 →
 log_verbosity = 1      # 默认只留警告与错误；排查问题再调大
 ```
 
-**凭据规则**：`api_hash`、bot token、手机号、验证码**只**来自环境变量
-（`TG_API_ID` / `TG_API_HASH` / `TG_BOT_TOKEN`）或交互式输入，配置文件里写了也会被忽略。
+**凭据规则**：`api_id` / `api_hash` 会写进 `fuyubot.toml`（`api_hash` 明文；也可以只用
+`TG_API_ID` / `TG_API_HASH`，环境变量优先）。Bot token、手机号、验证码、两步验证密码仍然
+只来自环境变量或交互输入，不落盘。
 
 **命令头**：`[command].prefix` 是**数组**，可以配多个（每项单个字符，不能是字母 / 数字 /
 空白）。没配时按账号类型取默认值：bot 认 `/`（`/start`、`/help`…），user 认 `.`
