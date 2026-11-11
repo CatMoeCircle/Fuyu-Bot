@@ -59,8 +59,8 @@ impl Page {
         Self::Overview,
         Self::Logs,
         Self::Config,
-        Self::Store,
         Self::Plugins,
+        Self::Store,
         Self::Help,
     ];
 
@@ -80,8 +80,8 @@ impl Page {
             Self::Overview => 0,
             Self::Logs => 1,
             Self::Config => 2,
-            Self::Store => 3,
-            Self::Plugins => 4,
+            Self::Plugins => 3,
+            Self::Store => 4,
             Self::Help => 5,
         }
     }
@@ -3481,7 +3481,7 @@ mod tests {
                 .iter()
                 .map(|page| page.title())
                 .collect::<Vec<_>>(),
-            ["概览", "日志", "配置", "商店", "插件", "帮助"]
+            ["概览", "日志", "配置", "插件", "商店", "帮助"]
         );
         // 导航顺序与 `1..=6` 的编号一致。
         for (index, page) in Page::ALL.iter().enumerate() {
@@ -3495,6 +3495,8 @@ mod tests {
         app.on_key(key(KeyCode::Char('2')));
         assert_eq!(app.page, Page::Logs);
         app.on_key(key(KeyCode::Char('4')));
+        assert_eq!(app.page, Page::Plugins);
+        app.on_key(key(KeyCode::Char('5')));
         assert_eq!(app.page, Page::Store);
         app.on_key(key(KeyCode::Char('6')));
         assert_eq!(app.page, Page::Help);
