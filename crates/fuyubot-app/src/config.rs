@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use fuyubot_loader::{DEFAULT_LOG_VERBOSITY, LogLevel};
+use fuyubot_loader::{DEFAULT_CACHE_CAPACITY, DEFAULT_LOG_VERBOSITY, LogLevel};
 
 /// 项目配置文件名。
 pub const CONFIG_FILE: &str = "fuyubot.toml";
@@ -34,6 +34,12 @@ pub struct Config {
     /// 命令头数组与触发者白名单（`[command]`）。不写命令头时 bot 认 `/`、user 认 `.`。
     #[serde(default)]
     pub command: Command,
+    /// 主人 / 全局管理员（`[roles]`）。跨命令的能力，和「谁能触发」的白名单分开。
+    #[serde(default)]
+    pub roles: Roles,
+    /// TDLib 对象缓存（`[cache]`）。
+    #[serde(default)]
+    pub cache: CacheConfig,
     #[serde(default)]
     pub plugins: Plugins,
     #[serde(default)]
@@ -52,6 +58,8 @@ impl Default for Config {
             bot: Bot::default(),
             telegram: Telegram::default(),
             command: Command::default(),
+            roles: Roles::default(),
+            cache: CacheConfig::default(),
             plugins: Plugins::default(),
             tdlib: Tdlib::default(),
             plugin: empty_table(),
@@ -149,6 +157,43 @@ impl Command {
     /// user 账户的白名单模式；没写 = `true`。
     pub fn whitelist_only(&self) -> bool {
         self.whitelist_only.unwrap_or(true)
+    }
+}
+
+/// `[roles]`：主人与全局管理员。
+///
+/// 它们决定「触发之后能做什么」，不是「能不能触发」——后者仍是 `[command].whitelist`。
+/// 群里的 Telegram 管理员是**会话角色**，由宿主用 `getChatMember` 现查，不在这张表里。
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+pub struct Roles {
+    /// 主人：最高权限。bot 账户没有隐式主人，必须显式配置；user 账户在列表为空时
+    /// 默认自己是主人，配置了列表则按列表来（可以换成别人）。
+    #[serde(default)]
+    pub owners: Vec<i64>,
+    /// 全局管理员：能用 `admin` 级命令，但不能用 `owner` 级。
+    #[serde(default)]
+    pub admins: Vec<i64>,
+}
+
+/// `[cache]`：宿主 TDLib 对象缓存。
+///
+/// 全量存 TDLib 原始 JSON，每种类型默认 100 条。100 条全量 `Value` 大约几 MiB；
+/// `capacity` 是**每种类型**的上限，不是总数。
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct CacheConfig {
+    /// 默认 `true`。关掉后 `Simplify` 不再读写缓存，但连接状态判断仍然保留。
+    pub enabled: Option<bool>,
+    /// 每种类型保留多少条（`chat` / `user` / `basic_group` / `supergroup` /
+    /// `chat_member` / `community` / `community_full_info` 各一份配额）。
+    pub capacity: Option<usize>,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            capacity: None,
+        }
     }
 }
 
@@ -340,7 +385,8 @@ pub fn remember_credentials(
 /// 保留注释、顺序、CRLF，只改这一段值（键/段不存在就补）。值可以跨行（多行数组 /
 /// 内联表）：整段折叠成一行，值里的注释原样搬到新值下面，绝不把后面的段吞掉。
 /// `value` 必须是**已校验并渲染好的 TOML 字面量**（字符串带引号，数字原样），
-/// 调用方负责类型校验。
+/// 调用方负责类型校验。写回前会先把整份文件重新解析一遍：段名 / 值跟现有内容
+/// 冲突（例如给内联表再补一个同名段）时返回 `Err`，**不动原文件**。
 pub fn set_config_value(
     path: &Path,
     section: &str,
@@ -356,12 +402,16 @@ pub fn set_config_value(
     if !set_toml_key(&mut lines, section, key, value) {
         return Ok(false);
     }
-    write_toml_lines(path, &original, lines)?;
+    // 写回前先自己解析一遍：段名 / 值与现有文件冲突时宁可报错，也别把配置改成半截。
+    let candidate = render_toml_lines(&original, &lines);
+    toml::from_str::<toml::Value>(&candidate)
+        .map_err(|error| format!("改完的配置不是合法 TOML：{error}"))?;
+    write_config_file(path, &candidate)?;
     Ok(true)
 }
 
-/// 把改过的行写回文件，保留原文件的 EOL 与末尾换行。
-fn write_toml_lines(path: &Path, original: &str, lines: Vec<String>) -> Result<(), String> {
+/// 把改过的行拼回文本，保留原文件的 EOL 与末尾换行。
+fn render_toml_lines(original: &str, lines: &[String]) -> String {
     // ⚠️ `lines()` 会把 `\r\n` 的 `\r` 也吃掉：Windows 上（或 git 开了 autocrlf）用户的
     // 配置是 CRLF，照 `join("\n")` 写回去等于把整个文件静默转成 LF——diff 里全是红。
     let eol = if original.contains("\r\n") {
@@ -374,6 +424,12 @@ fn write_toml_lines(path: &Path, original: &str, lines: Vec<String>) -> Result<(
     if original.ends_with('\n') {
         text.push_str(eol);
     }
+    text
+}
+
+/// 把改过的行写回文件，保留原文件的 EOL 与末尾换行。
+fn write_toml_lines(path: &Path, original: &str, lines: Vec<String>) -> Result<(), String> {
+    let text = render_toml_lines(original, &lines);
     write_config_file(path, &text)
 }
 
@@ -381,6 +437,27 @@ fn write_toml_lines(path: &Path, original: &str, lines: Vec<String>) -> Result<(
 fn section_header_is(line: &str, header: &str) -> bool {
     let text = line.trim();
     text.split('#').next().unwrap_or("").trim() == header
+}
+
+/// 段结束位置：下一个**顶层** `[…]` 段头，或文件末尾。
+///
+/// 不能只看「行首是 `[`」：多行数组的元素也可能写成 `["a", "b"]` / `[1, 2]` 开头，
+/// 那会被误认成段头、把后面的键划到段外。用 [`value_span`] 跳过整个值，只有键行之外
+/// 的 `[…]` 才算段头。
+fn section_end(lines: &[String], start: usize) -> usize {
+    let mut index = start;
+    while index < lines.len() {
+        if lines[index].trim_start().starts_with('[') {
+            return index;
+        }
+        let span = value_span(lines, index);
+        index = if span.last > index {
+            span.last + 1
+        } else {
+            index + 1
+        };
+    }
+    lines.len()
 }
 
 /// 在 `[section]` 段里把 `key` 设成 `value`（原地改 `lines`），返回有没有改动。
@@ -406,10 +483,7 @@ fn set_toml_key(lines: &mut Vec<String>, section: &str, key: &str, value: &str) 
         }
     };
     // 段的边界：下一个顶层 `[…]` 行，或文件末尾。
-    let end = lines[start..]
-        .iter()
-        .position(|line| line.trim_start().starts_with('['))
-        .map_or(lines.len(), |offset| start + offset);
+    let end = section_end(lines, start);
 
     for index in start..end {
         let trimmed = lines[index].trim();
@@ -638,6 +712,18 @@ fn value_span(lines: &[String], start: usize) -> ValueSpan {
 ///
 /// 纯函数，不碰进程环境（唯一例外是读 `config_path` 里那个凭据键）。文件不存在时如实说
 /// 「全是默认值」——`run` 本来就是按默认值起的。
+/// 用户 id 列表的展示：空表写成「（空）」，否则逗号分隔。
+fn format_ids(ids: &[i64]) -> String {
+    if ids.is_empty() {
+        "（空）".to_owned()
+    } else {
+        ids.iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<String> {
     let missing = if config_path.is_file() {
         ""
@@ -676,6 +762,14 @@ pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<Str
     } else {
         "false（⚠️ 已关闭：任何人都能触发，不建议）".to_owned()
     };
+    let owners = format_ids(&config.roles.owners);
+    let admins = format_ids(&config.roles.admins);
+    let cache_enabled = if config.cache.enabled.unwrap_or(true) {
+        "true".to_owned()
+    } else {
+        "false（不读写缓存）".to_owned()
+    };
+    let cache_capacity = config.cache.capacity.unwrap_or(DEFAULT_CACHE_CAPACITY);
     let mut lines = vec![
         format!("配置文件  {}{missing}", config_path.display()),
         format!("项目根    {}", root.display()),
@@ -703,6 +797,10 @@ pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<Str
         format!("[command]   prefix       = {prefixes}"),
         format!("[command]   whitelist    = {whitelist}"),
         format!("[command]   whitelist_only = {whitelist_only}"),
+        format!("[roles]     owners       = {owners}"),
+        format!("[roles]     admins       = {admins}"),
+        format!("[cache]     enabled      = {cache_enabled}"),
+        format!("[cache]     capacity     = {cache_capacity}（每种类型）"),
         format!(
             "[plugins]   dir          = {}",
             config.plugin_dir(root).display()
@@ -936,6 +1034,39 @@ mod tests {
         let lines = config_lines(&path, &root, &config).join("\n");
         assert!(lines.contains("[plugin.fuyubot.manage]"), "{lines}");
         assert!(lines.contains("[plugin.my.weather]"), "{lines}");
+    }
+
+    /// `[cache]` 段能解析、进配置树（宿主据此配置缓存），也能在 `config` 里看到生效值。
+    #[test]
+    fn cache_section_parses_and_round_trips() {
+        let root = temp("cache-config");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(&path, "[cache]\nenabled = false\ncapacity = 50\n").unwrap();
+        let config = load_config(&path).unwrap();
+        assert_eq!(config.cache.enabled, Some(false));
+        assert_eq!(config.cache.capacity, Some(50));
+
+        let json = config.to_json().unwrap();
+        assert_eq!(
+            json.pointer("/cache/enabled")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            json.pointer("/cache/capacity")
+                .and_then(serde_json::Value::as_u64),
+            Some(50)
+        );
+
+        let lines = config_lines(&path, &root, &config).join("\\n");
+        assert!(
+            lines.contains("[cache]     enabled      = false（不读写缓存）"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("[cache]     capacity     = 50（每种类型）"),
+            "{lines}"
+        );
     }
 
     /// `[command]` 段能解析、进配置树（宿主据此装闸门），也能在 `config` 里看到生效值。
@@ -1256,6 +1387,76 @@ mod tests {
             load_config(&path).unwrap().command.prefix,
             Some(vec!["/".to_owned(), "。".to_owned()])
         );
+    }
+
+    /// 嵌套数组的元素也以 `[` 开头：它们不是段头，后面的键仍属于这一段。
+    #[test]
+    fn multiline_nested_array_does_not_look_like_a_section_header() {
+        let root = temp("nested-array-section-end");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(
+            &path,
+            "[plugin.demo]\nmatrix = [\n  [1, 2],\n  [3, 4],\n]\nname = \"d\"\n",
+        )
+        .unwrap();
+
+        assert!(
+            set_config_value(&path, "plugin.demo", "name", "\"renamed\"").unwrap(),
+            "name 在同一个段里，应该能改"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("[plugin.demo]").count(), 1, "{text}");
+        assert!(text.contains("name = \"renamed\""), "{text}");
+        assert_eq!(
+            load_config(&path)
+                .unwrap()
+                .plugin
+                .get("demo")
+                .and_then(|table| table.get("name"))
+                .and_then(|value| value.as_str()),
+            Some("renamed")
+        );
+    }
+
+    /// 插件段按点路径写：`[plugin.fuyubot.manage]` 与内置段是同一条文本级路径。
+    #[test]
+    fn plugin_sections_are_editable_by_dotted_path() {
+        let root = temp("plugin-section-edit");
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(
+            &path,
+            "# 插件段\n[plugin.fuyubot.manage]\nreply_prefix = \"已安装：\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+
+        assert!(set_config_value(&path, "plugin.fuyubot.manage", "token", "\"new\"").unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# 插件段"), "{text}");
+        assert!(text.contains("token = \"new\""), "{text}");
+        assert_eq!(
+            load_config(&path)
+                .unwrap()
+                .plugin
+                .get("fuyubot")
+                .and_then(|table| table.get("manage"))
+                .and_then(|table| table.get("token"))
+                .and_then(|value| value.as_str()),
+            Some("new")
+        );
+    }
+
+    /// 写完会让文件变成非法 TOML 的改动必须被拒绝——宁可报错，也不能把配置改坏。
+    #[test]
+    fn a_write_that_would_break_toml_is_rejected() {
+        let root = temp("broken-write");
+        let path = root.join(CONFIG_FILE);
+        let original = "[plugin]\ndemo = { name = \"d\" }\n";
+        std::fs::write(&path, original).unwrap();
+
+        // `demo` 已经是内联表：再补一个 `[plugin.demo]` 段就是重复定义。
+        let error = set_config_value(&path, "plugin.demo", "name", "\"x\"").unwrap_err();
+        assert!(error.contains("不是合法 TOML"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     /// 在**真模板**上改每一行可编辑的键：所有注释必须原样留下。

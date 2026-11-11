@@ -157,6 +157,10 @@ impl UpdatePipeline {
             tracing::trace!(target: "fuyubot::update", "{payload}");
         }
 
+        // 先刷新宿主缓存：用 TDLib 原始 JSON，中间件改写的版本不污染缓存。
+        // 放闸门之前，命令处理器在回调里读到的就是这条更新带来的新值。
+        self.runtime.apply_cache_update(&payload);
+
         // 命令闸门：用户账户下 `/xxx` 不进入 `updateNewMessage` 通道（`on_command` 不响应），
         // 但仍然走中间件、仍然发 `update` 通用通道。放行的 `.` 前缀会被归一化成 `/xxx`。
         let gate = self.runtime.gate_command(&mut payload);

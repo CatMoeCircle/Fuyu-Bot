@@ -1,276 +1,106 @@
-//! 内置插件：`/help` 列出可用命令。
+//! 内置插件：`/help` 从**宿主**的命令能力表渲染。
 //!
-//! 命令表现在是**动态**的：任何插件都能在 `start()` 里经进程级共享服务
-//! `fuyubot.help.commands` 的 `register` 方法，把自己的命令登记进 `/help`，
-//! 不必改这个插件半行代码。静态的 `BUILTIN_COMMANDS` 只兜住三个内置命令，
-//! 其余命令由各插件自行为自己注册。
+//! 命令表不在这个插件里：插件在 `start()` 里经宿主预置的
+//! `fuyubot.host.commands` service 登记，宿主按 owner 管生命周期（卸载即回滚）。
+//! `/help` 只做两件事：
 //!
-//! 每条命令还带**归属插件**：服务方法里回问宿主 `HostApi::current_plugin()`，
-//! 由宿主按本线程作用域栈判定（与 `set_config` 的越权判定同一份映射），所以是
-//! 权威来源、插件伪造不了。`register` 的返回与 `list` 数组里都带 `plugin` 字段。
+//! 1. 问宿主要 `list`（命令名、说明、归属插件、角色、允许的会话）；
+//! 2. 按「全局角色 × 会话类型」过滤后按插件分组渲染。
 //!
-//! **`/help` 的正文按插件分组**：一个插件一段，组标题用宿主报告里的展示名
-//! （`display_name`，缺了退回短名）。`list` 仍是**扁平数组**——它是给程序读的
-//! 协议，分组只发生在给人看的那一侧。
+//! 过滤必须在**回复线程**里做：群管理员要问 `getChatMember`，不能在接收循环上等
+//! TDLib。`/help` 的回调因此起一个工作线程，先解析权限，再 `reply`。
 //!
-//! 这是插件之间「直接调用彼此能力」的标准桥（`provide_service_shared` +
-//! `call_service`，见 `fuyubot-abi` 的 `ServiceVTable`）：help 插件把命令注册表
-//! 暴露成一个服务，别的插件按名字调它的 `register` 方法，当场拿到
-//! `{"ok":true,"plugin":"…"}`。
+//! `chat_admin` 是**会话角色**：群里的 Telegram 管理员不等于 `[roles].admins`。
+//! 频道里发帖的本来就是频道身份，所以频道按「频道管理员」处理。
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
-use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::thread_local;
 
-use fuyubot_abi::{HostApi, LogLevel, Plugin, ServiceMethod, ServiceVTable, define_plugin};
-use fuyubot_simplify::{Command, CommandSubscription, SendMessageParams, Text, on_command};
+use fuyubot_abi::{HostApi, LogLevel, Plugin, define_plugin};
+use fuyubot_simplify::{
+    Command, CommandSubscription, SendMessageParams, Simplify, Text, on_command,
+};
 use serde_json::{Value, json};
 
-/// 动态命令注册表。`/help` 渲染时和静态基线合并去重后展示。
-///
-/// 它藏在 help 插件自己的动态库里（其它插件看不见这个符号），只通过下面的共享服务暴露出去。
-static REGISTRY: OnceLock<Mutex<Vec<CommandEntry>>> = OnceLock::new();
+/// 宿主命令能力表 service。
+const HOST_COMMANDS: &str = "fuyubot.host.commands";
 
-/// 注册表里的一条：命令名、说明，以及**登记它的插件名**。
-///
-/// `plugin` 是宿主判定的（[`caller`]），`None` 表示宿主自己 / 名字还没登记——
-/// 不是「插件自报为空」，两者都不该在 `/help` 里编造归属。
-struct CommandEntry {
+/// TDLib 往返的超时（`getChat` / `getChatMember`）。
+const LOOKUP_TIMEOUT_MS: u64 = 1_500;
+
+/// 会话类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatKind {
+    Private,
+    Group,
+    Channel,
+}
+
+/// 命令要求的最低角色（命令表里 `role` 字段）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    User,
+    ChatAdmin,
+    Admin,
+    Owner,
+}
+
+impl Role {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "user" => Some(Self::User),
+            "chat_admin" | "chat-admin" | "chatadmin" => Some(Self::ChatAdmin),
+            "admin" => Some(Self::Admin),
+            "owner" => Some(Self::Owner),
+            _ => None,
+        }
+    }
+
+    /// 这个人能不能看到 / 使用要求该角色的命令。
+    fn allows(self, global: GlobalRole, chat_admin: bool) -> bool {
+        match self {
+            Self::User => true,
+            Self::ChatAdmin => chat_admin,
+            Self::Admin => matches!(global, GlobalRole::Admin | GlobalRole::Owner),
+            Self::Owner => global == GlobalRole::Owner,
+        }
+    }
+}
+
+/// 配置算出的全局角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalRole {
+    User,
+    Admin,
+    Owner,
+}
+
+impl GlobalRole {
+    fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "owner" => Self::Owner,
+            "admin" => Self::Admin,
+            _ => Self::User,
+        }
+    }
+}
+
+/// 命令表里的一条（`/help` 需要的字段）。
+#[derive(Debug, Clone)]
+struct Entry {
     name: String,
     description: String,
     plugin: Option<String>,
+    role: Role,
+    scopes: Vec<ChatKind>,
+    hidden: bool,
 }
 
-fn registry() -> &'static Mutex<Vec<CommandEntry>> {
-    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// 把一条命令塞进注册表（按名字去重：已存在就更新说明与归属）。
-fn register_command(name: &str, description: &str, plugin: Option<&str>) {
-    if name.is_empty() {
-        return;
+impl Entry {
+    fn visible(&self, global: GlobalRole, chat_admin: bool, kind: ChatKind) -> bool {
+        !self.hidden && self.role.allows(global, chat_admin) && self.scopes.contains(&kind)
     }
-    let mut guard = registry().lock().expect("help 注册表被毒化");
-    match guard.iter_mut().find(|entry| entry.name == name) {
-        Some(entry) => {
-            entry.description = description.to_owned();
-            entry.plugin = plugin.map(str::to_owned);
-        }
-        None => guard.push(CommandEntry {
-            name: name.to_owned(),
-            description: description.to_owned(),
-            plugin: plugin.map(str::to_owned),
-        }),
-    }
-}
-
-/// 进程级共享服务名：其它插件经它把自己的命令登记进 `/help`。
-const SERVICE_NAME: &str = "fuyubot.help.commands";
-
-/// 静态兜底的命令（内置三件套），只在对应插件**没有**动态登记时补位。
-///
-/// 基线里没有来源（`plugin`），所以渲染时不标归属——这是「不知道就别编」，
-/// 而不是替 start / manage 声明它们。
-const BUILTIN_COMMANDS: &[(&str, &str)] = &[
-    ("start", "开始使用"),
-    ("help", "这条帮助"),
-    ("plugins", "看看装了哪些插件"),
-];
-
-// 服务方法返回给调用方的字符串由**提供方持有**：这里用线程局部缓冲，调用方读完即弃。
-// 宿主侧 `call_service` 同步调用并立刻把结果拷走，所以每个线程的缓冲在下次同线程调用前
-// 都不会被读到的那一份覆盖——安全。
-thread_local! {
-    static RESPONSE: RefCell<CString> = RefCell::new(CString::new("").unwrap());
-}
-
-/// 把一段文本放进线程局部缓冲并返回指针（调用方须在读走前不再调同名方法）。
-fn reply(text: &str) -> *const c_char {
-    // 说明里理论不该含 NUL；保险起见坏字符兜底成空串。
-    let c = match CString::new(text) {
-        Ok(c) => c,
-        Err(_) => CString::new("").unwrap(),
-    };
-    RESPONSE.with(|buf| {
-        *buf.borrow_mut() = c;
-        buf.borrow().as_ptr()
-    })
-}
-
-/// 问宿主「现在是谁在调我」：`context` 是 `build_service` 存进去的那份 `HostApi`。
-///
-/// 返回的是**权威**来源（宿主按本线程作用域栈判定），不是入参里自报的字段。
-/// context 为空（老宿主 / 直接调用）时返回 `None`，`/help` 就不标归属。
-fn caller(context: *mut c_void) -> Option<String> {
-    if context.is_null() {
-        return None;
-    }
-    // SAFETY: `build_service` 把 `vtable.context` 指向 `HelpService` 自持的
-    // `Box<HostApi>`，只要 `HelpService` 活着就一直有效（宿主回滚注册先于它被放下）。
-    let host = unsafe { &*(context as *const HostApi) };
-    host.current_plugin()
-}
-
-/// 服务方法 `register`：入参 `{"name": "...", "description": "..."}`。
-///
-/// 其它插件在自己的 `start()` 里调它登记命令；成功回
-/// `{"ok":true,"plugin":"登记者插件名"}`（宿主问不到身份时 `plugin` 是 `null`），
-/// 入参非法回 `{"error":"…"}`。
-unsafe extern "C" fn svc_register(
-    context: *mut c_void,
-    input_json: *const c_char,
-) -> *const c_char {
-    let input = match unsafe { CStr::from_ptr(input_json) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return reply(r#"{"error":"非 UTF-8 入参"}"#),
-    };
-    let value: Value = match serde_json::from_str(input) {
-        Ok(v) => v,
-        Err(_) => return reply(r#"{"error":"不是合法 JSON"}"#),
-    };
-    let name = match value.get("name").and_then(Value::as_str) {
-        Some(n) if !n.is_empty() => n,
-        _ => return reply(r#"{"error":"缺 name 或为空"}"#),
-    };
-    let description = value
-        .get("description")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    // 归属由宿主判，不看入参——插件没法伪造成别人。
-    let plugin = caller(context);
-    register_command(name, &description, plugin.as_deref());
-    let body = match &plugin {
-        Some(plugin) => json!({ "ok": true, "plugin": plugin }),
-        None => json!({ "ok": true, "plugin": Value::Null }),
-    };
-    reply(&body.to_string())
-}
-
-/// 服务方法 `list`：回 `[{"name":"…","description":"…","plugin":"…"}, …]`。
-///
-/// 动态登记优先（带宿主判定的 `plugin`），静态基线只补缺（无 `plugin` 字段）。
-unsafe extern "C" fn svc_list(_context: *mut c_void, _input_json: *const c_char) -> *const c_char {
-    let commands = collect_commands();
-    let body = serde_json::to_string(&commands).unwrap_or_else(|_| "[]".to_owned());
-    reply(&body)
-}
-
-/// 合并静态基线与动态注册表，按名字去重，**动态优先**、各自保持原顺序。
-///
-/// 动态优先的理由是来源：动态项带宿主判定的 `plugin`，比硬编码基线可信；
-/// 基线只补「插件没登记」的缺（比如某个内置插件没装）。
-fn collect_entries() -> Vec<CommandEntry> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    {
-        let guard = registry().lock().expect("help 注册表被毒化");
-        for entry in guard.iter() {
-            if !seen.insert(entry.name.clone()) {
-                continue;
-            }
-            out.push(CommandEntry {
-                name: entry.name.clone(),
-                description: entry.description.clone(),
-                plugin: entry.plugin.clone(),
-            });
-        }
-    }
-    for (name, description) in BUILTIN_COMMANDS {
-        if seen.insert((*name).to_owned()) {
-            out.push(CommandEntry {
-                name: (*name).to_owned(),
-                description: (*description).to_owned(),
-                plugin: None,
-            });
-        }
-    }
-    out
-}
-
-/// `list` 服务方法要的 JSON 数组（与 `/help` 渲染共用同一份 `collect_entries`）。
-fn collect_commands() -> Vec<Value> {
-    collect_entries().iter().map(entry_json).collect()
-}
-
-/// 一条命令的 JSON 形状：`plugin` 只有宿主问得到身份时才写（缺字段 ≠ 空串）。
-fn entry_json(entry: &CommandEntry) -> Value {
-    let mut value = json!({
-        "name": &entry.name,
-        "description": &entry.description,
-    });
-    if let Some(plugin) = &entry.plugin {
-        value["plugin"] = json!(plugin);
-    }
-    value
-}
-
-/// 把 `ServiceVTable` 与其指向的名字 / 方法数组打包在一起，保证后者活得一样久。
-///
-/// 注册进宿主的是 `vtable` 的裸指针，而它的 `name` / `methods` / 各方法 `name`
-/// 都指向同结构体里的 `names` 与 `methods` 缓冲——只要 `HelpService` 活着就有效。
-/// 插件卸载时 `stop()` 把 `Box` 放下，缓冲随之释放（届时宿主已回滚该服务注册）。
-struct HelpService {
-    /// 服务方法回问宿主「谁在调我」用的主机句柄；`vtable.context` 指向它。
-    ///
-    /// 单独 `Box` 一层是为了地址稳定：`HelpService` 本身会在 `Box` 里移动，
-    /// 但内部这个 `Box` 指向的堆地址不随外层移动改变。
-    #[allow(dead_code)]
-    host: Box<HostApi>,
-    vtable: ServiceVTable,
-    // 下面两个字段从不被代码「读」，但它们的缓冲被 `vtable` 的裸指针引用，
-    // 必须随 `HelpService` 一起活着——靠持有而非读取来保持存活，故跳过 dead_code。
-    #[allow(dead_code)]
-    methods: Vec<ServiceMethod>,
-    #[allow(dead_code)]
-    names: Vec<CString>,
-}
-
-// `ServiceVTable` / `ServiceMethod` 含裸指针，Rust 默认判为 `!Send + !Sync`。
-// 但这里它只是「指针 + 进程级只读数据（CString 缓冲、函数代码）」的打包，
-// 在进程内任意线程间移动 / 共享都安全——宿主经函数指针调 `svc_register` / `svc_list`，
-// 这两个函数只碰 `Mutex` 保护的 `REGISTRY` 与宿主的线程局部身份。手动标注。
-unsafe impl Send for HelpService {}
-unsafe impl Sync for HelpService {}
-
-/// 构造并自持有 `fuyubot.help.commands` 的服务表。
-///
-/// `host` 存进 `context`：服务方法被调用时用它回问「当前调用者是谁」。
-fn build_service(host: HostApi) -> Box<HelpService> {
-    let name_service = CString::new(SERVICE_NAME).expect("服务名不该含 NUL");
-    let name_register = CString::new("register").expect("方法名不该含 NUL");
-    let name_list = CString::new("list").expect("方法名不该含 NUL");
-    // 顺序固定：names[0]=服务名，names[1]=register，names[2]=list。
-    let names = vec![name_service, name_register, name_list];
-    let methods = vec![
-        ServiceMethod {
-            name: names[1].as_ptr(),
-            func: Some(svc_register),
-        },
-        ServiceMethod {
-            name: names[2].as_ptr(),
-            func: Some(svc_list),
-        },
-    ];
-    // 先装箱再取地址：`Box<HostApi>` 的堆地址不会因为外层 `HelpService` 搬家而变。
-    let host = Box::new(host);
-    let vtable = ServiceVTable {
-        name: names[0].as_ptr(),
-        version: 1,
-        size: core::mem::size_of::<ServiceVTable>() as u32,
-        context: (&*host as *const HostApi).cast_mut().cast::<c_void>(),
-        methods: methods.as_ptr(),
-        method_count: methods.len(),
-    };
-    Box::new(HelpService {
-        host,
-        vtable,
-        methods,
-        names,
-    })
 }
 
 struct HelpPlugin {
@@ -278,8 +108,6 @@ struct HelpPlugin {
     subscription: Option<CommandSubscription>,
     /// 还在跑的异步回复（`stop()` 里 join 掉：卸载之后不能再跑库里的代码）。
     sending: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    /// 持有的服务表；`stop()` 里放下即释放（与宿主回滚注册同步）。
-    service: Option<Box<HelpService>>,
 }
 
 impl Plugin for HelpPlugin {
@@ -288,42 +116,27 @@ impl Plugin for HelpPlugin {
             host,
             subscription: None,
             sending: Arc::new(Mutex::new(Vec::new())),
-            service: None,
         })
     }
 
     fn start(&mut self, _config_json: &str) -> Result<(), String> {
         let host = self.host;
 
-        // 1) 把命令注册表暴露成进程级共享服务，让其它插件能 `call_service` 进来。
-        //    服务表带着 `host`：方法被调用时要回问宿主「谁在登记」。
-        let service = build_service(host);
-        let handle = host.provide_service_shared(SERVICE_NAME, &service.vtable);
-        if !handle.is_valid() {
-            host.log(
-                LogLevel::Error,
-                "help 插件注册 fuyubot.help.commands 共享服务失败：其它插件将无法登记命令",
-            );
-        }
-        self.service = Some(service);
+        // `/help` 自己也要在表里：它现在是普通命令，不是特例。
+        register_help(host);
 
-        // 2) 登记 /help 自己（其它命令由各插件经上面的服务登记）。来源写死自己：
-        //    这条不走服务调用，问不到「调用者」，但 help 确实就是它的提供方。
-        register_command("help", "这条帮助", Some("fuyubot.help"));
-
-        // 3) 订阅 /help。
         let sending = Arc::clone(&self.sending);
         let subscription = on_command(host, move |command: &Command| {
             if !command.is("help") {
                 return;
             }
-            let params = SendMessageParams {
-                text: Some(Text::markdown(help_text(host))),
-                ..SendMessageParams::default()
-            };
-            // 命令回调跑在接收循环线程上：用 then（reply 会阻塞等 TDLib）。
-            let handle = command.reply_then(host, &params, move |result| {
-                if let Err(error) = result {
+            let host = host;
+            let sending = Arc::clone(&sending);
+            let command = command.clone();
+            // 回调在接收循环上：权限查询可能等 TDLib，必须挪到工作线程。
+            let handle = std::thread::spawn(move || {
+                let params = render_params(host, &command);
+                if let Err(error) = command.reply(host, &params) {
                     host.log(LogLevel::Error, &format!("help 插件回复失败: {error}"));
                 }
             });
@@ -338,7 +151,6 @@ impl Plugin for HelpPlugin {
 
     fn stop(&mut self) {
         self.subscription = None;
-        self.service = None;
         let mut sending = self
             .sending
             .lock()
@@ -359,13 +171,163 @@ impl Plugin for HelpPlugin {
     }
 }
 
-/// 帮助文本（Markdown：命令用 `/x`，粗体是 `*x*`）。
+/// 把 `/help` 自己登记进宿主命令表。失败只留一条日志：`/help` 本身仍然能用，
+/// 只是它不出现在自己的列表里。
+fn register_help(host: HostApi) {
+    let input = json!({
+        "name": "help",
+        "description": "这条帮助",
+        "role": "user",
+        "scopes": ["private", "group", "channel"],
+    });
+    match host.call_service(HOST_COMMANDS, "register", &input.to_string()) {
+        Ok(_) => {}
+        Err(error) => host.log(LogLevel::Warn, &format!("help 插件登记到宿主失败: {error}")),
+    }
+}
+
+/// 在工作线程里算出回复参数。
+fn render_params(host: HostApi, command: &Command) -> SendMessageParams {
+    let global = global_role(host, command.sender_user_id);
+    let kind = chat_kind(host, command.chat_id);
+    let chat_admin = match kind {
+        ChatKind::Private => false,
+        // 能在频道里发帖的本来就是频道管理员（TDLib 的发送者是 messageSenderChat）。
+        ChatKind::Channel => true,
+        ChatKind::Group => command
+            .sender_user_id
+            .is_some_and(|user_id| is_chat_admin(host, command.chat_id, user_id)),
+    };
+    let entries = list_entries(host);
+    let text = render_help(
+        &entries,
+        &plugin_display_names(host),
+        global,
+        kind,
+        chat_admin,
+    );
+    SendMessageParams {
+        text: Some(Text::markdown(text)),
+        link_preview: Some(false),
+        ..SendMessageParams::default()
+    }
+}
+
+/// 问宿主「这个人的全局角色」：纯内存，不碰 TDLib。
+fn global_role(host: HostApi, user_id: Option<i64>) -> GlobalRole {
+    let Some(user_id) = user_id else {
+        return GlobalRole::User;
+    };
+    let input = json!({ "user_id": user_id });
+    let Ok(raw) = host.call_service(HOST_COMMANDS, "role", &input.to_string()) else {
+        return GlobalRole::User;
+    };
+    let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    value
+        .get("global")
+        .and_then(Value::as_str)
+        .map(GlobalRole::parse)
+        .unwrap_or(GlobalRole::User)
+}
+
+/// 会话类型：私聊看 id 符号，群 / 频道要问 `getChat`（两者 id 都是负的）。
+fn chat_kind(host: HostApi, chat_id: i64) -> ChatKind {
+    if chat_id > 0 {
+        return ChatKind::Private;
+    }
+    // 会话类型 / 管理权的短缓存都在宿主（`fuyubot.host.cache`），这里不再存第二份：
+    // 否则 help 自己的 60 秒会比宿主的 30 秒 TTL 更旧，权限判断反而更危险。
+    Simplify::new(host)
+        .chat(chat_id, LOOKUP_TIMEOUT_MS)
+        .as_ref()
+        .and_then(kind_of_chat)
+        .unwrap_or(ChatKind::Group)
+}
+
+/// `getChat` 的 `type`：`chatTypePrivate` / `chatTypeBasicGroup` /
+/// `chatTypeSupergroup`（再看 `is_channel`）。
+fn kind_of_chat(chat: &Value) -> Option<ChatKind> {
+    match chat.pointer("/type/@type")?.as_str()? {
+        "chatTypePrivate" => Some(ChatKind::Private),
+        "chatTypeBasicGroup" => Some(ChatKind::Group),
+        "chatTypeSupergroup" => {
+            let is_channel = chat
+                .pointer("/type/is_channel")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(if is_channel {
+                ChatKind::Channel
+            } else {
+                ChatKind::Group
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 群管理权。查不到一律 `false`：不确定时说「没有」比说「有」安全。
 ///
-/// **按归属插件分组**：一个插件一段，组标题优先用宿主报告里的展示名
-/// （`plugin_manifest` 的 `display_name`），缺了退回短名。没有归属的静态基线
-/// 收在最后的「其它」里——不是「内置插件」，只是「不知道是谁登记的」。
-fn help_text(host: HostApi) -> String {
-    render_help(&collect_entries(), &plugin_display_names(host))
+/// `Simplify::chat_member` 走宿主缓存，`chat_member` 条目带 30 秒 TTL，
+/// 所以这里不需要再套一层 help 自己的缓存。
+fn is_chat_admin(host: HostApi, chat_id: i64, user_id: i64) -> bool {
+    Simplify::new(host).is_chat_admin(chat_id, user_id, None, LOOKUP_TIMEOUT_MS)
+}
+
+/// 从宿主读整张命令表。读不到 / 形状不对就空表——`/help` 会回一句「没有可用命令」，
+/// 而不是把插件搞崩。
+fn list_entries(host: HostApi) -> Vec<Entry> {
+    let Ok(raw) = host.call_service(HOST_COMMANDS, "list", "{}") else {
+        return Vec::new();
+    };
+    let Ok(items) = serde_json::from_str::<Vec<Value>>(&raw) else {
+        return Vec::new();
+    };
+    items.iter().filter_map(entry_of).collect()
+}
+
+fn entry_of(value: &Value) -> Option<Entry> {
+    let name = value.get("name")?.as_str()?.to_owned();
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let plugin = value
+        .get("plugin")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let role = Role::parse(value.get("role").and_then(Value::as_str).unwrap_or("user"))?;
+    let scopes = value
+        .get("scopes")?
+        .as_array()?
+        .iter()
+        .filter_map(|scope| scope.as_str())
+        .filter_map(parse_scope)
+        .collect::<Vec<_>>();
+    if scopes.is_empty() {
+        return None;
+    }
+    let hidden = value
+        .get("hidden")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(Entry {
+        name,
+        description,
+        plugin,
+        role,
+        scopes,
+        hidden,
+    })
+}
+
+fn parse_scope(raw: &str) -> Option<ChatKind> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "private" | "pm" | "dm" => Some(ChatKind::Private),
+        "group" | "supergroup" => Some(ChatKind::Group),
+        "channel" => Some(ChatKind::Channel),
+        _ => None,
+    }
 }
 
 /// 问宿主「插件名 → 展示名」。读不到（老宿主 / 没装插件目录）就空表，渲染退回短名。
@@ -395,15 +357,28 @@ fn plugin_display_names(host: HostApi) -> BTreeMap<String, String> {
     names
 }
 
-/// 把条目按插件分组渲染。组按插件名排序（稳定输出），「其它」永远在最后。
-fn render_help(entries: &[CommandEntry], display_names: &BTreeMap<String, String>) -> String {
-    let mut groups: BTreeMap<&str, Vec<&CommandEntry>> = BTreeMap::new();
+/// 过滤 + 按插件分组渲染。组按插件名排序（稳定输出），「其它」永远在最后。
+fn render_help(
+    entries: &[Entry],
+    display_names: &BTreeMap<String, String>,
+    global: GlobalRole,
+    kind: ChatKind,
+    chat_admin: bool,
+) -> String {
+    let mut groups: BTreeMap<&str, Vec<&Entry>> = BTreeMap::new();
     let mut unknown = Vec::new();
     for entry in entries {
+        if !entry.visible(global, chat_admin, kind) {
+            continue;
+        }
         match entry.plugin.as_deref() {
             Some(plugin) => groups.entry(plugin).or_default().push(entry),
             None => unknown.push(entry),
         }
+    }
+
+    if groups.is_empty() && unknown.is_empty() {
+        return "*可用命令*\n\n当前会话没有可用的命令。".to_owned();
     }
 
     let mut text = String::from("*可用命令*\n");
@@ -424,7 +399,7 @@ fn render_help(entries: &[CommandEntry], display_names: &BTreeMap<String, String
 }
 
 /// 一行的格式：`/name — 说明`；没有说明就只写 `/name`（不留悬空的破折号）。
-fn push_command(text: &mut String, command: &CommandEntry) {
+fn push_command(text: &mut String, command: &Entry) {
     if command.description.is_empty() {
         text.push_str(&format!("/{}\n", command.name));
     } else {
@@ -449,54 +424,100 @@ define_plugin!(HelpPlugin, "fuyubot.help");
 mod tests {
     use super::*;
 
-    /// 没有 context（老宿主 / 宿主自己直接调）时，不去编造归属。
-    #[test]
-    fn caller_without_context_is_none() {
-        assert!(caller(core::ptr::null_mut()).is_none());
-    }
-
-    fn entry(name: &str, description: &str, plugin: Option<&str>) -> CommandEntry {
-        CommandEntry {
+    fn entry(name: &str, role: Role, scopes: &[ChatKind], plugin: Option<&str>) -> Entry {
+        Entry {
             name: name.to_owned(),
-            description: description.to_owned(),
+            description: "说明".to_owned(),
             plugin: plugin.map(str::to_owned),
+            role,
+            scopes: scopes.to_vec(),
+            hidden: false,
         }
     }
 
-    /// 按插件分组：组按插件名排序，组标题用展示名（带短名），「其它」在最后。
     #[test]
-    fn render_help_groups_commands_by_plugin() {
+    fn owner_sees_owner_commands_but_a_user_does_not() {
         let entries = vec![
-            entry("start", "开始使用", Some("fuyubot.start")),
-            entry("help", "这条帮助", Some("fuyubot.help")),
-            entry("ping", "探活", None),
+            entry("start", Role::User, &[ChatKind::Private], None),
+            entry("config", Role::Owner, &[ChatKind::Private], None),
         ];
-        let names = BTreeMap::from([
-            ("fuyubot.help".to_owned(), "帮助".to_owned()),
-            ("fuyubot.start".to_owned(), "启动问候".to_owned()),
-        ]);
+        let names = BTreeMap::new();
+        let as_user = render_help(&entries, &names, GlobalRole::User, ChatKind::Private, false);
+        assert!(as_user.contains("/start"), "{as_user}");
+        assert!(!as_user.contains("/config"), "{as_user}");
 
-        let text = render_help(&entries, &names);
-        assert_eq!(
-            text,
-            "*可用命令*\n\n*帮助（help）*\n/help — 这条帮助\n\n\
-             *启动问候（start）*\n/start — 开始使用\n\n*其它*\n/ping — 探活\n"
+        let as_owner = render_help(
+            &entries,
+            &names,
+            GlobalRole::Owner,
+            ChatKind::Private,
+            false,
         );
+        assert!(as_owner.contains("/config"), "{as_owner}");
     }
 
-    /// 没有展示名 / 展示名与短名相同：组标题只写短名，不重复。
+    /// 群管理员只在本群看到 `chat_admin` 命令；全局管理员不会因此多看见它们。
     #[test]
-    fn group_title_falls_back_to_short_name() {
-        let names = BTreeMap::from([("fuyubot.start".to_owned(), "start".to_owned())]);
-        assert_eq!(group_title("fuyubot.start", &names), "start");
-        assert_eq!(group_title("fuyubot.manage", &names), "manage");
+    fn chat_admin_commands_are_scoped_to_the_group() {
+        let entries = vec![entry(
+            "ban",
+            Role::ChatAdmin,
+            &[ChatKind::Group],
+            Some("fuyubot.mod"),
+        )];
+        let names = BTreeMap::from([("fuyubot.mod".to_owned(), "管理".to_owned())]);
+        let as_member = render_help(&entries, &names, GlobalRole::User, ChatKind::Group, false);
+        assert!(!as_member.contains("/ban"), "{as_member}");
+        let as_admin = render_help(&entries, &names, GlobalRole::User, ChatKind::Group, true);
+        assert!(as_admin.contains("/ban"), "{as_admin}");
+        let as_owner_private = render_help(
+            &entries,
+            &names,
+            GlobalRole::Owner,
+            ChatKind::Private,
+            false,
+        );
+        assert!(!as_owner_private.contains("/ban"), "{as_owner_private}");
     }
 
-    /// 没有说明的命令不留悬空的破折号。
     #[test]
-    fn push_command_omits_empty_description() {
-        let mut text = String::new();
-        push_command(&mut text, &entry("ping", "", None));
-        assert_eq!(text, "/ping\n");
+    fn channel_only_commands_stay_in_channels() {
+        let entries = vec![entry("post", Role::User, &[ChatKind::Channel], None)];
+        let names = BTreeMap::new();
+        let channel = render_help(&entries, &names, GlobalRole::User, ChatKind::Channel, true);
+        assert!(channel.contains("/post"), "{channel}");
+        let group = render_help(&entries, &names, GlobalRole::User, ChatKind::Group, false);
+        assert!(!group.contains("/post"), "{group}");
+    }
+
+    #[test]
+    fn hidden_commands_are_not_rendered() {
+        let mut hidden = entry("secret", Role::User, &[ChatKind::Private], None);
+        hidden.hidden = true;
+        let text = render_help(
+            &[hidden],
+            &BTreeMap::new(),
+            GlobalRole::Owner,
+            ChatKind::Private,
+            false,
+        );
+        assert!(!text.contains("/secret"), "{text}");
+        assert!(text.contains("没有可用"), "{text}");
+    }
+
+    #[test]
+    fn parsing_a_host_entry_keeps_role_and_scopes() {
+        let value = json!({
+            "name": "ban",
+            "description": "禁言",
+            "plugin": "fuyubot.mod",
+            "role": "chat_admin",
+            "scopes": ["group"],
+            "hidden": false
+        });
+        let entry = entry_of(&value).expect("合法条目");
+        assert_eq!(entry.role, Role::ChatAdmin);
+        assert_eq!(entry.scopes, vec![ChatKind::Group]);
+        assert_eq!(entry.plugin.as_deref(), Some("fuyubot.mod"));
     }
 }

@@ -21,6 +21,29 @@ data_dir = "data"
 api_hash = ""
 # Bot Token / 手机号 / 两步验证密码**从不**写进这个文件：session 有效后它们用不上。
 
+[roles]
+# 主人 / 全局管理员（用户 id 数组）。它们决定「触发后能做什么」，不是「能不能触发」：
+# 后者仍由下面的 [command].whitelist 管。主人与管理员**绕过**白名单，始终能触发。
+#
+# - bot 账户没有隐式主人（Telegram 没有「这个 bot 是谁建的」接口），必须显式配置；
+#   空表 = 没有主人，主人级命令不可用。
+# - user 账户在 owners 为空时默认自己是主人；一旦配置了 owners 就按列表来，
+#   自己不在列表里就不再是主人（可以换成别人）。
+# - 群里的 Telegram 管理员是**会话角色**，由宿主用 getChatMember 现查，
+#   不会因为写进这里就变成全局管理员。
+# owners = [123456789]
+# admins = [987654321]
+owners = []
+admins = []
+
+[cache]
+# 宿主侧 TDLib 对象缓存：全量存 TDLib 原始 JSON，内存优先，未命中再请求 TDLib。
+# 每种类型（chat / user / basic_group / supergroup / chat_member / community /
+# community_full_info）各自保留 capacity 条，超出按最近最少使用淘汰。
+# 100 条全量 Value 大约几 MiB；`chat_member` 另有 30 秒 TTL（权限判断不能太旧）。
+enabled = true
+capacity = 100
+
 [command]
 # 命令头（数组，可以写多个）与触发者白名单。
 #

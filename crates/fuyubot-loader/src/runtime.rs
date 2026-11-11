@@ -28,7 +28,9 @@ use fuyubot_tdlib::{TdClient, TdlibError, schema::TdApiSchema};
 use fuyubot_tool::{ToolDescriptor, ToolHandle as ToolRegistration, ToolHandlerFn, ToolRegistry};
 use serde_json::{Value, json};
 
+use crate::cache::{CACHE_SERVICE, Cache, CacheKind, DEFAULT_CAPACITY};
 use crate::command::{self, AccountKind, CommandMeta, CommandPolicy, Gate};
+use crate::commands::{CommandRegistry, GlobalRole};
 
 /// 插件日志级别。宿主调 [`HostRuntime::set_log_verbosity`] 时用它，
 /// CLI 也从这里取，省得为了一个枚举去依赖 `fuyubot-abi`。
@@ -299,6 +301,16 @@ pub struct HostRuntime {
     identity_vtable: ServiceVTable,
     /// 内置「命令回复」service 的 vtable（同上）。
     command_vtable: ServiceVTable,
+    /// 内置「命令能力表」service 的 vtable（同上）。
+    commands_vtable: ServiceVTable,
+    /// 旧名字 `fuyubot.help.commands` 的兼容 vtable：让还没改名的插件继续能登记。
+    legacy_commands_vtable: ServiceVTable,
+    /// 宿主侧命令能力表。`/help` 与闸门读的是同一份。
+    commands: CommandRegistry,
+    /// 内置「TDLib 对象缓存」service 的 vtable（同上）。
+    cache_vtable: ServiceVTable,
+    /// 宿主侧 TDLib 对象缓存。管线在中间件之前刷新它。
+    cache: Cache,
     /// `getMe` 的结果（登录成功后由 CLI 用 [`HostRuntime::set_self_user`] 写进来）。
     /// `fuyubot.host.identity` service 读它；没登录 / 没接 TDLib 时是 `None`。
     self_user: Mutex<Option<Value>>,
@@ -619,6 +631,32 @@ impl HostRuntime {
                 methods: COMMAND_METHODS.0.as_ptr(),
                 method_count: COMMAND_METHODS.0.len(),
             },
+            commands_vtable: ServiceVTable {
+                name: COMMAND_REGISTRY_SERVICE_C.as_ptr(),
+                version: 1,
+                size: core::mem::size_of::<ServiceVTable>() as u32,
+                context: weak.as_ptr() as *mut c_void,
+                methods: COMMAND_REGISTRY_METHODS.0.as_ptr(),
+                method_count: COMMAND_REGISTRY_METHODS.0.len(),
+            },
+            legacy_commands_vtable: ServiceVTable {
+                name: LEGACY_HELP_SERVICE_C.as_ptr(),
+                version: 1,
+                size: core::mem::size_of::<ServiceVTable>() as u32,
+                context: weak.as_ptr() as *mut c_void,
+                methods: COMMAND_REGISTRY_METHODS.0.as_ptr(),
+                method_count: COMMAND_REGISTRY_METHODS.0.len(),
+            },
+            commands: CommandRegistry::default(),
+            cache_vtable: ServiceVTable {
+                name: CACHE_SERVICE_C.as_ptr(),
+                version: 1,
+                size: core::mem::size_of::<ServiceVTable>() as u32,
+                context: weak.as_ptr() as *mut c_void,
+                methods: CACHE_METHODS.0.as_ptr(),
+                method_count: CACHE_METHODS.0.len(),
+            },
+            cache: Cache::new(),
             self_user: Mutex::new(None),
             command_policy: Mutex::new(CommandPolicy::default()),
             command_contexts: Mutex::new(VecDeque::new()),
@@ -667,6 +705,8 @@ impl HostRuntime {
         rt.provide_plugins_service();
         rt.provide_identity_service();
         rt.provide_command_service();
+        rt.provide_commands_service();
+        rt.provide_cache_service();
         Ok(rt)
     }
 
@@ -730,6 +770,51 @@ impl HostRuntime {
             Ok(effect) => std::mem::forget(effect),
             Err(e) => self.warn(&format!("预置命令回复 service 失败: {e}")),
         }
+    }
+
+    /// 把内置「命令能力表」service 预置进服务表。
+    ///
+    /// 两个名字指向同一张表：
+    /// - `fuyubot.host.commands` —— 新插件用；
+    /// - `fuyubot.help.commands` —— 旧名字，保留一个版本，让还没改的插件继续能登记。
+    ///
+    /// `/help` 插件不再提供旧名字，所以不会撞名。
+    fn provide_commands_service(&self) {
+        for (name, vtable) in [
+            (
+                COMMAND_REGISTRY_SERVICE,
+                &self.commands_vtable as *const ServiceVTable,
+            ),
+            (
+                LEGACY_HELP_SERVICE,
+                &self.legacy_commands_vtable as *const ServiceVTable,
+            ),
+        ] {
+            match self
+                .ctx
+                .provide_named(name, AbiService { vtable, owner: 0 })
+            {
+                Ok(effect) => std::mem::forget(effect),
+                Err(e) => self.warn(&format!("预置命令能力表 service {name} 失败: {e}")),
+            }
+        }
+    }
+
+    /// 把内置「TDLib 对象缓存」service 预置进服务表。
+    fn provide_cache_service(&self) {
+        let vtable = &self.cache_vtable as *const ServiceVTable;
+        match self
+            .ctx
+            .provide_named(CACHE_SERVICE, AbiService { vtable, owner: 0 })
+        {
+            Ok(effect) => std::mem::forget(effect),
+            Err(e) => self.warn(&format!("预置缓存 service 失败: {e}")),
+        }
+    }
+
+    /// 管线在中间件之前调：缓存永远反映 TDLib 的原始更新，不受中间件改写影响。
+    pub(crate) fn apply_cache_update(&self, update: &Value) {
+        self.cache.apply_update(update);
     }
 
     /// 记下 `getMe` 的结果（CLI 在登录成功之后调）。
@@ -828,8 +913,26 @@ impl HostRuntime {
             &policy,
             account,
             self.self_user_id(),
+            &self.commands,
+            &self.cache,
             &mut host_reply,
         )
+    }
+
+    /// 配置算出的全局角色（`/help` 经 `fuyubot.host.commands` 的 `role` 方法读）。
+    ///
+    /// 纯内存，不碰 TDLib；`chat_admin` 是会话角色，不在这个答案里。
+    pub(crate) fn global_role_of(&self, user_id: Option<i64>) -> GlobalRole {
+        let policy = self
+            .command_policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let account = self.command_account(&policy);
+        let self_id = self.self_user_id();
+        let self_triggered =
+            account == AccountKind::User && user_id.is_some() && user_id == self_id;
+        policy.global_role(user_id, self_id, account, self_triggered)
     }
 
     /// 当前账号类型：活的 `getMe` 优先，身份未知时退回配置里的账号类型。
@@ -924,6 +1027,33 @@ impl HostRuntime {
             .command_policy
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = command_policy;
+
+        // `[cache]`：开关与每种类型的条数上限。类型写错只告警，回退默认值。
+        let cache_enabled = match root.pointer("/cache/enabled") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(enabled)) => *enabled,
+            Some(other) => {
+                self.warn(&format!(
+                    "[cache].enabled = {other} 不是 true / false，已按 true 处理"
+                ));
+                true
+            }
+        };
+        let cache_capacity = match root.pointer("/cache/capacity") {
+            None | Some(Value::Null) => DEFAULT_CAPACITY,
+            Some(value) => match value.as_u64() {
+                Some(value) => value as usize,
+                None => {
+                    self.warn(&format!(
+                        "[cache].capacity = {value} 不是正整数，已按 {DEFAULT_CAPACITY} 处理"
+                    ));
+                    DEFAULT_CAPACITY
+                }
+            },
+        };
+        self.cache.set_enabled(cache_enabled);
+        self.cache.set_capacity(cache_capacity);
+
         let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
         config.store = store;
         config.root = root;
@@ -1723,6 +1853,8 @@ impl HostRuntime {
     /// 子作用域的 owner 继承自父，所以 owner 整批回滚**连带**子作用域（设计文档 5.2）：
     /// 它们的注册一起撤，条目也从作用域表里摘掉。
     pub(crate) fn rollback_owner(&self, owner: u64) {
+        // 命令能力表也按 owner 整批摘：插件没了，它登记的命令不该还留在 `/help` 里。
+        self.commands.remove_owner(owner);
         let removed = self.take_registrations(|r| r.owner == owner);
         // 在锁外回滚：句柄的 Drop 会回头去动事件总线 / 工具表。
         // 倒序撤销：与「卸载是加载顺序的倒序」一致，后注册的东西先撤。
@@ -1768,6 +1900,8 @@ impl HostRuntime {
     ///
     /// 只影响这个 scope，同 owner 的其他作用域不受影响——这是「单个脚本独立卸载」的落点。
     pub(crate) fn rollback_scope(&self, scope: u64) {
+        // 脚本插件单独卸载：只摘它这个作用域里登记的命令。
+        self.commands.remove_scope(scope);
         if let Some(info) = self.scopes().get_mut(&scope) {
             info.alive = false;
         }
@@ -2645,6 +2779,292 @@ static COMMAND_METHODS: CommandMethods = CommandMethods([ServiceMethod {
 
 /// `reply`：插件回复命令。成功回 TDLib 的 `Message`，失败回 `{"@type":"error",…}`
 /// （服务接口不返回 NULL，否则调用方只能拿到一句笼统的失败）。
+/// 内置「命令能力表」service 的名字。插件在 `start()` 里经它登记命令；
+/// `/help` 与闸门读的是同一张表。
+pub const COMMAND_REGISTRY_SERVICE: &str = "fuyubot.host.commands";
+
+/// 同一个名字的 `CString` 版（`ServiceVTable.name` 要 NUL 结尾的指针）。
+const COMMAND_REGISTRY_SERVICE_C: &core::ffi::CStr = c"fuyubot.host.commands";
+
+/// 旧名字：原来由 help 插件提供。保留一个版本，老插件不用改就能继续登记。
+pub const LEGACY_HELP_SERVICE: &str = "fuyubot.help.commands";
+
+const LEGACY_HELP_SERVICE_C: &core::ffi::CStr = c"fuyubot.help.commands";
+
+/// 「命令能力表」service 的方法表。
+///
+/// - `register`：入参 `{name, description?, role?, scopes?, hidden?}`；
+/// - `unregister`：入参 `{name}`，只能注销自己的；
+/// - `list`：无参，返回全部条目（`/help` 用）；
+/// - `role`：入参 `{user_id?}`，返回 `{"global":"user|admin|owner"}`。
+struct CommandRegistryMethods([ServiceMethod; 4]);
+
+// SAFETY: 与 `ScopeMethods` 同理：`name` 指向 `'static` 字面量，`func` 是纯函数指针。
+unsafe impl Sync for CommandRegistryMethods {}
+
+static COMMAND_REGISTRY_METHODS: CommandRegistryMethods = CommandRegistryMethods([
+    ServiceMethod {
+        name: c"register".as_ptr(),
+        func: Some(api_commands_register),
+    },
+    ServiceMethod {
+        name: c"unregister".as_ptr(),
+        func: Some(api_commands_unregister),
+    },
+    ServiceMethod {
+        name: c"list".as_ptr(),
+        func: Some(api_commands_list),
+    },
+    ServiceMethod {
+        name: c"role".as_ptr(),
+        func: Some(api_commands_role),
+    },
+]);
+
+/// `register`：调用者由宿主判定（`current_caller`），插件伪造不了归属。
+unsafe extern "C" fn api_commands_register(
+    context: *mut c_void,
+    input: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    // SAFETY: 输入是 NUL 结尾 JSON。
+    let input = unsafe { cstr(input) }.unwrap_or("");
+    let value: Value = match serde_json::from_str(input) {
+        Ok(value) => value,
+        Err(_) => return host_string(r#"{"error":"不是合法 JSON"}"#),
+    };
+    let owner = rt.current_caller().unwrap_or_else(|| rt.current_owner());
+    let plugin = rt.owner_name(owner);
+    let scope = rt.current_scope();
+    match rt.commands.register(owner, scope, plugin, &value) {
+        Ok(entry) => host_string(
+            &json!({"ok": true, "name": entry.name, "plugin": entry.plugin}).to_string(),
+        ),
+        Err(error) => host_string(&json!({"error": error}).to_string()),
+    }
+}
+
+/// `unregister`：插件只能注销自己的；宿主（owner 0）可以注销任何一条。
+unsafe extern "C" fn api_commands_unregister(
+    context: *mut c_void,
+    input: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    // SAFETY: 输入是 NUL 结尾 JSON。
+    let input = unsafe { cstr(input) }.unwrap_or("");
+    let Ok(value) = serde_json::from_str::<Value>(input) else {
+        return host_string(r#"{"error":"不是合法 JSON"}"#);
+    };
+    let Some(name) = value.get("name").and_then(Value::as_str) else {
+        return host_string(r#"{"error":"缺 name"}"#);
+    };
+    let owner = rt.current_caller().unwrap_or_else(|| rt.current_owner());
+    if rt.commands.unregister(owner, name) {
+        host_string(r#"{"ok":true}"#)
+    } else {
+        host_string(&json!({"error": format!("没有可注销的命令 /{name}")}).to_string())
+    }
+}
+
+/// `list`：返回全部能力表条目；`/help` 在自己的回复线程里解析并过滤。
+unsafe extern "C" fn api_commands_list(
+    context: *mut c_void,
+    _input: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    let entries = rt
+        .commands
+        .list()
+        .iter()
+        .map(crate::commands::CommandEntry::to_json)
+        .collect::<Vec<_>>();
+    host_string(&Value::Array(entries).to_string())
+}
+
+/// `role`：把「配置里的全局角色」告诉插件（纯内存，不碰 TDLib）。
+unsafe extern "C" fn api_commands_role(
+    context: *mut c_void,
+    input: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    // SAFETY: 输入是 NUL 结尾 JSON。
+    let input = unsafe { cstr(input) }.unwrap_or("");
+    let value: Value = serde_json::from_str(input).unwrap_or(Value::Null);
+    let user_id = value.get("user_id").and_then(Value::as_i64);
+    host_string(&json!({"global": rt.global_role_of(user_id).as_str()}).to_string())
+}
+
+/// 内置「TDLib 对象缓存」service 的名字。
+const CACHE_SERVICE_C: &core::ffi::CStr = c"fuyubot.host.cache";
+
+/// 缓存 service 的方法表。
+///
+/// - `get`：`{kind,id,user_id?,ttl_ms?}` → `{value,online}`；
+/// - `put`：`{kind,id,user_id?,value}`；
+/// - `list_chats`：`{list,limit?}` → `{chats:[…]}`；
+/// - `chat_folders`：无参 → `updateChatFolders` 的快照；
+/// - `list_groups`：无参 → main / archive / 各 folder 的分组索引；
+/// - `stats` / `clear`：诊断与手动清空。
+struct CacheMethods([ServiceMethod; 7]);
+
+// SAFETY: 与 `ScopeMethods` 同理：`name` 指向 `'static` 字面量，`func` 是纯函数指针。
+unsafe impl Sync for CacheMethods {}
+
+static CACHE_METHODS: CacheMethods = CacheMethods([
+    ServiceMethod {
+        name: c"get".as_ptr(),
+        func: Some(api_cache_get),
+    },
+    ServiceMethod {
+        name: c"put".as_ptr(),
+        func: Some(api_cache_put),
+    },
+    ServiceMethod {
+        name: c"list_chats".as_ptr(),
+        func: Some(api_cache_list_chats),
+    },
+    ServiceMethod {
+        name: c"chat_folders".as_ptr(),
+        func: Some(api_cache_chat_folders),
+    },
+    ServiceMethod {
+        name: c"list_groups".as_ptr(),
+        func: Some(api_cache_list_groups),
+    },
+    ServiceMethod {
+        name: c"stats".as_ptr(),
+        func: Some(api_cache_stats),
+    },
+    ServiceMethod {
+        name: c"clear".as_ptr(),
+        func: Some(api_cache_clear),
+    },
+]);
+
+unsafe extern "C" fn api_cache_get(context: *mut c_void, input: *const c_char) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    // SAFETY: 输入是 NUL 结尾 JSON。
+    let input = unsafe { cstr(input) }.unwrap_or("");
+    let Ok(value) = serde_json::from_str::<Value>(input) else {
+        return host_string(r#"{"error":"不是合法 JSON"}"#);
+    };
+    let Some(kind) = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(CacheKind::parse)
+    else {
+        return host_string(r#"{"error":"kind 认不出来"}"#);
+    };
+    let Some(id) = value.get("id").and_then(Value::as_i64) else {
+        return host_string(r#"{"error":"缺 id"}"#);
+    };
+    let user_id = value.get("user_id").and_then(Value::as_i64);
+    let ttl_ms = value.get("ttl_ms").and_then(Value::as_u64).unwrap_or(0);
+    let lookup = rt.cache.get(kind, id, user_id, ttl_ms);
+    host_string(&json!({"value": lookup.value, "online": lookup.online}).to_string())
+}
+
+unsafe extern "C" fn api_cache_put(context: *mut c_void, input: *const c_char) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    // SAFETY: 输入是 NUL 结尾 JSON。
+    let input = unsafe { cstr(input) }.unwrap_or("");
+    let Ok(value) = serde_json::from_str::<Value>(input) else {
+        return host_string(r#"{"error":"不是合法 JSON"}"#);
+    };
+    let Some(kind) = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(CacheKind::parse)
+    else {
+        return host_string(r#"{"error":"kind 认不出来"}"#);
+    };
+    let Some(id) = value.get("id").and_then(Value::as_i64) else {
+        return host_string(r#"{"error":"缺 id"}"#);
+    };
+    let user_id = value.get("user_id").and_then(Value::as_i64);
+    let payload = value.get("value").cloned().unwrap_or(Value::Null);
+    rt.cache.put(kind, id, user_id, payload);
+    host_string(r#"{"ok":true}"#)
+}
+
+unsafe extern "C" fn api_cache_list_chats(
+    context: *mut c_void,
+    input: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    // SAFETY: 输入是 NUL 结尾 JSON。
+    let input = unsafe { cstr(input) }.unwrap_or("");
+    let Ok(value) = serde_json::from_str::<Value>(input) else {
+        return host_string(r#"{"error":"不是合法 JSON"}"#);
+    };
+    let Some(list) = value.get("list") else {
+        return host_string(r#"{"error":"缺 list"}"#);
+    };
+    let limit = value.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+    let chats = rt.cache.chats_in_list(list, limit);
+    host_string(&json!({"chats": chats}).to_string())
+}
+
+unsafe extern "C" fn api_cache_chat_folders(
+    context: *mut c_void,
+    _input: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    host_string(&json!({"value": rt.cache.chat_folders()}).to_string())
+}
+
+unsafe extern "C" fn api_cache_list_groups(
+    context: *mut c_void,
+    _input: *const c_char,
+) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    host_string(&json!({"groups": rt.cache.chat_list_groups()}).to_string())
+}
+
+unsafe extern "C" fn api_cache_stats(context: *mut c_void, _input: *const c_char) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    host_string(&rt.cache.stats().to_string())
+}
+
+unsafe extern "C" fn api_cache_clear(context: *mut c_void, _input: *const c_char) -> *const c_char {
+    // SAFETY: ABI 契约保证 context 来自本运行时。
+    let Some(rt) = (unsafe { runtime(context) }) else {
+        return core::ptr::null();
+    };
+    rt.cache.clear();
+    host_string(r#"{"ok":true}"#)
+}
+
 unsafe extern "C" fn api_command_reply(
     context: *mut c_void,
     input: *const c_char,
@@ -5795,6 +6215,106 @@ mod tests {
             assert!(error.contains("nope"), "{error}");
         }
         // vtable 是局部变量，活到本函数末尾——比所有调用都久。
+    }
+
+    /// 命令能力表：插件经宿主 service 登记，归属由宿主判定，卸载时按 owner 回滚。
+    #[test]
+    fn plugins_register_commands_with_the_host_and_rollback_removes_them() {
+        let rt = runtime();
+        let owner = rt.begin_plugin();
+        rt.register_owner_name(owner, "demo.commands");
+        // SAFETY: rt 活着；api 只在本测试里用。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+
+        let reply = api
+            .call_service(
+                COMMAND_REGISTRY_SERVICE,
+                "register",
+                r#"{"name":"Ping","description":"探活","role":"admin"}"#,
+            )
+            .expect("登记命令必须成功");
+        assert!(reply.contains(r#""ok":true"#), "{reply}");
+        assert!(reply.contains("demo.commands"), "{reply}");
+
+        let list = rt
+            .call_service(COMMAND_REGISTRY_SERVICE, "list", "{}")
+            .unwrap();
+        assert!(list.contains(r#""name":"ping""#), "{list}");
+        assert!(list.contains(r#""plugin":"demo.commands""#), "{list}");
+        assert!(list.contains(r#""role":"admin""#), "{list}");
+
+        // 另一个插件不能覆盖同名的命令。
+        let other = rt.begin_plugin();
+        rt.register_owner_name(other, "demo.other");
+        let denied = api
+            .call_service(COMMAND_REGISTRY_SERVICE, "register", r#"{"name":"ping"}"#)
+            .expect("服务调用本身成功");
+        assert!(denied.contains("已由 demo.commands 注册"), "{denied}");
+        rt.end_plugin();
+
+        rt.rollback_owner(owner);
+        rt.end_plugin();
+        rt.unregister_owner_name(owner);
+        assert!(
+            rt.call_service(COMMAND_REGISTRY_SERVICE, "list", "{}")
+                .unwrap()
+                .trim()
+                == "[]"
+        );
+    }
+
+    /// 缓存 service：插件经 `put` 回填、`get` 读取；离线时 `get` 带 `online:false`。
+    #[test]
+    fn plugins_can_read_and_write_the_host_cache() {
+        let rt = runtime();
+        // SAFETY: rt 活着；api 只在本测试里用。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+        let put = json!({
+            "kind": "chat",
+            "id": 7,
+            "value": {"@type": "chat", "id": 7, "title": "缓存里的标题", "positions": []}
+        });
+        api.call_service(CACHE_SERVICE, "put", &put.to_string())
+            .expect("put 必须成功");
+        let raw = api
+            .call_service(CACHE_SERVICE, "get", r#"{"kind":"chat","id":7,"ttl_ms":0}"#)
+            .expect("get 必须成功");
+        assert!(raw.contains("缓存里的标题"), "{raw}");
+        assert!(raw.contains(r#""online":true"#), "{raw}");
+
+        rt.apply_cache_update(&json!({
+            "@type": "updateConnectionState",
+            "state": {"@type": "connectionStateWaitingForNetwork"}
+        }));
+        let raw = api
+            .call_service(CACHE_SERVICE, "get", r#"{"kind":"user","id":9,"ttl_ms":0}"#)
+            .expect("get 必须成功");
+        assert!(raw.contains(r#""value":null"#), "{raw}");
+        assert!(raw.contains(r#""online":false"#), "{raw}");
+
+        let stats = api
+            .call_service(CACHE_SERVICE, "stats", "{}")
+            .expect("stats 必须成功");
+        assert!(stats.contains(r#""chat":1"#), "{stats}");
+    }
+
+    /// 旧名字 `fuyubot.help.commands` 仍然指向同一张表（兼容一个版本）。
+    #[test]
+    fn the_legacy_help_service_is_an_alias() {
+        let rt = runtime();
+        let owner = rt.begin_plugin();
+        rt.register_owner_name(owner, "demo.legacy");
+        // SAFETY: rt 活着；api 只在本测试里用。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+        api.call_service(LEGACY_HELP_SERVICE, "register", r#"{"name":"legacy"}"#)
+            .expect("旧名字也要能登记");
+        let list = rt
+            .call_service(COMMAND_REGISTRY_SERVICE, "list", "{}")
+            .unwrap();
+        assert!(list.contains(r#""name":"legacy""#), "{list}");
+        rt.rollback_owner(owner);
+        rt.end_plugin();
+        rt.unregister_owner_name(owner);
     }
 
     /// 服务方法能回问「谁在调我」：宿主按本线程作用域栈顶给出**权威**插件名。

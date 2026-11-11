@@ -1992,6 +1992,16 @@ pub const IDENTITY_SERVICE: &str = "fuyubot.host.identity";
 /// 返回：TDLib 的 `Message`（最终消息）；失败是 `{"@type":"error","code":…,"message":"…"}`。
 pub const COMMAND_SERVICE: &str = "fuyubot.host.command";
 
+/// 宿主预置的「TDLib 对象缓存」service。方法：`get` / `put` / `list_chats` /
+/// `list_groups` / `chat_folders` / `stats` / `clear`。
+///
+/// `get` 的返回是 `{value, online}`：命中直接返回；未命中且 `online == false` 时
+/// 调用方**不要**再发 TDLib 请求，直接按「拿不到」处理。
+pub const CACHE_SERVICE: &str = "fuyubot.host.cache";
+
+/// `chat_member` 缓存的 TTL。与宿主侧同一个值（两 crate 不互相依赖，只能各写一份）。
+pub const CHAT_MEMBER_TTL_MS: u64 = 30_000;
+
 /// 一条 `updateNewMessage` 里的命令：`/start`、`/help@SomeBot 参数`。
 ///
 /// 只认**文本消息**，并跳过自己发的（`is_outgoing`）——机器人不该响应自己。

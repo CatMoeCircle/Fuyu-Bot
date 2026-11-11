@@ -17,7 +17,7 @@
 
 use std::time::{Duration, Instant};
 
-use fuyubot_abi::LogLevel;
+use fuyubot_abi::{HostApi, LogLevel};
 use serde_json::{Map, Value, json};
 
 use crate::{Result, Simplify, SimplifyError, Topic};
@@ -342,6 +342,46 @@ pub fn remove_reaction_params(chat_id: i64, message_id: i64, reaction: &Reaction
     })
 }
 
+// ── 宿主缓存 ──────────────────────────────────────────────────────
+
+/// 缓存查询的三种结果：命中 / 未命中（可以去问 TDLib）/ 离线（别去问）。
+enum CacheAnswer {
+    Hit(Value),
+    Miss,
+    Offline,
+}
+
+fn cache_lookup(
+    host: HostApi,
+    kind: &str,
+    id: i64,
+    user_id: Option<i64>,
+    ttl_ms: u64,
+) -> CacheAnswer {
+    let input = json!({ "kind": kind, "id": id, "user_id": user_id, "ttl_ms": ttl_ms });
+    let Ok(raw) = host.call_service(crate::CACHE_SERVICE, "get", &input.to_string()) else {
+        // 老宿主没有缓存服务：按未命中处理，走原来的直连。
+        return CacheAnswer::Miss;
+    };
+    let Ok(reply) = serde_json::from_str::<Value>(&raw) else {
+        return CacheAnswer::Miss;
+    };
+    if let Some(value) = reply.get("value").filter(|value| !value.is_null()) {
+        return CacheAnswer::Hit(value.clone());
+    }
+    if reply.get("online").and_then(Value::as_bool) == Some(false) {
+        CacheAnswer::Offline
+    } else {
+        CacheAnswer::Miss
+    }
+}
+
+fn cache_store(host: HostApi, kind: &str, id: i64, user_id: Option<i64>, value: &Value) {
+    let input = json!({ "kind": kind, "id": id, "user_id": user_id, "value": value });
+    // 缓存写失败不影响调用方：它已经拿到 TDLib 的结果。
+    let _ = host.call_service(crate::CACHE_SERVICE, "put", &input.to_string());
+}
+
 // ── Simplify 上的入口 ─────────────────────────────────────────────
 
 impl Simplify {
@@ -373,6 +413,187 @@ impl Simplify {
             == Some("userTypeBot")
     }
 
+    // ── 会话信息 ──────────────────────────────────────────────
+
+    /// `getChat`：聊天的原始 JSON（`type` 里能分出私聊 / 群 / 频道）。
+    ///
+    /// **缓存优先**：宿主缓存命中直接返回；未命中且当前离线则返回 `None`
+    /// （不再等 TDLib 超时）；在线未命中才发 `getChat`，成功回填缓存。
+    ///
+    /// 返回的永远是**完整 Chat**（含完整的 `positions` / `chat_lists`），
+    /// 不会拿 [`Self::chats_in_list`] 的精简条目顶替。
+    ///
+    /// 群和频道的 chat id **都是负数**，只看符号分不出来；要判频道必须看
+    /// `type.@type == "chatTypeSupergroup"` 且 `type.is_channel == true`。
+    ///
+    /// ⚠️ **阻塞**当前线程，回调里请用 `*_then` / 工作线程。
+    pub fn chat(&self, chat_id: i64, timeout_ms: u64) -> Option<Value> {
+        self.cached_entity(
+            "chat",
+            chat_id,
+            None,
+            0,
+            crate::td_api::GetChat::METHOD,
+            json!({ "chat_id": chat_id }),
+            timeout_ms,
+        )
+    }
+
+    /// `getUser`：用户的原始 JSON。缓存优先，语义同 [`Self::chat`]。
+    pub fn user(&self, user_id: i64, timeout_ms: u64) -> Option<Value> {
+        self.cached_entity(
+            "user",
+            user_id,
+            None,
+            0,
+            crate::td_api::GetUser::METHOD,
+            json!({ "user_id": user_id }),
+            timeout_ms,
+        )
+    }
+
+    /// `getBasicGroup`：基本群的原始 JSON。缓存优先。
+    pub fn basic_group(&self, basic_group_id: i64, timeout_ms: u64) -> Option<Value> {
+        self.cached_entity(
+            "basic_group",
+            basic_group_id,
+            None,
+            0,
+            crate::td_api::GetBasicGroup::METHOD,
+            json!({ "basic_group_id": basic_group_id }),
+            timeout_ms,
+        )
+    }
+
+    /// `getSupergroup`：超级群 / 频道的原始 JSON。缓存优先。
+    pub fn supergroup(&self, supergroup_id: i64, timeout_ms: u64) -> Option<Value> {
+        self.cached_entity(
+            "supergroup",
+            supergroup_id,
+            None,
+            0,
+            crate::td_api::GetSupergroup::METHOD,
+            json!({ "supergroup_id": supergroup_id }),
+            timeout_ms,
+        )
+    }
+
+    /// `getCommunityFullInfo`：社区的完整信息。缓存优先。
+    ///
+    /// `community` 本身没有对应的 get 方法——TDLib 保证 `updateCommunity` 先到；
+    /// 所以 [`Self::community`] 只读缓存。
+    pub fn community_full_info(&self, community_id: i64, timeout_ms: u64) -> Option<Value> {
+        self.cached_entity(
+            "community_full_info",
+            community_id,
+            None,
+            0,
+            crate::td_api::GetCommunityFullInfo::METHOD,
+            json!({ "community_id": community_id }),
+            timeout_ms,
+        )
+    }
+
+    /// 社区的轻量对象：**只读缓存**（`updateCommunity` 是唯一来源）。
+    pub fn community(&self, community_id: i64) -> Option<Value> {
+        match cache_lookup(self.host(), "community", community_id, None, 0) {
+            CacheAnswer::Hit(value) => Some(value),
+            CacheAnswer::Miss | CacheAnswer::Offline => None,
+        }
+    }
+
+    /// `updateChatFolders` 的最新快照（chat list 定义）。只读缓存。
+    pub fn chat_folders(&self) -> Option<Value> {
+        let raw = self
+            .host()
+            .call_service(crate::CACHE_SERVICE, "chat_folders", "{}")
+            .ok()?;
+        let reply: Value = serde_json::from_str(&raw).ok()?;
+        reply.get("value").filter(|value| !value.is_null()).cloned()
+    }
+
+    /// 某个 chat list 的成员（按 `order` 倒序）。只读缓存。
+    ///
+    /// `list` 是 TDLib 的 `ChatList`，例如 `{"@type":"chatListMain"}`。
+    /// 每项是精简的 `{"@type":"chatListEntry","chat_id":…,"order":…,"is_pinned":…,
+    /// "title":…,"type":…}`：列表索引**不占** chat 的 100 条配额，所以 chat 对象
+    /// 被 LRU 淘汰后条目仍在；**它不夹带完整 Chat**，需要完整对象再调 [`Self::chat`]
+    /// （`getChat` 返回完整对象，包括完整的 `positions` / `chat_lists`）。
+    /// 缓存未命中（还没收到对应 chat）时返回空表；需要权威列表时自己发 `getChats`。
+    pub fn chats_in_list(&self, list: &Value, limit: usize) -> Vec<Value> {
+        let input = json!({ "list": list, "limit": limit });
+        let Ok(raw) =
+            self.host()
+                .call_service(crate::CACHE_SERVICE, "list_chats", &input.to_string())
+        else {
+            return Vec::new();
+        };
+        let Ok(reply) = serde_json::from_str::<Value>(&raw) else {
+            return Vec::new();
+        };
+        reply
+            .get("chats")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 某个 chat folder 的成员。`folder_id` 是 `chatFolderInfo.id`。
+    pub fn chats_in_folder(&self, folder_id: i64, limit: usize) -> Vec<Value> {
+        self.chats_in_list(
+            &json!({"@type": "chatListFolder", "chat_folder_id": folder_id}),
+            limit,
+        )
+    }
+
+    /// 列表分组：main / archive / 每个 chat folder。
+    ///
+    /// 每项是 `{"@type":"chatListGroup","kind":"main|archive|folder","title":…,
+    /// "list":<ChatList>,"count":…,"folder":<chatFolderInfo|null>}`；
+    /// 把 `list` 传给 [`Self::chats_in_list`] 就能取该组的成员。
+    pub fn chat_list_groups(&self) -> Vec<Value> {
+        let Ok(raw) = self
+            .host()
+            .call_service(crate::CACHE_SERVICE, "list_groups", "{}")
+        else {
+            return Vec::new();
+        };
+        let Ok(reply) = serde_json::from_str::<Value>(&raw) else {
+            return Vec::new();
+        };
+        reply
+            .get("groups")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 缓存优先的通用请求：命中返回；离线且未命中返回 `None`；在线未命中才发 TDLib。
+    fn cached_entity(
+        &self,
+        kind: &str,
+        id: i64,
+        user_id: Option<i64>,
+        ttl_ms: u64,
+        method: &str,
+        params: Value,
+        timeout_ms: u64,
+    ) -> Option<Value> {
+        match cache_lookup(self.host(), kind, id, user_id, ttl_ms) {
+            CacheAnswer::Hit(value) => return Some(value),
+            CacheAnswer::Offline => return None,
+            CacheAnswer::Miss => {}
+        }
+        let request = self
+            .host()
+            .td_invoke_simplified(method, &params.to_string())
+            .ok()?;
+        let response = self.wait_response(request, timeout_ms)?;
+        let value = self.soften(&response, method)?;
+        cache_store(self.host(), kind, id, user_id, &value);
+        Some(value)
+    }
+
     // ── 管理权 ────────────────────────────────────────────────
 
     /// `getChatMember`：某个成员在某个聊天里的 `ChatMember`（原始 JSON）。
@@ -380,13 +601,16 @@ impl Simplify {
     /// 超时、TDLib 报错（比如「成员不在群里」）都是 `None`——**不区分**这两种，
     /// 因为对「有没有管理权」这个问题来说它们答案一样。
     pub fn chat_member(&self, chat_id: i64, user_id: i64, timeout_ms: u64) -> Option<Value> {
-        let params = chat_member_params(chat_id, user_id).to_string();
-        let request = self
-            .host()
-            .td_invoke_simplified(crate::td_api::GetChatMember::METHOD, &params)
-            .ok()?;
-        let response = self.wait_response(request, timeout_ms)?;
-        self.soften(&response, "getChatMember")
+        // 成员信息带 30 秒 TTL：权限会变，不能只靠 updateChatMember。
+        self.cached_entity(
+            "chat_member",
+            chat_id,
+            Some(user_id),
+            crate::CHAT_MEMBER_TTL_MS,
+            crate::td_api::GetChatMember::METHOD,
+            chat_member_params(chat_id, user_id),
+            timeout_ms,
+        )
     }
 
     /// `user_id` 在 `chat_id` 里有没有管理权。

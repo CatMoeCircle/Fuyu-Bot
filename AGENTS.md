@@ -267,6 +267,40 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     可关，但模板 / 文档的注释必须写明「⚠️ 不建议关闭」——关掉后任何人都能触发插件。
     bot 账户的 `whitelist` 规则不受 `whitelist_only` 影响。
 
+65. **命令能力表在宿主，`/help` 只读它**：插件在 `start()` 里经
+    `fuyubot.host.commands` 的 `register` 登记 `{name, description?, role?, scopes?, hidden?}`，
+    **不要**再把命令塞进 help 插件自己的注册表。旧名字 `fuyubot.help.commands` 由宿主保留为
+    别名（一个版本），指向同一张表。归属由 ABI v6 的调用者栈判定，同名命令跨插件覆盖会被拒绝；
+    插件卸载 / 加载失败按 owner 回滚，脚本作用域按 scope 回滚。
+    `role` 是 `user`（默认）/ `chat_admin` / `admin` / `owner`，`scopes` 默认
+    `private + group`（`admin` / `owner` 默认**只有 private**，要群里用必须显式写）。宿主闸门在分发前能判的（`owner` / `admin`、缓存里已有的 chat kind / chat_member）直接拦；
+    `chat_admin` 与频道细分优先读**对象缓存**（`Chat.type` / `ChatMember.status`，成员 30 秒 TTL），
+    缓存没有的才放行给命令处理器或 `/help` 的回复线程再判——**不许在接收循环上等 TDLib**。
+    `[roles].owners` / `.admins` 是全局角色，群里的 Telegram 管理员是**会话角色**，两者不许混。
+    `owners` 为空时 user 账户自己默认是主人；一旦配置了 `owners` 就按表来（自己不在表里
+    就不再是主人，可以换成别人）。主人 / 全局管理员**不受 `[command].whitelist` 或
+    `whitelist_only` 影响**，始终能触发。隐藏只影响 `/help` 渲染，不是授权。
+
+66. **TDLib 对象缓存在宿主**：`HostRuntime` 缓存 `chat` / `user` / `basic_group` /
+    `supergroup` / `chat_member` / `community` / `community_full_info` 的**全量 JSON**，
+    每种类型默认 100 条，按 LRU 淘汰（`[cache].capacity` 是每种类型的上限，不是总数）。
+    管线在**中间件之前**把原始 `update*` 刷进缓存：`updateNewChat`、`updateChat*`、
+    `updateUser` / `updateUserStatus`、`updateBasicGroup`、`updateSupergroup`、
+    `updateCommunity` / `updateCommunityFullInfo`、`updateChatMember`、`updateChatFolders`。
+    `updateChatMember` 的成员对象字段是 `new_chat_member`（老版本 `member`）；
+    `updateChatReplyMarkup` 要落成 `reply_markup_message_id`；
+    `updateChatAddedToList` / `RemovedFromList` 维护 `chat_lists` 与 `positions`。
+    `chat_member` 带 30 秒 TTL（权限判断），其余不设 TTL；`updateConnectionState`
+    决定离线未命中时是否直接返回。**chat list 是独立索引，不参加 `[cache].capacity`**：
+    条目只存 `chat_id / order / is_pinned / title / type`，chat 对象被 LRU 淘汰后条目仍在
+    （`chats_in_list` 只返回精简条目，**不夹带完整 Chat**；完整对象走 `getChat` /
+    `Simplify::chat`，它必须返回完整 `positions` / `chat_lists`）。**分组要显式适配**：
+    `list_groups` 返回 main / archive / 各 `chatListFolder`（folder 标题取
+    `updateChatFolders` 的 `chatFolderInfo.name.text.text`，带 `count` 与可直接传给
+    `list_chats` 的 `list`）；folder 被删掉时旧索引要一起清掉。`Simplify` 经
+    `fuyubot.host.cache` 的 `get/put/list_chats/list_groups/chat_folders` 做缓存优先，
+    **不要逐资源探测**，也**不要在缓存锁里**碰 TDLib。
+
 ## 文档
 
 公开文档只在**文档站**（`FuyuBot-Docs/content/docs/**`）；改 ABI / CLI / 行为时同步那边。

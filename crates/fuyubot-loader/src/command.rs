@@ -15,10 +15,16 @@
 //! 账号类型优先看**活的** `getMe`（`self_user.type.@type == "userTypeBot"`）；
 //! 还没登录 / 回放时退回 `[telegram].account_type`（Android 写的是 `[telegram].account`），
 //! 都没有就按 bot 处理——这是引入闸门之前的行为。
+//!
+//! 闸门还读**宿主命令能力表**（[`crate::commands`]）：登记过的命令在这里就按
+//! `role` / `scopes` 判一次。没登记的命令照旧放行——那是给还没迁移的老插件的兼容路径。
 
 use std::collections::HashSet;
 
 use serde_json::{Map, Value};
+
+use crate::cache::{Cache, ChatKind};
+use crate::commands::{CommandRegistry, CommandRole, GlobalRole};
 
 /// bot 账户没配 `[command].prefix` 时的默认命令头。
 pub(crate) const DEFAULT_BOT_PREFIXES: [char; 1] = ['/'];
@@ -34,6 +40,10 @@ pub(crate) struct CommandPolicy {
     pub prefixes: Option<Vec<char>>,
     /// 允许触发命令的用户 id。自己的消息在用户账户下始终算数。
     pub whitelist: HashSet<i64>,
+    /// 主人（`[roles].owners`）：最高全局角色，绕过 `whitelist` 闸门。
+    pub owners: HashSet<i64>,
+    /// 全局管理员（`[roles].admins`）：能用 `admin` 级命令，绕过 `whitelist` 闸门。
+    pub admins: HashSet<i64>,
     /// user 账户的白名单模式：只响应自己与 `whitelist` 里的用户。
     ///
     /// 默认 `true`；`[command].whitelist_only = false` 可关（关掉后任何人都能触发），
@@ -48,6 +58,8 @@ impl Default for CommandPolicy {
         Self {
             prefixes: None,
             whitelist: HashSet::new(),
+            owners: HashSet::new(),
+            admins: HashSet::new(),
             whitelist_only: true,
             fallback_is_bot: true,
         }
@@ -64,6 +76,33 @@ impl CommandPolicy {
                 AccountKind::Bot => &DEFAULT_BOT_PREFIXES,
                 AccountKind::User => &DEFAULT_USER_PREFIXES,
             },
+        }
+    }
+
+    /// 主人 / 全局管理员绕过 `whitelist`：否则「配了主人却又被白名单挡住」会非常反直觉。
+    pub(crate) fn is_privileged(&self, sender: Option<i64>) -> bool {
+        sender.is_some_and(|id| self.owners.contains(&id) || self.admins.contains(&id))
+    }
+
+    /// 配置算出的全局角色。
+    ///
+    /// user 账户在 `[roles].owners` **为空**时默认自己是主人；一旦配置了 `owners`，
+    /// 就完全按配置判（自己不在表里就不再是主人，可以换成别人）。bot 账户没有隐式主人，
+    /// 必须显式写进 `[roles].owners`——Telegram 没有「这个 bot 是谁建的」这种接口。
+    pub(crate) fn global_role(
+        &self,
+        sender: Option<i64>,
+        _self_id: Option<i64>,
+        account: AccountKind,
+        self_triggered: bool,
+    ) -> GlobalRole {
+        if account == AccountKind::User && self_triggered && self.owners.is_empty() {
+            return GlobalRole::Owner;
+        }
+        match sender {
+            Some(id) if self.owners.contains(&id) => GlobalRole::Owner,
+            Some(id) if self.admins.contains(&id) => GlobalRole::Admin,
+            _ => GlobalRole::User,
         }
     }
 }
@@ -95,7 +134,8 @@ pub(crate) enum Gate {
     Pass,
     /// 是一条放行的命令；上下文登记进宿主，供命令回复接口使用。
     Command(CommandMeta),
-    /// 是命令，但不该触发：只发 `update` 通用通道，不发 `updateNewMessage`。
+    /// 是命令，但不该触发（命令头 / 白名单 / 能力表任一关没过）：
+    /// 只发 `update` 通用通道，不发 `updateNewMessage`。
     Blocked,
 }
 
@@ -123,13 +163,38 @@ impl CommandPolicy {
         }
 
         if let Some(raw) = section.and_then(|section| section.get("whitelist")) {
-            match parse_whitelist(raw) {
+            match parse_ids(raw, "[command].whitelist") {
                 Ok((list, mut problems)) => {
                     policy.whitelist = list;
                     warnings.append(&mut problems);
                 }
                 Err(problem) => {
                     warnings.push(format!("[command].whitelist {problem}，已按空表处理"));
+                }
+            }
+        }
+
+        // `[roles]`：主人 / 全局管理员。角色是跨命令的能力，不塞进 `[command]`。
+        let roles = root.get("roles");
+        if let Some(raw) = roles.and_then(|roles| roles.get("owners")) {
+            match parse_ids(raw, "[roles].owners") {
+                Ok((list, mut problems)) => {
+                    policy.owners = list;
+                    warnings.append(&mut problems);
+                }
+                Err(problem) => {
+                    warnings.push(format!("[roles].owners {problem}，已按空表处理"));
+                }
+            }
+        }
+        if let Some(raw) = roles.and_then(|roles| roles.get("admins")) {
+            match parse_ids(raw, "[roles].admins") {
+                Ok((list, mut problems)) => {
+                    policy.admins = list;
+                    warnings.append(&mut problems);
+                }
+                Err(problem) => {
+                    warnings.push(format!("[roles].admins {problem}，已按空表处理"));
                 }
             }
         }
@@ -200,8 +265,9 @@ fn parse_prefix(raw: &str) -> Option<char> {
     (!prefix.is_alphanumeric() && !prefix.is_whitespace()).then_some(prefix)
 }
 
-/// 白名单接受数字，也接受带引号的数字（手写配置里两种都常见）。
-fn parse_whitelist(value: &Value) -> Result<(HashSet<i64>, Vec<String>), &'static str> {
+/// 用户 id 列表（白名单 / 主人 / 管理员共用）：接受数字，也接受带引号的数字
+/// （手写配置里两种都常见）。`label` 只用于告警里指路。
+fn parse_ids(value: &Value, label: &str) -> Result<(HashSet<i64>, Vec<String>), &'static str> {
     let Some(items) = value.as_array() else {
         return Err("必须是数组");
     };
@@ -215,9 +281,7 @@ fn parse_whitelist(value: &Value) -> Result<(HashSet<i64>, Vec<String>), &'stati
             Some(id) => {
                 set.insert(id);
             }
-            None => warnings.push(format!(
-                "[command].whitelist 里的 {item} 不是用户 id，已跳过"
-            )),
+            None => warnings.push(format!("{label} 里的 {item} 不是用户 id，已跳过")),
         }
     }
     Ok((set, warnings))
@@ -284,6 +348,18 @@ fn command_at(text: &str, prefixes: &[char]) -> Option<(PrefixKind, usize, usize
     Some((kind, start, first.len_utf8()))
 }
 
+/// 命令名：去掉前缀与 `@BotName`，归一化成小写。前缀后面为空（`/`）时 `None`。
+fn command_name(text: &str, start: usize, prefix_len: usize) -> Option<String> {
+    let rest = text.get(start + prefix_len..)?;
+    let token = rest.split_whitespace().next()?;
+    let name = token.split('@').next().unwrap_or(token);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_ascii_lowercase())
+    }
+}
+
 /// 这段文本看起来是不是命令（与闸门同一套判定）。命令回复接口用它决定要不要记指纹。
 pub(crate) fn looks_like_command(text: &str, prefixes: &[char]) -> bool {
     command_at(text, prefixes).is_some()
@@ -298,6 +374,8 @@ pub(crate) fn gate(
     policy: &CommandPolicy,
     account: AccountKind,
     self_user_id: Option<i64>,
+    commands: &CommandRegistry,
+    cache: &Cache,
     host_reply: &mut dyn FnMut(i64, &str) -> bool,
 ) -> Gate {
     if payload.get("@type").and_then(Value::as_str) != Some("updateNewMessage") {
@@ -349,19 +427,21 @@ pub(crate) fn gate(
     let allowed = match account {
         AccountKind::Bot => {
             // bot 账户下 `/` 与配置的自定义命令头一视同仁：自己的出站消息不触发，
-            // 白名单非空时只认表里的用户。自定义头放行后会被归一化成 `/cmd`。
+            // 白名单非空时只认表里的用户。主人 / 全局管理员始终放行。
             !is_outgoing
-                && (policy.whitelist.is_empty()
+                && (policy.is_privileged(sender)
+                    || policy.whitelist.is_empty()
                     || sender.is_some_and(|id| policy.whitelist.contains(&id)))
         }
         AccountKind::User => match kind {
             // 用户账户下 `/xxx` 一律不交给插件——自己发的也不认。
             PrefixKind::Slash => false,
-            // 自定义命令头：白名单模式只认自己 / 表里的用户；关掉后任何人都能触发
-            // （`whitelist_only = false`，不建议）。
+            // 自定义命令头：白名单模式只认自己 / 表里的用户 / 主人与管理员；
+            // 关掉后任何人都能触发（`whitelist_only = false`，不建议）。
             PrefixKind::Custom => {
                 !policy.whitelist_only
                     || self_triggered
+                    || policy.is_privileged(sender)
                     || sender.is_some_and(|id| policy.whitelist.contains(&id))
             }
         },
@@ -370,6 +450,35 @@ pub(crate) fn gate(
     if !allowed {
         return Gate::Blocked;
     }
+
+    // 命令能力表：登记过的命令在**分发前**判角色与会话。没登记的照旧放行
+    // （老插件只订阅 `on_command`、从没登记过，不能因为上了表就静默失业）。
+    if let Some(name) = command_name(text, start, prefix_len)
+        && let Some(entry) = commands.get(&name)
+    {
+        let global = policy.global_role(sender, self_user_id, account, self_triggered);
+        // 会话类型优先用宿主缓存；缓存没有才退回「按 chat_id 符号粗略判」。
+        let kind = cache.chat_kind(chat_id);
+        let scope_ok = match kind {
+            Some(kind) => entry.scopes.iter().any(|scope| scope.matches(kind)),
+            None => entry.scope_allows_chat_id(chat_id),
+        };
+        // `chat_admin` 能由缓存给结论就直接判；缓存没有才放行给处理器。
+        let chat_admin = if entry.role == CommandRole::ChatAdmin {
+            match (kind, sender) {
+                // 频道帖子由频道身份发出：能发帖的就是频道管理员。
+                (Some(ChatKind::Channel), None) => Some(true),
+                (_, Some(user_id)) => cache.chat_admin(chat_id, user_id),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if !entry.role.allows_gate(global, chat_admin) || !scope_ok {
+            return Gate::Blocked;
+        }
+    }
+
     if kind == PrefixKind::Custom {
         rewrite(message, start, prefix_len, is_outgoing);
     }
@@ -432,8 +541,7 @@ mod tests {
         CommandPolicy {
             prefixes: Some(prefixes.to_vec()),
             whitelist: whitelist.iter().copied().collect(),
-            whitelist_only: true,
-            fallback_is_bot: true,
+            ..CommandPolicy::default()
         }
     }
 
@@ -457,7 +565,17 @@ mod tests {
         account: AccountKind,
         self_id: Option<i64>,
     ) -> Gate {
-        gate(payload, policy, account, self_id, &mut |_, _| false)
+        let commands = CommandRegistry::default();
+        let cache = Cache::default();
+        gate(
+            payload,
+            policy,
+            account,
+            self_id,
+            &commands,
+            &cache,
+            &mut |_, _| false,
+        )
     }
 
     fn command_meta(gate: Gate) -> CommandMeta {
@@ -710,6 +828,8 @@ mod tests {
             &policy,
             AccountKind::User,
             Some(7),
+            &CommandRegistry::default(),
+            &Cache::default(),
             &mut |chat_id, text| {
                 seen = Some((chat_id, text.to_owned()));
                 true
@@ -727,6 +847,8 @@ mod tests {
             &policy,
             AccountKind::User,
             Some(7),
+            &CommandRegistry::default(),
+            &Cache::default(),
             &mut |_, _| panic!("入站不该查宿主回复指纹"),
         );
         assert_eq!(decision, Gate::Blocked, "不在白名单的别人照样拦");
@@ -851,5 +973,427 @@ mod tests {
         }));
         assert_eq!(policy.whitelist, HashSet::from([7]));
         assert_eq!(warnings.len(), 2, "{warnings:?}");
+    }
+
+    #[test]
+    fn config_reads_owners_and_admins_from_roles() {
+        let (policy, warnings) = CommandPolicy::from_config(&json!({
+            "roles": {"owners": [1, "2"], "admins": [3, "x"]}
+        }));
+        assert_eq!(policy.owners, HashSet::from([1, 2]));
+        assert_eq!(policy.admins, HashSet::from([3]));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[roles].admins"), "{warnings:?}");
+    }
+
+    /// 主人 / 管理员即使不在 `[command].whitelist` 里也能触发。
+    #[test]
+    fn owners_and_admins_bypass_the_whitelist_gate() {
+        let mut policy = defaults(&[99]);
+        policy.owners = HashSet::from([1]);
+        policy.admins = HashSet::from([2]);
+
+        let mut owner = update("/start", false, 1);
+        assert!(matches!(
+            run(&mut owner, &policy, AccountKind::Bot, Some(10)),
+            Gate::Command(_)
+        ));
+        let mut admin = update("/start", false, 2);
+        assert!(matches!(
+            run(&mut admin, &policy, AccountKind::Bot, Some(10)),
+            Gate::Command(_)
+        ));
+        let mut stranger = update("/start", false, 3);
+        assert_eq!(
+            run(&mut stranger, &policy, AccountKind::Bot, Some(10)),
+            Gate::Blocked
+        );
+    }
+
+    fn run_with(
+        payload: &mut Value,
+        policy: &CommandPolicy,
+        account: AccountKind,
+        self_id: Option<i64>,
+        commands: &CommandRegistry,
+    ) -> Gate {
+        let cache = Cache::default();
+        gate(
+            payload,
+            policy,
+            account,
+            self_id,
+            commands,
+            &cache,
+            &mut |_, _| false,
+        )
+    }
+
+    fn run_with_cache(
+        payload: &mut Value,
+        policy: &CommandPolicy,
+        account: AccountKind,
+        self_id: Option<i64>,
+        commands: &CommandRegistry,
+        cache: &Cache,
+    ) -> Gate {
+        gate(
+            payload,
+            policy,
+            account,
+            self_id,
+            commands,
+            cache,
+            &mut |_, _| false,
+        )
+    }
+
+    fn supergroup(id: i64, is_channel: bool) -> Value {
+        json!({
+            "@type": "chat",
+            "id": id,
+            "type": {"@type": "chatTypeSupergroup", "supergroup_id": 1, "is_channel": is_channel},
+            "title": "群",
+            "positions": [],
+            "chat_lists": []
+        })
+    }
+
+    fn member(user_id: i64, admin: bool) -> Value {
+        json!({
+            "@type": "chatMember",
+            "member_id": {"@type": "messageSenderUser", "user_id": user_id},
+            "status": if admin {
+                json!({"@type": "chatMemberStatusAdministrator", "rights": {"@type": "chatAdministratorRights"}})
+            } else {
+                json!({"@type": "chatMemberStatusMember"})
+            }
+        })
+    }
+
+    #[test]
+    fn the_permission_table_uses_cached_chat_kind_for_scopes() {
+        use crate::cache::CacheKind;
+
+        let policy = defaults(&[]);
+        let commands = CommandRegistry::default();
+        commands
+            .register(
+                7,
+                0,
+                Some("p".to_owned()),
+                &json!({"name": "post", "scopes": ["group"]}),
+            )
+            .unwrap();
+        let mut payload = update("/post", false, 9);
+        payload["message"]["chat_id"] = json!(-100);
+
+        let group = Cache::default();
+        group.put(CacheKind::Chat, -100, None, supergroup(-100, false));
+        assert!(matches!(
+            run_with_cache(
+                &mut payload.clone(),
+                &policy,
+                AccountKind::Bot,
+                Some(10),
+                &commands,
+                &group
+            ),
+            Gate::Command(_)
+        ));
+
+        let channel = Cache::default();
+        channel.put(CacheKind::Chat, -100, None, supergroup(-100, true));
+        assert_eq!(
+            run_with_cache(
+                &mut payload,
+                &policy,
+                AccountKind::Bot,
+                Some(10),
+                &commands,
+                &channel
+            ),
+            Gate::Blocked,
+            "缓存已判出是频道，group-only 命令必须拦"
+        );
+    }
+
+    #[test]
+    fn the_permission_table_uses_cached_chat_member_for_chat_admin() {
+        use crate::cache::CacheKind;
+
+        let policy = defaults(&[]);
+        let commands = CommandRegistry::default();
+        commands
+            .register(
+                7,
+                0,
+                Some("p".to_owned()),
+                &json!({"name": "warn", "role": "chat_admin", "scopes": ["group"]}),
+            )
+            .unwrap();
+        let mut payload = update("/warn", false, 9);
+        payload["message"]["chat_id"] = json!(-100);
+
+        let cache = Cache::default();
+        cache.put(CacheKind::Chat, -100, None, supergroup(-100, false));
+        cache.put(CacheKind::ChatMember, -100, Some(9), member(9, false));
+        assert_eq!(
+            run_with_cache(
+                &mut payload.clone(),
+                &policy,
+                AccountKind::Bot,
+                Some(10),
+                &commands,
+                &cache
+            ),
+            Gate::Blocked,
+            "缓存说不是管理员，chat_admin 命令必须拦"
+        );
+
+        cache.put(CacheKind::ChatMember, -100, Some(9), member(9, true));
+        assert!(matches!(
+            run_with_cache(
+                &mut payload.clone(),
+                &policy,
+                AccountKind::Bot,
+                Some(10),
+                &commands,
+                &cache
+            ),
+            Gate::Command(_)
+        ));
+
+        // 缓存里没有成员：闸门不能等 TDLib，放行给处理器再判。
+        let empty = Cache::default();
+        empty.put(CacheKind::Chat, -100, None, supergroup(-100, false));
+        assert!(matches!(
+            run_with_cache(
+                &mut payload,
+                &policy,
+                AccountKind::Bot,
+                Some(10),
+                &commands,
+                &empty
+            ),
+            Gate::Command(_)
+        ));
+    }
+
+    #[test]
+    fn user_account_owners_and_admins_bypass_the_whitelist() {
+        let mut policy = defaults(&[99]);
+        policy.owners = HashSet::from([1]);
+        policy.admins = HashSet::from([2]);
+
+        let mut owner = update(".start", false, 1);
+        assert!(matches!(
+            run(&mut owner, &policy, AccountKind::User, Some(7)),
+            Gate::Command(_)
+        ));
+        let mut admin = update(".start", false, 2);
+        assert!(matches!(
+            run(&mut admin, &policy, AccountKind::User, Some(7)),
+            Gate::Command(_)
+        ));
+        let mut stranger = update(".start", false, 3);
+        assert_eq!(
+            run(&mut stranger, &policy, AccountKind::User, Some(7)),
+            Gate::Blocked
+        );
+    }
+
+    #[test]
+    fn user_self_is_owner_only_when_owners_are_empty() {
+        let mut policy = defaults(&[]);
+        assert_eq!(
+            policy.global_role(Some(7), Some(7), AccountKind::User, true),
+            GlobalRole::Owner,
+            "owners 为空时 user 账户自己默认是主人"
+        );
+        assert_eq!(
+            policy.global_role(Some(7), Some(7), AccountKind::Bot, true),
+            GlobalRole::User,
+            "bot 账户没有隐式主人"
+        );
+
+        policy.owners = HashSet::from([1]);
+        assert_eq!(
+            policy.global_role(Some(7), Some(7), AccountKind::User, true),
+            GlobalRole::User,
+            "配置了 owners 后，自己不在表里就不再是主人"
+        );
+        assert_eq!(
+            policy.global_role(Some(1), Some(7), AccountKind::User, false),
+            GlobalRole::Owner,
+            "配置的 owner 仍然有效"
+        );
+
+        policy.owners = HashSet::from([1, 7]);
+        assert_eq!(
+            policy.global_role(Some(7), Some(7), AccountKind::User, true),
+            GlobalRole::Owner,
+            "把自己写进 owners 才是主人"
+        );
+    }
+
+    #[test]
+    fn a_user_account_can_replace_the_default_owner() {
+        let mut policy = defaults(&[]);
+        let commands = CommandRegistry::default();
+        commands
+            .register(
+                7,
+                0,
+                Some("p".to_owned()),
+                &json!({"name": "config", "role": "owner", "scopes": ["private"]}),
+            )
+            .unwrap();
+        let mut default_owner = update(".config", true, 7);
+        assert!(
+            matches!(
+                run_with(
+                    &mut default_owner,
+                    &policy,
+                    AccountKind::User,
+                    Some(7),
+                    &commands
+                ),
+                Gate::Command(_)
+            ),
+            "owners 为空时自己默认是主人"
+        );
+
+        policy.owners = HashSet::from([1]);
+        let mut replaced = update(".config", true, 7);
+        assert_eq!(
+            run_with(
+                &mut replaced,
+                &policy,
+                AccountKind::User,
+                Some(7),
+                &commands
+            ),
+            Gate::Blocked,
+            "配置了 owners 后，自己不在表里就不再是主人"
+        );
+    }
+
+    #[test]
+    fn a_registered_owner_command_is_blocked_before_dispatch() {
+        let mut policy = defaults(&[]);
+        policy.owners = HashSet::from([1]);
+        let commands = CommandRegistry::default();
+        commands
+            .register(
+                7,
+                0,
+                Some("p".to_owned()),
+                &json!({"name": "config", "role": "owner"}),
+            )
+            .unwrap();
+
+        let mut stranger = update("/config", false, 9);
+        assert_eq!(
+            run_with(
+                &mut stranger,
+                &policy,
+                AccountKind::Bot,
+                Some(10),
+                &commands
+            ),
+            Gate::Blocked
+        );
+
+        let mut owner = update("/config", false, 1);
+        assert!(matches!(
+            run_with(&mut owner, &policy, AccountKind::Bot, Some(10), &commands),
+            Gate::Command(_)
+        ));
+    }
+
+    #[test]
+    fn a_registered_admin_command_requires_a_global_admin() {
+        let mut policy = defaults(&[]);
+        policy.admins = HashSet::from([2]);
+        let commands = CommandRegistry::default();
+        commands
+            .register(
+                7,
+                0,
+                Some("p".to_owned()),
+                &json!({"name": "reload", "role": "admin"}),
+            )
+            .unwrap();
+
+        let mut admin = update("/reload", false, 2);
+        assert!(matches!(
+            run_with(&mut admin, &policy, AccountKind::Bot, Some(10), &commands),
+            Gate::Command(_)
+        ));
+        let mut user = update("/reload", false, 9);
+        assert_eq!(
+            run_with(&mut user, &policy, AccountKind::Bot, Some(10), &commands),
+            Gate::Blocked
+        );
+    }
+
+    #[test]
+    fn a_group_only_command_is_blocked_in_a_private_chat() {
+        let policy = defaults(&[]);
+        let commands = CommandRegistry::default();
+        commands
+            .register(
+                7,
+                0,
+                Some("p".to_owned()),
+                &json!({"name": "ban", "scopes": ["group"]}),
+            )
+            .unwrap();
+
+        let mut private = update("/ban", false, 9);
+        assert_eq!(
+            run_with(&mut private, &policy, AccountKind::Bot, Some(10), &commands),
+            Gate::Blocked
+        );
+        let mut group = update("/ban", false, 9);
+        group["message"]["chat_id"] = json!(-100);
+        assert!(matches!(
+            run_with(&mut group, &policy, AccountKind::Bot, Some(10), &commands),
+            Gate::Command(_)
+        ));
+    }
+
+    /// `chat_admin` 需要 TDLib 往返，闸门判不了：先放行，交给处理器/`/help` 再判。
+    #[test]
+    fn chat_admin_commands_pass_the_gate() {
+        let policy = defaults(&[]);
+        let commands = CommandRegistry::default();
+        commands
+            .register(
+                7,
+                0,
+                Some("p".to_owned()),
+                &json!({"name": "warn", "role": "chat_admin", "scopes": ["group"]}),
+            )
+            .unwrap();
+        let mut payload = update("/warn", false, 9);
+        payload["message"]["chat_id"] = json!(-100);
+        assert!(matches!(
+            run_with(&mut payload, &policy, AccountKind::Bot, Some(10), &commands),
+            Gate::Command(_)
+        ));
+    }
+
+    /// 没登记的命令照旧放行：老插件从没注册过，不能因为上了表就静默失业。
+    #[test]
+    fn unregistered_commands_still_pass() {
+        let policy = defaults(&[]);
+        let commands = CommandRegistry::default();
+        let mut payload = update("/legacy", false, 9);
+        assert!(matches!(
+            run_with(&mut payload, &policy, AccountKind::Bot, Some(10), &commands),
+            Gate::Command(_)
+        ));
     }
 }

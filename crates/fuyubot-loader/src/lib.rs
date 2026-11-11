@@ -9,7 +9,9 @@
 //! 这里是本仓库唯一的「宿主层」：机制 crate 之间不许互相依赖，组合与桥接都发生在本 crate。
 
 mod bundle;
+mod cache;
 mod command;
+mod commands;
 mod loader;
 mod pipeline;
 mod runtime;
@@ -22,6 +24,7 @@ pub use bundle::{
     BUNDLE_MANIFEST, BundleError, BundleManifest, DISABLED_DIR, PluginEntry, PluginKind,
     SCRIPTS_DIR, current_platform, disabled_bundles, is_bundle_dir, plugin_entries, script_bundles,
 };
+pub use cache::DEFAULT_CAPACITY as DEFAULT_CACHE_CAPACITY;
 pub use loader::{
     DISABLED_SUFFIX, DLL_EXTENSION, DylibPlugin, LoadError, LoadedPlugin, PluginLoader, Probe,
     disabled_path, enabled_path, is_disabled, plugin_files,
