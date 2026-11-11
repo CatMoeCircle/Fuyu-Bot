@@ -57,10 +57,10 @@ pub enum Page {
 impl Page {
     pub const ALL: [Self; 6] = [
         Self::Overview,
-        Self::Plugins,
-        Self::Store,
         Self::Logs,
         Self::Config,
+        Self::Store,
+        Self::Plugins,
         Self::Help,
     ];
 
@@ -78,10 +78,10 @@ impl Page {
     pub const fn index(self) -> usize {
         match self {
             Self::Overview => 0,
-            Self::Plugins => 1,
-            Self::Store => 2,
-            Self::Logs => 3,
-            Self::Config => 4,
+            Self::Logs => 1,
+            Self::Config => 2,
+            Self::Store => 3,
+            Self::Plugins => 4,
             Self::Help => 5,
         }
     }
@@ -3481,7 +3481,7 @@ mod tests {
                 .iter()
                 .map(|page| page.title())
                 .collect::<Vec<_>>(),
-            ["概览", "插件", "商店", "日志", "配置", "帮助"]
+            ["概览", "日志", "配置", "商店", "插件", "帮助"]
         );
         // 导航顺序与 `1..=6` 的编号一致。
         for (index, page) in Page::ALL.iter().enumerate() {
@@ -3492,8 +3492,10 @@ mod tests {
     #[test]
     fn number_keys_jump_to_pages() {
         let mut app = app();
-        app.on_key(key(KeyCode::Char('4')));
+        app.on_key(key(KeyCode::Char('2')));
         assert_eq!(app.page, Page::Logs);
+        app.on_key(key(KeyCode::Char('4')));
+        assert_eq!(app.page, Page::Store);
         app.on_key(key(KeyCode::Char('6')));
         assert_eq!(app.page, Page::Help);
         // Tab 不再换页，只换焦点。
@@ -3559,13 +3561,13 @@ mod tests {
         let mut app = app();
         app.page = Page::Overview;
         app.on_key(key(KeyCode::Right));
-        assert_eq!(app.page, Page::Plugins);
+        assert_eq!(app.page, Page::Logs);
         app.on_key(key(KeyCode::Left));
         assert_eq!(app.page, Page::Overview);
 
         // 导航焦点下 h / l 也能左右切。
         app.on_key(key(KeyCode::Char('l')));
-        assert_eq!(app.page, Page::Plugins);
+        assert_eq!(app.page, Page::Logs);
         app.on_key(key(KeyCode::Char('h')));
         assert_eq!(app.page, Page::Overview);
 
@@ -4425,7 +4427,7 @@ mod tests {
         let mut app = app();
         app.on_key(key(KeyCode::Char('l')));
         assert_eq!(app.level_picker, None, "概览页按 l 不该弹框");
-        assert_eq!(app.page, Page::Plugins, "导航焦点下 l 切到下一页");
+        assert_eq!(app.page, Page::Logs, "导航焦点下 l 切到下一页");
 
         app.page = Page::Logs;
         app.on_key(key(KeyCode::Char('l')));
