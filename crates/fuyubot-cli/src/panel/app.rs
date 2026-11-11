@@ -495,6 +495,25 @@ const ACCOUNT_TYPES: [&str; 2] = ["bot", "user"];
 /// 日志级别可选项（`[plugins].log_level`）。
 const LOG_LEVEL_NAMES: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
 
+/// 非标量 TOML 值的类别：改完必须还是同一类（数组别悄悄变成字符串）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TomlShape {
+    Array,
+    Table,
+    Datetime,
+}
+
+impl TomlShape {
+    /// 给用户看的中文名（编辑框提示 / 校验错误都用它）。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Array => "TOML 数组",
+            Self::Table => "TOML 内联表",
+            Self::Datetime => "TOML 日期时间",
+        }
+    }
+}
+
 /// 可编辑配置项的类型 / 校验范围。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKind {
@@ -502,30 +521,46 @@ pub enum ConfigKind {
     Text { allow_empty: bool },
     /// 整数（含上下界，闭区间）。
     Integer { min: i64, max: i64 },
+    /// 浮点数（按 TOML 字面量校验，写回时补上 `.0`）。
+    Float,
+    /// 布尔（只能写 `true` / `false`，不带引号）。
+    Bool,
     /// 固定枚举，保存前转小写。
     Choice(&'static [&'static str]),
-    /// 只读行（凭据状态、插件段等）。
+    /// 数组 / 内联表 / 日期时间：按 TOML 原样解析，并保持原来的类别。
+    Toml(TomlShape),
+    /// 段头（`[section]`）：只用于分组展示，光标跳过、不可编辑。
+    Header,
+    /// 只读行（凭据状态等）。
     ReadOnly,
 }
 
 impl ConfigKind {
     pub const fn editable(self) -> bool {
-        !matches!(self, Self::ReadOnly)
+        !matches!(self, Self::ReadOnly | Self::Header)
+    }
+
+    /// 光标能不能停在这一行（段头不行）。
+    pub const fn selectable(self) -> bool {
+        !matches!(self, Self::Header)
     }
 }
 
-/// 配置页的一行：段 + 键 + 生效值 + 来源。
+/// 配置页的一行：段 + 键 + 生效值 + 来源；段头是单独的一行（`ConfigKind::Header`）。
 #[derive(Debug, Clone)]
 pub struct ConfigItem {
     pub section: String,
+    /// 段头行为空。
     pub key: String,
-    /// 编辑框里的初始值（未渲染的原始值）。
+    /// 编辑框里的初始值（未渲染的原始值）；凭据样子的键为空。
     pub value: String,
     /// 表格里展示的生效值（可能是绝对路径 / 带「默认」说明）。
     pub display: String,
     /// `文件` / `默认` / `只读` 之类。
     pub note: String,
     pub kind: ConfigKind,
+    /// 凭据样子的键：不回显旧值，编辑框留空 = 不修改。
+    pub secret: bool,
 }
 
 impl ConfigItem {
@@ -533,8 +568,17 @@ impl ConfigItem {
         self.kind.editable()
     }
 
+    pub fn selectable(&self) -> bool {
+        self.kind.selectable()
+    }
+
+    /// 段头显示成 `[段]`，普通项显示成 `[段].键`。
     pub fn path_label(&self) -> String {
-        format!("[{}].{}", self.section, self.key)
+        if matches!(self.kind, ConfigKind::Header) {
+            format!("[{}]", self.section)
+        } else {
+            format!("[{}].{}", self.section, self.key)
+        }
     }
 }
 
@@ -547,6 +591,8 @@ pub struct ConfigEdit {
     pub current: String,
     pub note: String,
     pub kind: ConfigKind,
+    /// 凭据样子的键：`input` 留空 = 保留原值。
+    pub secret: bool,
     pub input: String,
     /// 光标在第几个 `char`（不是字节）。
     pub cursor: usize,
@@ -563,6 +609,7 @@ impl ConfigEdit {
             current: item.display.clone(),
             note: item.note.clone(),
             kind: item.kind,
+            secret: item.secret,
             input: item.value.clone(),
             cursor,
             error: None,
@@ -620,7 +667,11 @@ fn byte_at(text: &str, char_index: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-/// 把配置读成「段 / 键 / 生效值 / 来源」的行，供配置页表格与编辑使用。
+/// 把配置读成「段头 + 键值行」，供配置页表格与编辑使用。
+///
+/// 一个段一行 `[段]` 头（[`ConfigKind::Header`]，光标跳过），下面跟这个段的键值行；
+/// 插件段 `[plugin.<名>]` 与内置段一视同仁，**值同样可以在面板里改**。
+/// 值写回走 `set_config_value`（文本级、保留注释与 CRLF）。
 fn build_config_items(
     config_path: &Path,
     root: &Path,
@@ -653,6 +704,7 @@ fn build_config_items(
 
     let mut items = Vec::new();
 
+    push_section(&mut items, "bot");
     let bot_name = config
         .bot
         .name
@@ -673,6 +725,7 @@ fn build_config_items(
         ConfigKind::Text { allow_empty: true },
     );
 
+    push_section(&mut items, "telegram");
     let account = config.telegram.account_type();
     let account_raw = account
         .as_ref()
@@ -746,6 +799,59 @@ fn build_config_items(
         ConfigKind::ReadOnly,
     );
 
+    push_section(&mut items, "command");
+    let prefix_literal = config.command.prefixes().map(|prefixes| {
+        toml::Value::Array(prefixes.iter().cloned().map(toml::Value::String).collect()).to_string()
+    });
+    push_config_item(
+        &mut items,
+        "command",
+        "prefix",
+        prefix_literal.clone().unwrap_or_default(),
+        prefix_literal.unwrap_or_else(|| "按账号默认（bot \"/\"、user \".\"）".to_owned()),
+        note("command", "prefix"),
+        ConfigKind::Toml(TomlShape::Array),
+    );
+
+    let whitelist_literal = toml::Value::Array(
+        config
+            .command
+            .whitelist
+            .iter()
+            .map(|id| toml::Value::Integer(*id))
+            .collect(),
+    )
+    .to_string();
+    push_config_item(
+        &mut items,
+        "command",
+        "whitelist",
+        whitelist_literal.clone(),
+        if config.command.whitelist.is_empty() {
+            "[]（空，不额外限制）".to_owned()
+        } else {
+            whitelist_literal
+        },
+        note("command", "whitelist"),
+        ConfigKind::Toml(TomlShape::Array),
+    );
+
+    let whitelist_only = config.command.whitelist_only();
+    push_config_item(
+        &mut items,
+        "command",
+        "whitelist_only",
+        whitelist_only.to_string(),
+        if whitelist_only {
+            "true（只认自己 + whitelist）".to_owned()
+        } else {
+            "false（⚠️ 已关闭：任何人都能触发）".to_owned()
+        },
+        note("command", "whitelist_only"),
+        ConfigKind::Bool,
+    );
+
+    push_section(&mut items, "plugins");
     let plugin_dir = config
         .plugins
         .dir
@@ -783,6 +889,22 @@ fn build_config_items(
         ConfigKind::Choice(&LOG_LEVEL_NAMES),
     );
 
+    let registry_url = config.plugins.registry_url.clone().unwrap_or_default();
+    push_config_item(
+        &mut items,
+        "plugins",
+        "registry_url",
+        registry_url.clone(),
+        if registry_url.trim().is_empty() {
+            "未配置（商店不可用）".to_owned()
+        } else {
+            registry_url
+        },
+        note("plugins", "registry_url"),
+        ConfigKind::Text { allow_empty: true },
+    );
+
+    push_section(&mut items, "tdlib");
     let tdlib_path = config.tdlib.path.clone().unwrap_or_default();
     push_config_item(
         &mut items,
@@ -809,6 +931,11 @@ fn build_config_items(
         ConfigKind::Integer { min: 0, max: 5 },
     );
 
+    let headers = config_file_headers(config_path);
+    flatten_plugin_items(&config.plugin, "plugin", &headers, &mut items);
+
+    // 凭据不是文件里的段：只提示「不落盘」这一条规则（`api_hash` 例外，在 [telegram] 里）。
+    push_section(&mut items, "凭据");
     push_config_item(
         &mut items,
         "凭据",
@@ -818,9 +945,42 @@ fn build_config_items(
         "只读".to_owned(),
         ConfigKind::ReadOnly,
     );
-
-    flatten_plugin_items(&config.plugin, "plugin", &mut items);
     items
+}
+
+/// 文件里真实存在的段头（`[a.b]` → `a.b`）。
+///
+/// 插件段里的嵌套表有两种写法：独立段头 `[plugin.a.nested]`，或父段里的内联表
+/// `nested = { … }`。写回时前者改段里的键、后者必须整段替换那个内联表值——所以
+/// 展平插件配置时得知道某个表到底是不是独立段（否则会写出重复定义）。
+fn config_file_headers(config_path: &Path) -> std::collections::BTreeSet<String> {
+    let Ok(text) = std::fs::read_to_string(config_path) else {
+        return std::collections::BTreeSet::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with('[') {
+                return None;
+            }
+            let header = line.split('#').next().unwrap_or("").trim();
+            let inner = header.strip_prefix('[')?.strip_suffix(']')?;
+            Some(inner.trim().to_owned())
+        })
+        .collect()
+}
+
+/// 段头行（`[段]`）：只用来分组，光标会跳过它。
+fn push_section(items: &mut Vec<ConfigItem>, section: &str) {
+    items.push(ConfigItem {
+        section: section.to_owned(),
+        key: String::new(),
+        value: String::new(),
+        display: String::new(),
+        note: String::new(),
+        kind: ConfigKind::Header,
+        secret: false,
+    });
 }
 
 fn push_config_item(
@@ -839,65 +999,136 @@ fn push_config_item(
         display,
         note,
         kind,
+        secret: false,
     });
 }
 
-/// 插件段只读展示：一个叶子表里的键各一行；子表继续下钻成 `[plugin.a.b]`。
-fn flatten_plugin_items(value: &toml::Value, prefix: &str, out: &mut Vec<ConfigItem>) {
+/// 插件段按 `[plugin.<名>]` 分组：段头一行，下面这个段里的键各一行。
+///
+/// 值**可编辑**，类型按 TOML 原值给（字符串 / 整数 / 浮点 / 布尔 / 数组 / 内联表）；
+/// 凭据样子的键不回显旧值，但可以写入新值（留空 = 不修改）。
+///
+/// 嵌套表分两种写法：
+/// - 独立段头 `[plugin.a.nested]` → 递归成自己的段；
+/// - 父段里的内联表 `nested = { … }`（或只是更深段名的前缀）→ 整张表当**一个值**，
+///   写回时替换父段里那个键，避免凭空补出一个重复定义的 `[plugin.a.nested]`。
+fn flatten_plugin_items(
+    value: &toml::Value,
+    prefix: &str,
+    headers: &std::collections::BTreeSet<String>,
+    out: &mut Vec<ConfigItem>,
+) {
     let Some(table) = value.as_table() else {
+        push_section(out, prefix);
+        out.push(ConfigItem {
+            section: prefix.to_owned(),
+            key: "（值）".to_owned(),
+            value: String::new(),
+            display: value.to_string(),
+            note: "只读".to_owned(),
+            kind: ConfigKind::ReadOnly,
+            secret: false,
+        });
+        return;
+    };
+
+    let leaves: Vec<(&String, &toml::Value)> = table
+        .iter()
+        .filter(|(_, value)| !value.is_table())
+        .collect();
+    let children: Vec<(&String, &toml::Value)> =
+        table.iter().filter(|(_, value)| value.is_table()).collect();
+    if prefix == "plugin" && table.is_empty() {
+        push_section(out, "plugin");
         push_config_item(
             out,
-            prefix,
-            "（值）",
+            "plugin",
+            "（无）",
             String::new(),
-            value.to_string(),
+            "没有 [plugin.*] 段（插件 set_config 或手写一段就会出现）".to_owned(),
             "只读".to_owned(),
             ConfigKind::ReadOnly,
         );
         return;
+    }
+    // 子表是「段名的一部分」（`[plugin.a]` 是 `[plugin.a.b]` 的前缀）就继续下钻；
+    // 否则它是父段里的一个内联表值。
+    let namespace = |key: &str| {
+        let path = format!("{prefix}.{key}");
+        headers
+            .iter()
+            .any(|header| header == &path || header.starts_with(&format!("{path}.")))
     };
+    let inline_children: Vec<(&String, &toml::Value)> = children
+        .iter()
+        .copied()
+        .filter(|(key, _)| !namespace(key.as_str()))
+        .collect();
+    let explicit = headers.contains(prefix);
+    let has_rows = !leaves.is_empty() || !inline_children.is_empty();
 
-    if table.is_empty() {
-        // 根部空表不单独占一行；子段空表给个提示。
-        if prefix != "plugin" {
+    if explicit || has_rows {
+        push_section(out, prefix);
+        for &(key, value) in &leaves {
+            push_plugin_item(out, prefix, key, value);
+        }
+        for &(key, value) in &inline_children {
+            push_plugin_item(out, prefix, key, value);
+        }
+        if leaves.is_empty() && children.is_empty() {
             push_config_item(
                 out,
                 prefix,
                 "（空）",
                 String::new(),
-                "该段没有键".to_owned(),
+                "该段还没有键（在文件里加一行就会出现）".to_owned(),
                 "只读".to_owned(),
                 ConfigKind::ReadOnly,
             );
         }
     }
 
-    for (key, value) in table {
-        if value.is_table() {
-            continue;
-        }
-        push_config_item(
-            out,
-            prefix,
-            key,
-            String::new(),
-            if is_secret_key(key) {
-                "已保存（不回显）".to_owned()
-            } else {
-                toml_value_display(value)
-            },
-            "只读".to_owned(),
-            ConfigKind::ReadOnly,
-        );
-    }
-    for (key, value) in table {
-        if value.is_table() {
-            flatten_plugin_items(value, &format!("{prefix}.{key}"), out);
+    for (key, value) in children {
+        if namespace(key) {
+            flatten_plugin_items(value, &format!("{prefix}.{key}"), headers, out);
         }
     }
 }
 
-/// 插件段里的常见凭据键在面板里不回显（它本来也是只读的）。
+/// 插件段里的一个键：类型照 TOML 原值给，凭据样子的键把旧值藏起来。
+fn push_plugin_item(out: &mut Vec<ConfigItem>, section: &str, key: &str, value: &toml::Value) {
+    let secret = is_secret_key(key);
+    let (kind, raw) = match value {
+        toml::Value::String(text) => (ConfigKind::Text { allow_empty: true }, text.clone()),
+        toml::Value::Integer(number) => (
+            ConfigKind::Integer {
+                min: i64::MIN,
+                max: i64::MAX,
+            },
+            number.to_string(),
+        ),
+        toml::Value::Float(_) => (ConfigKind::Float, toml_float_literal(value)),
+        toml::Value::Boolean(flag) => (ConfigKind::Bool, flag.to_string()),
+        toml::Value::Datetime(_) => (ConfigKind::Toml(TomlShape::Datetime), value.to_string()),
+        toml::Value::Array(_) => (ConfigKind::Toml(TomlShape::Array), value.to_string()),
+        toml::Value::Table(_) => (ConfigKind::Toml(TomlShape::Table), value.to_string()),
+    };
+    out.push(ConfigItem {
+        section: section.to_owned(),
+        key: key.to_owned(),
+        value: if secret { String::new() } else { raw },
+        display: if secret {
+            "已保存（不回显）".to_owned()
+        } else {
+            toml_value_display(value)
+        },
+        note: "文件".to_owned(),
+        kind,
+        secret,
+    });
+}
+
+/// 插件段里的常见凭据键在面板里不回显（仍可写入新值，留空 = 不修改）。
 fn is_secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     [
@@ -915,10 +1146,33 @@ fn toml_value_display(value: &toml::Value) -> String {
     }
 }
 
+/// 浮点的 TOML 字面量：`1` 不行（会变回整数），至少补成 `1.0`。
+fn toml_float_literal(value: &toml::Value) -> String {
+    let Some(number) = value.as_float() else {
+        return value.to_string();
+    };
+    if number.is_nan() {
+        return "nan".to_owned();
+    }
+    if number.is_infinite() {
+        return if number.is_sign_negative() {
+            "-inf".to_owned()
+        } else {
+            "inf".to_owned()
+        };
+    }
+    let text = format!("{number}");
+    if text.contains('.') || text.contains('e') || text.contains('E') {
+        text
+    } else {
+        format!("{text}.0")
+    }
+}
+
 /// 把编辑框里的文本校验成 TOML 字面量；错误消息直接展示给用户。
 fn validate_config_value(kind: ConfigKind, input: &str) -> Result<String, String> {
     match kind {
-        ConfigKind::ReadOnly => Err("该项只读，不能在面板里改".to_owned()),
+        ConfigKind::Header | ConfigKind::ReadOnly => Err("该项只读，不能在面板里改".to_owned()),
         ConfigKind::Text { allow_empty } => {
             let value = input.trim();
             if value.is_empty() && !allow_empty {
@@ -941,6 +1195,20 @@ fn validate_config_value(kind: ConfigKind, input: &str) -> Result<String, String
             }
             Ok(value.to_string())
         }
+        ConfigKind::Float => {
+            let value = parse_toml_value(input, "浮点数")?;
+            match value {
+                toml::Value::Float(_) => Ok(toml_float_literal(&value)),
+                // `1` 也能当浮点用：补成 `1.0` 写回去。
+                toml::Value::Integer(number) => Ok(format!("{number}.0")),
+                _ => Err("要填浮点数（如 1.5 / 2e3）".to_owned()),
+            }
+        }
+        ConfigKind::Bool => match input.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok("true".to_owned()),
+            "false" => Ok("false".to_owned()),
+            _ => Err("只能填 true / false".to_owned()),
+        },
         ConfigKind::Choice(choices) => {
             let value = input.trim().to_ascii_lowercase();
             if choices.contains(&value.as_str()) {
@@ -949,7 +1217,30 @@ fn validate_config_value(kind: ConfigKind, input: &str) -> Result<String, String
                 Err(format!("只能填 {}", choices.join(" / ")))
             }
         }
+        ConfigKind::Toml(shape) => {
+            let value = parse_toml_value(input, shape.label())?;
+            let shape_ok = match shape {
+                TomlShape::Array => value.is_array(),
+                TomlShape::Table => value.is_table(),
+                TomlShape::Datetime => value.is_datetime(),
+            };
+            if !shape_ok {
+                return Err(format!("要填 {}（TOML 原样写）", shape.label()));
+            }
+            Ok(input.trim().to_owned())
+        }
     }
+}
+
+/// 把一段 TOML 字面量解析成值（`v = <input>`）；语法错误原样带给用户。
+fn parse_toml_value(input: &str, what: &str) -> Result<toml::Value, String> {
+    let text = format!("v = {}", input.trim());
+    let table: toml::Table =
+        toml::from_str(&text).map_err(|error| format!("不是合法的 {what}：{error}"))?;
+    table
+        .get("v")
+        .cloned()
+        .ok_or_else(|| format!("不是合法的 {what}"))
 }
 
 /// 焦点：按键是操作左侧导航，还是中央工作区。
@@ -1136,6 +1427,8 @@ pub struct App {
     login_tx: Sender<LoginEvent>,
     /// 登录线程还活着（模态框关掉、等下一个问题的时候也是 `true`）。
     login_busy: bool,
+    /// 这次登录是 `s` 触发的：成功后自动继续启动实例。
+    start_after_login: bool,
 }
 
 impl App {
@@ -1223,6 +1516,7 @@ impl App {
             login_rx,
             login_tx,
             login_busy: false,
+            start_after_login: false,
         };
         app.refresh_all();
         app
@@ -1493,15 +1787,15 @@ impl App {
                 let items = build_config_items(&self.config_path, &self.root, &config);
                 self.config_error = None;
                 self.config_items = items;
-                self.config_selected = previous
+                let index = previous
                     .and_then(|(section, key)| {
                         self.config_items
                             .iter()
                             .position(|item| item.section == section && item.key == key)
                     })
-                    .unwrap_or(0)
-                    .min(self.config_items.len().saturating_sub(1));
-                self.ensure_config_visible();
+                    .unwrap_or(0);
+                // 段头不能选中：`config_select` 会就近落到它后面那一项。
+                self.config_select(index);
             }
             Err(error) => {
                 self.config_items.clear();
@@ -1676,32 +1970,33 @@ impl App {
     /// 起一次「只登录」：后台线程跑 `fuyubot-app` 的 boot + login，问题弹成输入框。
     ///
     /// 为什么必须在实例停着的时候做：TDLib 的数据库同一时刻只允许一个进程打开（约束 47）。
-    pub fn start_login(&mut self) {
+    pub fn start_login(&mut self) -> bool {
         if self.login_busy {
             self.set_toast("登录进行中…", Level::Info);
-            return;
+            return false;
         }
         if matches!(self.state, State::Running(_)) {
             self.set_toast(
                 "实例在跑：先停止再登录（TDLib 数据库只能一个进程开）",
                 Level::Info,
             );
-            return;
+            return false;
         }
         let options = match self.login_options() {
             Ok(options) => options,
             Err(error) => {
                 self.set_toast(error, Level::Info);
-                return;
+                return false;
             }
         };
         self.login_busy = true;
         self.set_toast(
-            "开始登录：登完 session 落在 data/，之后启动实例会直接 Ready",
+            "正在检查登录状态；需要时弹输入框，完成后自动继续",
             Level::Info,
         );
         let tx = self.login_tx.clone();
         let _ = login::spawn_login(options, tx);
+        true
     }
 
     /// `start_login` 的输入：目录 + 配置树 + TDLib 设置 + TUI 宿主。
@@ -1766,6 +2061,7 @@ impl App {
             KeyCode::Esc => {
                 modal.cancel();
                 self.login_busy = false;
+                self.start_after_login = false;
                 self.set_toast("已取消登录", Level::Info);
             }
             KeyCode::Enter => {
@@ -1801,15 +2097,23 @@ impl App {
                     }
                 }
                 LoginEvent::Done(result) => {
+                    let autostart = std::mem::take(&mut self.start_after_login);
                     self.login_busy = false;
                     self.login = None;
                     match result {
                         Ok(()) => {
-                            self.set_toast("登录成功：会话已落盘，可以启动实例了", Level::Info)
+                            self.set_toast("登录成功：会话已落盘，可以启动实例了", Level::Info);
+                            self.refresh_all();
+                            if autostart {
+                                self.spawn_instance();
+                            }
                         }
-                        Err(error) => self.set_toast(format!("登录失败：{error}"), Level::Info),
+                        Err(error) => {
+                            self.start_after_login = false;
+                            self.set_toast(format!("登录失败：{error}"), Level::Info);
+                            self.refresh_all();
+                        }
                     }
-                    self.refresh_all();
                 }
             }
         }
@@ -2042,7 +2346,9 @@ impl App {
             KeyCode::Char('s') => self.start(),
             KeyCode::Char('x') => self.ask_stop(),
             // 大写 L：只在实例停着时有效（TDLib 数据库只能一个进程开）。
-            KeyCode::Char('L') => self.start_login(),
+            KeyCode::Char('L') => {
+                self.start_login();
+            }
             // 日志页的专属操作只在工作区获得焦点时响应。
             KeyCode::Char('c') if self.page == Page::Logs && self.workspace_focused() => {
                 self.ask_clear_logs();
@@ -2148,14 +2454,27 @@ impl App {
         }
     }
 
-    /// 配置页选中行上下移动。
+    /// 配置页选中行上下移动（跳过 `[段]` 头）。
     pub fn config_move(&mut self, delta: isize) {
         if self.config_items.is_empty() {
             return;
         }
-        let last = self.config_items.len() - 1;
-        let next = (self.config_selected as isize + delta).clamp(0, last as isize) as usize;
-        self.config_selected = next;
+        let step: isize = if delta < 0 { -1 } else { 1 };
+        let mut index = self.config_selected as isize;
+        for _ in 0..delta.unsigned_abs() {
+            let mut candidate = index + step;
+            while candidate >= 0
+                && (candidate as usize) < self.config_items.len()
+                && !self.config_items[candidate as usize].selectable()
+            {
+                candidate += step;
+            }
+            if candidate < 0 || candidate as usize >= self.config_items.len() {
+                break;
+            }
+            index = candidate;
+        }
+        self.config_selected = index as usize;
         self.ensure_config_visible();
     }
 
@@ -2318,11 +2637,25 @@ impl App {
         }
     }
 
+    /// 选中第 `index` 行；落在段头上就就近挪到下一项（退而求其次找上一项）。
     fn config_select(&mut self, index: usize) {
         if self.config_items.is_empty() {
             return;
         }
-        self.config_selected = index.min(self.config_items.len() - 1);
+        let mut index = index.min(self.config_items.len() - 1);
+        if !self.config_items[index].selectable() {
+            index = self.config_items[index..]
+                .iter()
+                .position(ConfigItem::selectable)
+                .map(|offset| index + offset)
+                .or_else(|| {
+                    self.config_items[..index]
+                        .iter()
+                        .rposition(ConfigItem::selectable)
+                })
+                .unwrap_or(index);
+        }
+        self.config_selected = index;
         self.ensure_config_visible();
     }
 
@@ -2344,7 +2677,12 @@ impl App {
             return;
         };
         if !item.editable() {
-            self.set_toast(format!("{} 是只读项", item.path_label()), Level::Warn);
+            let message = if matches!(item.kind, ConfigKind::Header) {
+                format!("{} 是段头，选中下面的键再改", item.path_label())
+            } else {
+                format!("{} 是只读项", item.path_label())
+            };
+            self.set_toast(message, Level::Warn);
             return;
         }
         self.config_edit = Some(ConfigEdit::new(item));
@@ -2359,7 +2697,14 @@ impl App {
         let key = edit.key.clone();
         let label = edit.label.clone();
         let kind = edit.kind;
+        let secret = edit.secret;
         let input = edit.input.clone();
+        if secret && input.trim().is_empty() {
+            // 凭据样子的键不回显旧值：留空 = 不改（不是「清空」）。
+            self.config_edit = None;
+            self.set_toast(format!("{label} 没有改动（留空 = 保留原值）"), Level::Info);
+            return;
+        }
         if !self.config_path.is_file() {
             if let Some(edit) = self.config_edit.as_mut() {
                 edit.error = Some(
@@ -2709,8 +3054,35 @@ impl App {
 
     // ── 启停 ──────────────────────────────────────────────────────
 
-    /// `s`：后台起一个实例。**与手敲 `fuyubot run --background` 同一条路**。
+    /// `s`：自动判断要不要先登录，再后台起实例。
+    ///
+    /// 登录探测本身就是一次 `App::boot + login`：已有 session 时很快走完，
+    /// 没有 session 时弹现有登录框。`--no-login` / `--no-tdlib` 直接跳过探测。
     pub fn start(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        if !self.can_start() {
+            self.set_toast("已经在跑了（x 停止 / r 刷新）", Level::Warn);
+            return;
+        }
+        if self.login_busy {
+            self.start_after_login = true;
+            self.set_toast("登录完成后自动启动", Level::Info);
+            return;
+        }
+        if !self.spawn.no_login && !self.spawn.no_tdlib {
+            self.start_after_login = true;
+            if !self.start_login() {
+                self.start_after_login = false;
+            }
+            return;
+        }
+        self.spawn_instance();
+    }
+
+    /// 真正派生后台实例。**与手敲 `fuyubot run --background` 同一条路**。
+    fn spawn_instance(&mut self) {
         if self.busy.is_some() {
             return;
         }
@@ -3115,6 +3487,7 @@ mod tests {
                 display: format!("value {index}"),
                 note: "默认".to_owned(),
                 kind: ConfigKind::ReadOnly,
+                secret: false,
             })
             .collect();
         app.config_view = 10;
@@ -3688,6 +4061,21 @@ mod tests {
 
     /// 启动 / 停止还在路上时按 `x`：不许静默无视——那看起来就像「x 坏了」。
     #[test]
+    fn pressing_s_while_login_is_running_queues_autostart() {
+        let mut app = app();
+        app.login_busy = true;
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.start_after_login, "登录完成后应自动继续启动");
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("自动启动")),
+            "{:?}",
+            app.toast
+        );
+    }
+
+    #[test]
     fn stop_while_busy_explains_why_it_is_ignored() {
         let mut app = app();
         app.state = running();
@@ -4000,13 +4388,34 @@ mod tests {
         // 模板里的 [plugin.*] 即使为空也不该让配置页崩；核心项必须齐全。
         for (section, key) in [
             ("bot", "name"),
+            ("telegram", "api_id"),
+            ("command", "prefix"),
+            ("command", "whitelist"),
+            ("command", "whitelist_only"),
             ("plugins", "dir"),
             ("plugins", "log_level"),
+            ("plugins", "registry_url"),
             ("tdlib", "path"),
             ("tdlib", "log_verbosity"),
         ] {
             let _ = config_index(&app, section, key);
         }
+
+        // 配置页按 `[段]` 分组：每个内置段一行段头，光标会跳过它们。
+        for section in ["bot", "telegram", "command", "plugins", "tdlib", "plugin"] {
+            assert!(
+                app.config_items
+                    .iter()
+                    .any(|item| matches!(item.kind, ConfigKind::Header) && item.section == section),
+                "缺少段头 [{section}]"
+            );
+        }
+        assert!(
+            app.config_items
+                .iter()
+                .all(|item| item.section != "plugin" || !item.editable()),
+            "没有 [plugin.*] 段时只给一行说明"
+        );
     }
 
     #[test]
@@ -4142,12 +4551,12 @@ mod tests {
     }
 
     #[test]
-    fn plugin_config_rows_are_readonly_and_mask_secrets() {
+    fn plugin_config_rows_are_editable_and_mask_secrets() {
         let root = temp("panel-config-plugin");
         let path = root.join("fuyubot.toml");
         std::fs::write(
             &path,
-            "[bot]\nname = \"demo\"\n\n[plugin.demo]\ntoken = \"secret\"\nname = \"d\"\n",
+            "[bot]\nname = \"demo\"\n\n[plugin.demo]\ntoken = \"secret\"\nname = \"d\"\nretries = 3\nenabled = true\nweights = [1, 2]\n",
         )
         .unwrap();
         let app = App::new(
@@ -4157,12 +4566,178 @@ mod tests {
             Duration::from_secs(1),
             SpawnOptions::default(),
         );
+        // 段头与键分开：`[plugin.demo]` 是单独一行。
+        assert!(
+            app.config_items.iter().any(|item| {
+                matches!(item.kind, ConfigKind::Header) && item.section == "plugin.demo"
+            }),
+            "插件段应该有 [plugin.demo] 段头"
+        );
+
         let token = &app.config_items[config_index(&app, "plugin.demo", "token")];
-        assert!(!token.editable());
+        assert!(token.editable(), "插件段现在也能改");
+        assert!(token.secret);
         assert_eq!(token.display, "已保存（不回显）");
+        assert!(token.value.is_empty(), "凭据旧值不能带进编辑框");
+
         let name = &app.config_items[config_index(&app, "plugin.demo", "name")];
-        assert!(!name.editable());
+        assert!(name.editable());
+        assert!(!name.secret);
         assert_eq!(name.display, "d");
+        assert_eq!(name.value, "d");
+
+        let retries = &app.config_items[config_index(&app, "plugin.demo", "retries")];
+        assert!(matches!(retries.kind, ConfigKind::Integer { .. }));
+        assert_eq!(retries.value, "3");
+
+        let enabled = &app.config_items[config_index(&app, "plugin.demo", "enabled")];
+        assert_eq!(enabled.kind, ConfigKind::Bool);
+        assert_eq!(enabled.value, "true");
+
+        let weights = &app.config_items[config_index(&app, "plugin.demo", "weights")];
+        assert_eq!(weights.kind, ConfigKind::Toml(TomlShape::Array));
+        assert_eq!(weights.value, "[1, 2]");
+    }
+
+    #[test]
+    fn editing_a_plugin_config_value_writes_to_its_section() {
+        let root = temp("panel-config-plugin-edit");
+        let path = root.join("fuyubot.toml");
+        std::fs::write(
+            &path,
+            "[plugin.demo]\n# 这一行注释要留着\nname = \"d\"\ncount = 1\n",
+        )
+        .unwrap();
+        let mut app = App::new(
+            root,
+            path.clone(),
+            None,
+            Duration::from_secs(1),
+            SpawnOptions::default(),
+        );
+        app.page = Page::Config;
+        app.focus = Focus::Workspace;
+        app.config_selected = config_index(&app, "plugin.demo", "count");
+        app.on_key(key(KeyCode::Enter));
+        let edit = app.config_edit.as_mut().expect("插件段现在也能编辑");
+        edit.input = "9".to_owned();
+        edit.cursor = 1;
+        app.on_key(key(KeyCode::Enter));
+
+        assert!(app.config_edit.is_none(), "保存后应关闭编辑框");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# 这一行注释要留着"), "{text}");
+        assert!(text.contains("count = 9"), "{text}");
+        assert_eq!(
+            scaffold::load_config(&path)
+                .unwrap()
+                .plugin
+                .get("demo")
+                .and_then(|table| table.get("count")),
+            Some(&toml::Value::Integer(9))
+        );
+    }
+
+    #[test]
+    fn emptying_a_plugin_secret_keeps_the_old_value() {
+        let root = temp("panel-config-plugin-secret");
+        let path = root.join("fuyubot.toml");
+        let original = "[plugin.demo]\ntoken = \"secret\"\n";
+        std::fs::write(&path, original).unwrap();
+        let mut app = App::new(
+            root,
+            path.clone(),
+            None,
+            Duration::from_secs(1),
+            SpawnOptions::default(),
+        );
+        app.page = Page::Config;
+        app.focus = Focus::Workspace;
+        app.config_selected = config_index(&app, "plugin.demo", "token");
+        app.on_key(key(KeyCode::Enter));
+        let edit = app.config_edit.as_ref().expect("凭据也能改");
+        assert!(edit.secret);
+        assert!(edit.input.is_empty(), "旧凭据不回显");
+        // 直接回车 = 不改。
+        app.on_key(key(KeyCode::Enter));
+
+        assert!(app.config_edit.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("没有改动")),
+            "{:?}",
+            app.toast
+        );
+    }
+
+    #[test]
+    fn editing_a_toml_array_and_bool_config_item_writes_them() {
+        let root = temp("panel-config-toml");
+        let path = scaffold::init(&root, "demo", 12345).unwrap();
+        let mut app = App::new(
+            root,
+            path.clone(),
+            None,
+            Duration::from_secs(1),
+            SpawnOptions::default(),
+        );
+        app.page = Page::Config;
+        app.focus = Focus::Workspace;
+
+        app.config_selected = config_index(&app, "command", "prefix");
+        app.on_key(key(KeyCode::Enter));
+        let edit = app.config_edit.as_mut().unwrap();
+        edit.input = "[\"/\", \".\"]".to_owned();
+        edit.cursor = edit.input.chars().count();
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.config_edit.is_none(), "{:?}", app.config_edit);
+        assert_eq!(
+            scaffold::load_config(&path).unwrap().command.prefix,
+            Some(vec!["/".to_owned(), ".".to_owned()])
+        );
+
+        app.config_selected = config_index(&app, "command", "whitelist_only");
+        app.on_key(key(KeyCode::Enter));
+        let edit = app.config_edit.as_mut().unwrap();
+        edit.input = "FALSE".to_owned();
+        edit.cursor = edit.input.chars().count();
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            scaffold::load_config(&path).unwrap().command.whitelist_only,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn config_navigation_skips_section_headers() {
+        let root = temp("panel-config-nav");
+        let path = scaffold::init(&root, "demo", 12345).unwrap();
+        let mut app = App::new(
+            root,
+            path,
+            None,
+            Duration::from_secs(1),
+            SpawnOptions::default(),
+        );
+        app.page = Page::Config;
+        app.focus = Focus::Workspace;
+        app.config_selected = config_index(&app, "bot", "name");
+        assert!(
+            app.config_items
+                .iter()
+                .any(|item| matches!(item.kind, ConfigKind::Header)),
+            "应该有段头"
+        );
+
+        // 下一项是 [telegram] 段头：要跳过去，落到它的第一个键。
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.config_items[app.config_selected].key, "account_type");
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.config_items[app.config_selected].key, "name");
+        app.on_key(key(KeyCode::End));
+        assert!(app.config_items[app.config_selected].selectable());
     }
 
     #[test]

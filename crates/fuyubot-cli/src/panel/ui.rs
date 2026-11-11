@@ -33,7 +33,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::app::{
     App, ConfigEdit, ConfigItem, ConfigKind, FilterRow, Focus, Level, Page, PluginKind,
-    ProcessUsage,
+    ProcessUsage, TomlShape,
 };
 use super::logfmt;
 
@@ -851,13 +851,13 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::new().fg(Color::Gray),
             ),
             Span::styled(
-                format!("  ·  生效值（含默认值）{missing}"),
+                format!("  ·  按 [段] 分组 · 生效值（含默认值）{missing}"),
                 Style::new().fg(Color::DarkGray),
             ),
         ])
     } else {
         Line::from(Span::styled(
-            "配置 · 生效值（含默认值）",
+            "配置 · 按 [段] 分组 · 生效值（含默认值）",
             Style::new().fg(Color::DarkGray),
         ))
     };
@@ -892,7 +892,7 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
         let focused = app.workspace_focused();
         let width = table_area.width;
         if width >= 70 {
-            let header = Row::new(vec!["段", "键", "生效值", "来源"]).style(
+            let header = Row::new(vec!["键", "生效值", "来源"]).style(
                 Style::new()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
@@ -901,8 +901,14 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
                 .config_items
                 .iter()
                 .map(|item| {
+                    if matches!(item.kind, ConfigKind::Header) {
+                        return Row::new(vec![
+                            Cell::from(format!("[{}]", item.section)).style(config_section_style()),
+                            Cell::from("").style(config_section_style()),
+                            Cell::from("").style(config_section_style()),
+                        ]);
+                    }
                     Row::new(vec![
-                        Cell::from(item.section.clone()).style(Style::new().fg(Color::DarkGray)),
                         Cell::from(item.key.clone()).style(config_key_style(item)),
                         Cell::from(item.display.clone()),
                         Cell::from(item.note.clone()).style(Style::new().fg(Color::DarkGray)),
@@ -915,8 +921,7 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
                 header,
                 rows,
                 &[
-                    Constraint::Length(14),
-                    Constraint::Length(16),
+                    Constraint::Length(30),
                     Constraint::Min(0),
                     Constraint::Length(6),
                 ],
@@ -925,7 +930,7 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
                 focused,
             );
         } else if width >= 45 {
-            let header = Row::new(vec!["段", "键", "生效值（来源）"]).style(
+            let header = Row::new(vec!["键", "生效值（来源）"]).style(
                 Style::new()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
@@ -934,8 +939,13 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
                 .config_items
                 .iter()
                 .map(|item| {
+                    if matches!(item.kind, ConfigKind::Header) {
+                        return Row::new(vec![
+                            Cell::from(format!("[{}]", item.section)).style(config_section_style()),
+                            Cell::from("").style(config_section_style()),
+                        ]);
+                    }
                     Row::new(vec![
-                        Cell::from(item.section.clone()).style(Style::new().fg(Color::DarkGray)),
                         Cell::from(item.key.clone()).style(config_key_style(item)),
                         Cell::from(format!("{}（{}）", item.display, item.note)),
                     ])
@@ -946,11 +956,7 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
                 table_area,
                 header,
                 rows,
-                &[
-                    Constraint::Length(10),
-                    Constraint::Length(14),
-                    Constraint::Min(0),
-                ],
+                &[Constraint::Length(20), Constraint::Min(0)],
                 app.config_selected,
                 app.config_offset(),
                 focused,
@@ -967,7 +973,7 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
             format!("{} = {}", item.key, item.display)
         }
     } else {
-        "↑↓ 选择 · Enter 编辑 · Esc 返回".to_owned()
+        "↑↓ 选择 · Enter 编辑（[plugin.*] 段也能改） · Esc 返回".to_owned()
     };
     frame.render_widget(
         Paragraph::new(Span::styled(hint, Style::new().fg(Color::DarkGray))),
@@ -983,6 +989,11 @@ fn config_key_style(item: &ConfigItem) -> Style {
     }
 }
 
+/// 段头（`[段]`）样式：跟日志页的小标题用同一种青色。
+fn config_section_style() -> Style {
+    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+}
+
 /// 超窄屏的配置列表：每个配置占两行（完整键 + 值 / 来源），不再横向截断键。
 fn draw_config_compact(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let offset = app.config_offset();
@@ -990,6 +1001,16 @@ fn draw_config_compact(frame: &mut Frame, app: &App, area: Rect, focused: bool) 
     let max_rows = area.height as usize;
     let mut lines = Vec::new();
     for (index, item) in app.config_items.iter().enumerate().skip(offset) {
+        if matches!(item.kind, ConfigKind::Header) {
+            if lines.len() + 1 > max_rows {
+                break;
+            }
+            lines.push(Line::from(Span::styled(
+                format!("[{}]", item.section),
+                config_section_style(),
+            )));
+            continue;
+        }
         if lines.len() + 2 > max_rows {
             break;
         }
@@ -1072,7 +1093,11 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("← / →", "切换顶部标签页（窄屏横向导航；工作区焦点也生效）"),
         ("h / l", "导航焦点：上一页 / 下一页"),
         ("1 – 5", "概览 / 插件 / 日志 / 配置 / 帮助"),
-        ("s", "启动 bot（等价于 fuyubot run --background）"),
+        (
+            "s",
+            "启动 bot：先自动检查登录，缺登录会弹框；成功后自动继续",
+        ),
+        ("L", "只登录、不启动（通常直接按 s 即可）"),
         ("x", "停止 bot（再按 y 确认）"),
         ("r", "刷新状态、插件、日志与配置"),
         ("Enter / e", "日志页：进入选择模式；配置页：编辑选中项"),
@@ -1145,6 +1170,9 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     ));
     lines.push(Line::from(
         "  日志页只装一个窗口（首屏是尾部，往上翻按段回读）；底栏提示还能不能往回翻",
+    ));
+    lines.push(Line::from(
+        "  配置页按 [段] 分组（光标跳过段头）；[plugin.*] 段也能改，值按 TOML 原类型校验",
     ));
 
     let text_width = area.width.saturating_sub(2).max(1) as usize;
@@ -1842,7 +1870,7 @@ fn draw_config_editor(frame: &mut Frame, app: &App, area: Rect) {
         )]))
         .border_style(Style::new().fg(Color::Cyan));
 
-    let type_hint = match edit.kind {
+    let mut type_hint = match edit.kind {
         ConfigKind::Text { allow_empty: true } => "文本（可留空 = 用默认）".to_owned(),
         ConfigKind::Text { allow_empty: false } => "文本（不能为空）".to_owned(),
         ConfigKind::Integer { min, max } => {
@@ -1852,9 +1880,19 @@ fn draw_config_editor(frame: &mut Frame, app: &App, area: Rect) {
                 format!("整数 {min}–{max}")
             }
         }
+        ConfigKind::Float => "浮点数（如 1.5 / 2e3）".to_owned(),
+        ConfigKind::Bool => "true / false".to_owned(),
         ConfigKind::Choice(choices) => format!("可选：{}", choices.join(" / ")),
-        ConfigKind::ReadOnly => "只读".to_owned(),
+        ConfigKind::Toml(shape) => match shape {
+            TomlShape::Array => "TOML 数组（如 [\"a\", \"b\"] / [1, 2]）".to_owned(),
+            TomlShape::Table => "TOML 内联表（如 { a = 1 }）".to_owned(),
+            TomlShape::Datetime => "TOML 日期时间（如 2026-01-01T00:00:00Z）".to_owned(),
+        },
+        ConfigKind::Header | ConfigKind::ReadOnly => "只读".to_owned(),
     };
+    if edit.secret {
+        type_hint.push_str(" · 留空 = 不修改");
+    }
     let error = edit
         .error
         .as_ref()
@@ -2783,6 +2821,7 @@ mod tests {
             display: "demo".to_owned(),
             note: "默认".to_owned(),
             kind: ConfigKind::Text { allow_empty: true },
+            secret: false,
         }];
         app.config_selected = 0;
         let screen = text(&render(&mut app, 100, 24));
@@ -2806,6 +2845,7 @@ mod tests {
                 min: 0,
                 max: i64::MAX,
             },
+            secret: false,
         }];
         app.config_selected = 0;
         app.config_edit = Some(ConfigEdit {
@@ -2818,6 +2858,7 @@ mod tests {
                 min: 0,
                 max: i64::MAX,
             },
+            secret: false,
             input: "777".to_owned(),
             cursor: 3,
             error: None,
@@ -2838,6 +2879,15 @@ mod tests {
         app.config_items = vec![
             ConfigItem {
                 section: "telegram".to_owned(),
+                key: String::new(),
+                value: String::new(),
+                display: String::new(),
+                note: String::new(),
+                kind: ConfigKind::Header,
+                secret: false,
+            },
+            ConfigItem {
+                section: "telegram".to_owned(),
                 key: "api_id".to_owned(),
                 value: "12345".to_owned(),
                 display: "12345".to_owned(),
@@ -2846,6 +2896,16 @@ mod tests {
                     min: 0,
                     max: i64::MAX,
                 },
+                secret: false,
+            },
+            ConfigItem {
+                section: "plugins".to_owned(),
+                key: String::new(),
+                value: String::new(),
+                display: String::new(),
+                note: String::new(),
+                kind: ConfigKind::Header,
+                secret: false,
             },
             ConfigItem {
                 section: "plugins".to_owned(),
@@ -2854,11 +2914,21 @@ mod tests {
                 display: "info".to_owned(),
                 note: "默认".to_owned(),
                 kind: ConfigKind::Choice(&["error", "warn", "info", "debug", "trace"]),
+                secret: false,
             },
         ];
-        app.config_selected = 1;
+        app.config_selected = 3;
         let screen = text(&render(&mut app, 110, 30));
-        for expected in ["段", "键", "生效值", "来源", "api_id", "12345", "log_level"] {
+        for expected in [
+            "键",
+            "生效值",
+            "来源",
+            "[telegram]",
+            "[plugins]",
+            "api_id",
+            "12345",
+            "log_level",
+        ] {
             assert!(screen.contains(expected), "缺少 {expected}：\n{screen}");
         }
         assert!(screen.contains("Enter 编辑"), "{screen}");
@@ -3280,6 +3350,7 @@ mod tests {
                 min: 0,
                 max: i32::MAX as i64,
             },
+            secret: false,
         }];
         let screen = text(&render(&mut app, 30, 20));
         assert!(screen.contains("概"), "顶部应有单字标签：\n{screen}");

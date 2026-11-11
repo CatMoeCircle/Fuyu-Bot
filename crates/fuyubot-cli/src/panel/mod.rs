@@ -6,8 +6,9 @@
 //! `Tab` 在导航与工作区之间切换焦点（边框高亮），日志页在工作区焦点下可滚动（到顶再往上
 //! 会**分段回读**更早的日志；窗口有上限、翻在中间时冻结，`End` 重读尾部回到最新），
 //! 调日志级别、按级别 / 来源过滤，
-//! 并可选中一行复制（TDLib Update 复制完整 JSON）；配置页用表格展示生效值，
-//! 可选中单个配置项编辑（写回保留注释 / CRLF）。五个页面分别回答「现在什么状态 / 装了哪些插件 /
+//! 并可选中一行复制（TDLib Update 复制完整 JSON）；配置页按 `[段]` 分组展示生效值
+//! （段头单独一行、光标跳过），可选中单个配置项编辑——插件段 `[plugin.*]` 同样可改，
+//! 值按 TOML 原类型校验，写回保留注释 / CRLF。五个页面分别回答「现在什么状态 / 装了哪些插件 /
 //! 日志在说什么 / 生效的配置是什么 / 能按哪些键」。
 //!
 //! 设计边界（与 `run` / `status` 一致）：
@@ -54,8 +55,9 @@ pub fn require_terminal() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     Err(
-        "`fuyubot run --tui` 需要真终端（stdin / stdout 都是 TTY）——\
-         脚本或重定向里请用 `fuyubot status` / `fuyubot config` / `fuyubot plugin list`"
+        "面板需要真终端（stdin / stdout 都是 TTY）——`fuyubot`（不带子命令）与 \
+         `fuyubot run --tui` 是同一个入口；脚本或重定向里请用 `fuyubot status` / \
+         `fuyubot config` / `fuyubot plugin list`"
             .into(),
     )
 }

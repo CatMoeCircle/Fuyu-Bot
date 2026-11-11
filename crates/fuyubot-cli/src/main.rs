@@ -6,6 +6,7 @@
 //! **插件开发的事不在这里**：没有插件开发 CLI，写法与示例都在文档站（见 `docs/decisions.md` 变更 12）。
 //!
 //! ```text
+//! fuyubot                                   不带子命令 = 直接开**终端操作面板**（同 `run --tui`）
 //! fuyubot init                              生成 fuyubot.toml + plugins/
 //! fuyubot run [--background]                起框架、加载插件（后台运行 = 日志进 logs/fuyubot.log）
 //! fuyubot login                             只登录：建 client → 走完授权 → 打印账户 → 退出（不加载插件）
@@ -58,8 +59,12 @@ const TD_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Parser, Debug)]
 #[command(name = "fuyubot", version, about, long_about = None)]
 struct Cli {
+    /// 省略 = 直接开**终端操作面板**（与 `run --tui` 同一条路）。
+    ///
+    /// 「下载即用」的形态里，双击 exe 就是不带参数的一次调用：那里不该是一屏
+    /// usage，而该是能直接按 `s` 启动 bot 的面板。
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -168,6 +173,29 @@ struct RunArgs {
     /// 它就是现场——`cargo dev` 已经默认带上这个开关。
     #[arg(long)]
     trace_updates: bool,
+}
+
+impl RunArgs {
+    /// 不带子命令时（`./fuyubot`）用的那一份：**全默认值**，等价于 `run --tui`。
+    ///
+    /// 只给面板入口用：`config` 用模板里的默认文件名，其余开关全关
+    /// （`--api-id` / `--log-level` / `--replay` 这些只有显式写命令的人才会给）。
+    fn default_for_tui() -> Self {
+        Self {
+            config: PathBuf::from(scaffold::CONFIG_FILE),
+            api_id: None,
+            plugin_dir: None,
+            no_tdlib: false,
+            no_login: false,
+            background: false,
+            tui: true,
+            replay: None,
+            replay_wait: None,
+            log_level: None,
+            log_plugin: Vec::new(),
+            trace_updates: false,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -282,7 +310,12 @@ fn main() {
 
 /// 按子命令分派；`Err` = 这条命令失败，由 [`main`] 记一条 error 日志后以 1 退出。
 fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    match cli.command {
+    // 不带子命令 = 开面板：`./fuyubot` 与 `./fuyubot run --tui` 是同一个入口，
+    // 其余子命令（含 `run` 自己的 `--background` / `--replay`）一律原样走下面。
+    let Some(command) = cli.command else {
+        return run_tui(RunArgs::default_for_tui());
+    };
+    match command {
         Command::Init(args) => {
             let config = scaffold::init(&args.dir, &args.name, args.api_id)?;
             cli!(info, "已生成 {}", config.display());
@@ -2014,11 +2047,50 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
+    /// 测试里取值用：`command` 是 `Option`（省略 = 开面板），但这些用例都显式写了子命令。
+    fn command_of(cli: Cli) -> Command {
+        cli.command.expect("这次解析应当带子命令")
+    }
+
     #[test]
     fn the_cli_definition_is_valid() {
         // clap 的 `debug_assert` 会检查短选项冲突之类的定义错误。
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// `./fuyubot`（不带子命令）= 直接开面板；子命令一个都不能因此被抢走。
+    ///
+    /// 这条同时钉住「省略子命令」这一种**合法**输入：以前它会因为 `command` 是必填的
+    /// 而打成 usage 退出（双击 exe 得到一屏用法），现在等价于 `run --tui`。
+    #[test]
+    fn no_subcommand_means_the_panel() {
+        let cli = Cli::try_parse_from(["fuyubot"]).expect("不带参数应当解析成功");
+        assert!(
+            cli.command.is_none(),
+            "不带子命令不该落成某个具体的 Command"
+        );
+
+        // 真跑一遍分派入口：非 TTY 下要报「需要真终端」，而不是 usage。
+        let error = dispatch(cli).expect_err("测试里没有真终端，面板应当拒绝启动");
+        assert!(
+            error.to_string().contains("需要真终端"),
+            "应当报终端限制，实际是：{error}"
+        );
+
+        // 面板默认参数 = `run --tui` 的那一套（全默认值）。
+        let args = RunArgs::default_for_tui();
+        assert!(args.tui);
+        assert!(!args.background && !args.no_tdlib && !args.no_login);
+        assert_eq!(args.config, PathBuf::from(scaffold::CONFIG_FILE));
+        assert_eq!(args.api_id, None);
+        assert_eq!(args.replay, None);
+
+        // 子命令照旧生效（不会被「省略」这条分支吃掉）。
+        assert!(matches!(
+            command_of(Cli::try_parse_from(["fuyubot", "run"]).unwrap()),
+            Command::Run(_)
+        ));
     }
 
     /// 面板开关：长写 `--tui`、短写 `-t`；与后台 / 回放互斥。
@@ -2028,7 +2100,7 @@ mod tests {
 
         for spelling in ["--tui", "-t"] {
             let cli = parse(&["fuyubot", "run", spelling]).expect("应当接受 {spelling}");
-            match cli.command {
+            match command_of(cli) {
                 Command::Run(args) => assert!(args.tui, "{spelling} 没打开面板"),
                 other => panic!("{spelling} 解析成了别的子命令：{other:?}"),
             }
@@ -2040,7 +2112,7 @@ mod tests {
 
         // 无关参数原样保留。
         let cli = parse(&["fuyubot", "run", "--tui", "--api-id", "42"]).unwrap();
-        match cli.command {
+        match command_of(cli) {
             Command::Run(args) => {
                 assert!(args.tui);
                 assert_eq!(args.api_id, Some(42));
@@ -2222,7 +2294,7 @@ mod tests {
     fn subcommands_parse() {
         let cli = Cli::try_parse_from(["fuyubot", "plugin", "install", "x.dll"]).unwrap();
         assert!(matches!(
-            cli.command,
+            command_of(cli),
             Command::Plugin(PluginArgs {
                 command: PluginCommand::Install(_)
             })
@@ -2230,7 +2302,7 @@ mod tests {
 
         // `migrate` 是 **plugin 的子命令**（不是顶层），`--dry-run` 要能解析。
         let cli = Cli::try_parse_from(["fuyubot", "plugin", "migrate", "--dry-run"]).unwrap();
-        match cli.command {
+        match command_of(cli) {
             Command::Plugin(PluginArgs {
                 command: PluginCommand::Migrate(args),
             }) => {
@@ -2246,7 +2318,7 @@ mod tests {
         );
 
         let cli = Cli::try_parse_from(["fuyubot", "run", "--replay", "u.json"]).unwrap();
-        match cli.command {
+        match command_of(cli) {
             Command::Run(args) => assert_eq!(args.replay.as_deref(), Some(Path::new("u.json"))),
             other => panic!("解析成了 {other:?}"),
         }
@@ -2255,7 +2327,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["fuyubot", "run", "--log-level", "trace", "--trace-updates"])
                 .unwrap();
-        match cli.command {
+        match command_of(cli) {
             Command::Run(args) => {
                 assert_eq!(args.log_level.as_deref(), Some("trace"));
                 assert!(args.trace_updates);
@@ -2275,7 +2347,7 @@ mod tests {
             "fuyubot.start",
         ])
         .unwrap();
-        match cli.command {
+        match command_of(cli) {
             Command::Run(args) => assert_eq!(
                 args.log_plugin,
                 vec!["fuyubot.demo".to_owned(), "fuyubot.start".to_owned()]
@@ -2285,20 +2357,20 @@ mod tests {
 
         // 后台运行：只是 `run` 的一个开关（`status` / `stop` 面对的是同一个实例）。
         let cli = Cli::try_parse_from(["fuyubot", "run", "--background"]).unwrap();
-        match cli.command {
+        match command_of(cli) {
             Command::Run(args) => assert!(args.background && !args.no_login),
             other => panic!("解析成了 {other:?}"),
         }
         assert!(matches!(
-            Cli::try_parse_from(["fuyubot", "status"]).unwrap().command,
+            command_of(Cli::try_parse_from(["fuyubot", "status"]).unwrap()),
             Command::Status(_)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["fuyubot", "stop"]).unwrap().command,
+            command_of(Cli::try_parse_from(["fuyubot", "stop"]).unwrap()),
             Command::Stop(_)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["fuyubot", "config"]).unwrap().command,
+            command_of(Cli::try_parse_from(["fuyubot", "config"]).unwrap()),
             Command::Config(_)
         ));
 
@@ -2316,7 +2388,7 @@ mod tests {
     fn login_logout_and_api_id_parse() {
         // login：默认配置文件 + 可选 --api-id（非秘密，可以写在命令行）。
         let cli = Cli::try_parse_from(["fuyubot", "login"]).unwrap();
-        match cli.command {
+        match command_of(cli) {
             Command::Login(args) => {
                 assert_eq!(args.config, PathBuf::from(scaffold::CONFIG_FILE));
                 assert_eq!(args.api_id, None);
@@ -2324,26 +2396,26 @@ mod tests {
             other => panic!("解析成了 {other:?}"),
         }
         let cli = Cli::try_parse_from(["fuyubot", "login", "--api-id", "42"]).unwrap();
-        match cli.command {
+        match command_of(cli) {
             Command::Login(args) => assert_eq!(args.api_id, Some(42)),
             other => panic!("解析成了 {other:?}"),
         }
 
         // logout：默认是**预览**，`--yes` 才是真删。
         let cli = Cli::try_parse_from(["fuyubot", "logout"]).unwrap();
-        match cli.command {
+        match command_of(cli) {
             Command::Logout(args) => assert!(!args.yes, "默认绝不能是删除"),
             other => panic!("解析成了 {other:?}"),
         }
         let cli = Cli::try_parse_from(["fuyubot", "logout", "--yes"]).unwrap();
-        match cli.command {
+        match command_of(cli) {
             Command::Logout(args) => assert!(args.yes),
             other => panic!("解析成了 {other:?}"),
         }
 
         // run 也认 --api-id（缺口 24），并且和别的开关能一起给。
         let cli = Cli::try_parse_from(["fuyubot", "run", "--api-id", "7", "--no-login"]).unwrap();
-        match cli.command {
+        match command_of(cli) {
             Command::Run(args) => {
                 assert_eq!(args.api_id, Some(7));
                 assert!(args.no_login);
