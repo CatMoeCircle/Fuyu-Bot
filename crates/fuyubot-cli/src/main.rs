@@ -101,10 +101,11 @@ struct InitArgs {
     #[arg(long, default_value = "fuyubot")]
     name: String,
     /// TDLib api_id（到 https://my.telegram.org 申请）。**不是**秘密，可以写进配置。
-    /// api_hash 这个命令**不收**：`fuyubot run` 首次会问，问完写回配置
-    /// （或事先设环境变量 `TG_API_HASH`，那就一次都不用输）。
     #[arg(long, default_value_t = 0)]
     api_id: i64,
+    /// TDLib api_hash；给了就明文写进 `[telegram].api_hash`，不给就留空等首次 run 问。
+    #[arg(long, value_name = "HASH")]
+    api_hash: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -317,7 +318,12 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
     match command {
         Command::Init(args) => {
-            let config = scaffold::init(&args.dir, &args.name, args.api_id)?;
+            let config = scaffold::init_with_api_hash(
+                &args.dir,
+                &args.name,
+                args.api_id,
+                args.api_hash.as_deref(),
+            )?;
             cli!(info, "已生成 {}", config.display());
             cli!(info, "插件目录：{}", args.dir.join("plugins").display());
             cli!(

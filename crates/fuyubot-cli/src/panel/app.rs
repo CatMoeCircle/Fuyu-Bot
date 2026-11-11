@@ -439,6 +439,32 @@ pub struct Toast {
     pub until: Instant,
 }
 
+/// 首次使用还缺的 TDLib 凭据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialStep {
+    ApiId,
+    ApiHash,
+}
+
+impl CredentialStep {
+    pub fn prompt(self) -> &'static str {
+        match self {
+            Self::ApiId => "api_id（纯数字）",
+            Self::ApiHash => "api_hash（32 位十六进制）",
+        }
+    }
+}
+
+/// 首次启动的凭据弹框：一次只问一项。
+#[derive(Debug, Clone)]
+pub struct CredentialSetup {
+    pub step: CredentialStep,
+    pub input: String,
+    pub api_id: String,
+    pub api_hash: String,
+    pub error: Option<String>,
+}
+
 /// 正在进行的后台动作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Busy {
@@ -1429,6 +1455,10 @@ pub struct App {
     login_busy: bool,
     /// 这次登录是 `s` 触发的：成功后自动继续启动实例。
     start_after_login: bool,
+    /// 首次缺凭据时弹出的填写框（`None` = 不缺）。
+    pub credentials: Option<CredentialSetup>,
+    /// 凭据填完后是否要继续登录（`s` / `L` 都会置位）。
+    login_after_setup: bool,
 }
 
 impl App {
@@ -1517,6 +1547,8 @@ impl App {
             login_tx,
             login_busy: false,
             start_after_login: false,
+            credentials: None,
+            login_after_setup: false,
         };
         app.refresh_all();
         app
@@ -1967,6 +1999,140 @@ impl App {
 
     // ── 登录（只登录；面板自己不接 TDLib）────────────────────────────
 
+    /// 当前已知的 `api_id` / `api_hash`：命令行 / 配置 / 环境变量。
+    fn known_credentials(&self) -> (Option<i64>, Option<String>) {
+        let config = scaffold::load_config(&self.config_path).ok();
+        let api_id = self
+            .spawn
+            .api_id
+            .or_else(|| config.as_ref().and_then(|config| config.telegram.api_id))
+            .filter(|id| *id > 0);
+        let api_hash = std::env::var("TG_API_HASH")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .or_else(|| scaffold::load_api_hash(&self.config_path));
+        (api_id, api_hash)
+    }
+
+    /// 首次使用：缺 `api_id` 或 `api_hash` 时先弹填写框。
+    fn missing_credentials(&self) -> bool {
+        let (api_id, api_hash) = self.known_credentials();
+        api_id.is_none() || api_hash.is_none()
+    }
+
+    fn begin_credentials_setup(&mut self) {
+        if self.credentials.is_some() {
+            return;
+        }
+        let (api_id, api_hash) = self.known_credentials();
+        let step = if api_id.is_none() {
+            CredentialStep::ApiId
+        } else {
+            CredentialStep::ApiHash
+        };
+        self.credentials = Some(CredentialSetup {
+            step,
+            input: String::new(),
+            api_id: api_id.map(|id| id.to_string()).unwrap_or_default(),
+            api_hash: api_hash.unwrap_or_default(),
+            error: None,
+        });
+        self.set_toast(
+            "首次使用：填写 api_id / api_hash（会明文写回配置）",
+            Level::Info,
+        );
+    }
+
+    /// 凭据弹框的按键：一次只收一项。
+    fn on_credentials_key(&mut self, key: KeyEvent) {
+        let Some(mut setup) = self.credentials.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.login_after_setup = false;
+                self.start_after_login = false;
+                self.set_toast("已取消首次配置", Level::Info);
+            }
+            KeyCode::Enter => {
+                let input = setup.input.trim().to_owned();
+                match setup.step {
+                    CredentialStep::ApiId => match input.parse::<i64>() {
+                        Ok(id) if id > 0 => {
+                            setup.api_id = id.to_string();
+                            setup.input.clear();
+                            setup.error = None;
+                            if setup.api_hash.is_empty() {
+                                setup.step = CredentialStep::ApiHash;
+                                self.credentials = Some(setup);
+                            } else {
+                                self.finish_credentials(setup);
+                            }
+                        }
+                        _ => {
+                            setup.error = Some("api_id 必须是正整数".to_owned());
+                            self.credentials = Some(setup);
+                        }
+                    },
+                    CredentialStep::ApiHash => {
+                        if input.is_empty() {
+                            setup.error = Some("api_hash 不能为空".to_owned());
+                            self.credentials = Some(setup);
+                        } else {
+                            setup.api_hash = input;
+                            self.finish_credentials(setup);
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                setup.input.pop();
+                self.credentials = Some(setup);
+            }
+            KeyCode::Char(character) if !character.is_control() => {
+                setup.input.push(character);
+                self.credentials = Some(setup);
+            }
+            _ => self.credentials = Some(setup),
+        }
+    }
+
+    /// 两项都拿到：明文写回 `[telegram]`，然后继续登录（`s` 成功后还会自动启动）。
+    fn finish_credentials(&mut self, setup: CredentialSetup) {
+        let api_id: i64 = setup.api_id.trim().parse().unwrap_or(0);
+        let api_hash = setup.api_hash.trim().to_owned();
+        if api_id <= 0 || api_hash.is_empty() {
+            let mut setup = setup;
+            setup.error = Some("api_id / api_hash 都没填完整".to_owned());
+            self.credentials = Some(setup);
+            return;
+        }
+        match scaffold::remember_credentials(
+            &self.config_path,
+            Some(api_id),
+            Some(api_hash.as_str()),
+        ) {
+            Ok(_) => {
+                self.credentials = None;
+                self.refresh_all();
+                let login = std::mem::take(&mut self.login_after_setup);
+                if login {
+                    if !self.start_login() && self.credentials.is_none() {
+                        self.start_after_login = false;
+                    }
+                } else {
+                    self.start_after_login = false;
+                }
+            }
+            Err(error) => {
+                let mut setup = setup;
+                setup.error = Some(error);
+                self.credentials = Some(setup);
+            }
+        }
+    }
+
     /// 起一次「只登录」：后台线程跑 `fuyubot-app` 的 boot + login，问题弹成输入框。
     ///
     /// 为什么必须在实例停着的时候做：TDLib 的数据库同一时刻只允许一个进程打开（约束 47）。
@@ -1980,6 +2146,15 @@ impl App {
                 "实例在跑：先停止再登录（TDLib 数据库只能一个进程开）",
                 Level::Info,
             );
+            return false;
+        }
+        if self.credentials.is_some() {
+            self.set_toast("先完成首次配置", Level::Info);
+            return false;
+        }
+        if self.missing_credentials() {
+            self.login_after_setup = true;
+            self.begin_credentials_setup();
             return false;
         }
         let options = match self.login_options() {
@@ -2006,7 +2181,12 @@ impl App {
     fn login_options(&self) -> Result<fuyubot_app::AppOptions, String> {
         let config = scaffold::load_config(&self.config_path)?;
 
-        let api_id = self.spawn.api_id.or(config.telegram.api_id).unwrap_or(0);
+        let api_id = self
+            .spawn
+            .api_id
+            .filter(|id| *id > 0)
+            .or(config.telegram.api_id)
+            .unwrap_or(0);
         let api_hash = std::env::var("TG_API_HASH")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -2128,6 +2308,12 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             self.quit = true;
+            return;
+        }
+
+        // 首次配置弹框是模态的：先填 api_id / api_hash。
+        if self.credentials.is_some() {
+            self.on_credentials_key(key);
             return;
         }
 
@@ -3073,7 +3259,7 @@ impl App {
         }
         if !self.spawn.no_login && !self.spawn.no_tdlib {
             self.start_after_login = true;
-            if !self.start_login() {
+            if !self.start_login() && self.credentials.is_none() {
                 self.start_after_login = false;
             }
             return;
@@ -4060,6 +4246,49 @@ mod tests {
     }
 
     /// 启动 / 停止还在路上时按 `x`：不许静默无视——那看起来就像「x 坏了」。
+    #[test]
+    fn first_run_credentials_are_written_before_login() {
+        let root = temp("first-run-credentials");
+        let config_path = scaffold::init(&root, "demo", 0).unwrap();
+        let mut app = App::new(
+            root,
+            config_path.clone(),
+            None,
+            Duration::from_secs(1),
+            SpawnOptions::default(),
+        );
+        app.credentials = Some(CredentialSetup {
+            step: CredentialStep::ApiId,
+            input: String::new(),
+            api_id: String::new(),
+            api_hash: String::new(),
+            error: None,
+        });
+
+        for character in "12345".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        let setup = app.credentials.as_ref().expect("还差 api_hash");
+        assert_eq!(setup.step, CredentialStep::ApiHash);
+        assert_eq!(setup.api_id, "12345");
+
+        for character in "deadbeef".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+        app.on_key(key(KeyCode::Enter));
+
+        assert!(app.credentials.is_none(), "填完应关掉配置框");
+        assert_eq!(
+            scaffold::load_api_hash(&config_path).as_deref(),
+            Some("deadbeef")
+        );
+        assert_eq!(
+            scaffold::load_config(&config_path).unwrap().telegram.api_id,
+            Some(12345)
+        );
+    }
+
     #[test]
     fn pressing_s_while_login_is_running_queues_autostart() {
         let mut app = app();

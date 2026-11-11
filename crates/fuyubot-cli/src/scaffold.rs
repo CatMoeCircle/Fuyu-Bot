@@ -47,12 +47,18 @@ pub fn find_config(start: &Path) -> Option<PathBuf> {
 
 // ── init ───────────────────────────────────────────────────────────
 
-/// 生成 `fuyubot.toml` 与插件目录。
-///
-/// ⚠️ 这里**只写 `api_id`**：`api_hash` 在模板里是个空占位（`" "` 都不写，就是 `""`），
-/// 真值由 `run` 交互问过之后用 [`remember_credentials`] 写回——`init` 手上没有它，
-/// 也不该替用户去环境变量里捞。
+/// 生成 `fuyubot.toml` 与插件目录（不写 `api_hash`）。
 pub fn init(root: &Path, name: &str, api_id: i64) -> Result<PathBuf, String> {
+    init_with_api_hash(root, name, api_id, None)
+}
+
+/// 生成 `fuyubot.toml` 与插件目录，可选把 `api_hash` 一起明文写进 `[telegram]`。
+pub fn init_with_api_hash(
+    root: &Path,
+    name: &str,
+    api_id: i64,
+    api_hash: Option<&str>,
+) -> Result<PathBuf, String> {
     let config = root.join(CONFIG_FILE);
     if config.exists() {
         return Err(format!("{} 已经存在了，先挪走它", config.display()));
@@ -61,6 +67,7 @@ pub fn init(root: &Path, name: &str, api_id: i64) -> Result<PathBuf, String> {
     let request = fuyubot_app::InitRequest {
         name: Some(name.to_owned()),
         api_id: Some(api_id),
+        api_hash: api_hash.map(str::to_owned),
         ..fuyubot_app::InitRequest::default()
     };
     let config = fuyubot_app::init_config(root, &request)?;
@@ -1184,6 +1191,14 @@ mod tests {
         assert!(root.join("plugins").is_dir());
         // 第二次要被挡住，不能把用户改过的配置冲掉。
         assert!(init(&root, "mybot", 1).is_err());
+    }
+
+    #[test]
+    fn init_can_write_api_hash_in_plain_text() {
+        let root = temp("init-hash");
+        let path = init_with_api_hash(&root, "mybot", 12345, Some("deadbeef")).unwrap();
+        assert_eq!(load_api_hash(&path).as_deref(), Some("deadbeef"));
+        assert_eq!(load_config(&path).unwrap().telegram.api_id, Some(12345));
     }
 
     /// 装插件时**脚本要跟着走**（宿主按 cdylib 同目录找脚本），无关文件不搬。

@@ -32,8 +32,8 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthChar;
 
 use super::app::{
-    App, ConfigEdit, ConfigItem, ConfigKind, FilterRow, Focus, Level, Page, PluginKind,
-    ProcessUsage, TomlShape,
+    App, ConfigEdit, ConfigItem, ConfigKind, CredentialStep, FilterRow, Focus, Level, Page,
+    PluginKind, ProcessUsage, TomlShape,
 };
 use super::logfmt;
 
@@ -108,6 +108,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_filter_picker(frame, app, area);
     } else if app.config_edit.is_some() {
         draw_config_editor(frame, app, area);
+    } else if app.credentials.is_some() {
+        draw_credentials(frame, app, area);
     } else if app.login.is_some() {
         draw_login(frame, app, area);
     }
@@ -1804,6 +1806,57 @@ fn filter_row(selected: bool, label: &'static str, value: &'static str) -> Line<
         Span::styled(format!("{label}  "), style),
         Span::styled(format!("◂ {value} ▸"), style),
     ])
+}
+
+/// 首次启动缺凭据时的两步输入框：先 api_id，再 api_hash。
+fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(setup) = app.credentials.as_ref() else {
+        return;
+    };
+    let popup_width = area.width.saturating_sub(2).min(74).max(24);
+    let popup = centered(area, popup_width, 10);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .title(Line::from(vec![Span::styled(
+            " 首次配置 ",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )]))
+        .border_style(Style::new().fg(Color::Cyan));
+
+    let step = match setup.step {
+        CredentialStep::ApiId => "1/2",
+        CredentialStep::ApiHash => "2/2",
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{step}  TDLib {}", setup.step.prompt()),
+            Style::new().fg(Color::Gray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("> ", Style::new().fg(Color::Cyan)),
+            Span::raw(setup.input.clone()),
+            Span::styled("▏", Style::new().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+    ];
+    if let Some(error) = &setup.error {
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::new().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "Enter 下一步 · Esc 取消；会明文写入 fuyubot.toml",
+        Style::new().fg(Color::DarkGray),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 /// 编辑单个配置项（配置页按 Enter / e）。
