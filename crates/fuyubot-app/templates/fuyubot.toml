@@ -8,7 +8,7 @@ name = "__NAME__"
 account_type = "bot"
 api_id = __API_ID__
 data_dir = "data"
-# 凭据：run 首次问过会明文写回，别提交进版本库；也可用 TG_API_HASH。
+# 首次 run 后自动写入。
 api_hash = ""
 
 [roles]
