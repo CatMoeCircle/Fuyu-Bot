@@ -207,6 +207,14 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     TUI 商店层（`crates/fuyubot-cli/src/panel/store.rs`），且**不单独建 crate**（用户 2026
     拍板：完整功能只集成在 TUI）。其它宿主（APK 等）自己做商店，只复用 bundle 契约。
     `plugin install` 的 CLI 只装本地目录/包，不认 zip。
+    **索引 schema 2**（2026）：主文件是轻列表（`id/name/summary/tags/latest/detail`），
+    版本表 / 每平台资产在 `plugins/<id>.json` 按需拉；`versions` 按版本号**升序**。
+    选版本必须先筛 `yanked=false`、`abi ≤ ABI_VERSION`、`select_asset` 有包，再取最新——
+    低版本宿主回退到旧版本，不许「选最新再拒绝」。列表只显示本机可安装的插件：
+    轻条目用索引摘要 `platform_min_abi`（平台 → 可用版本最低 ABI，0 = 未声明），
+    分片到了就按真实版本表重算；没有摘要的老索引宁多勿漏。索引缓存 / ETag 在
+    `<plugin_dir>/.store/`，换版本的旧包在 `<plugin_dir>/.backup/`（都是点目录，扫描跳过）；
+    换版本前实例必须已停（Windows 锁 DLL）。
 
 62. **APK 在 `release-bot.yml` 的 `build-apk` job 里编，壳不在本仓**：
     壳是 [FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android)（Kotlin + Compose），

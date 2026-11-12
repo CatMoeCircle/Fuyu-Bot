@@ -30,21 +30,31 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use sha2::{Digest, Sha256};
 
-/// 索引 JSON 的大小上限：正常索引几百 KB，2MB 已经非常宽松。
-const INDEX_MAX_BYTES: u64 = 2 * 1024 * 1024;
+/// 索引 JSON 的大小上限。schema 2 的轻索引一 KB 一条都不到；8MB 是给还留在
+/// schema 1（全量条目）的旧索引留的余量，正常 sharded 索引远用不到。
+const INDEX_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// 单个插件明细分片（schema 2）的大小上限：只有描述 + 版本表，1MB 足够。
+const SHARD_MAX_BYTES: u64 = 1024 * 1024;
 /// 单个插件包的大小上限（契约 §7）。
 const PLUGIN_MAX_BYTES: u64 = 50 * 1024 * 1024;
 /// 解压之后允许占用的总字节数（防 zip bomb）。
 const EXTRACT_MAX_BYTES: u64 = 200 * 1024 * 1024;
 /// 单个包允许的文件数（目录条目不算）。
 const EXTRACT_MAX_FILES: usize = 2000;
-/// 本宿主认识的索引 schema 版本。
-const INDEX_SCHEMA: u32 = 1;
+/// 旧索引（全量条目）的 schema。
+const INDEX_SCHEMA_LEGACY: u32 = 1;
+/// 分片索引（轻列表 + `plugins/<id>.json` 明细）的 schema。
+const INDEX_SCHEMA_SHARDED: u32 = 2;
 /// 装到一半的目录：装完 `fs::rename` 走，失败整个删掉。
 const STAGING_DIR: &str = ".staging";
+/// 换版本时旧包先挪到这里（`<plugin_dir>/.backup/<id>/`），回滚直接换回来。
+/// 点开头：加载器与已安装扫描都会跳过它。
+const BACKUP_DIR: &str = ".backup";
+/// 索引与明细的本地缓存（`<plugin_dir>/.store/`）：点开头，扫描同样跳过。
+const CACHE_DIR: &str = ".store";
 /// 已安装目录的重扫间隔：安装 / 卸载之后会立刻扫，平时一秒一次够用。
 const SCAN_INTERVAL: Duration = Duration::from_secs(1);
 /// 连不上 / 解析不了 DNS 就别吊着：10 秒足够。
@@ -87,6 +97,20 @@ pub struct Store {
     last_scan: Instant,
     scan_dirty: bool,
 
+    // 明细分片（schema 2）与版本选择
+    /// 本地缓存目录：`<plugin_dir>/.store/`（索引 + 分片 + ETag）。
+    cache_dir: PathBuf,
+    /// 已拉下来的分片：id → 完整条目。schema 1 的条目本身就在 `index` 里，不进这里。
+    details: BTreeMap<String, IndexPlugin>,
+    /// 正在拉的分片 id（同一时刻只拉一个）。
+    detail_loading: Option<String>,
+    /// 分片拉取失败：id → 原文。选中时显示，不挡列表。
+    detail_errors: BTreeMap<String, String>,
+    /// 用户手动选的版本：id → version（`v` 打开选择器；不改索引）。
+    chosen_versions: BTreeMap<String, String>,
+    /// 版本选择器开着时的状态。
+    version_picker: Option<VersionPicker>,
+
     // 列表 / 详情 / 搜索
     query: String,
     /// `Some` = 正在输入过滤词（草稿与 `query` 同步，Esc 回滚到进入前的值）。
@@ -94,6 +118,8 @@ pub struct Store {
     query_before_search: Option<String>,
     /// 过滤之后的下标（指向 `index.plugins`）。
     filtered: Vec<usize>,
+    /// 因「本机跑不了」被隐藏的插件数（ABI 太新 / 没有本平台包 / 全下架）。
+    hidden_incompatible: usize,
     selected: usize,
     list_offset: usize,
     view_rows: usize,
@@ -121,7 +147,9 @@ impl Store {
         let registry_url = registry_url
             .map(|url| url.trim().to_owned())
             .filter(|url| !url.is_empty());
+        let cache_dir = plugin_dir.join(CACHE_DIR);
         let mut store = Self {
+            cache_dir,
             plugin_dir,
             registry_url,
             index: None,
@@ -131,10 +159,16 @@ impl Store {
             installed: Vec::new(),
             last_scan: Instant::now(),
             scan_dirty: true,
+            details: BTreeMap::new(),
+            detail_loading: None,
+            detail_errors: BTreeMap::new(),
+            chosen_versions: BTreeMap::new(),
+            version_picker: None,
             query: String::new(),
             search: None,
             query_before_search: None,
             filtered: Vec::new(),
+            hidden_incompatible: 0,
             selected: 0,
             list_offset: 0,
             view_rows: 10,
@@ -165,6 +199,8 @@ impl Store {
         if self.scan_dirty || self.last_scan.elapsed() >= SCAN_INTERVAL {
             self.rescan();
         }
+        // 选中项需要明细分片（schema 2）就顺手拉一次；有缓存 / 已拉过时是空操作。
+        self.ensure_selected_detail();
     }
 
     /// 页面拿到焦点时，所有按键先交给它。
@@ -181,6 +217,9 @@ impl Store {
         }
         if self.search.is_some() {
             return self.handle_search_key(key);
+        }
+        if self.version_picker.is_some() {
+            return self.handle_version_key(key);
         }
         match key.code {
             KeyCode::Esc => StoreKey::Close,
@@ -218,6 +257,14 @@ impl Store {
                 self.uninstall_selected();
                 StoreKey::Consumed
             }
+            KeyCode::Char('v') => {
+                self.open_version_picker();
+                StoreKey::Consumed
+            }
+            KeyCode::Char('b') => {
+                self.rollback_selected();
+                StoreKey::Consumed
+            }
             KeyCode::Char('/') => {
                 self.enter_search();
                 StoreKey::Consumed
@@ -252,6 +299,8 @@ impl Store {
         self.render_list(frame, list_area);
         self.render_detail(frame, detail_area);
         self.render_status(frame, status_area);
+        // 版本选择器盖在最上面（盖住列表与详情，但让状态行露出来显示错误）。
+        self.render_version_picker(frame, body);
     }
 
     /// 底栏那句键提示（由 `app.rs` 放到它自己的底栏，或由本页状态区显示）。
@@ -259,10 +308,13 @@ impl Store {
         if self.search.is_some() {
             return "输入过滤词（id / 名称 / 简介）· Enter 确认 · Esc 取消".to_owned();
         }
+        if self.version_picker.is_some() {
+            return "↑↓ 选版本 · Enter 确定 · Esc 取消（红字的是本宿主装不了的）".to_owned();
+        }
         if self.busy {
             return "安装中… 进度见上方状态行（不要关面板）".to_owned();
         }
-        "↑↓ 选择 · Enter 安装 · x 卸载 · / 搜索 · r 刷新 · Esc 返回".to_owned()
+        "↑↓ 选择 · Enter 安装 · v 选版本 · b 回滚 · x 卸载 · / 搜索 · r 刷新 · Esc 返回".to_owned()
     }
 
     /// 页面标题，例如 `插件商店 (12)`；有过滤词时显示 `插件商店 (3/12)`。
@@ -274,10 +326,14 @@ impl Store {
             return "插件商店（加载中…）".to_owned();
         }
         match &self.index {
-            Some(index) if self.query.trim().is_empty() => {
-                format!("插件商店 ({})", index.plugins.len())
+            Some(_) if self.query.trim().is_empty() => {
+                format!("插件商店 ({})", self.filtered.len())
             }
-            Some(index) => format!("插件商店 ({}/{})", self.filtered.len(), index.plugins.len()),
+            Some(index) => format!(
+                "插件商店 ({}/{})",
+                self.filtered.len(),
+                index.plugins.len().saturating_sub(self.hidden_incompatible)
+            ),
             None if self.index_error.is_some() => "插件商店（加载失败）".to_owned(),
             None => "插件商店".to_owned(),
         }
@@ -304,8 +360,13 @@ enum Status {
 /// 后台线程 → 界面的消息。
 #[derive(Debug)]
 enum Event {
-    /// 索引拉取结果（成功时已经校验过 schema）。
-    Index(Result<Index, String>),
+    /// 索引拉取结果（成功时已经校验过 schema）。`None` = 服务器说 304，缓存仍然有效。
+    Index(Result<Option<Index>, String>),
+    /// schema 2 明细分片结果。
+    Detail {
+        id: String,
+        result: Result<IndexPlugin, String>,
+    },
     /// 安装进度文本（给人看的一句话）。
     Progress(String),
     /// 安装结束：成功给出落盘信息，失败给出可操作的原因。
@@ -329,6 +390,14 @@ struct Installed {
     version: String,
     kind: PluginKind,
     path: PathBuf,
+}
+
+/// 版本选择器：`v` 打开，列出版本（含不可用的，标原因），Enter 选定，Esc 关掉。
+#[derive(Debug, Clone)]
+struct VersionPicker {
+    plugin_id: String,
+    /// 光标：指向 `plugin.versions` 的下标（含 yanked，保留审计痕迹好让人看懂）。
+    cursor: usize,
 }
 
 // ── 索引（契约 §7）─────────────────────────────────────────────────
@@ -366,6 +435,24 @@ pub(crate) struct IndexPlugin {
     pub latest: Option<String>,
     #[serde(default)]
     pub versions: Vec<IndexVersion>,
+    /// schema 2：明细分片路径（相对索引地址，或完整 https URL）。
+    /// 空 = 明细就在本条目里（schema 1，或分片文件本身）。
+    #[serde(default)]
+    pub detail: String,
+    /// schema 2 摘要（只在轻索引里）：平台 → 该平台**可用**版本的 ABI 下界
+    /// （0 = 版本没声明 abi，按「任意宿主都能试」算）。分片里没有这份字段。
+    /// 空 = 老索引没有摘要：列表不做兼容过滤（宁多勿漏）。
+    #[serde(default)]
+    pub platform_min_abi: BTreeMap<String, u32>,
+}
+
+/// schema 2 的明细分片：`{"schema":2,"plugin":{…}}`。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct Shard {
+    #[serde(default)]
+    pub schema: u32,
+    #[serde(default)]
+    pub plugin: IndexPlugin,
 }
 
 /// 一个版本。`versions` 的顺序按索引原样（我们从后往前找最新的可用版本）。
@@ -499,6 +586,8 @@ impl Store {
     }
 
     /// 起后台线程拉索引；同一时刻只允许一个。
+    ///
+    /// 先读本地缓存让列表立刻可用，再带 `If-None-Match` 去校验（304 就什么都不用换）。
     fn load_index(&mut self) {
         let Some(url) = self.registry_url.clone() else {
             self.fail(
@@ -512,16 +601,40 @@ impl Store {
         self.loading_index = true;
         self.index_error = None;
         self.set_status(Status::Loading);
+        if self.index.is_none() {
+            if let Some(index) = read_cached_index(&self.cache_dir, &url) {
+                self.apply_index(index, false);
+            }
+        }
+        let cached_etag = read_cache_etag(&self.cache_dir, &url);
         let tx = self.tx.clone();
+        let cache_dir = self.cache_dir.clone();
         let spawned = thread::Builder::new()
             .name("fuyubot-store-index".to_owned())
             .spawn(move || {
-                let result = fetch_index(&url);
+                let result = fetch_index(&url, cached_etag.as_deref(), &cache_dir);
                 let _ = tx.send(Event::Index(result));
             });
         if let Err(error) = spawned {
             self.loading_index = false;
             self.fail(format!("起不了索引线程：{error}（重启面板再试）"));
+        }
+    }
+
+    /// 换一份新索引：明细缓存、版本选择、错误都跟着作废（它们都属于旧索引）。
+    fn apply_index(&mut self, index: Index, announce: bool) {
+        let count = index.plugins.len();
+        self.details.clear();
+        self.detail_errors.clear();
+        self.detail_loading = None;
+        self.version_picker = None;
+        self.index = Some(index);
+        self.refresh_filtered();
+        self.scan_dirty = true;
+        if announce {
+            self.set_status(Status::Done(format!(
+                "索引已更新：{count} 个插件（/ 搜索，Enter 安装，v 选版本，x 卸载）"
+            )));
         }
     }
 
@@ -540,35 +653,56 @@ impl Store {
             );
             return;
         }
-        let Some(plugin) = self.selected_plugin().cloned() else {
+        let Some(light) = self.selected_plugin().cloned() else {
             self.fail("先选一个插件：列表是空的就按 r 重新加载索引，或用 / 改过滤词");
             return;
         };
-        let version = match select_version(&plugin) {
-            Ok(version) => version,
+        let plugin = self.full_plugin(&light);
+        if plugin.versions.is_empty() {
+            if plugin.detail.trim().is_empty() {
+                self.fail(format!(
+                    "{} 的索引条目没有版本信息（versions 为空、也没写 detail）：找上架方修",
+                    plugin.name
+                ));
+                return;
+            }
+            // schema 2：版本数据在分片里，还没拉下来（或拉失败）。别让用户干等。
+            self.ensure_selected_detail();
+            if let Some(error) = self.detail_errors.get(&plugin.id) {
+                self.fail(format!("读取 {} 的版本信息失败：{error}", plugin.name));
+            } else {
+                self.set_status(Status::Working(format!(
+                    "正在读取 {} 的版本信息…（拉完再按 Enter）",
+                    plugin.name
+                )));
+            }
+            return;
+        }
+        let version = match self.target_version(&plugin, ABI_VERSION) {
+            Ok(version) => version.clone(),
             Err(error) => {
                 self.fail(format!("装不了 {}：{error}", plugin.name));
                 return;
             }
         };
-        let Some((platform, asset)) = select_asset(version) else {
+        if let Some(installed) = self.installed(&plugin.id) {
+            if installed.version == version.version {
+                self.set_status(Status::Done(format!(
+                    "{} {} 已经装好了：换版本按 v，卸载按 x",
+                    plugin.name, version.version
+                )));
+                return;
+            }
+        }
+        let Some((platform, asset)) = select_asset(&version) else {
             self.fail(format!(
-                "{} {} 没有当前平台（{}）的安装包，也没有 any 回退：换一个版本，或让作者补发包",
+                "{} {} 没有当前平台（{}）的安装包，也没有 any 回退：按 v 换一个版本，或让作者补发包",
                 plugin.name,
                 version.version,
                 current_platform()
             ));
             return;
         };
-        if let Some(abi) = version.abi {
-            if abi > ABI_VERSION {
-                self.fail(format!(
-                    "{} {} 需要 ABI {abi}，本宿主是 {ABI_VERSION}：需要更新的宿主（升级 fuyubot 之后再装）",
-                    plugin.name, version.version
-                ));
-                return;
-            }
-        }
         if !is_https(&asset.url) {
             self.fail(format!(
                 "{} {} 的下载地址不是 https（{:?}）：拒绝明文下载，找上架方换成 https",
@@ -619,6 +753,173 @@ impl Store {
             self.busy = false;
             self.fail(format!("起不了安装线程：{error}（重启面板再试）"));
         }
+    }
+
+    /// v：把版本选择器开在当前选中插件上（光标落在“将安装”的那个版本）。
+    fn open_version_picker(&mut self) {
+        let Some(plugin) = self.selected_full_plugin() else {
+            self.fail("先选一个插件：列表是空的就按 r 重新加载索引");
+            return;
+        };
+        if plugin.versions.is_empty() {
+            if plugin.detail.trim().is_empty() {
+                self.fail(format!(
+                    "{} 的索引条目没有版本信息：找上架方修",
+                    plugin.name
+                ));
+                return;
+            }
+            self.ensure_selected_detail();
+            self.set_status(Status::Working(format!(
+                "正在读取 {} 的版本列表…（拉完再按 v）",
+                plugin.name
+            )));
+            return;
+        }
+        let cursor = self
+            .chosen_versions
+            .get(&plugin.id)
+            .and_then(|chosen| {
+                plugin
+                    .versions
+                    .iter()
+                    .position(|version| &version.version == chosen)
+            })
+            .or_else(|| {
+                self.target_version(&plugin, ABI_VERSION)
+                    .ok()
+                    .and_then(|target| {
+                        plugin
+                            .versions
+                            .iter()
+                            .position(|version| version.version == target.version)
+                    })
+            })
+            .unwrap_or(0);
+        self.version_picker = Some(VersionPicker {
+            plugin_id: plugin.id,
+            cursor,
+        });
+    }
+
+    /// 版本选择器打开时的按键：jk/↑↓ 移动，Enter 选定，Esc 关掉。
+    fn handle_version_key(&mut self, key: KeyEvent) -> StoreKey {
+        let Some(picker) = self.version_picker.clone() else {
+            return StoreKey::Ignored;
+        };
+        let Some(plugin) = self.selected_full_plugin() else {
+            self.version_picker = None;
+            return StoreKey::Consumed;
+        };
+        if plugin.id != picker.plugin_id {
+            self.version_picker = None;
+            return StoreKey::Consumed;
+        }
+        let last = plugin.versions.len().saturating_sub(1);
+        let cursor = picker.cursor.min(last);
+        match key.code {
+            KeyCode::Esc => self.version_picker = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.version_picker = Some(VersionPicker {
+                    plugin_id: picker.plugin_id,
+                    cursor: cursor.saturating_sub(1),
+                });
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.version_picker = Some(VersionPicker {
+                    plugin_id: picker.plugin_id,
+                    cursor: (cursor + 1).min(last),
+                });
+            }
+            KeyCode::Enter => {
+                let Some(version) = plugin.versions.get(cursor) else {
+                    self.version_picker = None;
+                    return StoreKey::Consumed;
+                };
+                // 装不了的版本可以看见、可以选中，但不许悄悄装——把原因顶到状态行。
+                if let Some(reason) = version_blocker(version, ABI_VERSION) {
+                    self.fail(format!(
+                        "{} {} 装不了：{reason}",
+                        plugin.name, version.version
+                    ));
+                    return StoreKey::Consumed;
+                }
+                self.chosen_versions
+                    .insert(plugin.id.clone(), version.version.clone());
+                self.version_picker = None;
+                self.set_status(Status::Done(format!(
+                    "已选 {} {}：Enter 安装（换版本后要重启实例）",
+                    plugin.name, version.version
+                )));
+            }
+            _ => {}
+        }
+        StoreKey::Consumed
+    }
+
+    /// b：把最近一次换版本时留下的 `.backup/` 换回来（只保留一步历史）。
+    fn rollback_selected(&mut self) {
+        if self.busy {
+            self.fail("安装进行中：等它结束再回滚");
+            return;
+        }
+        let Some(plugin) = self.selected_plugin().cloned() else {
+            self.fail("先选一个插件：列表是空的就按 r 重新加载索引");
+            return;
+        };
+        let Some(installed) = self.installed(&plugin.id).cloned() else {
+            self.fail(format!("{} 没有安装，没什么可回滚的", plugin.name));
+            return;
+        };
+        let backup = backup_path(&self.plugin_dir, &installed.path);
+        if !backup.is_dir() {
+            self.fail(format!(
+                "{} 没有上一版本可回滚：只有换过版本才会在 {} 留备份",
+                plugin.name,
+                backup.display()
+            ));
+            return;
+        }
+        let trash = self
+            .plugin_dir
+            .join(STAGING_DIR)
+            .join(format!("rollback-{}", plugin.id));
+        cleanup(&trash);
+        if let Some(parent) = trash.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                self.fail(format!("建 {} 失败：{error}", parent.display()));
+                return;
+            }
+        }
+        if let Err(error) = std::fs::rename(&installed.path, &trash) {
+            self.fail(format!(
+                "把当前版本挪开失败：{error}\
+                 （实例还在跑、DLL 被占用：Esc 回插件页按 x 停实例；商店页的 x 是卸载）"
+            ));
+            return;
+        }
+        if let Err(error) = std::fs::rename(&backup, &installed.path) {
+            let restored = std::fs::rename(&trash, &installed.path).is_ok();
+            self.fail(format!(
+                "把备份换回来失败：{error}{}",
+                if restored {
+                    "（当前版本已还原）"
+                } else {
+                    "（当前版本也没还原，两个目录都在，别手动删）"
+                }
+            ));
+            return;
+        }
+        cleanup(&trash);
+        self.scan_dirty = true;
+        self.rescan();
+        let version = self
+            .installed(&plugin.id)
+            .map_or_else(|| "?".to_owned(), |item| item.version.clone());
+        self.set_status(Status::Done(format!(
+            "已回滚 {} 到 {}：重启实例后生效",
+            plugin.name, version
+        )));
     }
 
     /// x：删掉已安装的目录（原生 `plugins/<id>/`，脚本 `plugins/scripts/<id>/`）。
@@ -711,33 +1012,87 @@ fn run_install(
 
 // ── 纯函数（可单测）───────────────────────────────────────────────
 
-/// 选版本：`latest` 对应且未 yanked → 用它；否则按索引顺序往回找最新的未下架版本。
-fn select_version(plugin: &IndexPlugin) -> Result<&IndexVersion, String> {
+/// 一个版本为什么装不了；`None` = 能装。
+///
+/// **ABI 检查属于「选择」而不是「安装」**：宿主 ABI 6 遇到只支持 ABI 7 的最新版，
+/// 要回退到仍支持 6 的旧版本，而不是先选最新再在安装前拒绝（那会让低版本宿主
+/// 永远看到「需要更新的宿主」，明明索引里就有能跑的旧版本）。
+fn version_blocker(version: &IndexVersion, host_abi: u32) -> Option<String> {
+    if version.yanked {
+        return Some("已下架".to_owned());
+    }
+    if let Some(abi) = version.abi {
+        if abi > host_abi {
+            return Some(format!("需要 ABI {abi}，本宿主是 {host_abi}"));
+        }
+    }
+    if select_asset(version).is_none() {
+        return Some(format!(
+            "没有 {} 的包（也没有 any 回退）",
+            current_platform()
+        ));
+    }
+    None
+}
+
+/// 选版本：优先 `latest`，但它必须**装得了**（未 yanked / ABI 够 / 有本平台包）；
+/// 否则按索引顺序往回找最新的可用版本。`versions` 的顺序约定为版本号升序。
+fn select_version(plugin: &IndexPlugin, host_abi: u32) -> Result<&IndexVersion, String> {
+    if plugin.versions.is_empty() {
+        return Err(format!(
+            "{} 的条目里没有版本信息（明细还没拉下来，或索引条目坏了）：按 r 重试",
+            plugin.name
+        ));
+    }
     let latest = plugin
         .latest
         .as_deref()
         .map(str::trim)
         .filter(|latest| !latest.is_empty());
     if let Some(latest) = latest {
-        if let Some(version) = plugin
-            .versions
-            .iter()
-            .find(|version| version.version == latest && !version.yanked)
-        {
+        if let Some(version) = plugin.versions.iter().find(|version| {
+            version.version == latest && version_blocker(version, host_abi).is_none()
+        }) {
             return Ok(version);
         }
     }
-    plugin
+    if let Some(version) = plugin
         .versions
         .iter()
         .rev()
-        .find(|version| !version.yanked)
-        .ok_or_else(|| {
-            format!(
-                "{} 没有未下架的版本（yanked 的不能装）：等上架方发布新版本",
-                plugin.name
-            )
-        })
+        .find(|version| version_blocker(version, host_abi).is_none())
+    {
+        return Ok(version);
+    }
+    Err(unavailable_reason(plugin, host_abi))
+}
+
+/// 一个可用版本都没有时，把原因说到能让人行动（升级宿主 / 换平台 / 等新版本）。
+fn unavailable_reason(plugin: &IndexPlugin, host_abi: u32) -> String {
+    if plugin.versions.iter().all(|version| version.yanked) {
+        return format!(
+            "{} 没有未下架的版本（yanked 的不能装）：等上架方发布新版本",
+            plugin.name
+        );
+    }
+    let newest_abi = plugin
+        .versions
+        .iter()
+        .filter(|version| !version.yanked)
+        .filter_map(|version| version.abi)
+        .filter(|abi| *abi > host_abi)
+        .min();
+    if let Some(abi) = newest_abi {
+        return format!(
+            "{} 的可用版本都要求 ABI ≥ {abi}，本宿主是 {host_abi}：升级 fuyubot 后再装，或等作者发兼容版本",
+            plugin.name
+        );
+    }
+    format!(
+        "{} 没有 {}（或 any）的安装包：让作者补这个平台的包",
+        plugin.name,
+        current_platform()
+    )
 }
 
 /// 选资产：`current_platform()` 精确匹配 → `any` 回退；都没有 = 这个平台装不了。
@@ -784,7 +1139,7 @@ pub(crate) fn verify_sha256(bytes: &[u8], expected_hex: &str) -> Result<(), Stri
 /// 1. 解开到 `plugin_dir/.staging/<id>/`（`extract_zip` 里防 zip-slip / 符号链接 / zip bomb）；
 /// 2. 用 [`BundleManifest`] 再校验一次 `id` / `version` / `entry`；
 /// 3. 目标 = `plugin_dir/<id>/`（native）或 `plugin_dir/scripts/<id>/`（python / js）；
-/// 4. 目标已存在 → 报错（**不覆盖**，提示先卸载）；
+/// 4. 目标已存在（升级 / 降级 / 换版本）→ 旧目录先挪到 `.backup/`，**失败可还原**；
 /// 5. `fs::rename(staging, dest)`；成功 / 失败都清掉 staging。
 pub(crate) fn install_from_bytes(
     bytes: &[u8],
@@ -834,29 +1189,62 @@ pub(crate) fn install_from_bytes(
         } else {
             plugin_dir.join(expected_id)
         };
-        if dest.exists() {
-            return Err(format!(
-                "{} 已经存在：先卸载旧版本（按 x），再装",
-                dest.display()
-            ));
-        }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 format!("建 {} 失败：{error}（检查插件目录权限）", parent.display())
             })?;
         }
-        std::fs::rename(&staging, &dest).map_err(|error| {
-            format!(
-                "把包挪到 {} 失败：{error}（被杀软 / 占用挡住了；关掉占用再试）",
-                dest.display()
-            )
-        })?;
+        if dest.exists() {
+            // 换版本：旧包留一份到 `.backup/`（只留最近一次，够回滚一步）。
+            let backup = backup_path(plugin_dir, &dest);
+            cleanup(&backup);
+            if let Some(parent) = backup.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("建备份目录 {} 失败：{error}", parent.display()))?;
+            }
+            std::fs::rename(&dest, &backup).map_err(|error| {
+                format!(
+                    "把旧版本挪到 {} 失败：{error}\
+                     （实例还在跑、DLL 被占用：Esc 回插件页按 x 停实例；商店页的 x 是卸载）",
+                    backup.display()
+                )
+            })?;
+            if let Err(error) = std::fs::rename(&staging, &dest) {
+                // 新包没到位：旧版本放回去，别留下一个空插件目录。
+                let restored = std::fs::rename(&backup, &dest).is_ok();
+                return Err(format!(
+                    "把新版本挪到 {} 失败：{error}{}",
+                    dest.display(),
+                    if restored {
+                        "（旧版本已还原）"
+                    } else {
+                        "（旧版本还原也失败了，备份还在 .backup/ 里，别手动删）"
+                    }
+                ));
+            }
+        } else {
+            std::fs::rename(&staging, &dest).map_err(|error| {
+                format!(
+                    "把包挪到 {} 失败：{error}（被杀软 / 占用挡住了；关掉占用再试）",
+                    dest.display()
+                )
+            })?;
+        }
         Ok(dest)
     })();
 
     // 成功时 staging 已经被 rename 走；失败时把半成品清掉，别让下次误用。
     cleanup(&staging);
     outcome
+}
+
+/// 某个已安装目录对应的备份路径：`<plugin_dir>/.backup/<相对路径>`。
+///
+/// 脚本插件是 `.backup/scripts/<id>`，原生是 `.backup/<id>`——保持镜像结构，
+/// 回滚时不用再猜 kind。
+fn backup_path(plugin_dir: &Path, dest: &Path) -> PathBuf {
+    let relative = dest.strip_prefix(plugin_dir).unwrap_or(Path::new(""));
+    plugin_dir.join(BACKUP_DIR).join(relative)
 }
 
 /// 把 zip 解开到 `dest`，只接受「安全的名字 + 普通文件 / 目录」。
@@ -983,17 +1371,29 @@ fn is_windows_reserved_name(segment: &str) -> bool {
 
 // ── 网络 ───────────────────────────────────────────────────────────
 
-/// 拉索引（后台线程入口）：≤ 2MB，解析后用 [`parse_index`] 校验 schema。
-fn fetch_index(url: &str) -> Result<Index, String> {
+/// 拉索引（后台线程入口）：≤ 8MB，解析后用 [`parse_index`] 校验 schema。
+///
+/// 带 `If-None-Match` 时服务器可能回 304——那不是错误，返回 `Ok(None)` 表示缓存仍有效。
+fn fetch_index(url: &str, etag: Option<&str>, cache_dir: &Path) -> Result<Option<Index>, String> {
     if !is_https(url) {
         return Err(format!(
             "索引地址 {url:?} 不是 https：拒绝明文拉取（改成 https，或按 r 重试）"
         ));
     }
-    let mut response = http_agent()
-        .get(url)
-        .call()
-        .map_err(|error| http_error("索引地址", url, error))?;
+    let mut request = http_agent().get(url);
+    if let Some(etag) = etag {
+        request = request.header("If-None-Match", etag);
+    }
+    let mut response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(304)) => return Ok(None),
+        Err(error) => return Err(http_error("索引地址", url, error)),
+    };
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let bytes = response
         .body_mut()
         .with_config()
@@ -1005,21 +1405,177 @@ fn fetch_index(url: &str) -> Result<Index, String> {
                 human_bytes(INDEX_MAX_BYTES)
             )
         })?;
-    parse_index(&bytes)
+    let index = parse_index(&bytes)?;
+    write_cache(cache_dir, url, &bytes, etag.as_deref());
+    Ok(Some(index))
 }
 
-/// 解析索引 JSON 并确认 schema 是本宿主认识的。
+/// 解析索引 JSON 并确认 schema 是本宿主认识的（1 = 全量，2 = 轻列表 + 分片）。
 fn parse_index(bytes: &[u8]) -> Result<Index, String> {
-    let index: Index = serde_json::from_slice(bytes).map_err(|error| {
-        format!("索引不是合法 JSON：{error}（对照文档站「插件分发格式 v1」§7 的字段）")
-    })?;
-    if index.schema != INDEX_SCHEMA {
+    let index: Index = serde_json::from_slice(bytes)
+        .map_err(|error| format!("索引不是合法 JSON：{error}（对照文档站「插件商店」的字段表）"))?;
+    if index.schema != INDEX_SCHEMA_LEGACY && index.schema != INDEX_SCHEMA_SHARDED {
         return Err(format!(
-            "索引的 schema 是 {}，本宿主只认 {INDEX_SCHEMA}：升级宿主，或换一份兼容的索引",
+            "索引的 schema 是 {}，本宿主只认 {INDEX_SCHEMA_LEGACY} / {INDEX_SCHEMA_SHARDED}：\
+             升级宿主，或换一份兼容的索引",
             index.schema
         ));
     }
     Ok(index)
+}
+
+/// 拉一个插件明细分片（schema 2）：`{"schema":2,"plugin":{…}}`。
+///
+/// `expected_id` 必须和分片里的 id 一致：分片是外部数据，不能让它把「另一个插件」
+/// 的版本表挂到当前条目上。
+fn fetch_detail(url: &str, expected_id: &str) -> Result<IndexPlugin, String> {
+    let bytes = fetch_bytes(url, SHARD_MAX_BYTES, "插件明细")?;
+    let shard: Shard = serde_json::from_slice(&bytes).map_err(|error| {
+        format!("插件明细不是合法 JSON：{error}（上架方的分片坏了，找他们重发）")
+    })?;
+    if shard.schema != INDEX_SCHEMA_SHARDED {
+        return Err(format!(
+            "插件明细的 schema 是 {}，本宿主只认 {INDEX_SCHEMA_SHARDED}：升级宿主",
+            shard.schema
+        ));
+    }
+    if shard.plugin.id != expected_id {
+        return Err(format!(
+            "插件明细的 id 是 {:?}，索引写的是 {expected_id:?}：上架方把分片配错了",
+            shard.plugin.id
+        ));
+    }
+    Ok(shard.plugin)
+}
+
+/// 明细分片地址：完整 https URL 原样用；绝对路径接索引的 origin；其余按索引目录拼。
+fn resolve_detail_url(index_url: &str, detail: &str) -> Result<String, String> {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return Err("索引条目没写明细地址（schema 2 的 detail）".to_owned());
+    }
+    if detail.to_ascii_lowercase().starts_with("https://") {
+        return Ok(detail.to_owned());
+    }
+    if detail.contains("://") || detail.starts_with("//") {
+        return Err(format!("明细地址只允许 https 或相对路径：{detail:?}"));
+    }
+    if detail.split('/').any(|part| part == "..") {
+        return Err(format!("明细地址不许带 `..`：{detail:?}"));
+    }
+    if !is_https(index_url) {
+        return Err(format!("索引地址不是 https：{index_url:?}"));
+    }
+    let base = index_url.trim();
+    let origin_end = base.find("://").map_or(0, |position| position + 3);
+    if detail.starts_with('/') {
+        let origin_end = base[origin_end..]
+            .find('/')
+            .map_or(base.len(), |offset| origin_end + offset);
+        return Ok(format!("{}{}", &base[..origin_end], detail));
+    }
+    let directory_end = base.rfind('/').filter(|position| *position >= origin_end);
+    match directory_end {
+        Some(end) => Ok(format!("{}/{}", &base[..end], detail)),
+        None => Ok(format!("{base}/{detail}")),
+    }
+}
+
+/// 读一个受限大小的文本响应（索引 / 明细分片共用）。
+fn fetch_bytes(url: &str, limit: u64, label: &str) -> Result<Vec<u8>, String> {
+    if !is_https(url) {
+        return Err(format!("{label}地址 {url:?} 不是 https：拒绝明文拉取"));
+    }
+    let mut response = http_agent()
+        .get(url)
+        .call()
+        .map_err(|error| http_error(label, url, error))?;
+    response
+        .body_mut()
+        .with_config()
+        .limit(limit)
+        .read_to_vec()
+        .map_err(|error| {
+            format!(
+                "读{label}失败：{error}（上限 {}，内容太大或连接断了）",
+                human_bytes(limit)
+            )
+        })
+}
+
+// ── 本地缓存（索引 + ETag）────────────────────────────────────────
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CacheMeta {
+    url: String,
+    #[serde(default)]
+    etag: Option<String>,
+}
+
+fn cache_paths(cache_dir: &Path) -> (PathBuf, PathBuf) {
+    (
+        cache_dir.join("index.json"),
+        cache_dir.join("index.meta.json"),
+    )
+}
+
+/// 读缓存里的索引；没有 / 坏了 / 属于别的商城就当没有（缓存永远不是权威）。
+fn read_cached_index(cache_dir: &Path, url: &str) -> Option<Index> {
+    let (body, meta) = cache_paths(cache_dir);
+    let meta: CacheMeta = serde_json::from_slice(&std::fs::read(meta).ok()?).ok()?;
+    if meta.url != url {
+        return None;
+    }
+    let bytes = std::fs::read(body).ok()?;
+    parse_index(&bytes).ok()
+}
+
+/// 读缓存里的 ETag；URL 对不上（换过商城）就不复用，免得拿别家的校验值。
+fn read_cache_etag(cache_dir: &Path, url: &str) -> Option<String> {
+    let (body, meta) = cache_paths(cache_dir);
+    if !body.is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(meta).ok()?;
+    let meta: CacheMeta = serde_json::from_slice(&bytes).ok()?;
+    if meta.url != url {
+        return None;
+    }
+    meta.etag.filter(|etag| !etag.trim().is_empty())
+}
+
+/// 清掉本地索引缓存（缓存坏了、或用户换了商城时用）。
+fn clear_cache(cache_dir: &Path) {
+    let (body, meta) = cache_paths(cache_dir);
+    let _ = std::fs::remove_file(body);
+    let _ = std::fs::remove_file(meta);
+}
+
+/// 原始字节落盘（写 `.tmp` 再 rename，别让半截文件被下次启动当成索引）。
+fn write_cache(cache_dir: &Path, url: &str, body: &[u8], etag: Option<&str>) {
+    if std::fs::create_dir_all(cache_dir).is_err() {
+        return;
+    }
+    let (body_path, meta_path) = cache_paths(cache_dir);
+    let tmp = cache_dir.join("index.json.tmp");
+    if std::fs::write(&tmp, body).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if std::fs::rename(&tmp, &body_path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    let meta = CacheMeta {
+        url: url.to_owned(),
+        etag: etag.map(str::to_owned),
+    };
+    if let Ok(text) = serde_json::to_vec(&meta) {
+        let tmp = cache_dir.join("index.meta.json.tmp");
+        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &meta_path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
 }
 
 /// 下载插件包（≤ `limit`），边下边报进度。
@@ -1130,16 +1686,24 @@ impl Store {
 
     fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Index(Ok(index)) => {
+            Event::Index(Ok(Some(index))) => {
                 self.loading_index = false;
                 self.index_error = None;
-                let count = index.plugins.len();
-                self.index = Some(index);
-                self.refresh_filtered();
-                self.scan_dirty = true;
-                self.set_status(Status::Done(format!(
-                    "索引已更新：{count} 个插件（/ 搜索，Enter 安装，x 卸载）"
-                )));
+                self.apply_index(index, true);
+            }
+            Event::Index(Ok(None)) => {
+                // 304：缓存还是最新的，列表不动。
+                self.loading_index = false;
+                self.index_error = None;
+                if self.index.is_some() {
+                    self.set_status(Status::Done(
+                        "索引已是最新（304，用的是本地缓存）".to_owned(),
+                    ));
+                } else {
+                    // 缓存读不出来但服务器仍然回 304：清掉缓存，强制无 ETag 重拉一次。
+                    clear_cache(&self.cache_dir);
+                    self.load_index();
+                }
             }
             Event::Index(Err(error)) => {
                 self.loading_index = false;
@@ -1147,6 +1711,21 @@ impl Store {
                 self.index_error = Some(error);
                 self.status = Status::Idle;
                 self.error_scroll = 0;
+            }
+            Event::Detail { id, result } => {
+                self.detail_loading = None;
+                match result {
+                    Ok(plugin) => {
+                        self.detail_errors.remove(&id);
+                        self.details.insert(id, plugin);
+                        // 分片可能推翻轻索引摘要（老索引没有 platform_min_abi）：
+                        // 重算列表，别把「其实装不了」的条目留在可见列表里。
+                        self.refresh_filtered();
+                    }
+                    Err(error) => {
+                        self.detail_errors.insert(id, error);
+                    }
+                }
             }
             Event::Progress(text) => self.set_status(Status::Working(text)),
             Event::Installed(Ok(outcome)) => {
@@ -1214,19 +1793,116 @@ impl Store {
         index.plugins.get(position)
     }
 
+    /// 列表条目可能是 schema 2 的轻条目（`versions` 为空、`detail` 指向分片）：
+    /// 已拉下来的分片优先，否则退回轻条目本身。
+    fn full_plugin(&self, plugin: &IndexPlugin) -> IndexPlugin {
+        if !plugin.versions.is_empty() || plugin.detail.trim().is_empty() {
+            return plugin.clone();
+        }
+        self.details
+            .get(&plugin.id)
+            .cloned()
+            .unwrap_or_else(|| plugin.clone())
+    }
+
+    fn selected_full_plugin(&self) -> Option<IndexPlugin> {
+        self.selected_plugin()
+            .map(|plugin| self.full_plugin(plugin))
+    }
+
+    /// 本机能不能跑这个插件：分片已拉下来就按真实版本表判断，否则用轻索引摘要。
+    fn usable_here(&self, plugin: &IndexPlugin) -> bool {
+        match self.details.get(&plugin.id) {
+            Some(full) => plugin_usable_here(full, ABI_VERSION),
+            None => plugin_usable_here(plugin, ABI_VERSION),
+        }
+    }
+
+    /// 选中的条目要版本数据但分片还没下来：起一个后台任务去拉。
+    /// 每帧调；重复调用由 `detail_loading` / `details` / `detail_errors` 挡掉。
+    fn ensure_selected_detail(&mut self) {
+        let Some(plugin) = self.selected_plugin() else {
+            return;
+        };
+        let id = plugin.id.clone();
+        let detail = plugin.detail.trim().to_owned();
+        if !plugin.versions.is_empty() || detail.is_empty() {
+            return;
+        }
+        if self.details.contains_key(&id)
+            || self.detail_errors.contains_key(&id)
+            || self.detail_loading.as_deref() == Some(id.as_str())
+        {
+            return;
+        }
+        let Some(index_url) = self.registry_url.clone() else {
+            return;
+        };
+        let url = match resolve_detail_url(&index_url, &detail) {
+            Ok(url) => url,
+            Err(error) => {
+                self.detail_errors.insert(id, error);
+                return;
+            }
+        };
+        self.detail_loading = Some(id.clone());
+        let tx = self.tx.clone();
+        let spawned = thread::Builder::new()
+            .name("fuyubot-store-detail".to_owned())
+            .spawn(move || {
+                let result = fetch_detail(&url, &id);
+                let _ = tx.send(Event::Detail { id, result });
+            });
+        if let Err(error) = spawned {
+            self.detail_loading = None;
+            self.fail(format!("起不了明细线程：{error}（重启面板再试）"));
+        }
+    }
+
+    /// 最终要装的版本：用户 `v` 选过的优先，否则按 ABI / 平台 / yanked 自动选。
+    fn target_version<'a>(
+        &self,
+        plugin: &'a IndexPlugin,
+        host_abi: u32,
+    ) -> Result<&'a IndexVersion, String> {
+        if let Some(chosen) = self.chosen_versions.get(&plugin.id) {
+            if let Some(version) = plugin
+                .versions
+                .iter()
+                .find(|version| &version.version == chosen)
+            {
+                if let Some(reason) = version_blocker(version, host_abi) {
+                    return Err(format!(
+                        "{} {} 装不了：{reason}（按 v 换一个版本）",
+                        plugin.name, version.version
+                    ));
+                }
+                return Ok(version);
+            }
+            // 选过的版本在新索引里没了：静默回退到自动选择，别卡住。
+        }
+        select_version(plugin, host_abi)
+    }
+
     /// 重算过滤结果（索引变了 / 过滤词变了才需要调）。
     fn refresh_filtered(&mut self) {
         let query = self.query.trim().to_ascii_lowercase();
-        self.filtered = match &self.index {
-            Some(index) => index
-                .plugins
-                .iter()
-                .enumerate()
-                .filter(|(_, plugin)| plugin_matches(plugin, &query))
-                .map(|(position, _)| position)
-                .collect(),
-            None => Vec::new(),
-        };
+        let mut filtered = Vec::new();
+        let mut hidden_incompatible = 0usize;
+        if let Some(index) = &self.index {
+            for (position, plugin) in index.plugins.iter().enumerate() {
+                // 只列本机能跑的：ABI 超了 / 没有本平台包 / 全下架的都不出现在列表里。
+                if !self.usable_here(plugin) {
+                    hidden_incompatible += 1;
+                    continue;
+                }
+                if plugin_matches(plugin, &query) {
+                    filtered.push(position);
+                }
+            }
+        }
+        self.filtered = filtered;
+        self.hidden_incompatible = hidden_incompatible;
         if self.selected >= self.filtered.len() {
             self.selected = self.filtered.len().saturating_sub(1);
         }
@@ -1301,6 +1977,8 @@ impl Store {
             "商店未配置：在 fuyubot.toml 的 [plugins] 里写 registry_url（或设 FUYUBOT_REGISTRY_URL），再按 r"
         } else if self.index.is_none() {
             "索引还没加载成功：按 r 重试（错误原文在下面）"
+        } else if self.query.trim().is_empty() && self.hidden_incompatible > 0 {
+            "当前系统（ABI / 平台）没有能装的插件：不兼容的条目已隐藏，升级 fuyubot 或换平台后再来"
         } else if self.query.trim().is_empty() {
             "索引里一个插件都没有——按 r 重新拉一次"
         } else {
@@ -1361,6 +2039,33 @@ fn plugin_matches(plugin: &IndexPlugin, query: &str) -> bool {
     contains(&plugin.id) || contains(&plugin.name) || contains(&plugin.summary)
 }
 
+/// 本机（当前 ABI + 当前平台）有没有可安装的版本。
+///
+/// - 自带版本表（schema 1 / 已拉下来的分片）：逐版本精确判断；
+/// - 轻条目：用索引里的 `platform_min_abi` 摘要（平台 → 可用版本的 ABI 下界）；
+/// - 两者都没有（老索引）：不知道就别藏，宁可多显示一个。
+fn plugin_usable_here(plugin: &IndexPlugin, host_abi: u32) -> bool {
+    if !plugin.versions.is_empty() {
+        return plugin
+            .versions
+            .iter()
+            .any(|version| version_blocker(version, host_abi).is_none());
+    }
+    if plugin.platform_min_abi.is_empty() {
+        return true;
+    }
+    let platform = current_platform();
+    let Some(min_abi) = plugin
+        .platform_min_abi
+        .get(platform)
+        .or_else(|| plugin.platform_min_abi.get("any"))
+    else {
+        return false;
+    };
+    // 0 = 该版本没写 abi：交给 plugin_init 判定，商店不拦。
+    *min_abi == 0 || *min_abi <= host_abi
+}
+
 // ── 绘制 ───────────────────────────────────────────────────────────
 
 impl Store {
@@ -1368,6 +2073,11 @@ impl Store {
         let title = match (&self.search, self.query.is_empty()) {
             (Some(draft), _) => format!(" 搜索 /{draft}▏ "),
             (None, false) => format!(" 过滤 \"{}\" · {} ", self.query, self.filtered.len()),
+            (None, true) if self.hidden_incompatible > 0 => format!(
+                " 索引 · {}（隐藏 {} 个不兼容） ",
+                self.filtered.len(),
+                self.hidden_incompatible
+            ),
             (None, true) => format!(" 索引 · {} ", self.filtered.len()),
         };
         let block = Block::bordered()
@@ -1411,22 +2121,48 @@ impl Store {
     }
 
     fn list_item(&self, plugin: &IndexPlugin) -> ListItem<'static> {
-        let version = plugin
+        let latest = plugin
             .latest
             .as_deref()
             .map(str::trim)
             .filter(|version| !version.is_empty())
             .unwrap_or("—");
-        let mut spans = vec![
-            Span::styled(
-                plugin.name.clone(),
-                Style::new().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("  {version}"), Style::new().fg(Color::DarkGray)),
-        ];
-        if self.installed(&plugin.id).is_some() {
+        // schema 1 的条目自带版本表；schema 2 要等分片下来才谈得上「本宿主装哪个」。
+        let full = if plugin.versions.is_empty() {
+            self.details.get(&plugin.id)
+        } else {
+            Some(plugin)
+        };
+        let target = full.and_then(|full| self.target_version(full, ABI_VERSION).ok());
+        let mut spans = vec![Span::styled(
+            plugin.name.clone(),
+            Style::new().add_modifier(Modifier::BOLD),
+        )];
+        match target {
+            // 最新版 ABI 太新、已回退到旧版本：列表里直接标出来，别让人以为装的是 latest。
+            Some(version) if version.version != latest => {
+                spans.push(Span::styled(
+                    format!("  {}", version.version),
+                    Style::new().fg(Color::Yellow),
+                ));
+                spans.push(Span::styled(
+                    format!("  兼容版（最新 {latest}）"),
+                    Style::new().fg(Color::DarkGray),
+                ));
+            }
+            _ => spans.push(Span::styled(
+                format!("  {latest}"),
+                Style::new().fg(Color::DarkGray),
+            )),
+        }
+        if let Some(installed) = self.installed(&plugin.id) {
+            let label = if target.is_some_and(|target| target.version != installed.version) {
+                "  [可换版本]"
+            } else {
+                "  [已安装]"
+            };
             spans.push(Span::styled(
-                "  [已安装]",
+                label,
                 Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
             ));
         }
@@ -1447,7 +2183,7 @@ impl Store {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let Some(plugin) = self.selected_plugin().cloned() else {
+        let Some(light) = self.selected_plugin().cloned() else {
             frame.render_widget(
                 Paragraph::new("（左列表里选一个插件看详情）")
                     .style(Style::new().fg(Color::DarkGray)),
@@ -1455,6 +2191,7 @@ impl Store {
             );
             return;
         };
+        let plugin = self.full_plugin(&light);
         let lines = self.detail_lines(&plugin);
         // `Paragraph::line_count` 在 ratatui 里是 unstable API（下游拿不到），自己数折行。
         let rows = wrapped_rows(&lines, inner.width);
@@ -1464,6 +2201,79 @@ impl Store {
             .wrap(Wrap { trim: false })
             .scroll((self.detail_scroll, 0));
         frame.render_widget(paragraph, inner);
+    }
+
+    /// 版本选择器：盖在列表 / 详情上，状态行留在外面显示「这个版本装不了」的原因。
+    fn render_version_picker(&self, frame: &mut Frame, area: Rect) {
+        let Some(picker) = self.version_picker.as_ref() else {
+            return;
+        };
+        let Some(plugin) = self.selected_full_plugin() else {
+            return;
+        };
+        if plugin.versions.is_empty() {
+            return;
+        }
+        let installed = self.installed(&plugin.id).map(|item| item.version.clone());
+        let chosen = self.chosen_versions.get(&plugin.id).cloned();
+        let items: Vec<ListItem> = plugin
+            .versions
+            .iter()
+            .map(|version| {
+                let mut spans = vec![Span::styled(
+                    version.version.clone(),
+                    Style::new().add_modifier(Modifier::BOLD),
+                )];
+                if installed.as_deref() == Some(version.version.as_str()) {
+                    spans.push(Span::styled("  [已安装]", Style::new().fg(Color::Green)));
+                }
+                if chosen.as_deref() == Some(version.version.as_str()) {
+                    spans.push(Span::styled("  ●", Style::new().fg(Color::Cyan)));
+                }
+                match version_blocker(version, ABI_VERSION) {
+                    Some(reason) => spans.push(Span::styled(
+                        format!("  {reason}"),
+                        Style::new().fg(Color::Red),
+                    )),
+                    None => {
+                        if let Some(abi) = version.abi {
+                            spans.push(Span::styled(
+                                format!("  ABI {abi}"),
+                                Style::new().fg(Color::DarkGray),
+                            ));
+                        }
+                    }
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let width = area
+            .width
+            .saturating_sub(4)
+            .clamp(20, 72)
+            .min(area.width.max(1));
+        let height = (plugin.versions.len() as u16 + 2)
+            .min(14)
+            .min(area.height.max(3));
+        let popup = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, popup);
+        let block = Block::bordered()
+            .title(Line::from(Span::styled(
+                " 选择版本 · Enter 确定 · Esc 取消 ",
+                Style::new().fg(Color::Cyan),
+            )))
+            .border_style(Style::new().fg(Color::Cyan));
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▸ ");
+        let mut state = ListState::default().with_selected(Some(picker.cursor));
+        frame.render_stateful_widget(list, popup, &mut state);
     }
 
     fn detail_lines(&self, plugin: &IndexPlugin) -> Vec<Line<'static>> {
@@ -1479,7 +2289,7 @@ impl Store {
             Line::from(""),
         ];
 
-        let version = select_version(plugin).ok();
+        let target = self.target_version(plugin, ABI_VERSION).ok();
         let latest = plugin
             .latest
             .as_deref()
@@ -1493,62 +2303,98 @@ impl Store {
                 format!("{}（{}）", installed.version, installed.kind.as_str()),
             ));
         }
-        if let Some(version) = version {
-            let abi = match version.abi {
-                Some(abi) if abi > ABI_VERSION => kv_styled(
-                    "ABI",
-                    format!("{abi}（需要更新的宿主：本宿主 {ABI_VERSION}）"),
-                    Color::Red,
-                ),
-                Some(abi) => kv("ABI", format!("{abi}（宿主 {ABI_VERSION}）")),
-                None => kv("ABI", "—（清单没写，装完以 plugin_init 为准）".to_owned()),
-            };
-            lines.push(abi);
-            if !version.api.is_empty() {
-                lines.push(kv("宿主 API", version.api.clone()));
-            }
-            match select_asset(version) {
-                Some((platform, asset)) => {
-                    let size = match asset.size {
-                        Some(size) if size > PLUGIN_MAX_BYTES => format!(
-                            "{}，超过 {} 上限：装不了",
-                            human_bytes(size),
-                            human_bytes(PLUGIN_MAX_BYTES)
-                        ),
-                        Some(size) => human_bytes(size),
-                        None => "大小未知".to_owned(),
-                    };
-                    lines.push(kv("平台", format!("{platform} · {size}")));
-                }
-                None => lines.push(kv_styled(
-                    "平台",
-                    format!("没有 {} 的包，也没有 any 回退", current_platform()),
-                    Color::Red,
-                )),
-            }
-            lines.push(kv(
-                "依赖",
-                if version.depends.is_empty() {
-                    "无".to_owned()
-                } else {
-                    version.depends.join(", ")
-                },
-            ));
-        }
         if !plugin.versions.is_empty() {
+            if let Some(target) = target {
+                lines.push(kv(
+                    "将安装",
+                    format!("{}（本宿主 ABI {ABI_VERSION}）", target.version),
+                ));
+                let abi = match target.abi {
+                    Some(abi) if abi > ABI_VERSION => kv_styled(
+                        "ABI",
+                        format!("{abi}（需要更新的宿主：本宿主 {ABI_VERSION}）"),
+                        Color::Red,
+                    ),
+                    Some(abi) => kv("ABI", format!("{abi}（宿主 {ABI_VERSION}）")),
+                    None => kv("ABI", "—（清单没写，装完以 plugin_init 为准）".to_owned()),
+                };
+                lines.push(abi);
+                if !target.api.is_empty() {
+                    lines.push(kv("宿主 API", target.api.clone()));
+                }
+                match select_asset(target) {
+                    Some((platform, asset)) => {
+                        let size = match asset.size {
+                            Some(size) if size > PLUGIN_MAX_BYTES => format!(
+                                "{}，超过 {} 上限：装不了",
+                                human_bytes(size),
+                                human_bytes(PLUGIN_MAX_BYTES)
+                            ),
+                            Some(size) => human_bytes(size),
+                            None => "大小未知".to_owned(),
+                        };
+                        lines.push(kv("平台", format!("{platform} · {size}")));
+                    }
+                    None => lines.push(kv_styled(
+                        "平台",
+                        format!("没有 {} 的包，也没有 any 回退", current_platform()),
+                        Color::Red,
+                    )),
+                }
+                lines.push(kv(
+                    "依赖",
+                    if target.depends.is_empty() {
+                        "无".to_owned()
+                    } else {
+                        target.depends.join(", ")
+                    },
+                ));
+            } else if let Err(error) = self.target_version(plugin, ABI_VERSION) {
+                lines.push(kv_styled("版本", error, Color::Red));
+            }
+        }
+
+        if plugin.versions.is_empty() && !plugin.detail.trim().is_empty() {
+            // schema 2：版本表在分片里，还没下来 / 拉失败。
+            let hint = match self.detail_errors.get(&plugin.id) {
+                Some(error) => format!("读取失败：{error}（r 重试）"),
+                None => "正在读取版本信息…".to_owned(),
+            };
+            lines.push(kv_styled("版本", hint, Color::Yellow));
+        } else if !plugin.versions.is_empty() {
+            let chosen = self.chosen_versions.get(&plugin.id);
             let versions = plugin
                 .versions
                 .iter()
                 .map(|version| {
+                    let mut suffix = String::new();
                     if version.yanked {
-                        format!("{}（已下架）", version.version)
+                        suffix.push_str("（已下架）");
+                    } else if let Some(reason) = version_blocker(version, ABI_VERSION) {
+                        suffix.push_str(&format!("（{reason}）"));
+                    }
+                    if chosen.is_some_and(|chosen| chosen == &version.version) {
+                        format!("● {}{suffix}", version.version)
                     } else {
-                        version.version.clone()
+                        format!("{}{suffix}", version.version)
                     }
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
             lines.push(kv("版本", versions));
+            if let (Some(installed), Some(target)) = (self.installed(&plugin.id), target) {
+                if installed.version != target.version {
+                    lines.push(kv(
+                        "操作",
+                        format!(
+                            "Enter 从 {} 换成 {}；v 选版本；b 回滚",
+                            installed.version, target.version
+                        ),
+                    ));
+                } else if backup_path(&self.plugin_dir, &installed.path).is_dir() {
+                    lines.push(kv("操作", "已是目标版本；b 可回滚到上一版本".to_owned()));
+                }
+            }
         }
         if !plugin.tags.is_empty() {
             lines.push(kv("标签", plugin.tags.join(", ")));
@@ -1854,7 +2700,7 @@ mod tests {
     #[test]
     fn index_json_parses_with_defaults() {
         let index = parse_index(INDEX_JSON.as_bytes()).expect("示例索引该解析成功");
-        assert_eq!(index.schema, INDEX_SCHEMA);
+        assert_eq!(index.schema, INDEX_SCHEMA_LEGACY);
         assert_eq!(index.plugins.len(), 1);
         let plugin = &index.plugins[0];
         assert_eq!(plugin.id, "com.example.weather");
@@ -1875,10 +2721,92 @@ mod tests {
 
     #[test]
     fn an_unknown_index_schema_is_reported() {
-        let error = parse_index(br#"{"schema":2,"plugins":[]}"#).expect_err("schema=2 该被拒绝");
+        // schema 2（轻索引 + 分片）现在是合法输入。
+        let sharded = parse_index(br#"{"schema":2,"plugins":[]}"#).expect("schema 2 该被接受");
+        assert_eq!(sharded.schema, INDEX_SCHEMA_SHARDED);
+        let error = parse_index(br#"{"schema":3,"plugins":[]}"#).expect_err("schema=3 该被拒绝");
         assert!(error.contains("schema"), "{error}");
         let error = parse_index(b"{ not json").expect_err("坏 JSON 该被拒绝");
         assert!(error.contains("JSON"), "{error}");
+    }
+
+    #[test]
+    fn a_sharded_index_keeps_the_light_entry_until_the_detail_arrives() {
+        let index = parse_index(
+            r#"{"schema":2,"plugins":[{
+                "id":"com.example.weather","name":"Weather","summary":"天气",
+                "latest":"1.2.0","detail":"plugins/com.example.weather.json"
+            }]}"#
+                .as_bytes(),
+        )
+        .expect("schema 2 条目该解析成功");
+        let plugin = &index.plugins[0];
+        assert!(plugin.versions.is_empty());
+        assert_eq!(plugin.detail, "plugins/com.example.weather.json");
+        assert_eq!(plugin.latest.as_deref(), Some("1.2.0"));
+
+        let shard: Shard = serde_json::from_str(
+            r#"{"schema":2,"plugin":{
+                "id":"com.example.weather","name":"Weather","latest":"1.2.0",
+                "versions":[{"version":"1.2.0","abi":6,"assets":{
+                    "any":{"url":"https://example.com/w.zip","sha256":"aa","size":1}}}]}}"#,
+        )
+        .expect("分片该解析成功");
+        assert_eq!(shard.plugin.versions.len(), 1);
+        assert_eq!(shard.plugin.versions[0].abi, Some(6));
+    }
+
+    /// 本地缓存：写进去能读回来；换过 URL 时 ETag 不复用（免得拿别家的校验值）。
+    #[test]
+    fn the_index_cache_round_trips_and_ignores_a_different_url() {
+        let root = temp("cache");
+        let cache = root.join(CACHE_DIR);
+        let url = "https://example.com/index.json";
+        write_cache(&cache, url, INDEX_JSON.as_bytes(), Some("\"v1\""));
+
+        let index = read_cached_index(&cache, url).expect("缓存该能读回来");
+        assert_eq!(index.plugins.len(), 1);
+        assert!(
+            read_cached_index(&cache, "https://other.example/index.json").is_none(),
+            "换过商城就不能用别家的缓存"
+        );
+        assert_eq!(
+            read_cache_etag(&cache, url).as_deref(),
+            Some("\"v1\""),
+            "同一个 URL 该带 ETag 去校验"
+        );
+        assert!(
+            read_cache_etag(&cache, "https://other.example/index.json").is_none(),
+            "换过商城就不能复用旧 ETag"
+        );
+        // 没有 body 时也不该把 ETag 交出去（否则 304 会拿到空列表）。
+        std::fs::remove_file(cache.join("index.json")).unwrap();
+        assert!(read_cache_etag(&cache, url).is_none());
+        assert!(read_cached_index(&cache, url).is_none());
+    }
+
+    #[test]
+    fn detail_urls_resolve_against_the_index_location() {
+        assert_eq!(
+            resolve_detail_url("https://host.example/store/index.json", "plugins/x.json").unwrap(),
+            "https://host.example/store/plugins/x.json"
+        );
+        assert_eq!(
+            resolve_detail_url("https://host.example/index.json", "/plugins/x.json").unwrap(),
+            "https://host.example/plugins/x.json"
+        );
+        assert_eq!(
+            resolve_detail_url(
+                "https://host.example/store/index.json",
+                "https://cdn.example/x.json"
+            )
+            .unwrap(),
+            "https://cdn.example/x.json"
+        );
+        // 明文 / 跳出目录 / 空地址都拒绝。
+        assert!(resolve_detail_url("https://host/index.json", "http://evil/x.json").is_err());
+        assert!(resolve_detail_url("https://host/index.json", "../x.json").is_err());
+        assert!(resolve_detail_url("https://host/index.json", "  ").is_err());
     }
 
     #[test]
@@ -1921,25 +2849,154 @@ mod tests {
     fn select_version_skips_yanked_versions() {
         let index = parse_index(INDEX_JSON.as_bytes()).unwrap();
         let plugin = &index.plugins[0];
-        let version = select_version(plugin).expect("1.2.0 没下架，该选它");
+        let version = select_version(plugin, ABI_VERSION).expect("1.2.0 没下架，该选它");
         assert_eq!(version.version, "1.2.0");
 
         // latest 指向一个 yanked 版本：跳过它，按顺序往回找可用的。
         let mut plugin = plugin.clone();
         plugin.latest = Some("1.0.0".to_owned());
-        let version = select_version(&plugin).expect("该跳过 yanked 找到 1.2.0");
+        let version = select_version(&plugin, ABI_VERSION).expect("该跳过 yanked 找到 1.2.0");
         assert_eq!(version.version, "1.2.0");
 
         // latest 缺省也一样往回找。
         plugin.latest = None;
-        assert_eq!(select_version(&plugin).unwrap().version, "1.2.0");
+        assert_eq!(
+            select_version(&plugin, ABI_VERSION).unwrap().version,
+            "1.2.0"
+        );
 
         // 全被 yanked：明确报错，不装。
         for version in &mut plugin.versions {
             version.yanked = true;
         }
-        let error = select_version(&plugin).expect_err("全 yanked 该报错");
+        let error = select_version(&plugin, ABI_VERSION).expect_err("全 yanked 该报错");
         assert!(error.contains("yanked"), "{error}");
+    }
+
+    /// 低版本宿主 + 已升 ABI 的新插件：必须回退到还支持本宿主 ABI 的最新小版本，
+    /// 而不是选最新再在安装前拒绝。
+    #[test]
+    fn select_version_falls_back_to_the_newest_abi_compatible_version() {
+        let mut plugin = parse_index(INDEX_JSON.as_bytes()).unwrap().plugins[0].clone();
+        let mut newest = plugin.versions[1].clone();
+        newest.version = "1.4.0".to_owned();
+        newest.abi = Some(ABI_VERSION + 1);
+        plugin.versions.push(newest.clone());
+        plugin.latest = Some("1.4.0".to_owned());
+
+        // 索引顺序是版本号升序（契约），所以 1.2.0 是「最新的兼容版本」。
+        let version = select_version(&plugin, ABI_VERSION).expect("该回退到 1.2.0");
+        assert_eq!(version.version, "1.2.0");
+
+        // 只有更新的 ABI 才装得了：报错要能让人知道该升级宿主。
+        let mut only_new = plugin.clone();
+        only_new
+            .versions
+            .retain(|version| version.abi > Some(ABI_VERSION));
+        let error = select_version(&only_new, ABI_VERSION).expect_err("全要求新 ABI 该报错");
+        assert!(error.contains("ABI"), "{error}");
+        assert!(error.contains(&(ABI_VERSION + 1).to_string()), "{error}");
+    }
+
+    #[test]
+    fn plugin_usable_here_checks_abi_and_platform() {
+        let index = parse_index(INDEX_JSON.as_bytes()).unwrap();
+        let mut plugin = index.plugins[0].clone(); // abi 5，windows + any
+        assert!(plugin_usable_here(&plugin, ABI_VERSION));
+        assert!(
+            !plugin_usable_here(&plugin, 4),
+            "宿主 ABI 4 装不了需要 ABI 5 的版本"
+        );
+
+        // 只剩一个别的平台的包：本机没有可用版本。
+        plugin.versions[1].assets.clear();
+        plugin.versions[1]
+            .assets
+            .insert("plan9-mips".to_owned(), Asset::default());
+        assert!(!plugin_usable_here(&plugin, ABI_VERSION));
+    }
+
+    #[test]
+    fn plugin_usable_here_uses_the_light_index_summary() {
+        let mut plugin = IndexPlugin::default();
+        assert!(plugin_usable_here(&plugin, 1), "没有摘要就不藏");
+
+        plugin.platform_min_abi.insert("any".to_owned(), 5);
+        assert!(plugin_usable_here(&plugin, 5));
+        assert!(!plugin_usable_here(&plugin, 4));
+
+        // 摘要里只有别的平台：本机装不了。
+        plugin.platform_min_abi.clear();
+        plugin.platform_min_abi.insert("plan9-mips".to_owned(), 1);
+        assert!(!plugin_usable_here(&plugin, 99));
+
+        // 0 = 版本没写 ABI：不拦，交给 plugin_init。
+        plugin
+            .platform_min_abi
+            .insert(current_platform().to_owned(), 0);
+        assert!(plugin_usable_here(&plugin, 1));
+    }
+
+    #[test]
+    fn the_list_only_shows_plugins_this_host_can_run() {
+        let mut store = Store::new(
+            temp("filter-host").join("plugins"),
+            Some("https://example.com/index.json".to_owned()),
+        );
+        let mut index = parse_index(INDEX_JSON.as_bytes()).unwrap();
+        let mut too_new = index.plugins[0].clone();
+        too_new.id = "com.example.too_new".to_owned();
+        too_new.name = "TooNew".to_owned();
+        too_new.latest = Some("2.0.0".to_owned());
+        too_new.versions.clear(); // 轻条目（schema 2）
+        too_new.detail = "plugins/com.example.too_new.json".to_owned();
+        too_new
+            .platform_min_abi
+            .insert("any".to_owned(), ABI_VERSION + 1);
+        index.plugins.push(too_new);
+
+        store.index = Some(index);
+        store.refresh_filtered();
+        assert_eq!(store.filtered.len(), 1, "只该留下本机能跑的那个");
+        assert_eq!(store.hidden_incompatible, 1);
+        assert_eq!(store.title(), "插件商店 (1)");
+
+        // 分片到了、确认装不了：列表自己纠正，不留下错误条目。
+        edge_store_with_bad_detail(&mut store);
+        assert_eq!(store.filtered.len(), 0);
+        assert_eq!(store.hidden_incompatible, 2);
+    }
+
+    /// 给上面那个测试塞一份「真实版本表里全是高 ABI」的分片，模拟详情晚到。
+    fn edge_store_with_bad_detail(store: &mut Store) {
+        let mut detail = IndexPlugin::default();
+        detail.id = "com.example.weather".to_owned();
+        detail.name = "Weather".to_owned();
+        detail.versions.push(IndexVersion {
+            version: "9.9.9".to_owned(),
+            abi: Some(ABI_VERSION + 1),
+            assets: BTreeMap::new(),
+            ..IndexVersion::default()
+        });
+        store.details.insert(detail.id.clone(), detail);
+        store.refresh_filtered();
+    }
+
+    #[test]
+    fn select_version_skips_versions_without_a_package_for_this_platform() {
+        let mut plugin = parse_index(INDEX_JSON.as_bytes()).unwrap().plugins[0].clone();
+        // 最新版只有别的平台的包；旧版本有 `any`，应该回退。
+        plugin.versions[1].assets.clear();
+        plugin.versions[1]
+            .assets
+            .insert("plan9-mips".to_owned(), Asset::default());
+        plugin.versions[0].yanked = false;
+        plugin.versions[0].assets.clear();
+        plugin.versions[0]
+            .assets
+            .insert("any".to_owned(), Asset::default());
+        let version = select_version(&plugin, ABI_VERSION).expect("该回退到有 any 的版本");
+        assert_eq!(version.version, "1.0.0");
     }
 
     #[test]
@@ -2056,23 +3113,50 @@ mod tests {
     }
 
     #[test]
-    fn install_from_bytes_refuses_an_existing_target() {
-        let root = temp("install-exists");
+    fn install_from_bytes_replaces_an_existing_target_and_keeps_a_backup() {
+        let root = temp("install-replace");
         let plugins = root.join("plugins");
-        let bytes = plugin_zip("com.example.demo", "1.0.0", "native", "bin/x.dll", b"one");
-        install_from_bytes(&bytes, "com.example.demo", "1.0.0", &plugins).expect("第一次该成功");
+        let first = plugin_zip("com.example.demo", "1.0.0", "native", "bin/x.dll", b"one");
+        install_from_bytes(&first, "com.example.demo", "1.0.0", &plugins).expect("第一次该成功");
 
-        let error = install_from_bytes(&bytes, "com.example.demo", "1.0.0", &plugins)
-            .expect_err("已存在的目标不许覆盖");
-        assert!(error.contains("先卸载"), "{error}");
+        let second = plugin_zip("com.example.demo", "1.1.0", "native", "bin/x.dll", b"two");
+        let dest = install_from_bytes(&second, "com.example.demo", "1.1.0", &plugins)
+            .expect("换版本该成功（旧包进 .backup）");
+        assert_eq!(dest, plugins.join("com.example.demo"));
+        assert_eq!(
+            std::fs::read(dest.join("bin").join("x.dll")).unwrap(),
+            b"two"
+        );
+        let backup = plugins.join(BACKUP_DIR).join("com.example.demo");
+        assert!(backup.is_dir(), "旧版本该留在 {backup:?} 里");
+        assert_eq!(
+            std::fs::read(backup.join("bin").join("x.dll")).unwrap(),
+            b"one"
+        );
         assert!(
             !plugins.join(STAGING_DIR).join("com.example.demo").exists(),
-            "失败也要清掉 staging"
+            "成功也要清掉 staging"
         );
-        // 原内容没被覆盖。
+        // `.backup/` 点开头：已安装列表只该看见当前版本。
+        assert_eq!(scan_installed(&plugins).len(), 1);
+    }
+
+    #[test]
+    fn backup_path_mirrors_the_bundle_layout() {
+        let plugins = Path::new("plugins");
         assert_eq!(
-            std::fs::read(plugins.join("com.example.demo").join("bin").join("x.dll")).unwrap(),
-            b"one"
+            backup_path(plugins, &plugins.join("com.example.native")),
+            plugins.join(BACKUP_DIR).join("com.example.native")
+        );
+        assert_eq!(
+            backup_path(
+                plugins,
+                &plugins.join(SCRIPTS_DIR).join("com.example.script")
+            ),
+            plugins
+                .join(BACKUP_DIR)
+                .join(SCRIPTS_DIR)
+                .join("com.example.script")
         );
     }
 
@@ -2179,20 +3263,30 @@ mod tests {
     }
 
     #[test]
-    fn a_yanked_or_wrong_abi_install_fails_before_downloading() {
+    fn an_incompatible_picked_version_fails_before_downloading() {
         let mut store = Store::new(
             temp("precheck").join("plugins"),
             Some("https://example.com/index.json".to_owned()),
         );
         let mut index = parse_index(INDEX_JSON.as_bytes()).unwrap();
-        // 把唯一可用版本的 abi 调到宿主之上：应该直接报「需要更新的宿主」。
+        // 1.0.0 修复成可用（任意平台），1.2.0 抬到宿主之上：
+        // 条目本身还在列表里（有旧版本可装），但用户硬选 1.2.0 要当场拒绝。
+        index.plugins[0].versions[0].yanked = false;
+        index.plugins[0].versions[0]
+            .assets
+            .insert("any".to_owned(), Asset::default());
         index.plugins[0].versions[1].abi = Some(ABI_VERSION + 1);
         store.index = Some(index);
         store.refresh_filtered();
+        assert_eq!(store.filtered.len(), 1, "有兼容旧版本的条目仍该显示");
+
+        store
+            .chosen_versions
+            .insert("com.example.weather".to_owned(), "1.2.0".to_owned());
         store.start_install();
         match store.status {
-            Status::Error(text) => assert!(text.contains("ABI"), "{text}"),
-            other => panic!("该报 ABI 不兼容，实际 {other:?}"),
+            Status::Error(ref text) => assert!(text.contains("ABI"), "{text}"),
+            ref other => panic!("该报 ABI 不兼容，实际 {other:?}"),
         }
         assert!(!store.busy, "没起下载线程就不该 busy");
     }
@@ -2229,5 +3323,86 @@ mod tests {
         assert_eq!(found[0].kind, PluginKind::Native);
         assert_eq!(found[1].id, "com.example.script");
         assert_eq!(found[1].kind, PluginKind::Js);
+    }
+
+    /// 版本选择器：默认停在「将安装」的版本；装不了的版本可以看见但不能选定。
+    #[test]
+    fn version_picker_selects_an_older_compatible_version() {
+        let mut store = Store::new(
+            temp("picker").join("plugins"),
+            Some("https://example.com/index.json".to_owned()),
+        );
+        let mut index = parse_index(INDEX_JSON.as_bytes()).unwrap();
+        let mut newest = index.plugins[0].versions[1].clone();
+        newest.version = "1.4.0".to_owned();
+        newest.abi = Some(ABI_VERSION + 1);
+        index.plugins[0].versions.push(newest);
+        index.plugins[0].latest = Some("1.4.0".to_owned());
+        store.index = Some(index);
+        store.refresh_filtered();
+
+        store.handle_key(key(KeyCode::Char('v')));
+        assert!(store.version_picker.is_some(), "v 该打开版本选择器");
+        assert_eq!(
+            store.version_picker.as_ref().unwrap().cursor,
+            1,
+            "光标该落在自动选中的 1.2.0（ABI 兼容的最新版）"
+        );
+
+        // 移到需要新 ABI 的 1.4.0：Enter 不选定，选择器留着并给出原因。
+        store.handle_key(key(KeyCode::Down));
+        store.handle_key(key(KeyCode::Enter));
+        assert!(store.version_picker.is_some());
+        assert!(
+            matches!(store.status, Status::Error(_)),
+            "{:?}",
+            store.status
+        );
+        assert!(store.chosen_versions.is_empty());
+
+        // 回到 1.2.0 选定。
+        store.handle_key(key(KeyCode::Up));
+        store.handle_key(key(KeyCode::Enter));
+        assert!(store.version_picker.is_none());
+        assert_eq!(
+            store
+                .chosen_versions
+                .get("com.example.weather")
+                .map(String::as_str),
+            Some("1.2.0")
+        );
+    }
+
+    #[test]
+    fn rollback_swaps_the_backup_back() {
+        let root = temp("rollback");
+        let plugins = root.join("plugins");
+        let first = plugin_zip("com.example.demo", "1.0.0", "native", "bin/x.dll", b"one");
+        install_from_bytes(&first, "com.example.demo", "1.0.0", &plugins).unwrap();
+        let second = plugin_zip("com.example.demo", "1.1.0", "native", "bin/x.dll", b"two");
+        install_from_bytes(&second, "com.example.demo", "1.1.0", &plugins).unwrap();
+
+        let mut store = Store::new(
+            plugins.clone(),
+            Some("https://example.com/index.json".to_owned()),
+        );
+        let mut index = parse_index(INDEX_JSON.as_bytes()).unwrap();
+        index.plugins[0].id = "com.example.demo".to_owned();
+        store.index = Some(index);
+        store.refresh_filtered();
+        store.rescan();
+
+        store.rollback_selected();
+        assert!(
+            matches!(store.status, Status::Done(_)),
+            "回滚该成功：{:?}",
+            store.status
+        );
+        let manifest = BundleManifest::load(&plugins.join("com.example.demo")).unwrap();
+        assert_eq!(manifest.version, "1.0.0");
+        assert!(
+            !plugins.join(BACKUP_DIR).join("com.example.demo").exists(),
+            "备份被换回来之后不该还留着"
+        );
     }
 }

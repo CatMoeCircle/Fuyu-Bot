@@ -83,7 +83,10 @@ toml = "0.9.12"
 # 级别过滤由 `HostRuntime` 在源头做，这样才能被 `.fuyubot/log-level` 运行期改。
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "fmt", "registry", "smallvec", "std"] }
-ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+# `gzip`：商店索引 / 明细分片在 GitHub Pages 上是 gzip 的，客户端要能自己解
+# （ureq 会在开了这个 feature 时自动加 `Accept-Encoding: gzip` 并解压；`flate2` 本来
+# 就因 `zip` 在 CLI 依赖树里，不引入新 crate 到运行时）。
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "gzip"] }
 # TUI 插件商店的 zip 解包。**只给 CLI**：加载器与运行时永远不碰压缩包（P1 的边界）。
 # 只要 deflate（flate2 后端）：aes/bzip2/zstd/xz 这些作者包里用不到，别拖一串 C 依赖。
 zip = { version = "4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
