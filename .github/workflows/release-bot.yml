@@ -618,12 +618,18 @@ jobs:
           export FUYUBOT_ANDROID_KEYSTORE_PASSWORD="$ANDROID_KEYSTORE_PASSWORD"
           export FUYUBOT_ANDROID_KEY_ALIAS="$ANDROID_KEY_ALIAS"
           export FUYUBOT_ANDROID_KEY_PASSWORD="$ANDROID_KEY_PASSWORD"
+          # 插件 ABI 从内核源码的 `ABI_VERSION` 取：换 ABI 时 APK 里的
+          # `CURRENT_PLUGIN_ABI` 自动跟上，绝不手抄（上游 README「版本与发布」）。
+          plugin_abi="$(sed -n 's/^pub const ABI_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' crates/fuyubot-abi/src/lib.rs)"
+          [[ -n "$plugin_abi" ]] || { echo "error: 读不到 crates/fuyubot-abi/src/lib.rs 的 ABI_VERSION" >&2; exit 1; }
+          echo "==> plugin abi: $plugin_abi"
           .github/scripts/build-android-apk.sh \
             "jni/fuyubot-${FUYUBOT_APK_VERSION}-android-jni-${{ matrix.abi }}.zip" \
             android-app \
             "${{ matrix.abi }}" \
             "$FUYUBOT_APK_VERSION" \
-            dist
+            dist \
+            "$plugin_abi"
           ls -lh dist/
 
       - uses: actions/upload-artifact@v4

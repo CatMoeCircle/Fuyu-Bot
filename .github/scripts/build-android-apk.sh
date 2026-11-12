@@ -13,25 +13,29 @@
 # 但允许 `System.load()` 同目录的 .so。上游 KernelManager 因此把内核当**可替换的数据**：
 # 随 APK 打包、首次启动释放到 `filesDir/fuyubot-kernel/`、版本变了就重装。
 #
-# ⚠️ 两处**必须按版本改写**的上游常量（不改就会安静地错）：
+# ⚠️ 三处**必须按版本改写**的上游常量（不改就会安静地错）：
 #   1. `data/update/UpdateChannel.kt` 的 `CURRENT_KERNEL_VERSION`：KernelManager 拿它和
 #      已安装内核比版本，**相等就跳过重装**。内核升级了这行没跟上，用户装上新 APK 仍然
 #      跑着 filesDir 里那份旧内核——症状是「更新了但没变化」，极难查。
 #   2. `app/build.gradle.kts` 的 `versionCode` / `versionName`：不改的话每个 Release 都是
 #      `1.0` / `1`，应用内的更新检查永远看不出新版本。
-#   两处都用「正则命中才改、改完回读校验」的方式，命中不了就**直接报错**——
+#   3. `data/plugin/PluginPlatform.kt` 的 `CURRENT_PLUGIN_ABI`：壳按它挑插件版本。
+#      内核换了 ABI、这行没跟上时，商店会把装不了的版本当成可装（或反过来错过能装的），
+#      装上后内核直接加载失败——它必须与本仓的 `fuyubot_abi::ABI_VERSION` 一致。
+#   三处都用「正则命中才改、改完回读校验」的方式，命中不了就**直接报错**——
 #   宁可这条 APK 编不出来，也不要发一个看起来正常、其实内核没换的包。
 #
 # 签名：用 apksigner 显式签（不用 AGP 的 injected signing）。keystore 类型按文件魔数
 # 自动判定（PKCS12 的 DER 与 JKS 的 0xFEEDFEED 是两种容器，apksigner 拿错类型会报
 # 「Keystore was tampered with, or password was incorrect」，很有迷惑性）。
 #
-# Args: <jni-zip> <app-repo-dir> <abi> <version> <dist-dir>
+# Args: <jni-zip> <app-repo-dir> <abi> <version> <dist-dir> <plugin-abi>
 #   jni-zip        fuyubot-<版本>-android-jni-<abi>.zip（本仓 build-android 的产物）
 #   app-repo-dir   FuyuBot-for-Android 的 checkout（含 gradlew、app/）
 #   abi            arm64-v8a / x86_64（AGP 口径，也是 APK 文件名里的那段）
 #   version        版本号（tag 名，如 v0.1.3；分支上手动跑是 dev-<短 sha>）
 #   dist-dir       输出目录，最终落到 <dist>/fuyubot-<version>-<abi>.apk
+#   plugin-abi     内核的插件 ABI（本仓 `fuyubot_abi::ABI_VERSION`，如 6）
 #
 # 环境变量（签名，缺一不可）：
 #   FUYUBOT_ANDROID_KEYSTORE            keystore 文件路径
@@ -46,6 +50,11 @@ APP="${2:?fuyubot-for-android checkout}"
 ABI="${3:?abi: arm64-v8a | x86_64}"
 VERSION="${4:?version}"
 DIST="${5:?dist dir}"
+PLUGIN_ABI="${6:?plugin abi（内核的 HostApiVTable ABI，如 6）}"
+
+case "$PLUGIN_ABI" in
+  ''|*[!0-9]*) echo "error: plugin-abi 必须是正整数（收到 $PLUGIN_ABI）" >&2; exit 1 ;;
+esac
 
 case "$ABI" in
   arm64-v8a) ARCH=aarch64 ;;
@@ -121,14 +130,15 @@ if [[ -z "$PY" ]]; then
 fi
 [[ -n "$PY" ]] || { echo "error: 找不到可用的 python3（改写版本常量需要它）" >&2; exit 1; }
 
-echo "==> 改写版本常量（version=$VERSION）"
-"$PY" - "$APP" "$VERSION" <<'PY'
+echo "==> 改写版本常量（version=$VERSION，plugin-abi=$PLUGIN_ABI）"
+"$PY" - "$APP" "$VERSION" "$PLUGIN_ABI" <<'PY'
 import re
 import sys
 from pathlib import Path
 
 app = Path(sys.argv[1])
 version = sys.argv[2]
+plugin_abi = sys.argv[3]
 
 # versionName 给用户看；versionCode 是 Android 比大小的整数。
 # 只有 `v1.2.3` / `v1.2.3-rc.1` 这种**以数字开头**的才算语义版本：
@@ -201,7 +211,17 @@ patch(
     'versionName = "<字符串>"',
 )
 
-print(f"OK versionName={name} versionCode={code} kernel={name}")
+# 3) 插件 ABI：壳的商城按它挑版本。内核换了 ABI 而这里没跟上时，会装上一个内核加载
+#    不了的插件（或错过能装的旧版本）——所以跟着本次内核一起写，不是手抄。
+patch(
+    "app/src/main/java/com/CatMoeCircle/fuyutd/data/plugin/PluginPlatform.kt",
+    r"^const val CURRENT_PLUGIN_ABI = \d+$",
+    f"const val CURRENT_PLUGIN_ABI = {plugin_abi}",
+    f"CURRENT_PLUGIN_ABI = {plugin_abi}",
+    "const val CURRENT_PLUGIN_ABI",
+)
+
+print(f"OK versionName={name} versionCode={code} kernel={name} pluginAbi={plugin_abi}")
 PY
 
 # ── 4. 编译 ──────────────────────────────────────────────────────

@@ -234,8 +234,9 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
       `.gitignore` 排除，缺了也照样编得出 APK——只是装到设备上首次启动报「资产中缺少内核目录」。
       所以判据只能是「APK 里真有 `assets/fuyubot-kernel/lib*.so`」，不能只看 `assembleRelease` 绿了。
     - **版本要注入进去**：上游 `CURRENT_KERNEL_VERSION`（`KernelManager` 拿它决定要不要重装内核，
-      相等就跳过）与 `versionCode` / `versionName` 都得按本仓的 tag 改写。漏改的症状是
-      「APK 更新了但还在跑旧内核」，且**不会报错**。
+      相等就跳过）、`versionCode` / `versionName` 与 `CURRENT_PLUGIN_ABI`（壳按它挑插件版本，
+      取本仓 `fuyubot_abi::ABI_VERSION`）都得按本仓的 tag / ABI 改写。漏改的症状是
+      「APK 更新了但还在跑旧内核」/「装到内核加载不了的插件」，且**不会报错**。
     - **资产名是 `fuyubot-<版本>-<abi>.apk`**（例 `fuyubot-v0.1.3-arm64-v8a.apk`）。两个 ABI 的 `.so`
       文件名完全相同，**不能装进同一个 APK**，所以必须分开发、文件名里带 abi。
       不加 `-android-` 段不撞名：可执行文件那批是 `fuyubot-<版本>-android-<平台>.zip`，
