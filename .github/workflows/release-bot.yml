@@ -470,7 +470,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          if [[ "$GIT_REF" == refs/tags/* ]]; then
+          # 版本口径必须与可执行文件包 / APK job 一致：显式指定 > tag 名 > 分支短 sha。
+          # 漏了 override 会让 dispatch 重发时 JNI 包叫 dev-<sha>，而 APK job 找的是 <tag>，
+          # 两边对不上直接失败（2026-11 重发 v0.1.5 踩过）。
+          if [[ -n "${FUYUBOT_VERSION_OVERRIDE:-}" ]]; then
+            version="$FUYUBOT_VERSION_OVERRIDE"
+          elif [[ "$GIT_REF" == refs/tags/* ]]; then
             version="$GIT_REF_NAME"
           else
             version="dev-${GIT_SHA:0:7}"
