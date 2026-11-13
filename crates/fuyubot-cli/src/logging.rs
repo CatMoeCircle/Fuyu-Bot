@@ -16,16 +16,25 @@
 //! TUI 的日志页按同一份格式解析着色（`panel::logfmt` 与 `panel::ui::log_line`），
 //! 所以改这里要同步那边。
 //!
+//! **TUI 期间不能写 stderr**：进了 alternate screen 之后，一行日志就会直接盖在界面上
+//! （长行还会折行把底部顶乱）。面板运行期间用 [`enter_tui`] 把输出改到日志文件，
+//! 退出时 [`leave_tui`] 恢复；文件里的行不带 ANSI，日志页照常解析。
+//!
 //! **为什么不按级别过滤**：插件日志的门槛由 `HostRuntime::set_log_verbosity` 在源头挡，
 //! 那个值还能被 `.fuyubot/log-level` 运行期改；订阅者这边再挡一层就会两边不一致
 //! （调高门槛后事件根本到不了格式化器）。
 
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write as _};
+use std::path::Path;
+use std::sync::Mutex;
 
 use time::{OffsetDateTime, UtcOffset};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::registry::LookupSpan;
@@ -40,11 +49,113 @@ const DATE: &str = "\x1b[90m";
 /// 时间列：亮蓝。和级别（红/黄/绿/青）、插件（青）、TDLib（品红）都不撞。
 const TIME: &str = "\x1b[94m";
 
+/// TUI 运行期间的日志落点。
+///
+/// 进了 alternate screen 之后，任何写到 stderr 的日志都会被终端直接盖在界面上
+/// （终端没有“旁路”一说），一行长日志就能把底部连同边框一起顶乱——登录检查、
+/// TDLib 初始化都是**每启动一次就写几行**。所以面板一开就把订阅者切到日志文件：
+/// 日志页本来读的就是这一份，信息不丢，界面也不再被弄脏。
+static TUI_LOG: Mutex<Option<TuiLog>> = Mutex::new(None);
+
+struct TuiLog {
+    /// 打不开文件时是 `None`：宁可丢弃日志，也**不能回退到 stderr**。
+    file: Option<File>,
+}
+
+impl TuiLog {
+    fn write(&mut self, bytes: &[u8]) {
+        if let Some(file) = self.file.as_mut() {
+            // 每行立即落盘：面板每秒读一次文件，攒着会晚一拍。
+            let _ = file.write_all(bytes);
+            let _ = file.flush();
+        }
+    }
+}
+
+/// 进入 TUI：日志改写到 `path`，同时关闭 ANSI 配色（日志文件必须是纯文本）。
+pub fn enter_tui(path: &Path) {
+    let file = (|| -> io::Result<File> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        OpenOptions::new().create(true).append(true).open(path)
+    })()
+    .ok();
+    let mut sink = TUI_LOG.lock().unwrap_or_else(|error| error.into_inner());
+    *sink = Some(TuiLog { file });
+}
+
+/// 离开 TUI：恢复 stderr 输出。
+pub fn leave_tui() {
+    let mut sink = TUI_LOG.lock().unwrap_or_else(|error| error.into_inner());
+    *sink = None;
+}
+
+/// 这一帧 / 这一行是否该按 TUI 模式处理（写文件、不带 ANSI）。
+fn tui_active() -> bool {
+    TUI_LOG.lock().map(|sink| sink.is_some()).unwrap_or(false)
+}
+
+/// 每一行先攒在内存里，整行再一次性交给落点：多线程同时登录 / 写日志时不会串行。
+#[derive(Default)]
+struct BufferedSink {
+    buffer: Vec<u8>,
+}
+
+impl BufferedSink {
+    fn emit(&mut self, bytes: &[u8]) {
+        if let Ok(mut sink) = TUI_LOG.lock() {
+            if let Some(sink) = sink.as_mut() {
+                sink.write(bytes);
+                return;
+            }
+        }
+        let stderr = io::stderr();
+        let mut handle = stderr.lock();
+        let _ = handle.write_all(bytes);
+        let _ = handle.flush();
+    }
+}
+
+impl io::Write for BufferedSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            let bytes = std::mem::take(&mut self.buffer);
+            self.emit(&bytes);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BufferedSink {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ConsoleWriter;
+
+impl<'a> MakeWriter<'a> for ConsoleWriter {
+    type Writer = BufferedSink;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        BufferedSink::default()
+    }
+}
+
 /// 装一次全局订阅者。重复调用（测试里同时走多条路径）只保留第一个。
 pub fn init() {
     let ansi = color_enabled();
     let layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
+        .with_writer(ConsoleWriter)
         .with_ansi(ansi)
         .event_format(LineFormat {
             ansi,
@@ -92,14 +203,16 @@ where
         let meta = event.metadata();
         let level = *meta.level();
         let message = fields.message.unwrap_or_default();
+        // TUI 期间日志落文件：ANSI 转义会污染日志页的解析。
+        let ansi = self.ansi && !tui_active();
 
-        self.clock.write(&mut writer, self.ansi)?;
+        self.clock.write(&mut writer, ansi)?;
         writer.write_str(" ")?;
 
         // TDLib 更新 / 响应：没有级别列，固定词缀——它们只在 `--trace-updates` 时出现，
         // 混在 TRACE 里反而难认。
         if is_tdlib_update(meta.target()) {
-            write_tag(&mut writer, "TDLib Update", self.ansi, MAGENTA)?;
+            write_tag(&mut writer, "TDLib Update", ansi, MAGENTA)?;
             writer.write_str(" ")?;
             writer.write_str(&message)?;
             return writer.write_str("\n");
@@ -107,23 +220,18 @@ where
 
         // 插件日志：`[plugins - 名字] LEVEL  内容`，青色词缀一眼区分来源。
         if let Some(plugin) = fields.plugin {
-            write_tag(
-                &mut writer,
-                &format!("[plugins - {plugin}]"),
-                self.ansi,
-                CYAN,
-            )?;
+            write_tag(&mut writer, &format!("[plugins - {plugin}]"), ansi, CYAN)?;
             writer.write_str(" ")?;
-            write_tag(&mut writer, level.as_str(), self.ansi, level_color(level))?;
+            write_tag(&mut writer, level.as_str(), ansi, level_color(level))?;
             writer.write_str("  ")?;
             writer.write_str(&message)?;
             return writer.write_str("\n");
         }
 
         // 宿主日志：`source LEVEL  内容`（来源在前，和插件 / TDLib 的词缀对齐）。
-        write_tag(&mut writer, &short_target(meta.target()), self.ansi, DIM)?;
+        write_tag(&mut writer, &short_target(meta.target()), ansi, DIM)?;
         writer.write_str(" ")?;
-        write_tag(&mut writer, level.as_str(), self.ansi, level_color(level))?;
+        write_tag(&mut writer, level.as_str(), ansi, level_color(level))?;
         writer.write_str("  ")?;
         writer.write_str(&message)?;
         writer.write_str("\n")
@@ -233,6 +341,25 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    /// 全局 TUI 状态只在这两个测试里动；ANSI 测试要和它们串行。
+    static TUI_TEST: Mutex<()> = Mutex::new(());
+
+    /// 测试里保证 `leave_tui` 一定执行（断言 panic 时也不会把全局状态留在 TUI 模式）。
+    struct TuiForTest;
+
+    impl TuiForTest {
+        fn new(path: &Path) -> Self {
+            enter_tui(path);
+            Self
+        }
+    }
+
+    impl Drop for TuiForTest {
+        fn drop(&mut self) {
+            leave_tui();
+        }
+    }
+
     /// 把格式化结果收进内存：测「三行格式 + 颜色前的纯文本」，不测真实时间。
     #[derive(Clone, Default)]
     struct Buf(Arc<Mutex<Vec<u8>>>);
@@ -341,6 +468,7 @@ mod tests {
 
     #[test]
     fn ansi_colors_distinguish_host_plugin_and_tdlib() {
+        let _guard = TUI_TEST.lock().unwrap_or_else(|error| error.into_inner());
         let text = capture_with(
             || {
                 tracing::warn!(target: "fuyubot::pipeline", "careful");
@@ -375,5 +503,33 @@ mod tests {
             "{:?}",
             lines[2]
         );
+    }
+
+    /// TUI 期间日志必须改写进文件（否则会直接盖在 alternate screen 上），
+    /// 且文件里不能带 ANSI（日志页按纯文本解析）。
+    #[test]
+    fn tui_logs_go_to_the_file_without_ansi() {
+        let _guard = TUI_TEST.lock().unwrap_or_else(|error| error.into_inner());
+        let root = crate::test_support::temp("logging-tui");
+        let path = root.join("logs").join("fuyubot.log");
+        let tui = TuiForTest::new(&path);
+
+        let text = capture_with(
+            || tracing::warn!(target: "fuyubot::pipeline", "careful"),
+            true,
+        );
+        assert!(!text.contains('\x1b'), "{text:?}");
+
+        {
+            // 走真实的落点：TUI 模式下应写文件而不是 stderr。
+            let mut writer = ConsoleWriter.make_writer();
+            writer.write_all("hello from tui\n".as_bytes()).unwrap();
+            writer.flush().unwrap();
+        }
+        drop(tui);
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, "hello from tui\n", "{written:?}");
+        assert!(!tui_active(), "离开 TUI 后恢复 stderr");
     }
 }

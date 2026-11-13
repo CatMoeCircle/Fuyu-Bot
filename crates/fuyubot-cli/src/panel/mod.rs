@@ -34,7 +34,7 @@ use std::time::Duration;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event};
 
-use crate::{existing_root, parent_or_dot, resolved_config_path, scaffold};
+use crate::{existing_root, logging, parent_or_dot, resolved_config_path, scaffold};
 use app::App;
 pub use app::SpawnOptions;
 
@@ -86,8 +86,13 @@ pub fn run(
     let mut app = App::new(root, config_path, plugin_dir, REFRESH_INTERVAL, spawn);
 
     let mut terminal = ratatui::try_init().map_err(|error| format!("初始化终端失败：{error}"))?;
+    // 进 alternate screen 之后的任何 stderr 日志都会直接盖在界面上（登录检查、
+    // TDLib 初始化每启动一次就写几行，长行还会折行把底部顶乱）。改成写日志文件，
+    // 日志页读的正是这一份。
+    logging::enter_tui(&app.log_path);
     let outcome = event_loop(&mut terminal, &mut app);
     ratatui::restore();
+    logging::leave_tui();
     outcome.map_err(Into::into)
 }
 
