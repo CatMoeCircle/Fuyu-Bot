@@ -54,7 +54,10 @@ fn nav_width_for(width: u16) -> u16 {
     }
 }
 
-/// 底部固定两行：操作 + 资源（窄屏资源只留 CPU / 内存 / 级别）。
+/// 底部固定两行：操作 + 资源。
+///
+/// 两行都**只画一行**：放不下就按显示宽度省略（见 [`fit_line`]），绝不交给终端折行——
+/// 真折一行会把资源行顶出屏幕（中文按两格算，`len()` 会低估宽度）。
 fn footer_height_for(_width: u16) -> u16 {
     2
 }
@@ -775,7 +778,7 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(" · y 复制", Style::new().fg(Color::DarkGray)),
             ])
         };
-        frame.render_widget(Paragraph::new(hint), footer);
+        frame.render_widget(Paragraph::new(fit_line(hint, footer.width)), footer);
         return;
     }
 
@@ -823,7 +826,7 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
         ])
     };
-    frame.render_widget(Paragraph::new(hint), footer);
+    frame.render_widget(Paragraph::new(fit_line(hint, footer.width)), footer);
 }
 
 fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -863,7 +866,10 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::new().fg(Color::DarkGray),
         ))
     };
-    frame.render_widget(Paragraph::new(summary_line), summary);
+    frame.render_widget(
+        Paragraph::new(fit_line(summary_line, summary.width)),
+        summary,
+    );
 
     if let Some(error) = &app.config_error {
         frame.render_widget(
@@ -873,9 +879,12 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
             table_area,
         );
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                "按 r 重新读取 · Esc 返回导航",
-                Style::new().fg(Color::DarkGray),
+            Paragraph::new(fit_line(
+                Line::from(Span::styled(
+                    "按 r 重新读取 · Esc 返回导航",
+                    Style::new().fg(Color::DarkGray),
+                )),
+                footer.width,
             )),
             footer,
         );
@@ -978,7 +987,10 @@ fn draw_config(frame: &mut Frame, app: &mut App, area: Rect) {
         "↑↓ 选择 · Enter 编辑（[plugin.*] 段也能改） · Esc 返回".to_owned()
     };
     frame.render_widget(
-        Paragraph::new(Span::styled(hint, Style::new().fg(Color::DarkGray))),
+        Paragraph::new(fit_line(
+            Line::from(Span::styled(hint, Style::new().fg(Color::DarkGray))),
+            footer.width,
+        )),
         footer,
     );
 }
@@ -1357,14 +1369,232 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(toast.text.clone(), Style::new().fg(color)),
             ])
         }
-        None => operations_line(app, compact),
+        None => operations_line(app, compact, area.width),
     };
-    frame.render_widget(Paragraph::new(line), operations);
-    frame.render_widget(Paragraph::new(metrics_lines(app, area.width)), metrics);
+    frame.render_widget(Paragraph::new(fit_line(line, area.width)), operations);
+    frame.render_widget(
+        Paragraph::new(fit_line(metrics_line(app, area.width), area.width)),
+        metrics,
+    );
+}
+
+/// 把一行按**显示宽度**收进 `width` 列，末尾补 `…`。
+///
+/// 底部只有两行，提示条 / 键位 / 资源都可能比终端宽：真让终端折行，资源行就会被顶出
+/// 屏幕，整个底部跟着错位。所以宁可省略，也不溢出；宽字符（中文占两格）要么整字留下，
+/// 要么整个丢掉，不劈成半个。
+fn fit_line(line: Line<'static>, width: u16) -> Line<'static> {
+    let width = usize::from(width);
+    if line.width() <= width {
+        return line;
+    }
+    if width == 0 {
+        return Line::default();
+    }
+    // 省一格给末尾的省略号。
+    let budget = width.saturating_sub(1);
+    let mut used = 0;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        let style = span.style;
+        let mut kept = String::new();
+        for ch in span.content.chars() {
+            let char_width = ch.width().unwrap_or(0);
+            if used + char_width > budget {
+                if !kept.is_empty() {
+                    spans.push(Span::styled(kept, style));
+                }
+                spans.push(Span::styled("…", Style::new().fg(Color::DarkGray)));
+                return Line::from(spans);
+            }
+            used += char_width;
+            kept.push(ch);
+        }
+        if !kept.is_empty() {
+            spans.push(Span::styled(kept, style));
+        }
+    }
+    spans.push(Span::styled("…", Style::new().fg(Color::DarkGray)));
+    Line::from(spans)
+}
+
+/// 弹窗宽度：左右各留一列，窄终端就用满；上限 `max`。
+fn dialog_width(area: Rect, max: u16) -> u16 {
+    area.width.saturating_sub(2).clamp(1, max)
+}
+
+/// 弹窗高度：正文行数 + 上下边框，不能超过屏幕。
+fn dialog_height(inner_rows: u16, area: Rect) -> u16 {
+    inner_rows.saturating_add(2).min(area.height)
+}
+
+/// 从长到短挑第一条放得下的底部提示：长提示在窄屏会折行，把输入框挤出弹窗。
+fn footer_hint<'a>(width: u16, hints: &[&'a str]) -> &'a str {
+    hints
+        .iter()
+        .copied()
+        .find(|hint| Line::from(*hint).width() <= usize::from(width))
+        .unwrap_or_else(|| hints.last().copied().unwrap_or(""))
+}
+
+/// 把一行按显示宽度收进 `width` 列，**保留尾部**（输入框的光标在末尾）。
+///
+/// 超长输入（Bot Token / api_hash / 密码）不能折行把弹窗撑高，也不能把光标挤出边框：
+/// 丢掉最左边、前面补 `…`。
+fn fit_line_tail(line: Line<'static>, width: u16) -> Line<'static> {
+    let width = usize::from(width);
+    if line.width() <= width {
+        return line;
+    }
+    if width == 0 {
+        return Line::default();
+    }
+    // 省一格给开头的省略号。
+    let budget = width.saturating_sub(1);
+    let mut used = 0;
+    let mut spans = Vec::new();
+    for span in line.spans.into_iter().rev() {
+        let style = span.style;
+        let mut kept = String::new();
+        for ch in span.content.chars().rev() {
+            let char_width = ch.width().unwrap_or(0);
+            if used + char_width > budget {
+                if !kept.is_empty() {
+                    spans.push(Span::styled(kept.chars().rev().collect::<String>(), style));
+                }
+                spans.push(Span::styled("…", Style::new().fg(Color::DarkGray)));
+                spans.reverse();
+                return Line::from(spans);
+            }
+            used += char_width;
+            kept.push(ch);
+        }
+        if !kept.is_empty() {
+            spans.push(Span::styled(kept.chars().rev().collect::<String>(), style));
+        }
+    }
+    spans.push(Span::styled("…", Style::new().fg(Color::DarkGray)));
+    spans.reverse();
+    Line::from(spans)
+}
+
+/// 弹窗正文折行：按**显示宽度**折（中文两格），优先在空格 / 标点后断。
+///
+/// 弹窗高度是按折出来的行数算的，所以这里自己折、`Paragraph` 不再二次 `wrap`——
+/// 否则 ratatui 的单词折行会跟高度估算对不上，最后一行被边框切掉。
+fn wrap_dialog_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let chars: Vec<(char, Style)> = line
+        .spans
+        .into_iter()
+        .flat_map(|span| {
+            let style = span.style;
+            span.content
+                .chars()
+                .map(|ch| (ch, style))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let breaks_after = |ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '，' | '。'
+                    | '；'
+                    | '：'
+                    | '！'
+                    | '？'
+                    | '、'
+                    | '）'
+                    | '】'
+                    | '」'
+                    | ','
+                    | '.'
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | ')'
+                    | ']'
+            )
+    };
+    let row_width = |row: &[(char, Style)]| -> u16 {
+        row.iter()
+            .map(|(ch, _)| UnicodeWidthChar::width(*ch).unwrap_or(0) as u16)
+            .sum()
+    };
+    let last_break = |row: &[(char, Style)]| -> Option<usize> {
+        row.iter()
+            .rposition(|(ch, _)| breaks_after(*ch))
+            .map(|index| index + 1)
+    };
+
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut current: Vec<(char, Style)> = Vec::new();
+    let mut used: u16 = 0;
+    let mut break_at: Option<usize> = None;
+
+    for (ch, style) in chars {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+        if used > 0 && used.saturating_add(char_width) > width {
+            match break_at.take() {
+                // 有空格 / 标点就断在那儿，别把手机号、api_hash 这种词切成两半。
+                Some(cut) if cut > 0 && cut < current.len() => {
+                    let rest = current.split_off(cut);
+                    used = row_width(&rest);
+                    rows.push(current);
+                    current = rest;
+                    break_at = last_break(&current);
+                }
+                _ => {
+                    rows.push(std::mem::take(&mut current));
+                    used = 0;
+                }
+            }
+        }
+        // 折行后的行首空格没有意义。
+        if current.is_empty() && ch.is_whitespace() {
+            continue;
+        }
+        used = used.saturating_add(char_width);
+        current.push((ch, style));
+        if breaks_after(ch) {
+            break_at = Some(current.len());
+        }
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+
+    rows.into_iter()
+        .map(|row| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut text = String::new();
+            let mut style = None;
+            for (ch, next) in row {
+                if style.is_some_and(|style| style != next) {
+                    spans.push(Span::styled(std::mem::take(&mut text), style.unwrap()));
+                }
+                style = Some(next);
+                text.push(ch);
+            }
+            if !text.is_empty() {
+                spans.push(Span::styled(text, style.expect("有字符就有样式")));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// 当前可用操作：按焦点（导航 / 工作区）与页面给键位，不列用不上的键。
-fn operations_line(app: &App, compact: bool) -> Line<'static> {
+///
+/// `width` 是这一行真正能用的列数：放不下的键位从尾部整条省略（不切半个「退出」），
+/// 末尾补 `…` 说明还有更多——和 `fit_line` 的兜底是同一条规矩。
+fn operations_line(app: &App, compact: bool, width: u16) -> Line<'static> {
     let focused = app.workspace_focused();
     let selecting = focused && app.page == Page::Logs && app.log_select.is_some();
     let tag = if selecting {
@@ -1500,21 +1730,38 @@ fn operations_line(app: &App, compact: bool) -> Line<'static> {
         }
     }
 
+    let width = usize::from(width);
+    let mut used = Line::from(spans.clone()).width();
+    let mut shown = 0usize;
     for (index, (keys, label)) in items.iter().enumerate() {
-        if index > 0 {
+        let item_width = Line::from(format!("{keys} {label}")).width();
+        // 还没显示的条目 ≥ 1 时要给末尾的「 …」留两格。
+        let more = index + 1 < items.len();
+        let indicator = usize::from(more) * 2;
+        let separator = if shown == 0 { 0 } else { 3 };
+        if used + separator + item_width + indicator > width {
+            break;
+        }
+        if shown > 0 {
             spans.push(Span::styled(" · ", Style::new().fg(Color::DarkGray)));
+            used += 3;
         }
         spans.push(Span::styled(
             format!("{keys} "),
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(*label));
+        used += item_width;
+        shown += 1;
+    }
+    if shown < items.len() && used + 2 <= width {
+        spans.push(Span::styled(" …", Style::new().fg(Color::DarkGray)));
     }
     Line::from(spans)
 }
 
-/// 资源占用：宽终端一行，窄终端拆成两行。
-fn metrics_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+/// 资源占用：宽终端一行全信息；放不下时退成精简版（CPU / 内存 / 级别），再放不下就省略。
+fn metrics_line(app: &App, width: u16) -> Line<'static> {
     let (cpu, memory) = match app.usage {
         Some(ProcessUsage {
             cpu_percent,
@@ -1537,7 +1784,7 @@ fn metrics_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         .unwrap_or_else(|| "—".to_owned());
     let level = app.effective_level().to_owned();
 
-    if width >= 70 {
+    let full = {
         let fields: [(&str, String); 6] = [
             (
                 "CPU",
@@ -1560,7 +1807,12 @@ fn metrics_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             ("日志", level.clone()),
             ("PID", pid),
         ];
-        return vec![metric_line(&fields, &level)];
+        metric_line(&fields, &level)
+    };
+    // 运行时长会长（`23 小时 59 分 59 秒`），不能只看宽度够 70 就画全量：
+    // 以**这一帧实际宽度**为准，放不下就退精简版。
+    if width >= 70 && full.width() <= usize::from(width) {
+        return full;
     }
 
     let cpu_short = if has_usage {
@@ -1574,19 +1826,22 @@ fn metrics_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         "—".to_owned()
     };
     // 手机上只留 CPU / 内存 / 当前级别；运行时长、插件数、PID 不占地方。
-    vec![Line::from(vec![
-        Span::styled(" CPU ", Style::new().fg(Color::DarkGray)),
-        Span::styled(cpu_short, Style::new().fg(Color::Gray)),
-        Span::styled(" · 内存 ", Style::new().fg(Color::DarkGray)),
-        Span::styled(memory_short, Style::new().fg(Color::Gray)),
-        Span::styled(" · ", Style::new().fg(Color::DarkGray)),
-        Span::styled(
-            level.clone(),
-            Style::new()
-                .fg(level_color(&level))
-                .add_modifier(Modifier::BOLD),
-        ),
-    ])]
+    fit_line(
+        Line::from(vec![
+            Span::styled(" CPU ", Style::new().fg(Color::DarkGray)),
+            Span::styled(cpu_short, Style::new().fg(Color::Gray)),
+            Span::styled(" · 内存 ", Style::new().fg(Color::DarkGray)),
+            Span::styled(memory_short, Style::new().fg(Color::Gray)),
+            Span::styled(" · ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                level.clone(),
+                Style::new()
+                    .fg(level_color(&level))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        width,
+    )
 }
 
 fn metric_line(fields: &[(&str, String)], level: &str) -> Line<'static> {
@@ -1813,9 +2068,8 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
     let Some(setup) = app.credentials.as_ref() else {
         return;
     };
-    let popup_width = area.width.saturating_sub(2).min(74).max(24);
-    let popup = centered(area, popup_width, 10);
-    frame.render_widget(Clear, popup);
+    let popup_width = dialog_width(area, 74);
+    let inner_width = popup_width.saturating_sub(2).max(1);
 
     let block = Block::bordered()
         .title(Line::from(vec![Span::styled(
@@ -1828,38 +2082,53 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
         CredentialStep::ApiId => "1/2",
         CredentialStep::ApiHash => "2/2",
     };
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("{step}  TDLib {}", setup.step.prompt()),
-            Style::new().fg(Color::Gray),
-        )),
-        Line::from(""),
+    let prompt = Line::from(Span::styled(
+        format!("{step}  TDLib {}", setup.step.prompt()),
+        Style::new().fg(Color::Gray),
+    ));
+    let mut prompt_lines = wrap_dialog_line(prompt, inner_width);
+    let prompt_rows = prompt_lines.len() as u16;
+    let input = fit_line_tail(
         Line::from(vec![
             Span::styled("> ", Style::new().fg(Color::Cyan)),
             Span::raw(setup.input.clone()),
             Span::styled("▏", Style::new().fg(Color::Cyan)),
         ]),
-        Line::from(""),
-    ];
-    if let Some(error) = &setup.error {
-        lines.push(Line::from(Span::styled(
-            error.clone(),
-            Style::new().fg(Color::Red),
-        )));
-    }
+        inner_width,
+    );
+    let error_lines = setup.error.as_ref().map_or_else(Vec::new, |error| {
+        wrap_dialog_line(
+            Line::from(Span::styled(error.clone(), Style::new().fg(Color::Red))),
+            inner_width,
+        )
+    });
+    let error_rows = error_lines.len() as u16;
+    // 长提示在窄屏会折行，把输入框 / 底部提示挤出弹窗；按放得下的档位挑一条。
+    let footer = footer_hint(
+        inner_width,
+        &[
+            "Enter 下一步 · Esc 取消；会明文写入 fuyubot.toml",
+            "Enter 下一步 · Esc 取消",
+            "Enter/Esc",
+        ],
+    );
+    let inner_rows = prompt_rows + 1 + 1 + 1 + error_rows + 1 + 1;
+    let popup = centered(area, popup_width, dialog_height(inner_rows, area));
+    frame.render_widget(Clear, popup);
+
+    let mut lines = std::mem::take(&mut prompt_lines);
+    lines.push(Line::from(""));
+    lines.push(input);
+    lines.push(Line::from(""));
+    lines.extend(error_lines);
     lines.push(Line::from(Span::styled(
-        "Enter 下一步 · Esc 取消；会明文写入 fuyubot.toml",
+        footer,
         Style::new().fg(Color::DarkGray),
     )));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        popup,
-    );
+    lines.push(Line::from(""));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-/// 编辑单个配置项（配置页按 Enter / e）。
 /// 登录输入框：一个问题 + 一行输入（密码打码）。
 ///
 /// 面板里每显示一次，就代表 `fuyubot-app` 的登录流程正卡在 `AppHost::ask` 那一步等人。
@@ -1867,9 +2136,8 @@ fn draw_login(frame: &mut Frame, app: &App, area: Rect) {
     let Some(modal) = app.login.as_ref() else {
         return;
     };
-    let popup_width = area.width.saturating_sub(2).min(74).max(24);
-    let popup = centered(area, popup_width, 9);
-    frame.render_widget(Clear, popup);
+    let popup_width = dialog_width(area, 74);
+    let inner_width = popup_width.saturating_sub(2).max(1);
 
     let block = Block::bordered()
         .title(Line::from(vec![Span::styled(
@@ -1883,31 +2151,45 @@ fn draw_login(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         modal.input.clone()
     };
-    let lines = vec![
-        Line::from(Span::styled(
-            modal.prompt.clone(),
-            Style::new().fg(Color::Gray),
-        )),
-        Line::from(""),
+    let prompt = Line::from(Span::styled(
+        modal.prompt.clone(),
+        Style::new().fg(Color::Gray),
+    ));
+    let mut lines = wrap_dialog_line(prompt, inner_width);
+    let prompt_rows = lines.len() as u16;
+    // 输入框永远只占一行：太长的 Token / 手机号从左边省略，光标留在框内。
+    let input = fit_line_tail(
         Line::from(vec![
             Span::styled("> ", Style::new().fg(Color::Cyan)),
             Span::raw(shown),
             Span::styled("▏", Style::new().fg(Color::Cyan)),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter 提交 · Esc 取消（登录期间实例必须是停的）",
-            Style::new().fg(Color::DarkGray),
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        popup,
+        inner_width,
     );
+    let footer = footer_hint(
+        inner_width,
+        &[
+            "Enter 提交 · Esc 取消（登录期间实例必须是停的）",
+            "Enter 提交 · Esc 取消",
+            "Enter/Esc",
+        ],
+    );
+    let inner_rows = prompt_rows + 1 + 1 + 1 + 1 + 1;
+    let popup = centered(area, popup_width, dialog_height(inner_rows, area));
+    frame.render_widget(Clear, popup);
+
+    lines.push(Line::from(""));
+    lines.push(input);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        footer,
+        Style::new().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
+/// 编辑单个配置项（配置页按 Enter / e）。
 fn draw_config_editor(frame: &mut Frame, app: &App, area: Rect) {
     let Some(edit) = app.config_edit.as_ref() else {
         return;
@@ -2517,7 +2799,7 @@ mod log_line_tests {
 mod tests {
     use super::*;
     use crate::instance::{Info, PluginDetail, State};
-    use crate::panel::app::{App, Page, SpawnOptions};
+    use crate::panel::app::{App, CredentialSetup, Page, SpawnOptions};
     use crate::test_support::temp;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2716,6 +2998,148 @@ mod tests {
         // 底部第二行：资源占用。
         for label in ["CPU", "内存", "运行", "插件", "日志", "PID"] {
             assert!(metrics.contains(label), "缺少 {label}：{metrics:?}");
+        }
+    }
+
+    /// 底部两行必须按**显示宽度**收进终端：以前宽终端固定画全量，长运行时长 / 长提示
+    /// 一超出宽度就会被真终端折行，资源行被顶出屏幕、整个底部错位。
+    #[test]
+    fn footer_lines_fit_every_width_and_ellipsize_when_cut() {
+        let mut app = app();
+        let mut state = running();
+        if let State::Running(Some(info)) = &mut state {
+            // 长运行时长 + 大 PID + 多插件：资源行在 70 列附近最容易放不下。
+            info.started = crate::instance::unix_now().saturating_sub(100_000);
+            info.pid = 123_456;
+            info.detail.active = (0..12).map(|index| format!("plugin.{index}")).collect();
+        }
+        app.state = state;
+        app.usage = Some(ProcessUsage {
+            cpu_percent: 99.9,
+            memory_bytes: 2048 * 1024 * 1024,
+        });
+        app.focus = Focus::Workspace;
+        // 日志页的键位提示最长。
+        app.page = Page::Logs;
+
+        for width in [16u16, 20, 24, 30, 40, 50, 60, 69, 70, 72, 74, 80, 100, 160] {
+            for compact in [true, false] {
+                let line = operations_line(&app, compact, width);
+                assert!(
+                    line.width() <= usize::from(width),
+                    "操作行溢出 width={width} compact={compact}: {line:?}"
+                );
+            }
+            let metrics = metrics_line(&app, width);
+            assert!(
+                metrics.width() <= usize::from(width),
+                "资源行溢出 width={width}: {metrics:?}"
+            );
+        }
+
+        // 70 列放不下 7 条完整提示：尾部补省略号，而不是切出半个「退出」。
+        let line = operations_line(&app, false, 70);
+        let text: String = line.spans.iter().map(|span| span.content.clone()).collect();
+        assert!(text.ends_with('…'), "{text:?}");
+    }
+
+    #[test]
+    fn fit_line_keeps_wide_chars_whole_and_ellipsizes() {
+        assert_eq!(fit_line(Line::from("abc"), 3).width(), 3);
+        assert_eq!(fit_line(Line::from("abc"), 2).to_string(), "a…");
+        assert_eq!(fit_line(Line::from("abc"), 0).width(), 0);
+
+        // 10 列：4 个汉字（8 格）+ 省略号 = 9 格；第 5 个汉字不能被劈成半格。
+        let line = fit_line(Line::from("中文测试中文测试"), 10);
+        assert!(line.width() <= 10, "{line:?}");
+        assert!(line.to_string().ends_with('…'), "{line:?}");
+        assert!(line.to_string().starts_with("中文测试"), "{line:?}");
+    }
+
+    #[test]
+    fn a_long_toast_is_cut_instead_of_wrapped() {
+        let mut app = app();
+        app.set_toast(
+            format!("启动失败：{}", "原因很长的错误".repeat(30)),
+            Level::Error,
+        );
+        let buffer = render(&mut app, 40, 20);
+        let screen = text(&buffer);
+        let footer = screen.lines().nth(18).expect("要有操作行");
+        assert!(footer.contains('…'), "{footer:?}");
+        assert!(Line::from(footer).width() <= 40, "{footer:?}");
+    }
+
+    /// 登录弹窗的底部提示和问题都可能比弹窗宽：高度要跟着折行涨，
+    /// 输入框只留一行（太长保留尾部），否则提示会被边框切掉。
+    #[test]
+    fn login_modal_keeps_the_footer_and_input_on_screen() {
+        for width in [80u16, 60, 50, 40, 30, 24, 20] {
+            let mut app = app();
+            let (tx, _rx) = std::sync::mpsc::channel();
+            app.login = Some(crate::panel::login::LoginModal::new(
+                fuyubot_app::AskKind::Phone,
+                "手机号（带国家码，例如 +8613800138000）".to_owned(),
+                tx,
+            ));
+            let screen = text(&render(&mut app, width, 24));
+            assert!(screen.contains("手机号"), "width={width}\n{screen}");
+            assert!(screen.contains("8613800138000"), "width={width}\n{screen}");
+            assert!(screen.contains("Enter"), "width={width}\n{screen}");
+            assert!(screen.contains("Esc"), "width={width}\n{screen}");
+        }
+    }
+
+    /// 首次配置的两个字段不能把底部提示挤出弹窗；api_hash 太长时输入框保留尾部。
+    #[test]
+    fn credentials_modal_fits_the_footer_and_long_input() {
+        for width in [80u16, 60, 50, 40, 30, 24, 20] {
+            let mut app = app();
+            app.credentials = Some(CredentialSetup {
+                step: CredentialStep::ApiHash,
+                input: "a".repeat(120),
+                api_id: "1".to_owned(),
+                api_hash: String::new(),
+                error: Some("api_id 必须是正整数".to_owned()),
+            });
+            let screen = text(&render(&mut app, width, 24));
+            assert!(screen.contains("TDLib"), "width={width}\n{screen}");
+            assert!(screen.contains("Enter"), "width={width}\n{screen}");
+            // 错误原文要被完整画出来，不能因为高度不够被切掉。
+            assert!(screen.contains("api_id"), "width={width}\n{screen}");
+            assert!(screen.contains("整数"), "width={width}\n{screen}");
+            // 120 个 a 放不下一行：保留尾部（省略号在开头）。
+            assert!(screen.contains('…'), "width={width}\n{screen}");
+        }
+    }
+
+    #[test]
+    fn fit_line_tail_keeps_the_cursor_end() {
+        assert_eq!(fit_line_tail(Line::from("abcdef"), 4).to_string(), "…def");
+        assert_eq!(fit_line_tail(Line::from("abc"), 10).to_string(), "abc");
+        assert_eq!(
+            fit_line_tail(Line::from("中文测试"), 5).to_string(),
+            "…测试"
+        );
+        assert_eq!(fit_line_tail(Line::from("abc"), 0).width(), 0);
+    }
+
+    #[test]
+    fn dialog_wrap_breaks_at_spaces_not_inside_numbers() {
+        for width in [36u16, 24, 18] {
+            let rows =
+                wrap_dialog_line(Line::from("手机号（带国家码，例如 +8613800138000）"), width);
+            let text: Vec<String> = rows
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+                .collect();
+            assert!(
+                text.iter().any(|row| row.contains("+8613800138000")),
+                "width={width} {text:?}"
+            );
+            for row in &rows {
+                assert!(row.width() <= usize::from(width), "width={width} {row:?}");
+            }
         }
     }
 
