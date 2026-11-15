@@ -32,6 +32,12 @@ const SCRIPTS_DIR: &str = "scripts";
 const MANIFEST_FILE: &str = "plugin.json";
 /// 一条介绍最多显示多少个字符（Telegram 单条上限 4096，长介绍会挤掉别的行）。
 const DESCRIPTION_LIMIT: usize = 80;
+/// 向宿主登记的命令：`/plugins` 只给主人看 / 用。
+///
+/// 不写 `scopes` 时按角色默认——`owner` 默认只有 `private`（不在群里出现）。
+/// 主人 / 管理员身份来自 `[roles].owners`，不是 Telegram 会话管理员。
+const PLUGINS_COMMAND: &str =
+    r#"{"name":"plugins","description":"列出已安装和已禁用的插件","role":"owner"}"#;
 
 struct ManagePlugin {
     host: HostApi,
@@ -86,12 +92,9 @@ impl Plugin for ManagePlugin {
         self.subscription = Some(subscription);
 
         // 经宿主的命令能力表登记（`fuyubot.host.commands`）：服务由宿主预置，
-        // 不再依赖 help 插件先启动。
-        match host.call_service(
-            "fuyubot.host.commands",
-            "register",
-            r#"{"name":"plugins","description":"列出已安装和已禁用的插件"}"#,
-        ) {
+        // 不再依赖 help 插件先启动。`role = owner`：只有主人能列出插件清单
+        // （`[roles].owners`；bot 账户不配 owners 就没有主人，命令也就没人能用）。
+        match host.call_service("fuyubot.host.commands", "register", PLUGINS_COMMAND) {
             Ok(reply) => host.log(
                 LogLevel::Info,
                 &format!("manage 插件已向宿主登记命令：{reply}"),
@@ -463,6 +466,19 @@ define_plugin!(ManagePlugin, "fuyubot.manage");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/plugins` 是主人命令：登记 JSON 必须带 `role = owner`，否则能力表会放所有人。
+    #[test]
+    fn plugins_command_is_registered_as_owner_only() {
+        let value: serde_json::Value = serde_json::from_str(PLUGINS_COMMAND).unwrap();
+        assert_eq!(value["name"], "plugins");
+        assert_eq!(value["role"], "owner");
+        assert!(
+            value["description"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
+    }
 
     /// 测试用的临时目录：放**工作区的 `target/` 里**，不用系统临时目录——
     /// 沙箱化跑测试时 `%TEMP%` 可能不可写（2026 实测：建目录直接 access denied）。

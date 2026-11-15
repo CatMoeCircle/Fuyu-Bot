@@ -32,6 +32,7 @@
       "id": 2003,
       "chat_id": 7,
       "is_outgoing": false,
+      "sender_id": { "@type": "messageSenderUser", "user_id": 42 },
       "content": {
         "@type": "messageText",
         "text": { "@type": "formattedText", "text": "/plugins" }

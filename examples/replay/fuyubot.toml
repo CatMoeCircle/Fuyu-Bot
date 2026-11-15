@@ -1,0 +1,13 @@
+# 回放专用配置：给内置插件的离线自检一个「主人」，让 /plugins 能通过角色闸门。
+#
+# `run --replay` 只加载插件、不接 TDLib；这里除账号类型与主人之外都走默认值。
+# 用法（在仓库根）：
+#   target\debug\fuyubot.exe run --config examples\replay\fuyubot.toml ^
+#     --replay examples\replay\builtin_commands.json --plugin-dir <项目>\plugins
+
+[telegram]
+# bot 账户没有「自己」这种主人身份，所以必须显式配 [roles].owners。
+account_type = "bot"
+
+[roles]
+owners = [42]

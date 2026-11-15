@@ -10,8 +10,16 @@
 //! 过滤必须在**回复线程**里做：群管理员要问 `getChatMember`，不能在接收循环上等
 //! TDLib。`/help` 的回调因此起一个工作线程，先解析权限，再 `reply`。
 //!
-//! `chat_admin` 是**会话角色**：群里的 Telegram 管理员不等于 `[roles].admins`。
-//! 频道里发帖的本来就是频道身份，所以频道按「频道管理员」处理。
+//! 可见性的两条轴（详见 [`Entry::visible`]）：
+//!
+//! - **角色是层级**：`owner` ⊃ `admin` ⊃ `user`。主人看得见管理员和普通命令，
+//!   管理员看不见主人才能用的命令。
+//! - **`chat_admin` 是会话角色**：只认本会话的 Telegram 管理员，跟全局角色分开；
+//!   频道里发帖的本来就是频道身份，所以频道按「频道管理员」处理。
+//!
+//! **私聊是主人的管理视图**：全局主人在私聊里看得见全部未隐藏的 `user` /
+//! `admin` / `owner` 命令，不受 `scopes` 限制（`chat_admin` 除外——私聊里没有
+//! 会话管理员）。群 / 频道对所有人（含主人）都严格按 `scopes` 过滤。
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -98,8 +106,28 @@ struct Entry {
 }
 
 impl Entry {
+    /// 这一条对「当前的人 × 当前会话」可不可见。
+    ///
+    /// 两条轴，分开算：
+    ///
+    /// - **角色是层级**：`owner` ⊃ `admin` ⊃ `user`。主人看得见管理员和普通命令，
+    ///   管理员看不见主人的命令。
+    /// - **`chat_admin` 是会话角色**：只认本会话的 Telegram 管理员，跟全局角色
+    ///   完全分开。私聊里没有会话管理员，所以那里谁都看不到 `chat_admin` 命令
+    ///   （全局主人也一样）。
+    ///
+    /// 会话范围（`scopes`）只在群里 / 频道里挡人。**私聊是主人的管理视图**：
+    /// 全局主人在这里看得见全部未隐藏的 `user` / `admin` / `owner` 命令，哪怕它
+    /// 只在群里用——不用切到群里就能知道机器人到底有哪些命令。普通用户和全局
+    /// 管理员仍按 `scopes` 过滤；群 / 频道对所有人（含主人）都严格按 `scopes`。
     fn visible(&self, global: GlobalRole, chat_admin: bool, kind: ChatKind) -> bool {
-        !self.hidden && self.role.allows(global, chat_admin) && self.scopes.contains(&kind)
+        if self.hidden || !self.role.allows(global, chat_admin) {
+            return false;
+        }
+        if kind == ChatKind::Private && global == GlobalRole::Owner {
+            return true;
+        }
+        self.scopes.contains(&kind)
     }
 }
 
@@ -454,6 +482,105 @@ mod tests {
             false,
         );
         assert!(as_owner.contains("/config"), "{as_owner}");
+    }
+
+    /// 私聊是主人的管理视图：角色是层级，`scopes` 不再挡命令。
+    ///
+    /// 主人的可见集合 = 普通命令 ∪ 管理员命令 ∪ 主人命令，哪怕某条命令只在群里 /
+    /// 频道里用。`chat_admin` 是**会话角色**，私聊里没有会话管理员，所以照样不显示。
+    #[test]
+    fn owner_in_private_sees_every_role_regardless_of_scope() {
+        let entries = vec![
+            entry(
+                "start",
+                Role::User,
+                &[ChatKind::Private, ChatKind::Group],
+                Some("fuyubot.start"),
+            ),
+            entry(
+                "post",
+                Role::User,
+                &[ChatKind::Channel],
+                Some("fuyubot.post"),
+            ),
+            entry(
+                "reload",
+                Role::Admin,
+                &[ChatKind::Group],
+                Some("fuyubot.manage"),
+            ),
+            entry(
+                "ban",
+                Role::ChatAdmin,
+                &[ChatKind::Group],
+                Some("fuyubot.mod"),
+            ),
+            entry(
+                "config",
+                Role::Owner,
+                &[ChatKind::Private],
+                Some("fuyubot.manage"),
+            ),
+        ];
+        let text = render_help(
+            &entries,
+            &BTreeMap::new(),
+            GlobalRole::Owner,
+            ChatKind::Private,
+            false,
+        );
+        for name in ["/start", "/post", "/reload", "/config"] {
+            assert!(text.contains(name), "主人私聊应看到 {name}：\n{text}");
+        }
+        assert!(
+            !text.contains("/ban"),
+            "chat_admin 是会话角色，私聊里谁都不是：\n{text}"
+        );
+    }
+
+    /// 管理员看不见主人才能用的命令（私聊也一样），但看得见普通 + 管理员命令。
+    #[test]
+    fn admin_never_sees_owner_commands() {
+        let entries = vec![
+            entry("start", Role::User, &[ChatKind::Private], None),
+            entry("reload", Role::Admin, &[ChatKind::Private], None),
+            entry("config", Role::Owner, &[ChatKind::Private], None),
+        ];
+        let text = render_help(
+            &entries,
+            &BTreeMap::new(),
+            GlobalRole::Admin,
+            ChatKind::Private,
+            false,
+        );
+        assert!(text.contains("/start"), "{text}");
+        assert!(text.contains("/reload"), "{text}");
+        assert!(!text.contains("/config"), "{text}");
+    }
+
+    /// 群里对主人也严格按 `scopes`：仅私聊的管理员命令不会漏进群。
+    #[test]
+    fn owner_in_group_still_follows_scopes() {
+        let entries = vec![
+            entry("config", Role::Owner, &[ChatKind::Private], None),
+            entry("ban", Role::Admin, &[ChatKind::Private], None),
+            entry(
+                "start",
+                Role::User,
+                &[ChatKind::Private, ChatKind::Group],
+                None,
+            ),
+        ];
+        let text = render_help(
+            &entries,
+            &BTreeMap::new(),
+            GlobalRole::Owner,
+            ChatKind::Group,
+            false,
+        );
+        assert!(text.contains("/start"), "{text}");
+        assert!(!text.contains("/config"), "{text}");
+        assert!(!text.contains("/ban"), "{text}");
     }
 
     /// 群管理员只在本群看到 `chat_admin` 命令；全局管理员不会因此多看见它们。

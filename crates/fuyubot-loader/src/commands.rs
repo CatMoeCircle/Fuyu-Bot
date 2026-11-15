@@ -454,7 +454,10 @@ mod tests {
         assert!(!CommandRole::ChatAdmin.allows_gate(GlobalRole::User, Some(false)));
         assert!(!CommandRole::Admin.allows_gate(GlobalRole::User, None));
         assert!(CommandRole::Admin.allows_gate(GlobalRole::Admin, None));
+        // 角色是层级：主人同样过管理员这一关（/help 的可见性也按同一套判）。
+        assert!(CommandRole::Admin.allows_gate(GlobalRole::Owner, None));
         assert!(!CommandRole::Owner.allows_gate(GlobalRole::Admin, None));
+        assert!(CommandRole::Owner.allows_gate(GlobalRole::Owner, None));
     }
 
     #[test]

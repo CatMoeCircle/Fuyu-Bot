@@ -288,7 +288,11 @@ fn parse_ids(value: &Value, label: &str) -> Result<(HashSet<i64>, Vec<String>), 
 }
 
 /// `[telegram].account_type`（CLI）或 `[telegram].account`（Android）。
-fn account_from_config(root: &Value) -> Option<bool> {
+/// 配置声明的账号类型（`[telegram].account_type`，Android 写 `account`）。
+///
+/// `Some(true)` = bot，`Some(false)` = user，`None` = 没写 / 认不出来。
+/// 宿主用它判断「bot 没配主人」是否该在**登录之前**就提醒（登录后以 `getMe` 为准）。
+pub(crate) fn account_from_config(root: &Value) -> Option<bool> {
     let telegram = root.get("telegram")?;
     ["account_type", "account"].iter().find_map(|key| {
         let raw = telegram.get(*key)?.as_str()?.trim();

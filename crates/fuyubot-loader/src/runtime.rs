@@ -207,6 +207,11 @@ impl std::fmt::Debug for AbiService {
 /// 所以用户的注释、段顺序、`api_hash` 都不会被卷进来。
 #[derive(Default)]
 struct ConfigState {
+    /// 用户配置文件本身（`fuyubot.toml`）：只为了在告警里指路，**运行时不写它**。
+    ///
+    /// 面板 / 手改配置需要用户知道改哪个文件；`store` 是它旁边的 `plugin-config/`，
+    /// 拿不出文件名，所以单独留一份。
+    path: Option<PathBuf>,
     /// 插件配置的运行时落盘目录（`<配置文件所在目录>/plugin-config/`）。`None` = 不可写。
     store: Option<PathBuf>,
     /// 完整配置树的 JSON（三层已经合成好；`get_config` 读的就是它）。
@@ -316,6 +321,8 @@ pub struct HostRuntime {
     self_user: Mutex<Option<Value>>,
     /// 命令闸门策略（`[command]` 段），[`HostRuntime::install_config`] 时解析好。
     command_policy: Mutex<CommandPolicy>,
+    /// 「bot 账户没配主人」的告警是否已经打过（幂等：登录与启动两处都可能触发）。
+    owner_warning: AtomicBool,
     /// 最近放行的命令 `(chat, message)`：命令回复接口据此判断要不要编辑原消息。
     command_contexts: Mutex<VecDeque<CommandMeta>>,
     /// 宿主通过命令回复接口**发出去**的新消息 `(chat, text)`：同名出站更新不再触发命令，
@@ -659,6 +666,7 @@ impl HostRuntime {
             cache: Cache::new(),
             self_user: Mutex::new(None),
             command_policy: Mutex::new(CommandPolicy::default()),
+            owner_warning: AtomicBool::new(false),
             command_contexts: Mutex::new(VecDeque::new()),
             command_replies: Mutex::new(VecDeque::new()),
             config: Mutex::new(ConfigState::default()),
@@ -826,6 +834,77 @@ impl HostRuntime {
             .self_user
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(me);
+        // 账号类型到这里才确定（`getMe` 覆盖配置里的 `account_type`）：bot 没配主人要立刻提醒。
+        let account = match self.self_user_is_bot() {
+            Some(true) => AccountKind::Bot,
+            Some(false) => AccountKind::User,
+            None => return,
+        };
+        self.emit_owner_warning(account);
+    }
+
+    /// `account` 是当前认定的账号类型但 `[roles].owners` 为空：返回该打的告警文本
+    /// （`None` = 不用提醒）。
+    ///
+    /// 为什么只提醒 bot：user 账户在 `owners` 为空时**自己**默认是主人（见
+    /// [`CommandPolicy::global_role`]），而 bot 没有隐式主人——Telegram 没有
+    /// 「这个 bot 是谁建的」这种接口，只能由用户显式写 id。忘了写的后果是
+    /// `role = owner / admin` 的命令谁都触发不了，且**不报错**，所以得主动说。
+    fn missing_owner_warning(&self, account: AccountKind) -> Option<String> {
+        if account != AccountKind::Bot {
+            return None;
+        }
+        let owners_empty = self
+            .command_policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .owners
+            .is_empty();
+        if !owners_empty {
+            return None;
+        }
+        let location = self
+            .config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path
+            .clone()
+            .map(|path| format!("配置文件 {} 的", path.display()))
+            .unwrap_or_else(|| "配置文件的".to_owned());
+        Some(format!(
+            "当前是 bot 账户，但 `[roles].owners` 还是空的：`owner` / `admin` 级命令谁都触发不了\
+——bot 账户没有隐式主人。请在{location} `[roles]` 段里填 `owners = [<你的 user id>]`\
+（可以问 @userinfobot 查），保存后重启 fuyubot 生效。"
+        ))
+    }
+
+    /// bot 账户没配主人时打一条告警。**每次启动最多一次**（启动与登录两条路径都会判）。
+    ///
+    /// `[command].whitelist_only` 之类的其他配置错误由 [`Self::install_config`] 逐条报，
+    /// 这条单独拎出来的原因：它不是「写错」，是「没写」，而且不会让任何一次调用失败。
+    pub fn warn_if_bot_without_owner(&self) {
+        if self.owner_warning.load(Ordering::Relaxed) {
+            return;
+        }
+        let policy = self
+            .command_policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.emit_owner_warning(self.command_account(&policy));
+    }
+
+    /// 真正判断 + 去重 + 打日志。`account` 是调用方**已经确定**的账号类型。
+    fn emit_owner_warning(&self, account: AccountKind) {
+        if self.owner_warning.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(warning) = self.missing_owner_warning(account) else {
+            return;
+        };
+        if !self.owner_warning.swap(true, Ordering::Relaxed) {
+            self.warn(&warning);
+        }
     }
 
     /// 自己的全部活跃用户名（`usernames.active_usernames`，字段路径见约束 42）。
@@ -1003,6 +1082,7 @@ impl HostRuntime {
     /// 这里顺手把**运行时落盘**（`<path 的目录>/plugin-config/*.toml`）并进来，只填缺失键：
     /// 用户配置优先，插件上次存的值排在它下面。
     pub fn install_config(&self, path: Option<PathBuf>, root: Value) {
+        let config_path = path.clone();
         let store = path
             .as_ref()
             .and_then(|path| path.parent())
@@ -1055,9 +1135,15 @@ impl HostRuntime {
         self.cache.set_capacity(cache_capacity);
 
         let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
+        config.path = config_path;
         config.store = store;
         config.root = root;
         config.user_plugin = user_plugin;
+        drop(config);
+
+        // 账号类型从配置里就能看出来的话，别等登录完才提醒（登录要人工输入，可能很久）。
+        // 登录成功后 `set_self_user` 会再判一次——那次以 `getMe` 为准，且只提醒一遍。
+        self.warn_if_bot_without_owner();
     }
 
     /// 合并插件包自带的默认配置（`plugin.json` 的 `config`），**只填缺失键**。
@@ -6503,6 +6589,72 @@ mod tests {
         assert_eq!(rt.self_user_id(), Some(7));
         rt.set_self_user(json!({"id": 7, "type": {"@type": "userTypeRegular"}}));
         assert_eq!(rt.self_user_is_bot(), Some(false));
+    }
+
+    /// bot 账户 + `[roles].owners` 为空 → 要提醒；user 账户 / 配了主人 / 还没确定账号类型 → 不提醒。
+    ///
+    /// 这条告警指向的是「没写」而不是「写错」：bot 没有隐式主人，忘配的后果是
+    /// `owner` / `admin` 级命令**谁都触发不了**，而任何一次调用都不会失败。
+    #[test]
+    fn bot_accounts_without_owners_get_a_warning() {
+        let warn = |rt: &HostRuntime, account: AccountKind| rt.missing_owner_warning(account);
+
+        // bot + 空 owners：有话说，并且指向配置文件。
+        let rt = runtime();
+        rt.install_config(
+            Some(PathBuf::from("proj/fuyubot.toml")),
+            json!({"telegram": {"account_type": "bot"}}),
+        );
+        let warning = warn(&rt, AccountKind::Bot).expect("bot + 空 owners 应该提醒");
+        assert!(warning.contains("[roles].owners"), "{warning}");
+        assert!(warning.contains("fuyubot.toml"), "{warning}");
+        assert!(warning.contains("重启"), "{warning}");
+
+        // user + 空 owners：自己默认就是主人，不用提醒。
+        assert_eq!(warn(&rt, AccountKind::User), None);
+
+        // 配了主人：不用提醒（即使账号是 bot）。
+        let owned = runtime();
+        owned.install_config(
+            None,
+            json!({"telegram": {"account_type": "bot"}, "roles": {"owners": [42]}}),
+        );
+        assert_eq!(warn(&owned, AccountKind::Bot), None);
+
+        // 没有配置文件（嵌入方 / 测试替身）：告警照样出，只是不指路。
+        let bare = runtime();
+        let warning = warn(&bare, AccountKind::Bot).expect("空配置也要提醒");
+        assert!(!warning.contains("配置文件 的"), "{warning}");
+    }
+
+    /// 只有 `owners` 为空**且**账号是 bot 时才落日志；同一进程只落一次。
+    #[test]
+    fn the_missing_owner_warning_is_emitted_once_and_only_for_bots() {
+        let rt = runtime();
+        rt.install_config(None, json!({"telegram": {"account_type": "bot"}}));
+        // 启动路径（还没登录，账号类型取配置）：第一次打，第二次不再打。
+        rt.warn_if_bot_without_owner();
+        assert!(rt.owner_warning.load(Ordering::Relaxed));
+        rt.warn_if_bot_without_owner();
+        assert!(rt.owner_warning.load(Ordering::Relaxed));
+
+        // `set_self_user` 里那条路径不会重复打（标志已经置上了）。
+        rt.set_self_user(json!({"id": 1, "type": {"@type": "userTypeBot"}}));
+        assert!(rt.owner_warning.load(Ordering::Relaxed));
+
+        // user 账户：一次都不打。
+        let user = runtime();
+        user.install_config(None, json!({"telegram": {"account_type": "user"}}));
+        user.warn_if_bot_without_owner();
+        assert!(!user.owner_warning.load(Ordering::Relaxed));
+
+        // 登录之后才知道是 bot（配置写的是 user）：`set_self_user` 补打这一条。
+        let flipped = runtime();
+        flipped.install_config(None, json!({"telegram": {"account_type": "user"}}));
+        flipped.warn_if_bot_without_owner();
+        assert!(!flipped.owner_warning.load(Ordering::Relaxed));
+        flipped.set_self_user(json!({"id": 1, "type": {"@type": "userTypeBot"}}));
+        assert!(flipped.owner_warning.load(Ordering::Relaxed));
     }
 
     /// 闸门接在运行时上：user 账户拦 `/`，`.` 前缀归一化成 `/`。

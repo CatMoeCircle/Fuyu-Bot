@@ -14,6 +14,7 @@ api_hash = ""
 [roles]
 # 主人 / 全局管理员 id；主人和管理员不受命令白名单影响。
 # owners 为空时 user 账户默认自己是主人；填了就按列表来。
+# ⚠️ bot 账户没有隐式主人：不填 owners，owner / admin 级命令谁都触发不了。
 owners = []
 admins = []
 

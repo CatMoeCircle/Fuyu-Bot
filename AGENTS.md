@@ -294,6 +294,11 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     `owners` 为空时 user 账户自己默认是主人；一旦配置了 `owners` 就按表来（自己不在表里
     就不再是主人，可以换成别人）。主人 / 全局管理员**不受 `[command].whitelist` 或
     `whitelist_only` 影响**，始终能触发。隐藏只影响 `/help` 渲染，不是授权。
+    **`/help` 的可见性是「角色层级 × 会话」**：`owner` ⊃ `admin` ⊃ `user`（主人看得见
+    管理员和普通命令，管理员看不见主人才能用的命令），`chat_admin` 单独按本会话管理员判、
+    不继承全局角色。**私聊是主人的管理视图**：全局主人在私聊里不受 `scopes` 限制，
+    看得见全部未隐藏的 `user` / `admin` / `owner` 命令（`chat_admin` 除外——私聊里没有
+    会话管理员）；群 / 频道对所有人（含主人）严格按 `scopes`。
 
 66. **TDLib 对象缓存在宿主**：`HostRuntime` 缓存 `chat` / `user` / `basic_group` /
     `supergroup` / `chat_member` / `community` / `community_full_info` 的**全量 JSON**，
