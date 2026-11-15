@@ -7,7 +7,7 @@
 //! 运行时读的是同一个 `fuyubot.toml`，schema 留在 CLI 里迟早跟 Android 那份漂移。这里只做
 //! **转出口**，免得 CLI 与面板里几十个调用点全改成 `fuyubot_app::…`。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use fuyubot_core::Kernel;
@@ -91,17 +91,57 @@ pub fn init_with_api_hash(
     Ok(config)
 }
 
-/// 内置插件的文件名主干：`fuyubot_plugin_start` → `fuyubot_plugin_start.{dll,so,dylib}`。
+/// 内置插件的静态元数据。**唯一来源是仓库根的 `plugins/builtins.json`**：
+/// Rust 侧（`init` / `run` 的自动安装）与发布脚本（`.github/scripts/builtin-bundles.sh`）
+/// 读同一份，别再各写一张表。
 ///
-/// 这三个由 `cargo package-bot`（以及 release 流程）编出来，跟可执行文件放在一起。
-/// ⚠️ 是**打包后**的名字：cargo 在 Linux / macOS 上给 cdylib 加 `lib` 前缀，
-/// 发布包与 `cargo package-bot` 的 `target/release/` 里两种形态都可能出现，
-/// 所以查找走 [`builtin_artifact`]，别在这里拼死文件名。
-pub const BUILTIN_PLUGINS: &[&str] = &[
-    "fuyubot_plugin_start",
-    "fuyubot_plugin_help",
-    "fuyubot_plugin_manage",
-];
+/// 字段只有分发格式 v1 需要的身份信息；`entry` / `version` / `abi` 在落盘时算，
+/// 因为入口文件名带平台扩展名、版本跟工作区走、ABI 跟宿主走。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BuiltinPlugin {
+    /// 插件 id，也是包目录名（`plugins/<id>/`）。
+    pub id: String,
+    /// 产物文件名主干：`fuyubot_plugin_start` → `bin/fuyubot_plugin_start.{dll,so,dylib}`。
+    pub stem: String,
+    /// 展示名（中文）。
+    pub name: String,
+    /// 一句话介绍。
+    pub description: String,
+}
+
+/// 编进 CLI 的内置插件表。`include_str!` 让改 JSON 必然触发重编。
+const BUILTIN_PLUGINS_JSON: &str = include_str!("../../../plugins/builtins.json");
+
+/// 读内置插件表。仓库里的文件坏掉是构建问题，报出具体 JSON 错误而不是猜。
+fn builtin_plugins() -> Result<Vec<BuiltinPlugin>, String> {
+    serde_json::from_str(BUILTIN_PLUGINS_JSON)
+        .map_err(|error| format!("内置插件元数据 plugins/builtins.json 解析失败: {error}"))
+}
+
+/// 给内置插件生成分发格式 v1 的清单（`plugin.json`）。
+///
+/// 版本取 CLI 的 `CARGO_PKG_VERSION`（三个插件都是 `version.workspace = true`，同一个版本）；
+/// 入口固定为包内的 `bin/<stem>.<ext>`——`install_builtins` 与发布脚本都按这个布局铺。
+fn builtin_manifest(plugin: &BuiltinPlugin) -> BundleManifest {
+    BundleManifest {
+        schema: 1,
+        id: plugin.id.clone(),
+        name: plugin.name.clone(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        kind: PluginKind::Native,
+        entry: format!("bin/{}.{DLL_EXTENSION}", plugin.stem),
+        // 静态预检用；真值仍以 `plugin_init` 返回的 handle 为准。
+        abi: Some(fuyubot_loader::abi::ABI_VERSION),
+        platforms: Vec::new(),
+        depends: Vec::new(),
+        optional_depends: Vec::new(),
+        provides: Vec::new(),
+        config: None,
+        description: plugin.description.clone(),
+        license: "MIT OR Apache-2.0".to_owned(),
+        homepage: String::new(),
+    }
+}
 
 /// 在 `dir` 里找内置插件的产物：无前缀名优先，其次才是 cargo 加的 `lib` 前缀名。
 ///
@@ -117,39 +157,200 @@ fn builtin_artifact(dir: &Path, stem: &str) -> Option<PathBuf> {
     .find(|path| path.is_file())
 }
 
-/// 把内置插件装进插件目录：先看**可执行文件旁边**，再看它下面的 `plugins/`
-/// （发布包里是后者，`cargo package-bot` 出来的是前者）。
+/// 旧形态的**禁用**产物：`<stem>.<ext>.disable`（无前缀优先，也认 `lib` 前缀）。
+fn disabled_builtin_artifact(dir: &Path, stem: &str) -> Option<PathBuf> {
+    [
+        format!("{stem}.{DLL_EXTENSION}"),
+        format!("lib{stem}.{DLL_EXTENSION}"),
+    ]
+    .into_iter()
+    .map(|file| fuyubot_loader::disabled_path(&dir.join(file)))
+    .find(|path| path.is_file())
+}
+
+/// 插件目录里已经装着的包（按清单 id 认，不按目录名——面板开关会挪目录、也可能保留展示名）。
+fn installed_bundle_ids(plugin_dir: &Path) -> BTreeSet<String> {
+    plugin_entries(plugin_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            PluginEntry::Bundle(dir) => BundleManifest::load(&dir).ok().map(|m| m.id),
+            PluginEntry::Legacy(_) => None,
+        })
+        .collect()
+}
+
+/// 被禁用的包 id（`.disabled/<id>/` 或旧面板留下的 `<id>.disable/`）。
+fn disabled_bundle_ids(plugin_dir: &Path) -> BTreeSet<String> {
+    fuyubot_loader::disabled_bundles(plugin_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|dir| BundleManifest::load(&dir).ok().map(|m| m.id))
+        .collect()
+}
+
+/// 把一个动态库放进 `<bundle>/bin/<stem>.<ext>`，再写 `plugin.json`。
 ///
-/// **只装缺的**：目标已存在就跳过，不覆盖用户换过的版本。返回这次真的拷过去的文件。
-/// 装进去的名字一律**无前缀**（`fuyubot_plugin_start.so`，不带 `lib`）：与发布包一致，
-/// 也让「已存在就跳过」的判断对得上——否则 Linux 上每次 `init` 都会再拷一份 `lib…so`。
+/// `move_source = true` 用于旧形态迁移：原文件**必须搬走**，留在原处会被当成第二个插件
+/// 再加载一次。写清单失败时尽量把库放回原处，别留下「目录在、清单没有」的半成品。
+fn materialize_bundle(
+    plugin: &BuiltinPlugin,
+    source: &Path,
+    bundle: &Path,
+    move_source: bool,
+) -> Result<(), String> {
+    let manifest = validated_manifest(builtin_manifest(plugin))?;
+    let bin_dir = bundle.join("bin");
+    std::fs::create_dir_all(&bin_dir).map_err(|e| format!("建不了 {}: {e}", bin_dir.display()))?;
+    let artifact = bin_dir.join(format!("{}.{DLL_EXTENSION}", plugin.stem));
+
+    let placed = if move_source {
+        match std::fs::rename(source, &artifact) {
+            Ok(()) => Ok(()),
+            // 同一插件目录内理论上不会跨盘；网络盘 / 重挂载点兜一手「复制 + 删源」。
+            Err(_) => std::fs::copy(source, &artifact).and_then(|_| std::fs::remove_file(source)),
+        }
+    } else {
+        std::fs::copy(source, &artifact).map(|_| ())
+    };
+    if let Err(error) = placed {
+        let _ = std::fs::remove_dir_all(bundle);
+        return Err(format!(
+            "拷贝 {} → {} 失败: {error}",
+            source.display(),
+            artifact.display()
+        ));
+    }
+
+    if let Err(error) = manifest.write(bundle) {
+        if move_source {
+            let _ = std::fs::rename(&artifact, source);
+        }
+        let _ = std::fs::remove_dir_all(bundle);
+        return Err(format!(
+            "写不了 {} 的 plugin.json: {error}",
+            bundle.display()
+        ));
+    }
+    Ok(())
+}
+
+/// 把**现成的包目录**整目录复制过去，并校验目标里的清单能指向一个真实入口。
+fn copy_bundle(source: &Path, target: &Path) -> Result<(), String> {
+    copy_dir_recursive(source, target)?;
+    let valid = BundleManifest::load(target).and_then(|manifest| manifest.validate(target));
+    if let Err(error) = valid {
+        let _ = std::fs::remove_dir_all(target);
+        return Err(format!("内置插件包 {} 不可用: {error}", source.display()));
+    }
+    Ok(())
+}
+
+/// 清掉与包同名的旧形态平铺库（启用 / 禁用都算）。
 ///
-/// ⚠️ **被禁用（`….disable`）的也算「已存在」**：不然面板里关掉一个内置插件之后，
-/// 下次 `run` 会重新拷一份启用的进来，开关等于没按——禁用是用户的决定，不该被
-/// 「只装缺的」这一步悄悄撤销。
+/// 包已经在了还留着平铺 dll 的话，`plugin_entries` 会把两个都列出来——同一条命令被注册两次，
+/// 加载时就会被宿主拒绝。旧文件是产品产物、不是用户配置，可以直接清掉。
+fn remove_stale_flat(plugin_dir: &Path, plugin: &BuiltinPlugin) -> Result<(), String> {
+    for path in [
+        builtin_artifact(plugin_dir, &plugin.stem),
+        disabled_builtin_artifact(plugin_dir, &plugin.stem),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("删不了旧形态内置插件 {}: {e}", path.display()))?;
+        cli!(info, "已清理旧形态内置插件 {}", path.display());
+    }
+    Ok(())
+}
+
+/// 把内置插件装成**插件包**（`plugins/<id>/plugin.json` + `bin/<动态库>`）。
 ///
-/// 这只是「复制一个已经编好的产物」，不碰编译——和 `plugin install` 同一件事（约束 40）。
+/// 来源按优先级：
+/// 1. **本插件目录里已有的平铺库**（老版本 `init` / `run` 装进去的）→ 就地迁成包；
+///    `.disable` 的迁进 `.disabled/<id>/`，禁用状态不丢。这一步也清掉「包 + 平铺」并存
+///    的重复件。
+/// 2. **可执行文件旁边 / 它下面的 `plugins/`**：发布包给的是现成包，`cargo package-bot`
+///    给的是 `target/release/` 里的平铺产物——两种都认。
+///
+/// **只装缺的**：已经是一个包（按清单 id 认）或被禁用（`.disabled/` 里）就跳过，
+/// 不覆盖用户换过的版本。返回这次新落成的包目录。
+///
+/// 这只是「复制 / 改名已经编好的产物」，不碰编译——和 `plugin install` 同一件事（约束 40）。
 pub fn install_builtins(plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("拿不到可执行文件路径: {e}"))?;
     let Some(exe_dir) = exe.parent() else {
         return Ok(Vec::new());
     };
-    let sources = [exe_dir.to_path_buf(), exe_dir.join("plugins")];
+    install_builtins_from(
+        &[exe_dir.to_path_buf(), exe_dir.join("plugins")],
+        plugin_dir,
+    )
+}
+
+/// [`install_builtins`] 的可测试版本：来源目录显式给。
+fn install_builtins_from(sources: &[PathBuf], plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let plugins = builtin_plugins()?;
     std::fs::create_dir_all(plugin_dir)
         .map_err(|e| format!("建不了 {}: {e}", plugin_dir.display()))?;
+    let installed = installed_bundle_ids(plugin_dir);
+    let disabled = disabled_bundle_ids(plugin_dir);
 
     let mut copied = Vec::new();
-    for stem in BUILTIN_PLUGINS {
-        let Some(source) = sources.iter().find_map(|dir| builtin_artifact(dir, stem)) else {
-            continue;
-        };
-        let target = plugin_dir.join(format!("{stem}.{DLL_EXTENSION}"));
-        if target.exists() || fuyubot_loader::disabled_path(&target).exists() {
+    for plugin in &plugins {
+        let bundle = plugin_dir.join(&plugin.id);
+        let disabled_bundle = plugin_dir.join(DISABLED_DIR).join(&plugin.id);
+
+        // 已经是包（目录名可能是展示名）或被禁用：不再装第二份，只清掉平铺残留。
+        if installed.contains(&plugin.id) || disabled.contains(&plugin.id) {
+            remove_stale_flat(plugin_dir, plugin)?;
             continue;
         }
-        std::fs::copy(&source, &target)
-            .map_err(|e| format!("拷贝 {} → {} 失败: {e}", source.display(), target.display()))?;
-        copied.push(target);
+        // 目录在、但清单读不出来（半成品 / 被手改坏）：不覆盖用户的东西，跳过去。
+        if bundle.exists() || disabled_bundle.exists() {
+            cli!(
+                warn,
+                "内置插件 {} 的目标已存在但不是可用的插件包，跳过：{}",
+                plugin.id,
+                if bundle.exists() {
+                    bundle.display()
+                } else {
+                    disabled_bundle.display()
+                }
+            );
+            continue;
+        }
+
+        // ① 老版本装进来的平铺库：先迁成包，避免它和新包同时出现。
+        if let Some(legacy) = builtin_artifact(plugin_dir, &plugin.stem) {
+            materialize_bundle(plugin, &legacy, &bundle, true)?;
+            copied.push(bundle);
+            continue;
+        }
+        if let Some(legacy) = disabled_builtin_artifact(plugin_dir, &plugin.stem) {
+            materialize_bundle(plugin, &legacy, &disabled_bundle, true)?;
+            continue;
+        }
+
+        // ② 可执行文件旁边自带的内置插件。
+        let source_bundle = sources.iter().map(|dir| dir.join(&plugin.id)).find(|dir| {
+            BundleManifest::load(dir)
+                .map(|manifest| manifest.id == plugin.id)
+                .unwrap_or(false)
+        });
+        if let Some(source) = source_bundle {
+            copy_bundle(&source, &bundle)?;
+            copied.push(bundle);
+            continue;
+        }
+        if let Some(source) = sources
+            .iter()
+            .find_map(|dir| builtin_artifact(dir, &plugin.stem))
+        {
+            materialize_bundle(plugin, &source, &bundle, false)?;
+            copied.push(bundle);
+        }
     }
     Ok(copied)
 }
@@ -618,6 +819,7 @@ pub fn migrate(plugin_dir: &Path, dry_run: bool) -> Result<Vec<String>, String> 
             plugin_dir.display()
         ));
     }
+    let builtins = builtin_plugins()?;
     let mut report = Vec::new();
     let entries = plugin_entries(plugin_dir)
         .map_err(|error| format!("扫不了 {}: {error}", plugin_dir.display()))?;
@@ -633,9 +835,9 @@ pub fn migrate(plugin_dir: &Path, dry_run: bool) -> Result<Vec<String>, String> 
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_default();
         let bare = stem.strip_prefix("lib").unwrap_or(&stem);
-        if BUILTIN_PLUGINS.contains(&bare) {
+        if builtins.iter().any(|builtin| builtin.stem == bare) {
             report.push(format!(
-                "跳过内置插件 {}（run 会自己装；迁成包会导致重复加载）",
+                "跳过内置插件 {}（run / init 会把它装成插件包；手工迁会重复加载）",
                 path.display()
             ));
             continue;
@@ -1337,6 +1539,206 @@ mod tests {
         assert_eq!(
             builtin_artifact(&dir, stem).as_deref(),
             Some(plain.as_path())
+        );
+    }
+
+    // ── 内置插件：包形态 ──────────────────────────────────────────
+
+    /// 内置插件表只认那三个，id / 产物主干是发布脚本与 `install_builtins` 的共同契约。
+    #[test]
+    fn builtin_metadata_lists_the_three_shipped_plugins() {
+        let plugins = builtin_plugins().unwrap();
+        let pairs: Vec<(&str, &str)> = plugins
+            .iter()
+            .map(|plugin| (plugin.id.as_str(), plugin.stem.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("fuyubot.start", "fuyubot_plugin_start"),
+                ("fuyubot.help", "fuyubot_plugin_help"),
+                ("fuyubot.manage", "fuyubot_plugin_manage"),
+            ]
+        );
+        assert!(plugins.iter().all(|plugin| !plugin.name.is_empty()));
+        assert!(plugins.iter().all(|plugin| !plugin.description.is_empty()));
+    }
+
+    /// 有平铺产物时，装进去的必须是**包**：`plugins/<id>/plugin.json` + `bin/库`。
+    #[test]
+    fn install_builtins_writes_bundle_packages() {
+        let source = temp("builtin-bundle-src");
+        let plugin_dir = temp("builtin-bundle-dst");
+        let plugins = builtin_plugins().unwrap();
+        let plugin = &plugins[0];
+        let artifact = source.join(format!("{}.{DLL_EXTENSION}", plugin.stem));
+        std::fs::write(&artifact, b"lib").unwrap();
+
+        let installed = install_builtins_from(std::slice::from_ref(&source), &plugin_dir).unwrap();
+        assert_eq!(installed, vec![plugin_dir.join(&plugin.id)]);
+
+        let bundle = plugin_dir.join(&plugin.id);
+        let manifest = BundleManifest::load(&bundle).unwrap();
+        assert_eq!(manifest.id, plugin.id);
+        assert_eq!(manifest.name, plugin.name);
+        assert_eq!(manifest.kind, PluginKind::Native);
+        assert_eq!(
+            manifest.entry,
+            format!("bin/{}.{DLL_EXTENSION}", plugin.stem)
+        );
+        assert_eq!(manifest.abi, Some(fuyubot_loader::abi::ABI_VERSION));
+        // 写完要能通过加载器自己的三道校验（平台 / 入口存在 / 仍在包内）。
+        manifest.validate(&bundle).unwrap();
+        assert!(
+            bundle
+                .join("bin")
+                .join(format!("{}.{DLL_EXTENSION}", plugin.stem))
+                .is_file()
+        );
+    }
+
+    /// 老版本装进来的平铺库要**就地迁成包**：原文件搬走，不能再被当成第二个插件加载。
+    #[test]
+    fn install_builtins_migrates_a_legacy_flat_library_in_place() {
+        let plugin_dir = temp("builtin-migrate-flat");
+        let plugins = builtin_plugins().unwrap();
+        let plugin = &plugins[0];
+        let flat = plugin_dir.join(format!("{}.{DLL_EXTENSION}", plugin.stem));
+        std::fs::write(&flat, b"legacy").unwrap();
+
+        let installed = install_builtins_from(&[], &plugin_dir).unwrap();
+        assert_eq!(installed, vec![plugin_dir.join(&plugin.id)]);
+        assert!(!flat.exists(), "平铺库必须搬走，否则会加载两份");
+
+        let bundle = plugin_dir.join(&plugin.id);
+        let manifest = BundleManifest::load(&bundle).unwrap();
+        manifest.validate(&bundle).unwrap();
+        assert_eq!(
+            std::fs::read(
+                bundle
+                    .join("bin")
+                    .join(format!("{}.{DLL_EXTENSION}", plugin.stem))
+            )
+            .unwrap(),
+            b"legacy"
+        );
+    }
+
+    /// 平铺库被 `.disable` 过：迁进 `.disabled/<id>/`，**不能**顺手启用回来。
+    #[test]
+    fn install_builtins_keeps_a_disabled_legacy_library_disabled() {
+        let plugin_dir = temp("builtin-migrate-disabled");
+        let plugins = builtin_plugins().unwrap();
+        let plugin = &plugins[0];
+        let flat = plugin_dir.join(format!("{}.{DLL_EXTENSION}", plugin.stem));
+        let disabled_flat = fuyubot_loader::disabled_path(&flat);
+        std::fs::write(&disabled_flat, b"off").unwrap();
+
+        assert!(install_builtins_from(&[], &plugin_dir).unwrap().is_empty());
+        assert!(
+            !plugin_dir.join(&plugin.id).exists(),
+            "禁用项不许装成启用包"
+        );
+
+        let bundle = plugin_dir.join(DISABLED_DIR).join(&plugin.id);
+        assert!(fuyubot_loader::is_bundle_dir(&bundle));
+        BundleManifest::load(&bundle)
+            .unwrap()
+            .validate(&bundle)
+            .unwrap();
+        assert!(!disabled_flat.exists(), "旧文件已经搬进包里了");
+    }
+
+    /// 已经是一个包（哪怕目录名是展示名）就不再装第二份；同名的平铺残留顺手清掉。
+    #[test]
+    fn install_builtins_skips_an_existing_bundle_and_cleans_stale_flat_files() {
+        let plugin_dir = temp("builtin-skip-existing");
+        let source = temp("builtin-skip-existing-src");
+        let plugins = builtin_plugins().unwrap();
+        let plugin = &plugins[0];
+
+        let bundle = plugin_dir.join(&plugin.id);
+        std::fs::create_dir_all(bundle.join("bin")).unwrap();
+        let entry = bundle
+            .join("bin")
+            .join(format!("{}.{DLL_EXTENSION}", plugin.stem));
+        std::fs::write(&entry, b"bundled").unwrap();
+        builtin_manifest(plugin).write(&bundle).unwrap();
+
+        let flat = plugin_dir.join(format!("{}.{DLL_EXTENSION}", plugin.stem));
+        std::fs::write(&flat, b"stale").unwrap();
+        let src_artifact = source.join(format!("{}.{DLL_EXTENSION}", plugin.stem));
+        std::fs::write(&src_artifact, b"new").unwrap();
+
+        let installed = install_builtins_from(std::slice::from_ref(&source), &plugin_dir).unwrap();
+        assert!(installed.is_empty(), "已经是包了就不该再动它");
+        assert!(!flat.exists(), "平铺旧件要清掉，否则会加载两份");
+        assert_eq!(std::fs::read(&entry).unwrap(), b"bundled");
+    }
+
+    /// 发布包给的是现成包目录：整目录复制，清单与入口原样过去。
+    #[test]
+    fn install_builtins_copies_a_ready_bundle_from_the_release_layout() {
+        let source = temp("builtin-release-src");
+        let plugin_dir = temp("builtin-release-dst");
+        let plugins = builtin_plugins().unwrap();
+        let plugin = &plugins[0];
+
+        let src_bundle = source.join(&plugin.id);
+        std::fs::create_dir_all(src_bundle.join("bin")).unwrap();
+        std::fs::write(
+            src_bundle
+                .join("bin")
+                .join(format!("{}.{DLL_EXTENSION}", plugin.stem)),
+            b"release",
+        )
+        .unwrap();
+        builtin_manifest(plugin).write(&src_bundle).unwrap();
+
+        let installed = install_builtins_from(std::slice::from_ref(&source), &plugin_dir).unwrap();
+        assert_eq!(installed, vec![plugin_dir.join(&plugin.id)]);
+        let bundle = plugin_dir.join(&plugin.id);
+        BundleManifest::load(&bundle)
+            .unwrap()
+            .validate(&bundle)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(
+                bundle
+                    .join("bin")
+                    .join(format!("{}.{DLL_EXTENSION}", plugin.stem))
+            )
+            .unwrap(),
+            b"release"
+        );
+    }
+
+    /// 面板按展示名把包挪进 `.disabled/`：按清单 id 也得认出来，不能又装一份启用的。
+    #[test]
+    fn install_builtins_respects_a_disabled_bundle_under_another_directory_name() {
+        let plugin_dir = temp("builtin-disabled-bundle");
+        let source = temp("builtin-disabled-bundle-src");
+        let plugins = builtin_plugins().unwrap();
+        let plugin = &plugins[0];
+
+        let disabled = plugin_dir.join(DISABLED_DIR).join("启动问候");
+        std::fs::create_dir_all(disabled.join("bin")).unwrap();
+        std::fs::write(
+            disabled
+                .join("bin")
+                .join(format!("{}.{DLL_EXTENSION}", plugin.stem)),
+            b"off",
+        )
+        .unwrap();
+        builtin_manifest(plugin).write(&disabled).unwrap();
+
+        let artifact = source.join(format!("{}.{DLL_EXTENSION}", plugin.stem));
+        std::fs::write(&artifact, b"on").unwrap();
+        let installed = install_builtins_from(std::slice::from_ref(&source), &plugin_dir).unwrap();
+        assert!(installed.is_empty());
+        assert!(
+            !plugin_dir.join(&plugin.id).exists(),
+            "禁用状态是用户的决定，不能装成启用的"
         );
     }
 

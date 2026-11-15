@@ -205,7 +205,10 @@ Rust / C / Python / JS 四种写法见
 
 ## 插件
 
-内置三个：`/start`、`/help`、`/plugins`。自己的插件放进 `plugins/`：Rust / C / C++ / Go 编成动态库；
+内置三个：`/start`、`/help`、`/plugins`（`/plugins` 只给主人，需配 `[roles].owners`）；
+它们也按下面的 bundle 格式装成
+`plugins/<id>/`（`init` / `run` 自动完成，旧版本的平铺 dll 会就地迁移）。
+自己的插件放进 `plugins/`：Rust / C / C++ / Go 编成动态库；
 Python / JS / TS 写脚本目录，由 [`fuyubot-script`](https://github.com/CatMoeCircle/FuyuBot-Script)
 托管（从它的 Release 下 `fuyubot-script-<OS>-<平台>.zip`，解压到 `plugins/`）：
 

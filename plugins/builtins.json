@@ -1,0 +1,20 @@
+[
+  {
+    "id": "fuyubot.start",
+    "stem": "fuyubot_plugin_start",
+    "name": "启动问候",
+    "description": "回复 /start 的欢迎语"
+  },
+  {
+    "id": "fuyubot.help",
+    "stem": "fuyubot_plugin_help",
+    "name": "帮助",
+    "description": "汇总并回复 /help 的命令表"
+  },
+  {
+    "id": "fuyubot.manage",
+    "stem": "fuyubot_plugin_manage",
+    "name": "插件管理",
+    "description": "列出已安装和已禁用的插件"
+  }
+]

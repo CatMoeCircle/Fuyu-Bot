@@ -827,8 +827,8 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // （`init` 只在缺配置时才会建 `plugins/`，配置已存在而目录被删掉就轮到这条兜底）。
     std::fs::create_dir_all(&plugin_dir)
         .map_err(|e| format!("建不了插件目录 {}: {e}", plugin_dir.display()))?;
-    // 内置插件（/start、/help、/plugins）跟可执行文件放在一起，装进插件目录就能用。
-    // **只装缺的**，而且回放不碰用户目录（`--replay` 是离线验插件的开发路径）。
+    // 内置插件（/start、/help、/plugins）跟可执行文件放在一起，装成**插件包**（`plugins/<id>/`）。
+    // **只装缺的**，旧版本的平铺库会就地迁成包；回放不碰用户目录（`--replay` 是离线验插件的开发路径）。
     if args.replay.is_none() {
         match scaffold::install_builtins(&plugin_dir) {
             Ok(staged) => {

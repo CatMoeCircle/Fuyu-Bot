@@ -4,7 +4,7 @@
 #   fuyubot-<版本>-android-jni-<abi>.zip
 #     libfuyubotjni.so   ← 宿主 System.loadLibrary("fuyubotjni")
 #     libtdjson.so       ← 同 ABI，必须一起给
-#     plugins/*.so       ← 可选的内置插件（/start、/help、/plugins）
+#     plugins/<id>/      ← 可选的内置插件包（plugin.json + bin/*.so，/start、/help、/plugins）
 #     include/fuyubot_jni.h
 #     README.txt
 #
@@ -16,6 +16,8 @@
 #   tdjson-source-dir  含 libtdjson.so 的目录（默认 .tdlib-cache/<version>/android-<arch>）
 #   package-name       包名（默认 `fuyubot-android-jni-<abi>`；release-bot 传带版本号的名字）
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TRIPLE="${1:?target triple}"
 ABI="${2:?abi: arm64-v8a | x86_64}"
@@ -82,16 +84,9 @@ if [[ ! -f "$STAGE/libc++_shared.so" ]]; then
   echo "         新包应带 libc++_shared / libcrypto / libssl 三个独立 .so（见 build-tdlib-android.sh）" >&2
 fi
 
-# 内置插件：Linux 产物带 `lib` 前缀，包里一律**无前缀**（与可执行文件包的口径一致）。
-for stem in fuyubot_plugin_start fuyubot_plugin_help fuyubot_plugin_manage; do
-  src="$PLUGIN_DIR/${stem}.so"
-  [[ -f "$src" ]] || src="$PLUGIN_DIR/lib${stem}.so"
-  if [[ -f "$src" ]]; then
-    cp "$src" "$STAGE/plugins/${stem}.so"
-  else
-    echo "warning: 缺内置插件 ${stem}.so（带 lib 前缀的也试过了），本次不带它" >&2
-  fi
-done
+# 内置插件（可选）：铺成插件分发格式 v1 的目录包（`plugins/<id>/plugin.json` + `bin/*.so`）。
+# JNI 包里缺内置插件不致命，所以用 optional；元数据只有 plugins/builtins.json 一份。
+bash "$SCRIPT_DIR/builtin-bundles.sh" "$STAGE/plugins" "$PLUGIN_DIR" so optional
 
 # 用 printf 而不是 heredoc：YAML 块标量会把内容整体缩进，缩进的 EOF 不会终止 heredoc。
 printf '%s\n' \
@@ -105,7 +100,8 @@ printf '%s\n' \
   "     （本包的 tdjson 把 OpenSSL / libc++ 静态并进去了，不需要额外依赖；" \
   "      若你的 tdjson 是动态版，还得一起拷 libc++_shared.so / libcrypto.so* / libssl.so*，" \
   "      少了它们设备上会直接报 library not found）" \
-  "  2) plugins/*.so（可选）→ 拷到你的 <root>/plugins/ 再 chmod 0444（targetSdk 34+ 的只读要求）" \
+  "  2) plugins/<id>/ 插件包（可选）→ 整个目录拷到你的 <root>/plugins/，目录与 .so 都 chmod 0444" \
+  "     （targetSdk 34+ 要求动态加载的代码只读；包内布局是 plugin.json + bin/*.so）" \
   "  3) 代码里**先加载依赖、再加载 tdjson、最后加载 fuyubotjni**：" \
   "     System.load(File(nativeLibraryDir, \"libc++_shared.so\").absolutePath)" \
   "     System.load(File(nativeLibraryDir, \"libcrypto.so.3\").absolutePath)   // 版本号按产物实际文件名" \

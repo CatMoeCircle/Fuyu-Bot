@@ -168,6 +168,8 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
 49. **发行形态是「下载即用」**：`fuyubot-<版本>-<OS>-<平台>.zip`（`<OS>` = windows / linux / macos，
     `<平台>` = x86_64 / aarch64），**解压出来就是本体**（zip 里不再套一层目录），
     内容是 exe + tdjson + `plugins/`；内置插件**不单独打包**，中间 tar.gz 只留在 Actions artifacts。
+    内置插件也走分发格式 v1：发布包与项目的 `plugins/` 里都是 `plugins/<id>/plugin.json` + `bin/*`，
+    不再有平铺 dll（老项目里的平铺产物由 `init` / `run` 就地迁成包）。
 50. **Go 的 c-shared 插件不能卸载**：识别 `Go buildinf` 魔数并故意不卸载；同进程重复加载不可靠。
 51. **发布顺序**：本仓发 `fuyubot-abi` / `fuyubot-tdlib-sys` →
     FuyuBot-Script 发各平台 dll 资产（不进 crates.io）。不要把 patch 写进下游的 `Cargo.toml`。
@@ -198,6 +200,9 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     加载器必须能**不 dlopen** 就拿到 `id/version/kind/entry/depends`（`probe_bundle`），
     真正 `dlopen` 只发生在 `DylibPlugin::apply`；`plugin_files` 只服务旧形态，
     新代码不要再用它扫插件目录。bundle 的 `plugin_init` 名字与清单 id 不一致要拒绝加载。
+    **内置插件（`fuyubot.start` / `.help` / `.manage`）也走这套**：它们的身份只写在
+    `plugins/builtins.json`（Rust 的 `install_builtins` 与发布脚本
+    `.github/scripts/builtin-bundles.sh` 读同一份），别在代码或脚本里再写第二张表。
 60. **Go 的 c-shared 没有 `plugin.json` 就拒绝**：`PluginLoader::probe` 在读文件魔数阶段
     直接返回 `GoRequiresManifest`，**不 dlopen**——它一旦映射就永远不能卸载，必须在
     映射前就知道依赖。唯一例外是 `probe_for_migration`（`plugin migrate` 用，进程即将退出），

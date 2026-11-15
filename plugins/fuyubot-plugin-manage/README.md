@@ -2,6 +2,10 @@
 
 内置插件（cdylib）：`/plugins` 列出宿主进程里**真在跑**的插件，外加已禁用的。
 
+- **只有主人能用**：命令登记时声明 `role = "owner"`（主人来自 `[roles].owners`；
+  bot 账户不配 `owners` 就没有主人，`/plugins` 也就没人能触发）。
+  `owner` 命令默认 `scopes = private`，不会在群里出现；要群里用必须显式写 `scopes`。
+
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
 - 每行是 `名称（id）— 介绍`：展示名 / 介绍来自插件自报的 `plugin_manifest`（`display_name` / `description`），脚本插件等没有 manifest 的再从 `plugins/scripts/<id>/plugin.json` 补；老插件没有展示名就只写 id。

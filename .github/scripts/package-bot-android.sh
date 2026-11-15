@@ -4,7 +4,7 @@
 #   fuyubot-android-<arch>/
 #     fuyubot             ← aarch64-linux-android / x86_64-linux-android 的 ELF 可执行文件
 #     libtdjson.so        ← 同级：loader 的优先级 2b「可执行文件目录」靠它命中
-#     plugins/*.so        ← 内置插件（/start、/help、/plugins），`init` 会自己装进项目
+#     plugins/<id>/       ← 内置插件包（plugin.json + bin/*.so），`init` 会自己装进项目
 #     README.txt
 #
 # 为什么 tdjson 必须同级：Android 上 `dlopen("libtdjson.so")` 不会去搜 $PWD，
@@ -17,6 +17,8 @@
 #   package-name         包目录名（默认 `fuyubot-android-<arch>`；release-bot 传带版本号的名字，
 #                        这样 publish 打出来的 zip 与桌面口径一致：fuyubot-<版本>-android-<arch>.zip）
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TRIPLE="${1:?target triple}"
 ARCH="${2:?arch: aarch64 | x86_64}"
@@ -62,17 +64,9 @@ if [[ ! -f "$STAGE/libc++_shared.so" ]]; then
   echo "         新包应带 libc++_shared / libcrypto / libssl 三个独立 .so（见 build-tdlib-android.sh）" >&2
 fi
 
-# 内置插件：cdylib 文件名在 Linux 上有 `lib` 前缀，包里必须是**无前缀**的
-# `fuyubot_plugin_<名字>.so`（`scaffold::install_builtins` 按 `{stem}.so` 找）。
-for stem in fuyubot_plugin_start fuyubot_plugin_help fuyubot_plugin_manage; do
-  src="$PLUGIN_DIR/${stem}.so"
-  [[ -f "$src" ]] || src="$PLUGIN_DIR/lib${stem}.so"
-  [[ -f "$src" ]] || {
-    echo "error: 缺内置插件产物 ${stem}.so（带 lib 前缀的也试过了，目录 $PLUGIN_DIR）" >&2
-    exit 1
-  }
-  cp "$src" "$STAGE/plugins/${stem}.so"
-done
+# 内置插件：铺成插件分发格式 v1 的目录包（`plugins/<id>/plugin.json` + `bin/*.so`）。
+# cdylib 在 Linux 上有 `lib` 前缀，包里统一无前缀；元数据只有 plugins/builtins.json 一份。
+bash "$SCRIPT_DIR/builtin-bundles.sh" "$STAGE/plugins" "$PLUGIN_DIR" so required
 
 # 用 printf 而不是 heredoc：YAML 块标量会把内容整体缩进，缩进的 `EOF` 不会终止 heredoc。
 printf '%s\n' \
@@ -80,7 +74,7 @@ printf '%s\n' \
   "" \
   "外置 TDLib：${VERSION}（commit ${COMMIT}，库与可执行文件同级，别删 libtdjson.so" \
   "  以及同级的 libc++_shared.so / libcrypto.so* / libssl.so*——tdjson 动态依赖它们）" \
-  "内置插件在 plugins/（/start、/help、/plugins），init/run 会自动装进项目" \
+  "内置插件在 plugins/<id>/ 的插件包里（/start、/help、/plugins），init/run 会自动装进项目" \
   "" \
   "放哪儿跑：**要可执行权限的目录**——Termux 家目录（\$HOME）或 adb 推的 /data/local/tmp。" \
   "  /sdcard 挂着 noexec，放那儿跑不起来。" \
@@ -146,10 +140,18 @@ if interp is None:
 if "linker" not in interp:
     raise SystemExit(f"PT_INTERP 看着不像 Android 的动态链接器：{interp}")
 
-for required in ("libtdjson.so", "plugins/fuyubot_plugin_start.so",
-                 "plugins/fuyubot_plugin_help.so", "plugins/fuyubot_plugin_manage.so"):
-    if not (stage / required).is_file():
-        raise SystemExit(f"包里缺 {required}")
+if not (stage / "libtdjson.so").is_file():
+    raise SystemExit("包里缺 libtdjson.so")
+# 内置插件必须是**包**：清单在、入口在，缺一样 init 就会静默少装一个。
+for plugin_id, stem in (
+    ("fuyubot.start", "fuyubot_plugin_start"),
+    ("fuyubot.help", "fuyubot_plugin_help"),
+    ("fuyubot.manage", "fuyubot_plugin_manage"),
+):
+    for required in (f"plugins/{plugin_id}/plugin.json",
+                     f"plugins/{plugin_id}/bin/{stem}.so"):
+        if not (stage / required).is_file():
+            raise SystemExit(f"包里缺 {required}")
 
 print(f"OK ELF64 {arch} e_type={e_type} e_machine={e_machine} interp={interp}")
 PY

@@ -3,7 +3,7 @@
 #
 #   JNI 包（本仓 release-bot 的 build-android 产物）
 #     libfuyubotjni.so / libtdjson.so / libc++_shared.so / libcrypto.so / libssl.so
-#     plugins/*.so、include/、README.txt
+#     plugins/<id>/（插件包）、include/、README.txt
 #         │  解压到 app/src/main/assets/fuyubot-kernel/（那是上游约定的**指定目录**，
 #         │  被 .gitignore 排除、不入库，缺了它也照样能编出「没有内核的」APK）
 #         ▼
@@ -94,8 +94,8 @@ done
 if ! printf '%s\n' "$listing" | grep -qx 'libc++_shared.so'; then
   echo "warning: JNI 包里没有 libc++_shared.so（静态并入的旧 tdjson？）——设备上可能加载失败" >&2
 fi
-if ! printf '%s\n' "$listing" | grep -q '^plugins/.*\.so$'; then
-  echo "warning: JNI 包里没有 plugins/*.so，APK 里会没有 /start、/help、/plugins" >&2
+if ! printf '%s\n' "$listing" | grep -q '^plugins/[^/]*/plugin\.json$'; then
+  echo "warning: JNI 包里没有 plugins/<id>/plugin.json，APK 里会没有 /start、/help、/plugins" >&2
 fi
 
 # ── 2. 放进上游约定的指定目录 ─────────────────────────────────────
