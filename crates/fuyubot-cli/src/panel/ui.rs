@@ -2131,7 +2131,9 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
 
 /// 登录输入框：一个问题 + 一行输入（密码打码）。
 ///
-/// 面板里每显示一次，就代表 `fuyubot-app` 的登录流程正卡在 `AppHost::ask` 那一步等人。
+/// 整个登录期间它都在：正等某个问题的答案时显示输入框，其余时候（线程还在启动
+/// TDLib、刚把答案交出去等下一个问题）显示「处理中」——**弹窗不消失**，按键才
+/// 不会漏给全局快捷键（`1`..`6` / `q` / `s` 会把面板跳走，登录直接被打断）。
 fn draw_login(frame: &mut Frame, app: &App, area: Rect) {
     let Some(modal) = app.login.as_ref() else {
         return;
@@ -2146,7 +2148,10 @@ fn draw_login(frame: &mut Frame, app: &App, area: Rect) {
         )]))
         .border_style(Style::new().fg(Color::Cyan));
 
-    let shown = if modal.masked() {
+    let asking = modal.asking();
+    let shown = if !asking {
+        String::new()
+    } else if modal.masked() {
         "•".repeat(modal.input.chars().count())
     } else {
         modal.input.clone()
@@ -2158,22 +2163,44 @@ fn draw_login(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = wrap_dialog_line(prompt, inner_width);
     let prompt_rows = lines.len() as u16;
     // 输入框永远只占一行：太长的 Token / 手机号从左边省略，光标留在框内。
-    let input = fit_line_tail(
-        Line::from(vec![
-            Span::styled("> ", Style::new().fg(Color::Cyan)),
-            Span::raw(shown),
-            Span::styled("▏", Style::new().fg(Color::Cyan)),
-        ]),
-        inner_width,
-    );
-    let footer = footer_hint(
-        inner_width,
-        &[
-            "Enter 提交 · Esc 取消（登录期间实例必须是停的）",
-            "Enter 提交 · Esc 取消",
-            "Enter/Esc",
-        ],
-    );
+    let input = if asking {
+        fit_line_tail(
+            Line::from(vec![
+                Span::styled("> ", Style::new().fg(Color::Cyan)),
+                Span::raw(shown),
+                Span::styled("▏", Style::new().fg(Color::Cyan)),
+            ]),
+            inner_width,
+        )
+    } else {
+        // 等待态没有可编辑的光标：只说明「按键归它、正在等」。
+        fit_line_tail(
+            Line::from(Span::styled(
+                "处理中，请稍候…",
+                Style::new().fg(Color::DarkGray),
+            )),
+            inner_width,
+        )
+    };
+    let footer = if asking {
+        footer_hint(
+            inner_width,
+            &[
+                "Enter 提交 · Esc 取消（登录期间实例必须是停的）",
+                "Enter 提交 · Esc 取消",
+                "Enter/Esc",
+            ],
+        )
+    } else {
+        footer_hint(
+            inner_width,
+            &[
+                "登录进行中 · 按键先交给它 · Esc 取消 · Ctrl+C 退出",
+                "登录进行中 · Esc 取消 · Ctrl+C 退出",
+                "Esc/Ctrl+C",
+            ],
+        )
+    };
     let inner_rows = prompt_rows + 1 + 1 + 1 + 1 + 1;
     let popup = centered(area, popup_width, dialog_height(inner_rows, area));
     frame.render_widget(Clear, popup);
@@ -3088,6 +3115,20 @@ mod tests {
             assert!(screen.contains("Enter"), "width={width}\n{screen}");
             assert!(screen.contains("Esc"), "width={width}\n{screen}");
         }
+    }
+
+    /// 等待态（线程还在启动 TDLib）也要画出来：用户得知道按键为什么没反应、
+    /// 以及怎么取消；这时没有输入框，不该再出现「Enter 提交」。
+    #[test]
+    fn login_waiting_modal_explains_itself() {
+        let mut app = app();
+        app.login = Some(crate::panel::login::LoginModal::waiting(
+            "正在启动 TDLib 并检查登录状态…",
+        ));
+        let screen = text(&render(&mut app, 80, 24));
+        assert!(screen.contains("处理中"), "{screen}");
+        assert!(screen.contains("Esc"), "{screen}");
+        assert!(!screen.contains("Enter 提交"), "{screen}");
     }
 
     /// 首次配置的两个字段不能把底部提示挤出弹窗；api_hash 太长时输入框保留尾部。

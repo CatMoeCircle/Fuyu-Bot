@@ -41,6 +41,13 @@ const LOG_WINDOW_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// 提示条停留多久。
 const TOAST_SECS: u64 = 4;
 
+/// 登录线程最长能**沉默**多久：`fuyubot-app` 的登录预算是 600s，这里留一分钟余量。
+///
+/// 登录是**模态**的（这段时间所有按键都归它），所以必须有一条兜底：线程真卡死了，
+/// 也不能让面板永远出不来。只算「没在等用户输入」的时间——等人不算卡住
+/// （每个问题自己有 300s 的 `ASK_TIMEOUT` 兜着）。
+const LOGIN_WATCHDOG: Duration = Duration::from_secs(660);
+
 // ── 页面 ───────────────────────────────────────────────────────────
 
 /// 左侧导航的六个页面。
@@ -1459,6 +1466,10 @@ pub struct App {
     pub credentials: Option<CredentialSetup>,
     /// 凭据填完后是否要继续登录（`s` / `L` 都会置位）。
     login_after_setup: bool,
+    /// 用户按过 `Esc`：下一个问题一到就回绝（登录线程启动 TDLib 时没有可回绝的对象）。
+    login_cancel_requested: bool,
+    /// 登录线程最后一次「有进展」（开跑 / 弹出一个问题）的时刻：看门狗用它解锁界面。
+    login_idle: Instant,
 }
 
 impl App {
@@ -1549,6 +1560,8 @@ impl App {
             start_after_login: false,
             credentials: None,
             login_after_setup: false,
+            login_cancel_requested: false,
+            login_idle: Instant::now(),
         };
         app.refresh_all();
         app
@@ -1965,6 +1978,17 @@ impl App {
     /// 事件循环每转一圈调一次：收工作线程结果、清过期提示、到点刷新。
     pub fn tick(&mut self) {
         self.poll_login();
+        // 登录是模态的，所以必须有一条兜底：线程真卡死了也得把界面放出来
+        // （线程自己会按登录预算超时退出，这里只管解锁界面）。
+        // 正等人填问题不算卡住：那是用户的节奏，问题自己有 `ASK_TIMEOUT`。
+        let asking = self.login.as_ref().is_some_and(LoginModal::asking);
+        if self.login_busy && !asking && self.login_idle.elapsed() >= LOGIN_WATCHDOG {
+            self.login_busy = false;
+            self.login = None;
+            self.login_cancel_requested = false;
+            self.start_after_login = false;
+            self.set_toast("登录超时：已解锁面板（实例仍未登录）", Level::Warn);
+        }
         // 商店的后台线程（索引 / 安装）要靠这里回投；离开商店页也要排空，
         // 否则安装完成后状态会一直停在「进行中」。
         if let Some(store) = self.store.as_mut() {
@@ -2165,6 +2189,11 @@ impl App {
             }
         };
         self.login_busy = true;
+        self.login_cancel_requested = false;
+        self.login_idle = Instant::now();
+        // 先把弹窗立起来：线程要启动 TDLib，这几秒里按键全归弹窗——
+        // 用户此刻往往已经在敲 bot_token 了。
+        self.login = Some(LoginModal::waiting("正在启动 TDLib 并检查登录状态…"));
         self.set_toast(
             "正在检查登录状态；需要时弹输入框，完成后自动继续",
             Level::Info,
@@ -2232,28 +2261,35 @@ impl App {
         })
     }
 
-    /// 登录弹窗开着时的按键：只管输入。
+    /// 登录弹窗开着时的按键：只管输入；`Esc` 取消整个流程。
+    ///
+    /// **弹窗永远放回去**（取消也算「等 Done 收尾」）：提交之后到下一个问题之间
+    /// 那段真空里的按键也必须由它吃掉，不能落回全局快捷键。
     fn on_login_key(&mut self, key: KeyEvent) {
         let Some(mut modal) = self.login.take() else {
+            // 登录线程在跑但弹窗被收掉了（不该发生）：同样吃掉按键。
             return;
         };
         match key.code {
             KeyCode::Esc => {
-                modal.cancel();
-                self.login_busy = false;
                 self.start_after_login = false;
-                self.set_toast("已取消登录", Level::Info);
+                self.login_after_setup = false;
+                self.login_cancel_requested = true;
+                if modal.asking() {
+                    modal.cancel();
+                    self.set_toast("已取消登录", Level::Info);
+                } else {
+                    self.set_toast("正在取消登录…", Level::Info);
+                }
             }
             KeyCode::Enter => {
                 modal.submit();
-                // 下一个问题会由 `poll_login` 再弹；这里不设 busy=false。
             }
             KeyCode::Backspace => modal.backspace(),
             KeyCode::Char(character) => modal.push(character),
-            _ => {
-                self.login = Some(modal);
-            }
+            _ => {}
         }
+        self.login = Some(modal);
     }
 
     fn poll_login(&mut self) {
@@ -2267,7 +2303,14 @@ impl App {
                     prompt,
                     reply,
                 } => {
-                    self.login = Some(LoginModal::new(kind, prompt, reply));
+                    if self.login_cancel_requested {
+                        // 按过 `Esc`：别再把这个框弹出来，当场回绝（流程会自己收尾）。
+                        LoginModal::new(kind, prompt, reply).cancel();
+                    } else {
+                        // 弹出一个问题 = 线程有进展：看门狗重新计时。
+                        self.login_idle = Instant::now();
+                        self.login = Some(LoginModal::new(kind, prompt, reply));
+                    }
                 }
                 LoginEvent::State(state, detail) => {
                     if state == fuyubot_app::AppState::Ready {
@@ -2278,6 +2321,7 @@ impl App {
                 }
                 LoginEvent::Done(result) => {
                     let autostart = std::mem::take(&mut self.start_after_login);
+                    let cancelled = std::mem::take(&mut self.login_cancel_requested);
                     self.login_busy = false;
                     self.login = None;
                     match result {
@@ -2290,7 +2334,11 @@ impl App {
                         }
                         Err(error) => {
                             self.start_after_login = false;
-                            self.set_toast(format!("登录失败：{error}"), Level::Info);
+                            if cancelled {
+                                self.set_toast("已取消登录", Level::Info);
+                            } else {
+                                self.set_toast(format!("登录失败：{error}"), Level::Info);
+                            }
                             self.refresh_all();
                         }
                     }
@@ -2317,8 +2365,11 @@ impl App {
             return;
         }
 
-        // 登录弹窗是模态的：开着的时候只认它自己的按键（输入 / 提交 / 取消）。
-        if self.login.is_some() {
+        // 登录是模态的——**整段时间**都算，不只是弹窗画着的那几帧：启动 TDLib、
+        // 等 Telegram 回包、刚提交完等下一个问题，这些空档里都没有输入框，可用户
+        // 往往已经在敲 bot_token / api_hash 了。漏给全局快捷键的话，其中的
+        // `1`..`6` 会换页、`q` / `Esc` 会退出面板、`s` / `x` 会启停实例——登录直接被打断。
+        if self.login.is_some() || self.login_busy {
             self.on_login_key(key);
             return;
         }
@@ -4293,19 +4344,124 @@ mod tests {
         );
     }
 
+    /// 登录一开始弹窗就立起来（线程还在启动 TDLib）：敲 bot_token 的 `1`..`6` / `s` / `q`
+    /// 一个都不许漏给全局快捷键——漏了就是换页 / 启停 / 退出面板，登录被打断。
     #[test]
-    fn pressing_s_while_login_is_running_queues_autostart() {
+    fn login_swallows_shortcuts_while_the_thread_boots() {
         let mut app = app();
         app.login_busy = true;
-        app.on_key(key(KeyCode::Char('s')));
-        assert!(app.start_after_login, "登录完成后应自动继续启动");
+        app.login = Some(LoginModal::waiting("正在启动 TDLib 并检查登录状态…"));
+        for character in "1q2s3x4?5".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+        assert!(!app.quit, "`q` 不该退出面板");
+        assert_eq!(app.page, Page::Overview, "数字键不该换页");
+        assert!(!app.confirm_stop, "`x` 不该开停止确认框");
+        assert!(!app.start_after_login, "`s` 不该被当成「完成后自动启动」");
+        assert!(app.busy.is_none(), "`s` 不该派生实例");
+        assert!(app.credentials.is_none(), "`s` 不该顺带弹出首次配置");
+        assert!(app.login_busy, "登录还在跑");
+        // 等待态的输入框不收字符：这些按键只被吃掉，不进答案。
+        let modal = app.login.as_ref().expect("弹窗要一直在");
+        assert!(!modal.asking());
+        assert!(modal.input.is_empty());
+    }
+
+    /// 提交完一个答案到下一个问题之间也有一段真空：弹窗不能消失，按键仍归它。
+    #[test]
+    fn login_modal_stays_up_between_questions() {
+        let mut app = app();
+        let (reply, wait) = std::sync::mpsc::channel();
+        app.login_busy = true;
+        app.login = Some(LoginModal::new(
+            fuyubot_app::AskKind::BotToken,
+            "bot_token（@BotFather 给的）".to_owned(),
+            reply,
+        ));
+        for character in "123456:AAH".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(wait.try_recv().unwrap().as_deref(), Some("123456:AAH"));
+        let modal = app.login.as_ref().expect("提交后弹窗不能消失");
+        assert!(!modal.asking(), "交出去之后转「等待」");
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(!app.quit);
+        assert_eq!(app.page, Page::Overview);
+    }
+
+    /// 真空里按 `Esc`：不许退出面板，只记下「下一个问题直接回绝」。
+    #[test]
+    fn esc_while_login_waits_cancels_the_next_question() {
+        let mut app = app();
+        app.login_busy = true;
+        app.login = Some(LoginModal::waiting("正在启动 TDLib 并检查登录状态…"));
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.quit, "Esc 只取消登录，不该退出面板");
+        assert!(app.login_cancel_requested);
+
+        let (reply, wait) = std::sync::mpsc::channel();
+        app.login_tx
+            .send(LoginEvent::Ask {
+                kind: fuyubot_app::AskKind::BotToken,
+                prompt: "bot_token".to_owned(),
+                reply,
+            })
+            .unwrap();
+        app.tick();
+        assert_eq!(wait.try_recv().unwrap(), None, "问题要被当场回绝");
+        // 线程还在收尾：弹窗留在「等待」，按键继续归它，直到 `Done` 把它收掉。
+        assert!(app.login.as_ref().is_some_and(|modal| !modal.asking()));
+    }
+
+    /// 登录线程卡死也不能把面板永远锁住。
+    #[test]
+    fn a_stuck_login_thread_unlocks_the_panel() {
+        let mut app = app();
+        app.login_busy = true;
+        app.login = Some(LoginModal::waiting("正在启动 TDLib…"));
+        app.login_idle = Instant::now()
+            .checked_sub(Duration::from_secs(700))
+            .expect("往回算 700s");
+        app.tick();
+        assert!(!app.login_busy);
+        assert!(app.login.is_none());
         assert!(
             app.toast
                 .as_ref()
-                .is_some_and(|toast| toast.text.contains("自动启动")),
+                .is_some_and(|toast| toast.text.contains("超时")),
             "{:?}",
             app.toast
         );
+    }
+
+    /// 只有「没在等人」才计时：用户慢慢填 bot token 不该被「登录超时」打断。
+    #[test]
+    fn a_question_left_open_does_not_trip_the_watchdog() {
+        let mut app = app();
+        let (reply, _wait) = std::sync::mpsc::channel();
+        app.login_busy = true;
+        app.login = Some(LoginModal::new(
+            fuyubot_app::AskKind::BotToken,
+            "bot_token".to_owned(),
+            reply,
+        ));
+        app.login_idle = Instant::now()
+            .checked_sub(Duration::from_secs(700))
+            .expect("往回算 700s");
+        app.tick();
+        assert!(app.login_busy, "等人输入不算卡住");
+        assert!(app.login.as_ref().is_some_and(LoginModal::asking));
+    }
+
+    /// `s` 的意图照样留得到登录之后：那是按下 `s` 那一刻置的位，
+    /// 不是「登录期间再按一次」。
+    #[test]
+    fn pressing_s_first_queues_autostart_for_the_login_it_started() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.credentials.is_some(), "缺凭据先弹首次配置");
+        assert!(app.start_after_login, "登录成功后要自动继续启动");
     }
 
     #[test]

@@ -30,11 +30,26 @@ pub enum LoginEvent {
     Done(Result<(), String>),
 }
 
+/// 弹窗当前处在哪一步。
+///
+/// 登录流程在「把答案交出去」与「下一个问题到达」之间有一段真空（第一次登录要先
+/// 启动 TDLib、等 Telegram 回包，可能好几秒）。真空里弹窗**必须留在屏幕上**并继续
+/// 吃掉按键：用户这时候往往已经在敲 bot_token / api_hash，里面的 `1`..`6`、`q`、`s`
+/// 一旦漏给全局快捷键，就是换页 / 退出面板 / 启停实例——登录直接被打断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginPhase {
+    /// 还没轮到提问（正在启动 TDLib）或已经提交、等下一个问题：输入框不收按键。
+    Waiting,
+    /// 正等用户填这一项。
+    Asking,
+}
+
 /// 界面上那个输入框（一次只显示一个问题）。
 pub struct LoginModal {
     pub kind: AskKind,
     pub prompt: String,
     pub input: String,
+    pub phase: LoginPhase,
     reply: Option<Sender<Option<String>>>,
 }
 
@@ -44,25 +59,51 @@ impl LoginModal {
             kind,
             prompt,
             input: String::new(),
+            phase: LoginPhase::Asking,
             reply: Some(reply),
         }
     }
 
+    /// 还没轮到提问（登录线程在启动 TDLib）：先把弹窗立起来，按键归它。
+    pub fn waiting(prompt: impl Into<String>) -> Self {
+        Self {
+            kind: AskKind::Other,
+            prompt: prompt.into(),
+            input: String::new(),
+            phase: LoginPhase::Waiting,
+            reply: None,
+        }
+    }
+
+    /// 正等人填这一项吗。
+    pub fn asking(&self) -> bool {
+        self.phase == LoginPhase::Asking
+    }
+
     pub fn push(&mut self, character: char) {
-        if !character.is_control() {
+        if self.asking() && !character.is_control() {
             self.input.push(character);
         }
     }
 
     pub fn backspace(&mut self) {
-        self.input.pop();
+        if self.asking() {
+            self.input.pop();
+        }
     }
 
     /// 提交：把去掉首尾空白的答案送回去。返回送出的内容（给调用方打提示用）。
+    ///
+    /// 交出去就转「等待」：下一个问题到达前弹窗不消失，也不会重复提交。
     pub fn submit(&mut self) -> Option<String> {
+        if !self.asking() {
+            return None;
+        }
         let reply = self.reply.take()?;
         let answer = self.input.trim().to_owned();
         let _ = reply.send(Some(answer.clone()));
+        self.phase = LoginPhase::Waiting;
+        self.input.clear();
         Some(answer)
     }
 
@@ -71,6 +112,8 @@ impl LoginModal {
         if let Some(reply) = self.reply.take() {
             let _ = reply.send(None);
         }
+        self.phase = LoginPhase::Waiting;
+        self.input.clear();
     }
 
     /// 密码 / 验证码不该原样显示——这里只用来决定输入框要不要打码。
@@ -210,5 +253,35 @@ mod tests {
         let (reply, _wait) = channel();
         let password = LoginModal::new(AskKind::Password, "两步验证密码".to_owned(), reply);
         assert!(password.masked());
+    }
+
+    /// 等待态（还没轮到提问）一个字符都不收：这段时间的按键归面板吃，
+    /// 不能进「答案」缓冲区，更不能转手变成快捷键。
+    #[test]
+    fn waiting_modal_ignores_typing() {
+        let mut modal = LoginModal::waiting("正在启动 TDLib…");
+        assert!(!modal.asking());
+        for ch in "123456:AAF".chars() {
+            modal.push(ch);
+        }
+        modal.backspace();
+        assert!(modal.input.is_empty());
+        assert!(modal.submit().is_none());
+    }
+
+    /// 提交之后就转「等待」：同一个答案不许送第二遍，弹窗也不许消失。
+    #[test]
+    fn submit_switches_to_waiting() {
+        let (mut modal, wait) = modal();
+        modal.push('4');
+        modal.push('2');
+        assert_eq!(modal.submit().as_deref(), Some("42"));
+        assert!(!modal.asking());
+        assert!(modal.input.is_empty());
+        assert_eq!(wait.try_recv().unwrap().as_deref(), Some("42"));
+        assert!(modal.submit().is_none());
+        // 等待态里再敲字符不会进缓冲区。
+        modal.push('q');
+        assert!(modal.input.is_empty());
     }
 }
