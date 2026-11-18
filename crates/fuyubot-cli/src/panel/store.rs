@@ -110,6 +110,10 @@ pub struct Store {
     chosen_versions: BTreeMap<String, String>,
     /// 版本选择器开着时的状态。
     version_picker: Option<VersionPicker>,
+    /// `i` 打开的一键安装框：输入 id → 依赖计划 → 确认安装。
+    install_dialog: Option<InstallDialog>,
+    /// 算好的安装计划，正等人按 Enter 确认（依赖 / 硬依赖缺失时才会出现）。
+    pending_install: Option<InstallPlan>,
 
     // 列表 / 详情 / 搜索
     query: String,
@@ -164,6 +168,8 @@ impl Store {
             detail_errors: BTreeMap::new(),
             chosen_versions: BTreeMap::new(),
             version_picker: None,
+            install_dialog: None,
+            pending_install: None,
             query: String::new(),
             search: None,
             query_before_search: None,
@@ -215,6 +221,9 @@ impl Store {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return StoreKey::Ignored;
         }
+        if self.install_dialog.is_some() {
+            return self.handle_install_key(key);
+        }
         if self.search.is_some() {
             return self.handle_search_key(key);
         }
@@ -222,7 +231,14 @@ impl Store {
             return self.handle_version_key(key);
         }
         match key.code {
-            KeyCode::Esc => StoreKey::Close,
+            KeyCode::Esc => {
+                // Esc 先撤掉待确认的计划，再关页：别让人按错一次就少装依赖。
+                if self.pending_install.take().is_some() {
+                    self.set_status(Status::Idle);
+                    return StoreKey::Consumed;
+                }
+                StoreKey::Close
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(-1);
                 StoreKey::Consumed
@@ -250,7 +266,12 @@ impl Store {
                 StoreKey::Consumed
             }
             KeyCode::Enter => {
-                self.start_install();
+                // 有算好的计划（依赖 / 硬依赖缺失）就先走确认，否则直接装选中的。
+                if self.pending_install.is_some() {
+                    self.start_pending_install();
+                } else {
+                    self.start_install();
+                }
                 StoreKey::Consumed
             }
             KeyCode::Char('x') => {
@@ -259,6 +280,10 @@ impl Store {
             }
             KeyCode::Char('v') => {
                 self.open_version_picker();
+                StoreKey::Consumed
+            }
+            KeyCode::Char('i') => {
+                self.open_install_dialog();
                 StoreKey::Consumed
             }
             KeyCode::Char('b') => {
@@ -299,12 +324,16 @@ impl Store {
         self.render_list(frame, list_area);
         self.render_detail(frame, detail_area);
         self.render_status(frame, status_area);
-        // 版本选择器盖在最上面（盖住列表与详情，但让状态行露出来显示错误）。
+        // 版本选择器 / 一键安装框盖在最上面（盖住列表与详情，但让状态行露出来显示错误）。
         self.render_version_picker(frame, body);
+        self.render_install_dialog(frame, body);
     }
 
     /// 底栏那句键提示（由 `app.rs` 放到它自己的底栏，或由本页状态区显示）。
     pub fn footer_hint(&self) -> String {
+        if self.install_dialog.is_some() {
+            return "输入插件 id（可写前缀，唯一就够）· Enter 装它和依赖 · Esc 取消".to_owned();
+        }
         if self.search.is_some() {
             return "输入过滤词（id / 名称 / 简介）· Enter 确认 · Esc 取消".to_owned();
         }
@@ -314,7 +343,8 @@ impl Store {
         if self.busy {
             return "安装中… 进度见上方状态行（不要关面板）".to_owned();
         }
-        "↑↓ 选择 · Enter 安装 · v 选版本 · b 回滚 · x 卸载 · / 搜索 · r 刷新 · Esc 返回".to_owned()
+        "↑↓ 选择 · Enter 安装 · i 按 id 安装 · v 选版本 · b 回滚 · x 卸载 · / 搜索 · r 刷新 · Esc 返回"
+            .to_owned()
     }
 
     /// 页面标题，例如 `插件商店 (12)`；有过滤词时显示 `插件商店 (3/12)`。
@@ -369,12 +399,12 @@ enum Event {
     },
     /// 安装进度文本（给人看的一句话）。
     Progress(String),
-    /// 安装结束：成功给出落盘信息，失败给出可操作的原因。
-    Installed(Result<InstalledOutcome, String>),
+    /// 安装结束：整条链的结果（哪个包成功、哪个失败、哪些没轮到）。
+    Installed(InstallReport),
 }
 
 /// 装好的包。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct InstalledOutcome {
     id: String,
     name: String,
@@ -390,6 +420,212 @@ struct Installed {
     version: String,
     kind: PluginKind,
     path: PathBuf,
+    /// 清单里声明的服务名：依赖解析靠它把「服务名」对到「插件 id」。
+    provides: Vec<String>,
+}
+
+/// 一键安装框（按 i 打开）：只输 id，依赖由商店自己算。
+#[derive(Debug, Clone)]
+struct InstallDialog {
+    input: String,
+    cursor: usize,
+}
+
+impl InstallDialog {
+    fn new(input: String) -> Self {
+        let cursor = input.chars().count();
+        Self { input, cursor }
+    }
+
+    /// 光标位置换算成字节偏移（输入框里全是 ASCII 的 id，但通用写法更稳）。
+    fn cursor_byte(&self) -> usize {
+        self.input
+            .char_indices()
+            .nth(self.cursor)
+            .map_or(self.input.len(), |(index, _)| index)
+    }
+
+    fn insert(&mut self, character: char) {
+        let at = self.cursor_byte();
+        self.input.insert(at, character);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor -= 1;
+        let at = self.cursor_byte();
+        self.input.remove(at);
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.input.chars().count() {
+            return;
+        }
+        let at = self.cursor_byte();
+        self.input.remove(at);
+    }
+}
+
+/// 依赖计划里的一项：硬依赖（depends）缺了就跑不起来，软依赖（optional_depends）缺了只是少点东西。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DepState {
+    /// 服务已经由某个装好的插件提供；`by` 是那个插件的 id（不知道时为空串）。
+    Provided { by: String },
+    /// 缺了，但索引里找得到：可以自动装（`id` 是索引里的插件 id）。
+    Installable { id: String, latest: String },
+    /// 缺了，索引里也没有：只能说清楚让人自己去找。
+    Unavailable { reason: String },
+}
+
+/// 「装这个要连带装什么」的一行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DepPlan {
+    /// 索引里原本写的那个名字（服务名或插件 id）。
+    name: String,
+    hard: bool,
+    state: DepState,
+}
+
+impl DepPlan {
+    fn installable(&self) -> bool {
+        matches!(self.state, DepState::Installable { .. })
+    }
+
+    fn auto_install_id(&self) -> Option<&str> {
+        match &self.state {
+            DepState::Installable { id, .. } => Some(id.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// 计划里真正要下载 / 解压的一个包。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallJob {
+    id: String,
+    version: String,
+    platform: String,
+    url: String,
+    sha256: String,
+    /// 硬依赖 / 主插件 = true；软依赖 = false（失败只提醒，不中止链）。
+    hard: bool,
+}
+
+impl InstallJob {
+    fn label(&self) -> String {
+        format!("{} {}（{}）", self.id, self.version, self.platform)
+    }
+}
+
+/// 一次「一键安装」的计划：依赖在前、主插件在后。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallPlan {
+    primary_id: String,
+    primary_name: String,
+    jobs: Vec<InstallJob>,
+    deps: Vec<DepPlan>,
+    /// 已经在目标版本上、这次不动的依赖。
+    skipped: Vec<String>,
+}
+
+impl InstallPlan {
+    fn new(primary: &IndexPlugin) -> Self {
+        Self {
+            primary_id: primary.id.clone(),
+            primary_name: primary.name.clone(),
+            jobs: Vec::new(),
+            deps: Vec::new(),
+            skipped: Vec::new(),
+        }
+    }
+
+    /// 硬依赖里有找不到的：装出来的插件跑不起来，得先把这话说在最前面。
+    fn missing_hard(&self) -> Vec<&DepPlan> {
+        self.deps
+            .iter()
+            .filter(|dep| dep.hard && matches!(dep.state, DepState::Unavailable { .. }))
+            .collect()
+    }
+
+    /// 会顺带装上 / 已经在的软依赖（装完之后提示人「这些是可选的」）。
+    fn soft(&self) -> Vec<&DepPlan> {
+        self.deps.iter().filter(|dep| !dep.hard).collect()
+    }
+
+    /// 状态行那一句：装哪几个、缺什么。
+    fn summary(&self) -> String {
+        let jobs = self
+            .jobs
+            .iter()
+            .map(InstallJob::label)
+            .collect::<Vec<_>>()
+            .join(" → ");
+        let mut text = if self.jobs.is_empty() {
+            format!("{} 不需要再装什么", self.primary_name)
+        } else {
+            format!("将安装 {jobs}（依赖在前）")
+        };
+        let hard_missing = self.missing_hard();
+        if !hard_missing.is_empty() {
+            text.push_str("｜硬依赖缺失：");
+            text.push_str(
+                &hard_missing
+                    .iter()
+                    .map(|dep| dep.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            text.push_str("（装上也跑不起来）");
+        }
+        let soft_missing: Vec<&DepPlan> = self
+            .soft()
+            .into_iter()
+            .filter(|dep| matches!(dep.state, DepState::Unavailable { .. }))
+            .collect();
+        if !soft_missing.is_empty() {
+            text.push_str("｜软依赖可选：");
+            text.push_str(
+                &soft_missing
+                    .iter()
+                    .map(|dep| dep.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        text.push_str("｜Enter 安装 · Esc 取消");
+        text
+    }
+}
+
+/// 一个包装完的结果（成功 / 失败的理由都留着，好一起报给用户）。
+#[derive(Debug, Clone)]
+struct JobOutcome {
+    id: String,
+    version: String,
+    /// 这个包是不是别人的依赖（而不是用户点名要装的那个）。
+    dependency: bool,
+    /// 是不是硬依赖（失败要中止整条链）。
+    hard: bool,
+    result: Result<InstalledOutcome, String>,
+}
+
+impl JobOutcome {
+    fn kind_is_script(&self) -> bool {
+        self.result.as_ref().is_ok_and(|done| done.kind.is_script())
+    }
+}
+
+/// 整条安装链的结果。
+#[derive(Debug, Clone)]
+struct InstallReport {
+    primary_id: String,
+    outcomes: Vec<JobOutcome>,
+    deps: Vec<DepPlan>,
+    /// 因为前面的包失败而没再装的（保持顺序，别假装装了）。
+    aborted: Vec<String>,
 }
 
 /// 版本选择器：`v` 打开，列出版本（含不可用的，标原因），Enter 选定，Esc 关掉。
@@ -466,8 +702,16 @@ pub(crate) struct IndexVersion {
     /// 需要的 ABI；大于宿主的 [`ABI_VERSION`] 就不让装。
     #[serde(default)]
     pub abi: Option<u32>,
+    /// 硬依赖：这些插件不在，装上也跑不起来（商店只展示，不强制）。
     #[serde(default)]
     pub depends: Vec<String>,
+    /// 软依赖：有就用、没有也能跑（缺了会提醒，也尝试自动装）。
+    #[serde(default)]
+    pub optional_depends: Vec<String>,
+    /// 本版本提供的服务名：一键安装解析依赖时用它把「服务名」对到「插件 id」。
+    /// 老索引没有这个字段（空表）：那时只能按 id 匹配。
+    #[serde(default)]
+    pub provides: Vec<String>,
     /// 下架的版本不参与选择。
     #[serde(default)]
     pub yanked: bool,
@@ -657,102 +901,7 @@ impl Store {
             self.fail("先选一个插件：列表是空的就按 r 重新加载索引，或用 / 改过滤词");
             return;
         };
-        let plugin = self.full_plugin(&light);
-        if plugin.versions.is_empty() {
-            if plugin.detail.trim().is_empty() {
-                self.fail(format!(
-                    "{} 的索引条目没有版本信息（versions 为空、也没写 detail）：找上架方修",
-                    plugin.name
-                ));
-                return;
-            }
-            // schema 2：版本数据在分片里，还没拉下来（或拉失败）。别让用户干等。
-            self.ensure_selected_detail();
-            if let Some(error) = self.detail_errors.get(&plugin.id) {
-                self.fail(format!("读取 {} 的版本信息失败：{error}", plugin.name));
-            } else {
-                self.set_status(Status::Working(format!(
-                    "正在读取 {} 的版本信息…（拉完再按 Enter）",
-                    plugin.name
-                )));
-            }
-            return;
-        }
-        let version = match self.target_version(&plugin, ABI_VERSION) {
-            Ok(version) => version.clone(),
-            Err(error) => {
-                self.fail(format!("装不了 {}：{error}", plugin.name));
-                return;
-            }
-        };
-        if let Some(installed) = self.installed(&plugin.id) {
-            if installed.version == version.version {
-                self.set_status(Status::Done(format!(
-                    "{} {} 已经装好了：换版本按 v，卸载按 x",
-                    plugin.name, version.version
-                )));
-                return;
-            }
-        }
-        let Some((platform, asset)) = select_asset(&version) else {
-            self.fail(format!(
-                "{} {} 没有当前平台（{}）的安装包，也没有 any 回退：按 v 换一个版本，或让作者补发包",
-                plugin.name,
-                version.version,
-                current_platform()
-            ));
-            return;
-        };
-        if !is_https(&asset.url) {
-            self.fail(format!(
-                "{} {} 的下载地址不是 https（{:?}）：拒绝明文下载，找上架方换成 https",
-                plugin.name, version.version, asset.url
-            ));
-            return;
-        }
-        let sha256 = asset.sha256.trim().to_owned();
-        if sha256.is_empty() {
-            self.fail(format!(
-                "{} {} 的索引条目没有 sha256：没有校验值就不装（找上架方补上）",
-                plugin.name, version.version
-            ));
-            return;
-        }
-        // id 会当目录名用，先按 bundle 契约的语法校验，绝不让索引把路径带出插件目录。
-        if let Err(error) = check_id(&plugin.id) {
-            self.fail(error);
-            return;
-        }
-
-        self.busy = true;
-        self.set_status(Status::Working(format!(
-            "开始安装 {} {}（{platform}）…",
-            plugin.id, version.version
-        )));
-        let tx = self.tx.clone();
-        let plugin_dir = self.plugin_dir.clone();
-        let id = plugin.id.clone();
-        let expected_version = version.version.clone();
-        let platform = platform.to_owned();
-        let url = asset.url.clone();
-        let spawned = thread::Builder::new()
-            .name("fuyubot-store-install".to_owned())
-            .spawn(move || {
-                let outcome = run_install(
-                    &tx,
-                    &id,
-                    &expected_version,
-                    &platform,
-                    &url,
-                    &sha256,
-                    &plugin_dir,
-                );
-                let _ = tx.send(Event::Installed(outcome));
-            });
-        if let Err(error) = spawned {
-            self.busy = false;
-            self.fail(format!("起不了安装线程：{error}（重启面板再试）"));
-        }
+        self.submit_install(&light.id, false);
     }
 
     /// v：把版本选择器开在当前选中插件上（光标落在“将安装”的那个版本）。
@@ -964,19 +1113,156 @@ impl Store {
     }
 }
 
-/// 后台线程里跑的整套：下载 → 校验 → 解压 → 落盘。
+/// 把一条安装链的结果说成一句人话：成功（`true`）/ 失败（`false`）与正文。
+///
+/// 规则：全部成功 = Done；有失败 = 其余（包括没轮到的）也要交代清楚，
+/// 硬依赖失败时直接说「主插件没装成」，不让人误以为只坏了一个可选件。
+fn report_summary(report: &InstallReport) -> Option<(bool, String)> {
+    if report.outcomes.is_empty() && report.aborted.is_empty() {
+        return None;
+    }
+    let mut installed: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for outcome in &report.outcomes {
+        match &outcome.result {
+            Ok(done) => installed.push(format!(
+                "{} {}{}",
+                done.name,
+                done.version,
+                if outcome.kind_is_script() {
+                    "（脚本）"
+                } else {
+                    ""
+                }
+            )),
+            Err(error) => failures.push(format!(
+                "{} {}{}{}：{error}",
+                outcome.id,
+                outcome.version,
+                if outcome.dependency {
+                    "（依赖）"
+                } else {
+                    ""
+                },
+                if outcome.hard {
+                    ""
+                } else {
+                    "（软依赖，可不管）"
+                }
+            )),
+        }
+    }
+    if failures.is_empty() && report.aborted.is_empty() {
+        let paths: Vec<String> = report
+            .outcomes
+            .iter()
+            .filter_map(|outcome| outcome.result.as_ref().ok())
+            .map(|done| format!("{} {}", done.id, done.path.display()))
+            .collect();
+        let mut text = format!(
+            "已安装 {}：重启回插件页按 s 生效（{}）",
+            installed.join("、"),
+            paths.join("；")
+        );
+        let soft: Vec<&DepPlan> = report
+            .deps
+            .iter()
+            .filter(|dep| !dep.hard && dep.installable())
+            .collect();
+        if !soft.is_empty() {
+            text.push_str("｜顺带装了软依赖：");
+            text.push_str(
+                &soft
+                    .iter()
+                    .map(|dep| {
+                        dep.auto_install_id()
+                            .map_or_else(|| dep.name.clone(), |id| format!("{}→{id}", dep.name))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        return Some((true, text));
+    }
+    let mut text = String::from("安装链中断：");
+    if !failures.is_empty() {
+        text.push_str(&failures.join("；"));
+    }
+    if !report.aborted.is_empty() {
+        text.push_str(&format!(
+            "；因为前面失败，这些没装：{}",
+            report.aborted.join(", ")
+        ));
+    }
+    if !installed.is_empty() {
+        text.push_str(&format!("（已完成的：{}）", installed.join(", ")));
+    }
+    let hard_missing: Vec<&DepPlan> = report
+        .deps
+        .iter()
+        .filter(|dep| dep.hard && matches!(dep.state, DepState::Unavailable { .. }))
+        .collect();
+    if !hard_missing.is_empty() {
+        text.push_str(&format!(
+            "｜硬依赖没找到：{}（装上也跑不起来）",
+            hard_missing
+                .iter()
+                .map(|dep| dep.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Some((false, text))
+}
+
+/// 后台线程里跑的整条链：按计划顺序下载 → 校验 → 解压 → 落盘。
+///
+/// 硬依赖（顺序在前）失败就中止后面所有包；软依赖失败只记下来，不挡主插件。
+fn run_install_plan(
+    tx: &Sender<Event>,
+    primary_id: &str,
+    jobs: &[InstallJob],
+    deps: &[DepPlan],
+    plugin_dir: &Path,
+) -> InstallReport {
+    let mut report = InstallReport {
+        primary_id: primary_id.to_owned(),
+        outcomes: Vec::new(),
+        deps: deps.to_vec(),
+        aborted: Vec::new(),
+    };
+    let mut stopped = false;
+    for (index, job) in jobs.iter().enumerate() {
+        if stopped {
+            report.aborted.push(job.label());
+            continue;
+        }
+        let result = run_install(tx, job, plugin_dir);
+        let hard = job.hard;
+        let failed = result.is_err();
+        report.outcomes.push(JobOutcome {
+            id: job.id.clone(),
+            version: job.version.clone(),
+            dependency: index > 0,
+            hard,
+            result,
+        });
+        if failed && hard {
+            stopped = true;
+        }
+    }
+    report
+}
+
+/// 单个包：下载 → 校验 → 解压 → 落盘。
 fn run_install(
     tx: &Sender<Event>,
-    id: &str,
-    version: &str,
-    platform: &str,
-    url: &str,
-    expected_sha256: &str,
+    job: &InstallJob,
     plugin_dir: &Path,
 ) -> Result<InstalledOutcome, String> {
-    let label = format!("{id} {version}（{platform}）");
+    let label = job.label();
     send_progress(tx, format!("下载 {label}…"));
-    let bytes = download(tx, &label, url, PLUGIN_MAX_BYTES)?;
+    let bytes = download(tx, &label, &job.url, PLUGIN_MAX_BYTES)?;
     send_progress(
         tx,
         format!(
@@ -984,30 +1270,459 @@ fn run_install(
             human_bytes(bytes.len() as u64)
         ),
     );
-    verify_sha256(&bytes, expected_sha256)?;
+    verify_sha256(&bytes, &job.sha256)?;
     send_progress(tx, "校验通过，解压到 .staging…".to_owned());
-    let path = install_from_bytes(&bytes, id, version, plugin_dir)?;
+    let path = install_from_bytes(&bytes, &job.id, &job.version, plugin_dir)?;
     let manifest = BundleManifest::load(&path).ok();
     let kind = manifest
         .as_ref()
         .map_or(PluginKind::Native, |manifest| manifest.kind);
     let name = manifest.as_ref().map_or_else(
-        || id.to_owned(),
+        || job.id.clone(),
         |manifest| {
             if manifest.name.is_empty() {
-                id.to_owned()
+                job.id.clone()
             } else {
                 manifest.name.clone()
             }
         },
     );
     Ok(InstalledOutcome {
-        id: id.to_owned(),
+        id: job.id.clone(),
         name,
-        version: version.to_owned(),
+        version: job.version.clone(),
         kind,
         path,
     })
+}
+
+// ── 一键安装（按 id）与依赖解析 ────────────────────────────────────
+
+impl Store {
+    /// `i`：打开一键安装框，默认带上当前选中插件的 id（手敲 id 也行）。
+    fn open_install_dialog(&mut self) {
+        if self.busy {
+            self.set_status(Status::Working("安装进行中：等这一次结束再操作".to_owned()));
+            return;
+        }
+        if self.registry_url.is_none() {
+            self.fail(
+                "商店未配置：在 fuyubot.toml 写 [plugins].registry_url（或设 FUYUBOT_REGISTRY_URL），再按 r 重试",
+            );
+            return;
+        }
+        if self.index.is_none() {
+            self.load_index();
+            self.fail("索引还没加载好：等它拉完（或按 r）再按 i");
+            return;
+        }
+        let prefill = self
+            .selected_plugin()
+            .map(|plugin| plugin.id.clone())
+            .unwrap_or_default();
+        self.install_dialog = Some(InstallDialog::new(prefill));
+        self.set_status(Status::Working(
+            "按 id 安装：输入插件 id（可写前缀，唯一就够），Enter 算依赖，Esc 取消".to_owned(),
+        ));
+    }
+
+    /// 一键安装框开着时的按键：编辑 id、Enter 提交、Esc 关掉。
+    fn handle_install_key(&mut self, key: KeyEvent) -> StoreKey {
+        let mut submit = false;
+        {
+            let Some(dialog) = self.install_dialog.as_mut() else {
+                return StoreKey::Ignored;
+            };
+            match key.code {
+                KeyCode::Esc => {
+                    self.install_dialog = None;
+                    self.set_status(Status::Idle);
+                    return StoreKey::Consumed;
+                }
+                KeyCode::Enter => submit = true,
+                KeyCode::Backspace => dialog.backspace(),
+                KeyCode::Delete => dialog.delete(),
+                KeyCode::Left => dialog.cursor = dialog.cursor.saturating_sub(1),
+                KeyCode::Right => {
+                    dialog.cursor = (dialog.cursor + 1).min(dialog.input.chars().count());
+                }
+                KeyCode::Home => dialog.cursor = 0,
+                KeyCode::End => dialog.cursor = dialog.input.chars().count(),
+                KeyCode::Char(character) if !character.is_control() => dialog.insert(character),
+                _ => {}
+            }
+        }
+        if submit {
+            let input = self
+                .install_dialog
+                .as_ref()
+                .map(|dialog| dialog.input.clone())
+                .unwrap_or_default();
+            self.install_dialog = None;
+            self.submit_install(&input, false);
+        }
+        StoreKey::Consumed
+    }
+
+    /// 按名字找索引里的条目：精确 id → id 前缀（唯一）→ 名称包含（唯一）。
+    fn find_plugin(&self, query: &str) -> Result<IndexPlugin, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("先写一个插件 id（列表里选中一项再按 i 会帮你填好）".to_owned());
+        }
+        let Some(index) = self.index.as_ref() else {
+            return Err("索引还没加载好：等它拉完（或按 r）再试".to_owned());
+        };
+        if let Some(plugin) = index.plugins.iter().find(|plugin| plugin.id == query) {
+            return Ok(self.full_plugin(plugin));
+        }
+        let lower = query.to_ascii_lowercase();
+        let prefix: Vec<&IndexPlugin> = index
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.id.to_ascii_lowercase().starts_with(&lower))
+            .collect();
+        if prefix.len() == 1 {
+            return Ok(self.full_plugin(prefix[0]));
+        }
+        if prefix.len() > 1 {
+            let names = prefix
+                .iter()
+                .take(6)
+                .map(|plugin| plugin.id.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "{query} 能对上多个插件：{names}——写全 id（或按 / 搜索后 Enter）"
+            ));
+        }
+        let by_name: Vec<&IndexPlugin> = index
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.name.to_ascii_lowercase().contains(&lower))
+            .collect();
+        if by_name.len() == 1 {
+            return Ok(self.full_plugin(by_name[0]));
+        }
+        if by_name.len() > 1 {
+            return Err(format!(
+                "{query} 对上 {} 个名称相近的插件：写全 id（按 / 搜索看 id）",
+                by_name.len()
+            ));
+        }
+        Err(format!(
+            "索引里没有 {query}：按 / 搜索确认 id，或按 r 重拉索引"
+        ))
+    }
+
+    /// 某个服务名是哪个插件提供的：已装包的 manifest 优先，其次已拉下来的分片。
+    fn provider_of(&self, name: &str) -> Option<String> {
+        // 依赖名本身就是插件 id（已装）时直接认。
+        if self.installed.iter().any(|item| item.id == name) {
+            return Some(name.to_owned());
+        }
+        if let Some(installed) = self
+            .installed
+            .iter()
+            .find(|item| item.provides.iter().any(|service| service == name))
+        {
+            return Some(installed.id.clone());
+        }
+        // 明细分片里有就认分片，否则看轻索引自带的版本表（schema 1 条目）。
+        self.details
+            .values()
+            .find(|plugin| {
+                plugin
+                    .versions
+                    .iter()
+                    .any(|version| version.provides.iter().any(|service| service == name))
+            })
+            .map(|plugin| plugin.id.clone())
+            .or_else(|| {
+                self.index.as_ref().and_then(|index| {
+                    index
+                        .plugins
+                        .iter()
+                        .find(|plugin| {
+                            plugin.versions.iter().any(|version| {
+                                version.provides.iter().any(|service| service == name)
+                            })
+                        })
+                        .map(|plugin| plugin.id.clone())
+                })
+            })
+    }
+
+    /// 一个依赖名对应的索引条目：id 直接命中，或「提供这个服务的插件」。
+    fn resolve_dependency(&self, name: &str) -> Result<IndexPlugin, String> {
+        let Some(index) = self.index.as_ref() else {
+            return Err("索引还没加载好".to_owned());
+        };
+        if let Some(plugin) = index.plugins.iter().find(|plugin| plugin.id == name) {
+            return Ok(self.full_plugin(plugin));
+        }
+        if let Some(id) = self.provider_of(name) {
+            if let Some(plugin) = index.plugins.iter().find(|plugin| plugin.id == id) {
+                return Ok(self.full_plugin(plugin));
+            }
+            return Err(format!("{name} 由已安装的 {id} 提供，但索引里没有它"));
+        }
+        Err(format!(
+            "索引里没有提供 {name} 的插件（按 / 搜名字确认，或让作者在 plugin.json 里声明 provides）"
+        ))
+    }
+
+    /// 把「装这个」翻译成「按顺序装这些」：依赖在前、被依赖的在后，已装过的跳过。
+    fn build_install_plan(&self, primary: &IndexPlugin) -> Result<InstallPlan, String> {
+        let mut plan = InstallPlan::new(primary);
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        self.visit_for_plan(primary, true, &mut plan, &mut seen)?;
+        if plan.jobs.is_empty() {
+            return Err(format!("{} 已经装好了：换版本按 v，卸载按 x", primary.name));
+        }
+        Ok(plan)
+    }
+
+    /// 深度优先后序：先把依赖推进 jobs，再推自己。
+    fn visit_for_plan(
+        &self,
+        plugin: &IndexPlugin,
+        hard: bool,
+        plan: &mut InstallPlan,
+        seen: &mut std::collections::BTreeSet<String>,
+    ) -> Result<(), String> {
+        if !seen.insert(plugin.id.clone()) {
+            return Ok(());
+        }
+        if plugin.versions.is_empty() && !plugin.detail.trim().is_empty() {
+            return Err(format!(
+                "{} 的版本信息还没拉下来：按 r 刷新索引后再试（明细在 {}）",
+                plugin.name, plugin.detail
+            ));
+        }
+        let version = self.target_version(plugin, ABI_VERSION)?.clone();
+        // 依赖先走：硬依赖失败就整条装不了；软依赖失败只提醒。
+        for (hard, names) in [
+            (true, version.depends.clone()),
+            (false, version.optional_depends.clone()),
+        ] {
+            for name in names {
+                match self.resolve_dependency(&name) {
+                    Ok(dependency) => {
+                        let installed = self.installed(&dependency.id).is_some();
+                        plan.deps.push(DepPlan {
+                            name: name.clone(),
+                            hard,
+                            state: if installed {
+                                DepState::Provided {
+                                    by: dependency.id.clone(),
+                                }
+                            } else {
+                                DepState::Installable {
+                                    id: dependency.id.clone(),
+                                    latest: dependency
+                                        .latest
+                                        .clone()
+                                        .unwrap_or_else(|| "?".to_owned()),
+                                }
+                            },
+                        });
+                        // 软依赖装不上不影响主插件：失败由安装报告里标成「软失败」。
+                        let _ = self.visit_for_plan(&dependency, hard, plan, seen);
+                    }
+                    Err(reason) => plan.deps.push(DepPlan {
+                        name: name.clone(),
+                        hard,
+                        state: DepState::Unavailable { reason },
+                    }),
+                }
+            }
+        }
+        match self.installed(&plugin.id) {
+            Some(installed) if installed.version == version.version => {
+                if plugin.id != plan.primary_id {
+                    plan.skipped.push(plugin.id.clone());
+                }
+            }
+            _ => {
+                let job = self.resolve_job(plugin, &version, hard)?;
+                plan.jobs.push(job);
+            }
+        }
+        Ok(())
+    }
+
+    /// 一个版本装得了吗（yanked / ABI / 平台 / https / sha256）——装不了就返回原因。
+    fn resolve_job(
+        &self,
+        plugin: &IndexPlugin,
+        version: &IndexVersion,
+        hard: bool,
+    ) -> Result<InstallJob, String> {
+        if let Some(reason) = version_blocker(version, ABI_VERSION) {
+            return Err(format!(
+                "{} {} 装不了：{reason}",
+                plugin.name, version.version
+            ));
+        }
+        let Some((platform, asset)) = select_asset(version) else {
+            return Err(format!(
+                "{} {} 没有当前平台（{}）的安装包，也没有 any 回退",
+                plugin.name,
+                version.version,
+                current_platform()
+            ));
+        };
+        if !is_https(&asset.url) {
+            return Err(format!(
+                "{} {} 的下载地址不是 https（{:?}）：拒绝明文下载",
+                plugin.name, version.version, asset.url
+            ));
+        }
+        let sha256 = asset.sha256.trim().to_owned();
+        if sha256.is_empty() {
+            return Err(format!(
+                "{} {} 的索引条目没有 sha256：没有校验值就不装",
+                plugin.name, version.version
+            ));
+        }
+        check_id(&plugin.id)?;
+        Ok(InstallJob {
+            id: plugin.id.clone(),
+            version: version.version.clone(),
+            platform: platform.to_owned(),
+            url: asset.url.clone(),
+            sha256,
+            hard,
+        })
+    }
+
+    /// 算依赖并决定下一步：没有要连带装的就直接开始，有就把计划摆出来等人确认。
+    fn submit_install(&mut self, query: &str, preview_only: bool) {
+        if self.busy {
+            self.set_status(Status::Working("安装进行中：等这一次结束再操作".to_owned()));
+            return;
+        }
+        if self.registry_url.is_none() {
+            self.fail(
+                "商店未配置：在 fuyubot.toml 写 [plugins].registry_url（或设 FUYUBOT_REGISTRY_URL），再按 r 重试",
+            );
+            return;
+        }
+        let plugin = match self.find_plugin(query) {
+            Ok(plugin) => plugin,
+            Err(error) => {
+                self.fail(error);
+                return;
+            }
+        };
+        if plugin.versions.is_empty() && !plugin.detail.trim().is_empty() {
+            let id = plugin.id.clone();
+            self.request_detail(&id);
+            self.set_status(Status::Working(format!(
+                "正在读取 {} 的版本信息…（拉完再按一次 Enter / i）",
+                plugin.name
+            )));
+            return;
+        }
+        let plan = match self.build_install_plan(&plugin) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.fail(error);
+                return;
+            }
+        };
+        // 只有「要连带装别的」或「硬依赖找不到」才需要确认：单装一个不该多一次按键。
+        let needs_confirm = plan.jobs.len() > 1 || !plan.missing_hard().is_empty();
+        if preview_only || needs_confirm {
+            let summary = plan.summary();
+            self.set_status(Status::Working(summary));
+            self.pending_install = Some(plan);
+            return;
+        }
+        self.start_install_plan(plan);
+    }
+
+    /// Enter（有 pending 计划时）：把计划里的包按顺序装下去。
+    fn start_pending_install(&mut self) {
+        let Some(plan) = self.pending_install.take() else {
+            return;
+        };
+        self.start_install_plan(plan);
+    }
+
+    /// 起安装线程：按计划顺序装，依赖在前；任何一个失败即中止后面。
+    fn start_install_plan(&mut self, plan: InstallPlan) {
+        let labels = plan
+            .jobs
+            .iter()
+            .map(InstallJob::label)
+            .collect::<Vec<_>>()
+            .join(" → ");
+        self.busy = true;
+        self.pending_install = None;
+        self.set_status(Status::Working(format!(
+            "开始安装 {labels}（{} 个包）…",
+            plan.jobs.len()
+        )));
+        let tx = self.tx.clone();
+        let plugin_dir = self.plugin_dir.clone();
+        let jobs = plan.jobs.clone();
+        let deps = plan.deps.clone();
+        let primary = plan.primary_id.clone();
+        let spawned = thread::Builder::new()
+            .name("fuyubot-store-install".to_owned())
+            .spawn(move || {
+                let report = run_install_plan(&tx, &primary, &jobs, &deps, &plugin_dir);
+                let _ = tx.send(Event::Installed(report));
+            });
+        if let Err(error) = spawned {
+            self.busy = false;
+            self.fail(format!("起不了安装线程：{error}（重启面板再试）"));
+        }
+    }
+
+    /// 拉某个插件的明细分片（一键安装解析依赖前要用到版本表）。
+    fn request_detail(&mut self, id: &str) {
+        let Some(plugin) = self
+            .index
+            .as_ref()
+            .and_then(|index| index.plugins.iter().find(|plugin| plugin.id == id))
+        else {
+            return;
+        };
+        let detail = plugin.detail.trim().to_owned();
+        if detail.is_empty()
+            || self.details.contains_key(id)
+            || self.detail_errors.contains_key(id)
+            || self.detail_loading.as_deref() == Some(id)
+        {
+            return;
+        }
+        let Some(index_url) = self.registry_url.clone() else {
+            return;
+        };
+        let url = match resolve_detail_url(&index_url, &detail) {
+            Ok(url) => url,
+            Err(error) => {
+                self.detail_errors.insert(id.to_owned(), error);
+                return;
+            }
+        };
+        self.detail_loading = Some(id.to_owned());
+        let tx = self.tx.clone();
+        let id = id.to_owned();
+        let spawned = thread::Builder::new()
+            .name("fuyubot-store-detail".to_owned())
+            .spawn(move || {
+                let result = fetch_detail(&url, &id);
+                let _ = tx.send(Event::Detail { id, result });
+            });
+        if let Err(error) = spawned {
+            self.detail_loading = None;
+            self.fail(format!("起不了明细线程：{error}（重启面板再试）"));
+        }
+    }
 }
 
 // ── 纯函数（可单测）───────────────────────────────────────────────
@@ -1728,32 +2443,16 @@ impl Store {
                 }
             }
             Event::Progress(text) => self.set_status(Status::Working(text)),
-            Event::Installed(Ok(outcome)) => {
+            Event::Installed(report) => {
                 self.busy = false;
                 self.scan_dirty = true;
                 self.rescan();
-                self.select_by_id(&outcome.id);
-                let message = if outcome.kind.is_script() {
-                    format!(
-                        "已安装 {} {}（脚本插件 → {}）",
-                        outcome.name,
-                        outcome.version,
-                        outcome.path.display()
-                    )
-                } else {
-                    format!(
-                        "已安装 {} {} → {}：重启后生效（原生动态库）",
-                        outcome.name,
-                        outcome.version,
-                        outcome.path.display()
-                    )
-                };
-                self.set_status(Status::Done(message));
-            }
-            Event::Installed(Err(error)) => {
-                self.busy = false;
-                self.scan_dirty = true;
-                self.fail(format!("安装失败：{error}"));
+                self.select_by_id(&report.primary_id);
+                match report_summary(&report) {
+                    Some((true, text)) => self.set_status(Status::Done(text)),
+                    Some((false, text)) => self.fail(text),
+                    None => self.set_status(Status::Idle),
+                }
             }
         }
     }
@@ -2026,6 +2725,7 @@ fn collect_installed(dir: &Path, out: &mut Vec<Installed>) {
             version: manifest.version,
             kind: manifest.kind,
             path,
+            provides: manifest.provides,
         });
     }
 }
@@ -2276,6 +2976,142 @@ impl Store {
         frame.render_stateful_widget(list, popup, &mut state);
     }
 
+    /// 依赖行的统一渲染（详情页与安装计划共用同一套判断）。
+    fn push_dependency_lines(&self, lines: &mut Vec<Line<'static>>, names: &[String], hard: bool) {
+        let label = if hard { "硬依赖" } else { "软依赖" };
+        if names.is_empty() {
+            if hard {
+                lines.push(kv("硬依赖", "无".to_owned()));
+            }
+            return;
+        }
+        for name in names {
+            let (text, color) = match self.resolve_dependency(name) {
+                Ok(dependency) => {
+                    if self.installed(&dependency.id).is_some() {
+                        (format!("{name}（已装：{}）", dependency.id), Color::Green)
+                    } else {
+                        (
+                            format!(
+                                "{name}（未装 → 自动装 {}）",
+                                dependency
+                                    .latest
+                                    .clone()
+                                    .unwrap_or_else(|| dependency.id.clone())
+                            ),
+                            Color::Yellow,
+                        )
+                    }
+                }
+                Err(reason) => (
+                    format!("{name}（{reason}）"),
+                    if hard { Color::Red } else { Color::DarkGray },
+                ),
+            };
+            lines.push(kv_styled(label, text, color));
+        }
+    }
+    /// 一键安装框：一行输入 + 依赖计划预览（依赖 / 硬依赖缺失都摆在这里）。
+    fn render_install_dialog(&self, frame: &mut Frame, area: Rect) {
+        let Some(dialog) = self.install_dialog.as_ref() else {
+            return;
+        };
+        let width = area
+            .width
+            .saturating_sub(4)
+            .clamp(30, 78)
+            .min(area.width.max(1));
+        let height = 7u16.min(area.height.max(3));
+        let popup = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, popup);
+        let block = Block::bordered()
+            .title(Line::from(Span::styled(
+                " 按 id 安装 · Enter 安装 · Esc 取消 ",
+                Style::new().fg(Color::Cyan),
+            )))
+            .border_style(Style::new().fg(Color::Cyan));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        // 光标按字符位置画（输入框里允许写非 ASCII 的说明，别让光标错位）。
+        let before: String = dialog.input.chars().take(dialog.cursor).collect();
+        let after: String = dialog.input.chars().skip(dialog.cursor).collect();
+        let [input_row, hint_row, plan_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .areas(inner);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("id  ", Style::new().fg(Color::DarkGray)),
+                Span::raw(before),
+                Span::styled("▏", Style::new().fg(Color::Cyan)),
+                Span::raw(after),
+            ])),
+            input_row,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "硬依赖缺了跑不起来，软依赖缺了只是少点东西；两者都会尝试自动装。",
+                Style::new().fg(Color::DarkGray),
+            )))
+            .wrap(Wrap { trim: false }),
+            hint_row,
+        );
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if let Some(plan) = self.pending_install.as_ref() {
+            lines.push(section("将按顺序安装"));
+            for job in &plan.jobs {
+                lines.push(kv(
+                    if job.hard { "包" } else { "可选包" },
+                    format!("{} {}（{}）", job.id, job.version, job.platform),
+                ));
+            }
+            for dep in &plan.deps {
+                let (label, note, color) = match &dep.state {
+                    DepState::Provided { by } => (
+                        if dep.hard { "已装" } else { "已装(软)" },
+                        if by.is_empty() {
+                            dep.name.clone()
+                        } else {
+                            format!("{} ← {by}", dep.name)
+                        },
+                        Color::Green,
+                    ),
+                    DepState::Installable { id, latest } => (
+                        if dep.hard {
+                            "自动装"
+                        } else {
+                            "自动装(软)"
+                        },
+                        format!("{} → {id} {latest}", dep.name),
+                        Color::Yellow,
+                    ),
+                    DepState::Unavailable { reason } => (
+                        if dep.hard { "缺失!" } else { "可选缺" },
+                        format!("{}：{reason}", dep.name),
+                        if dep.hard {
+                            Color::Red
+                        } else {
+                            Color::DarkGray
+                        },
+                    ),
+                };
+                lines.push(kv_styled(label, note, color));
+            }
+        } else {
+            lines.push(kv(
+                "提示",
+                "Enter 后先算依赖：要连带装别的会先列出来让你确认".to_owned(),
+            ));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), plan_area);
+    }
     fn detail_lines(&self, plugin: &IndexPlugin) -> Vec<Line<'static>> {
         let mut lines = vec![
             Line::from(Span::styled(
@@ -2341,14 +3177,9 @@ impl Store {
                         Color::Red,
                     )),
                 }
-                lines.push(kv(
-                    "依赖",
-                    if target.depends.is_empty() {
-                        "无".to_owned()
-                    } else {
-                        target.depends.join(", ")
-                    },
-                ));
+                // 依赖按「已装 / 能自动装 / 找不到」分色：一键安装会按同一份判断去装。
+                self.push_dependency_lines(&mut lines, &target.depends, true);
+                self.push_dependency_lines(&mut lines, &target.optional_depends, false);
             } else if let Err(error) = self.target_version(plugin, ABI_VERSION) {
                 lines.push(kv_styled("版本", error, Color::Red));
             }
@@ -2678,6 +3509,7 @@ mod tests {
             "api": ">=1.0",
             "abi": 5,
             "depends": ["fuyubot.help.commands"],
+            "optional_depends": ["alice.ffmpeg"],
             "yanked": true,
             "assets": {"windows-x86_64": {"url": "https://example.com/old.zip", "sha256": "aa", "size": 10}}
           },
@@ -2710,6 +3542,9 @@ mod tests {
         assert!(plugin.versions[0].yanked);
         assert_eq!(plugin.versions[1].abi, Some(5));
         assert_eq!(plugin.versions[1].depends, Vec::<String>::new());
+        // 软依赖缺省为空；写了就原样读出（只展示，不参与选版本）。
+        assert_eq!(plugin.versions[0].optional_depends, ["alice.ffmpeg"]);
+        assert!(plugin.versions[1].optional_depends.is_empty());
         // 缺省字段全靠 serde(default) 兜住：空索引也能解析。
         let empty = parse_index(br#"{"schema":1}"#).expect("空索引该解析成功");
         assert!(empty.plugins.is_empty());
@@ -3403,6 +4238,194 @@ mod tests {
         assert!(
             !plugins.join(BACKUP_DIR).join("com.example.demo").exists(),
             "备份被换回来之后不该还留着"
+        );
+    }
+
+    /// 造一份带依赖关系的索引：`app.alpha` 硬依赖 `lib.base`（由 `lib.base.pack` 提供），
+    /// 软依赖 `media.ffmpeg`；两个资产都用 any，任何平台都能选。
+    fn dependency_index() -> Index {
+        parse_index(
+            r#"{"schema":1,"plugins":[
+                {"id":"app.alpha","name":"Alpha","latest":"1.0.0","versions":[{
+                    "version":"1.0.0","abi":0,"depends":["lib.base"],
+                    "optional_depends":["media.ffmpeg"],"provides":["alpha.api"],
+                    "assets":{"any":{"url":"https://example.com/a.zip","sha256":"aa","size":1}}}]},
+                {"id":"lib.base.pack","name":"基础库","latest":"2.0.0","versions":[{
+                    "version":"2.0.0","abi":0,"provides":["lib.base"],
+                    "assets":{"any":{"url":"https://example.com/b.zip","sha256":"bb","size":1}}}]},
+                {"id":"media.ffmpeg","name":"FFmpeg","latest":"0.5.0","versions":[{
+                    "version":"0.5.0","abi":0,
+                    "assets":{"any":{"url":"https://example.com/c.zip","sha256":"cc","size":1}}}]},
+                {"id":"media.audio","name":"Audio","latest":"0.1.0","versions":[{
+                    "version":"0.1.0","abi":0,
+                    "assets":{"any":{"url":"https://example.com/d.zip","sha256":"dd","size":1}}}]}
+            ]}"#
+            .as_bytes(),
+        )
+        .expect("依赖索引该解析成功")
+    }
+
+    #[test]
+    fn the_index_accepts_a_provides_field_and_defaults_it_to_empty() {
+        let index = dependency_index();
+        let alpha = index
+            .plugins
+            .iter()
+            .find(|plugin| plugin.id == "app.alpha")
+            .unwrap();
+        assert_eq!(alpha.versions[0].provides, ["alpha.api"]);
+        let ffmpeg = index
+            .plugins
+            .iter()
+            .find(|plugin| plugin.id == "media.ffmpeg")
+            .unwrap();
+        assert!(
+            ffmpeg.versions[0].provides.is_empty(),
+            "没写 provides 时是空表"
+        );
+    }
+
+    /// 一键安装：硬依赖在前、主插件在后，软依赖也一起排上。
+    #[test]
+    fn the_install_plan_puts_dependencies_first() {
+        let mut store = Store::new(
+            temp("plan-order").join("plugins"),
+            Some("https://example.com/index.json".to_owned()),
+        );
+        store.index = Some(dependency_index());
+        store.refresh_filtered();
+        let plugin = store.find_plugin("app.alpha").expect("该按 id 找到");
+        let plan = store.build_install_plan(&plugin).expect("该算出计划");
+        let order: Vec<&str> = plan.jobs.iter().map(|job| job.id.as_str()).collect();
+        assert_eq!(
+            order,
+            ["lib.base.pack", "media.ffmpeg", "app.alpha"],
+            "依赖在前"
+        );
+        // 服务名 lib.base 被解析成提供它的 lib.base.pack。
+        let hard = plan.deps.iter().find(|dep| dep.hard).expect("该有硬依赖行");
+        assert_eq!(hard.name, "lib.base");
+        assert!(hard.installable(), "索引里有，能自动装");
+        assert_eq!(hard.auto_install_id(), Some("lib.base.pack"));
+    }
+
+    /// 已装的依赖不再排进计划；全装好了就直说。
+    #[test]
+    fn an_already_installed_dependency_is_skipped() {
+        let root = temp("plan-skip");
+        let plugins = root.join("plugins");
+        let dep = plugins.join("lib.base.pack");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(
+            dep.join(BUNDLE_MANIFEST),
+            r#"{"schema":1,"id":"lib.base.pack","name":"基础库","version":"2.0.0","kind":"native","entry":"x.dll","provides":["lib.base"]}"#,
+        )
+        .unwrap();
+        let mut store = Store::new(plugins, Some("https://example.com/index.json".to_owned()));
+        store.index = Some(dependency_index());
+        store.refresh_filtered();
+        store.rescan();
+        let plugin = store.find_plugin("app.alpha").unwrap();
+        let plan = store.build_install_plan(&plugin).unwrap();
+        assert!(
+            !plan.jobs.iter().any(|job| job.id == "lib.base.pack"),
+            "已装的硬依赖不该再下一遍"
+        );
+        assert!(plan.skipped.contains(&"lib.base.pack".to_owned()));
+        let hard = plan.deps.iter().find(|dep| dep.hard).unwrap();
+        assert!(
+            matches!(hard.state, DepState::Provided { .. }),
+            "该认成已提供"
+        );
+    }
+
+    /// 硬依赖在索引里找不到：计划照样给出来，但把「装上也跑不起来」写清楚。
+    #[test]
+    fn a_missing_hard_dependency_is_reported_and_forces_a_confirmation() {
+        let mut store = Store::new(
+            temp("plan-missing").join("plugins"),
+            Some("https://example.com/index.json".to_owned()),
+        );
+        let index = parse_index(
+            br#"{"schema":1,"plugins":[{"id":"app.beta","name":"Beta","latest":"1.0.0",
+                "versions":[{"version":"1.0.0","abi":0,"depends":["nope.service"],
+                "assets":{"any":{"url":"https://example.com/b.zip","sha256":"bb","size":1}}}]}]}"#,
+        )
+        .unwrap();
+        store.index = Some(index);
+        store.refresh_filtered();
+        store.submit_install("app.beta", false);
+        assert!(
+            store.pending_install.is_some(),
+            "有硬依赖缺失时要先给出计划让人确认，而不是直接装"
+        );
+        let plan = store.pending_install.as_ref().unwrap();
+        assert_eq!(plan.missing_hard().len(), 1);
+        let summary = plan.summary();
+        assert!(summary.contains("硬依赖缺失"), "{summary}");
+        assert!(summary.contains("nope.service"), "{summary}");
+    }
+
+    /// 按 id 一键安装：精确 id、唯一前缀、唯一名称都能找到；对不上就报清楚。
+    #[test]
+    fn find_plugin_accepts_a_unique_prefix_or_name() {
+        let mut store = Store::new(
+            temp("plan-find").join("plugins"),
+            Some("https://example.com/index.json".to_owned()),
+        );
+        store.index = Some(dependency_index());
+        assert_eq!(store.find_plugin("app.alpha").unwrap().id, "app.alpha");
+        assert_eq!(store.find_plugin(" app.al ").unwrap().id, "app.alpha");
+        assert_eq!(store.find_plugin("FFmpeg").unwrap().id, "media.ffmpeg");
+        assert!(
+            store
+                .find_plugin("")
+                .expect_err("空输入该报错")
+                .contains("id")
+        );
+        assert!(
+            store
+                .find_plugin("media")
+                .expect_err("前缀对上多个时要报错")
+                .contains("多个")
+        );
+        // 唯一前缀照样能装（lib.base.pack 是索引里唯一以 lib 开头的）。
+        assert_eq!(store.find_plugin("lib").unwrap().id, "lib.base.pack");
+        assert!(store.find_plugin("nothing").is_err());
+    }
+
+    /// 一键安装框：i 打开、输入 id、Enter 提交、Esc 关掉。
+    #[test]
+    fn the_install_dialog_edits_and_submits() {
+        let mut store = Store::new(
+            temp("plan-dialog").join("plugins"),
+            Some("https://example.com/index.json".to_owned()),
+        );
+        store.index = Some(dependency_index());
+        store.refresh_filtered();
+        assert_eq!(
+            store.handle_key(key(KeyCode::Char('i'))),
+            StoreKey::Consumed
+        );
+        let count = store
+            .install_dialog
+            .as_ref()
+            .expect("i 该打开安装框")
+            .input
+            .chars()
+            .count();
+        // 清空再逐字输入 media.ffmpeg，Enter 提交。
+        for _ in 0..count {
+            store.handle_key(key(KeyCode::Backspace));
+        }
+        for character in "media.ffmpeg".chars() {
+            store.handle_key(key(KeyCode::Char(character)));
+        }
+        store.handle_key(key(KeyCode::Enter));
+        assert!(store.install_dialog.is_none(), "提交后该收起输入框");
+        assert!(
+            store.pending_install.is_none(),
+            "不需要确认的单装不该停在确认态"
         );
     }
 }

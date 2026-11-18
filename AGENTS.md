@@ -220,6 +220,15 @@ cargo test -p fuyubot-tdlib --test integration --offline -- --ignored real_bot_l
     分片到了就按真实版本表重算；没有摘要的老索引宁多勿漏。索引缓存 / ETag 在
     `<plugin_dir>/.store/`，换版本的旧包在 `<plugin_dir>/.backup/`（都是点目录，扫描跳过）；
     换版本前实例必须已停（Windows 锁 DLL）。
+    **按 id 一键安装 + 依赖自动下载**（2026，同在 `store.rs`）：`i` 输入 id（精确 / 唯一前缀 /
+    唯一名称），商店用 `depends` / `optional_depends` 算出一份**依赖在前**的安装计划再动手。
+    依赖名既可以是插件 id，也可以是**服务名**——靠索引的 `provides` 字段与已装包的
+    `plugin.json.provides` 反查是谁提供；两者都没有就如实报「找不到」，不许瞎猜。
+    硬依赖缺失时**先摆计划让人确认**（Enter 装 / Esc 撤），不静默带着缺陷装；软依赖缺了
+    只提醒，自动装失败也不挡主插件。计划的任一步失败即中止后面的包（`aborted` 里列清楚）。
+    新版本检查也只在面板：`crates/fuyubot-cli/src/panel/update.rs` 用 `ureq` 问一次
+    `GET https://api.github.com/repos/<owner>/<repo>/releases/latest`，比 `CARGO_PKG_VERSION`
+    大才提示，**不下载、不替换 exe**；开关是 `[update].enabled` / `FUYUBOT_UPDATE_CHECK=0`。
 
 62. **APK 在 `release-bot.yml` 的 `build-apk` job 里编，壳不在本仓**：
     壳是 [FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android)（Kotlin + Compose），

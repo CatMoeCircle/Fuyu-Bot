@@ -26,6 +26,7 @@ mod logfmt;
 mod login;
 pub mod store;
 mod ui;
+pub mod update;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};

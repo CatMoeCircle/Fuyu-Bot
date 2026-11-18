@@ -30,9 +30,10 @@ mod tdstate;
 
 pub use app::{App, AppError, AppOptions, TdlibSettings};
 pub use config::{
-    Bot, CONFIG_FILE, CONFIG_TEMPLATE, Command, Config, InitRequest, LOG_LEVELS, Plugins, Tdlib,
-    Telegram, config_lines, init_config, load_api_hash, load_config, log_level_name,
-    parse_log_level, quote_toml_string, remember_credentials, render_template, set_config_value,
+    Bot, CONFIG_FILE, CONFIG_TEMPLATE, Command, Config, DEFAULT_UPDATE_REPO, InitRequest,
+    LOG_LEVELS, Plugins, Tdlib, Telegram, Update, config_lines, init_config, load_api_hash,
+    load_config, log_level_name, parse_log_level, quote_toml_string, remember_credentials,
+    render_template, set_config_value,
 };
 pub use host::{AppHost, AppState, AskKind, SilentHost};
 pub use live::{LiveView, PluginInfo, PluginLoadReport, PluginSkip, empty_plugins_json};

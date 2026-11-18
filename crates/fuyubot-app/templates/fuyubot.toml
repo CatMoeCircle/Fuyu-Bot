@@ -34,6 +34,12 @@ dir = "plugins"
 log_level = "info"
 registry_url = "https://catmoecircle.github.io/FuyuBot-plugins/index.json"
 
+[update]
+# 面板启动时问一次 GitHub 的 Releases API，有新版本就在顶栏与概览页提示。
+# 只读、不下载、不替换 exe；fuyubot run 不联网检查。
+enabled = true
+repo = "CatMoeCircle/Fuyu-Bot"
+
 [tdlib]
 path = ""           # 留空自动找 tdjson
 log_verbosity = 1

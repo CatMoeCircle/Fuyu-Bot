@@ -339,6 +339,39 @@ fn overview_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         }
         return lines;
     }
+    // 版本 / 更新：检查结果、错误原文都放这里（顶栏只挂一句短的）。
+    lines.push(section("版本"));
+    lines.push(kv("当前版本", format!("v{}", env!("CARGO_PKG_VERSION"))));
+    match (app.update_info.as_ref(), app.update_error.as_deref()) {
+        (Some(info), _) => {
+            lines.push(kv_styled(
+                "有新版本",
+                format!("{}（{}）", info.tag, info.url),
+                Color::Yellow,
+            ));
+            if !info.published_at.is_empty() {
+                lines.push(kv("发布时间", info.published_at.clone()));
+            }
+            let first = info
+                .notes
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("");
+            if !first.is_empty() {
+                lines.push(kv("更新说明", first.trim().to_owned()));
+            }
+        }
+        (None, Some(error)) => {
+            lines.push(kv_styled("检查更新", error.to_owned(), Color::DarkGray));
+        }
+        (None, None) => {
+            lines.push(kv(
+                "检查更新",
+                "已是最新（按 U 再查一次；[update].enabled = false 可关）".to_owned(),
+            ));
+        }
+    }
+    lines.push(Line::from(""));
     lines.extend([
         section("位置"),
         kv("项目根", shown_path(&app.root)),
@@ -1114,6 +1147,10 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ("L", "只登录、不启动（通常直接按 s 即可）"),
         ("x", "停止 bot（再按 y 确认）"),
         ("r", "刷新状态、插件、日志与配置"),
+        (
+            "U",
+            "问一次 GitHub 有没有新版本（面板启动时也会自动查一次）",
+        ),
         ("Enter / e", "日志页：进入选择模式；配置页：编辑选中项"),
         (
             "Space / Enter",
@@ -1248,6 +1285,13 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         format!("[fuyubot - v{}]", env!("CARGO_PKG_VERSION")),
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )];
+    // 有新版本就在版本号后面挂一个黄标：顶栏是唯一「总会看见」的地方。
+    if let Some(line) = app.update_line() {
+        title.push(Span::styled(
+            format!("  ↑ {line}"),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
     if area.width >= 50 {
         title.push(Span::styled(
             "  终端操作面板",
@@ -1678,15 +1722,16 @@ fn operations_line(app: &App, compact: bool, width: u16) -> Line<'static> {
             Page::Store if compact => items.extend([
                 ("↑↓", "选"),
                 ("Enter", "装"),
+                ("i", "按 id"),
                 ("/", "搜索"),
                 ("Esc", "返回"),
             ]),
             Page::Store => items.extend([
                 ("↑↓", "选择"),
                 ("Enter", "安装"),
+                ("i", "按 id 装"),
                 ("x", "卸载"),
                 ("/", "搜索"),
-                ("r", "刷新"),
                 ("Esc", "返回"),
             ]),
             Page::Config if compact => {
@@ -2497,6 +2542,14 @@ fn section(title: &str) -> Line<'static> {
             title.to_owned(),
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
+    ])
+}
+
+/// 带颜色的键值行（概览页的「有新版本 / 检查失败」用它上色）。
+fn kv_styled(label: &str, value: String, color: Color) -> Line<'static> {
+    Line::from(vec![
+        kv_label(label),
+        Span::styled(value, Style::new().fg(color)),
     ])
 }
 

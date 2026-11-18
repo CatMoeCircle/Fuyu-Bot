@@ -27,6 +27,7 @@ use crate::panel::clipboard;
 use crate::panel::logfmt::{self, LevelFilter, LogFilter, SourceFilter};
 use crate::panel::login::{self, LoginEvent, LoginModal};
 use crate::panel::store::{self, StoreKey};
+use crate::panel::update;
 use crate::scaffold;
 
 /// 首屏从文件尾部装多少行（再往回看就按段加载）。
@@ -937,6 +938,35 @@ fn build_config_items(
         ConfigKind::Text { allow_empty: true },
     );
 
+    push_section(&mut items, "update");
+    let update_enabled = config.update.enabled();
+    push_config_item(
+        &mut items,
+        "update",
+        "enabled",
+        update_enabled.to_string(),
+        if update_enabled {
+            format!(
+                "true（每次开面板问一次 GitHub · 当前 v{}）",
+                update::current_version()
+            )
+        } else {
+            "false（不联网检查版本）".to_owned()
+        },
+        note("update", "enabled"),
+        ConfigKind::Bool,
+    );
+    let update_repo = config.update.repo();
+    push_config_item(
+        &mut items,
+        "update",
+        "repo",
+        update_repo.clone(),
+        update_repo,
+        note("update", "repo"),
+        ConfigKind::Text { allow_empty: false },
+    );
+
     push_section(&mut items, "tdlib");
     let tdlib_path = config.tdlib.path.clone().unwrap_or_default();
     push_config_item(
@@ -1470,6 +1500,20 @@ pub struct App {
     login_cancel_requested: bool,
     /// 登录线程最后一次「有进展」（开跑 / 弹出一个问题）的时刻：看门狗用它解锁界面。
     login_idle: Instant,
+    /// 新版本检查的结果：`None` = 还没查完 / 已是最新 / 检查关着。
+    pub update_info: Option<update::UpdateInfo>,
+    /// 检查失败的原因（没网 / 限流 / 仓库名写错），顶栏不显示，概览页给一行原文。
+    pub update_error: Option<String>,
+    /// 检查开着没有（`[update].enabled` + `FUYUBOT_UPDATE_CHECK`）。
+    update_enabled: bool,
+    /// 检查的仓库（`owner/repo`）。
+    update_repo: String,
+    /// 首帧自动查一次；`U` 手动再查。
+    update_started: bool,
+    /// 还在查（避免重复起线程）。
+    update_checking: bool,
+    /// 后台检查线程 → 界面。
+    update_rx: Option<Receiver<Result<Option<update::UpdateInfo>, String>>>,
 }
 
 impl App {
@@ -1562,9 +1606,73 @@ impl App {
             login_after_setup: false,
             login_cancel_requested: false,
             login_idle: Instant::now(),
+            update_info: None,
+            update_error: None,
+            update_enabled: true,
+            update_repo: String::new(),
+            update_started: false,
+            update_checking: false,
+            update_rx: None,
         };
         app.refresh_all();
         app
+    }
+
+    /// `U` / 首帧：起后台线程问一次 GitHub（同一时刻只查一次）。
+    pub fn check_update(&mut self) {
+        if !self.update_enabled || self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        self.update_started = true;
+        self.update_rx = Some(update::spawn_check(
+            self.update_repo.clone(),
+            update::current_version().to_owned(),
+        ));
+    }
+
+    /// 收后台检查的结果（每帧调，绝不阻塞）。
+    fn poll_update(&mut self) {
+        let Some(receiver) = self.update_rx.as_ref() else {
+            return;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return;
+        };
+        self.update_rx = None;
+        self.update_checking = false;
+        match result {
+            Ok(found) => {
+                self.update_error = None;
+                self.update_info = found.clone();
+                match found {
+                    Some(info) => self.set_toast(
+                        format!("有新版本 {}：按 U 再看，或去 Release 页下载", info.tag),
+                        Level::Warn,
+                    ),
+                    None => self.set_toast(
+                        format!("已是最新（v{}）", update::current_version()),
+                        Level::Info,
+                    ),
+                }
+            }
+            Err(error) => {
+                self.update_info = None;
+                self.update_error = Some(error.clone());
+                self.set_toast(format!("检查更新失败：{error}"), Level::Warn);
+            }
+        }
+    }
+
+    /// 顶栏 / 概览页用的一句话：有新版本时给出 tag，否则为空。
+    pub fn update_line(&self) -> Option<String> {
+        self.update_info.as_ref().map(|info| {
+            if info.name.is_empty() {
+                format!("新版本 {}", info.tag)
+            } else {
+                format!("新版本 {}（{}）", info.tag, info.name)
+            }
+        })
     }
 
     /// **真在跑**的实例信息（`Stale` 不算）。
@@ -1829,6 +1937,18 @@ impl App {
                     self.store = None;
                     self.registry_url = registry_url;
                 }
+                // 新版本检查：开关与仓库都跟着配置走（换了仓库，旧结果就不作数了）。
+                let update_enabled = config.update.enabled();
+                let update_repo = config.update.repo();
+                if !update_enabled || update_repo != self.update_repo {
+                    self.update_info = None;
+                    self.update_error = None;
+                    self.update_checking = false;
+                    self.update_rx = None;
+                    self.update_started = false;
+                }
+                self.update_enabled = update_enabled;
+                self.update_repo = update_repo;
                 let items = build_config_items(&self.config_path, &self.root, &config);
                 self.config_error = None;
                 self.config_items = items;
@@ -1993,6 +2113,11 @@ impl App {
         // 否则安装完成后状态会一直停在「进行中」。
         if let Some(store) = self.store.as_mut() {
             store.tick();
+        }
+        self.poll_update();
+        // 首帧自动查一次（配置关掉就不查）。
+        if !self.update_started {
+            self.check_update();
         }
         while let Ok(done) = self.rx.try_recv() {
             self.busy = None;
@@ -2599,6 +2724,18 @@ impl App {
             KeyCode::Char('r') => {
                 self.refresh_all();
                 self.set_toast("已刷新", Level::Info);
+            }
+            // 大写 U：手动再问一次 GitHub（首帧已经自动查过）。
+            KeyCode::Char('U') => {
+                if !self.update_enabled {
+                    self.set_toast(
+                        "更新检查关着：把 [update].enabled 改成 true（或删掉 FUYUBOT_UPDATE_CHECK）",
+                        Level::Warn,
+                    );
+                } else {
+                    self.check_update();
+                    self.set_toast("正在检查新版本…", Level::Info);
+                }
             }
             KeyCode::Char('f') if self.page == Page::Logs && self.workspace_focused() => {
                 if self.follow {

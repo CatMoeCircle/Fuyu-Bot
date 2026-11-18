@@ -42,6 +42,9 @@ pub struct Config {
     pub cache: CacheConfig,
     #[serde(default)]
     pub plugins: Plugins,
+    /// 新版本检查（段名 update）：面板启动时问一次 GitHub 的 Releases API。
+    #[serde(default)]
+    pub update: Update,
     #[serde(default)]
     pub tdlib: Tdlib,
     /// 每个插件自己的配置段：`[plugin.<插件名>]`。插件名是点分的（如 `fuyubot.manage`），
@@ -61,6 +64,7 @@ impl Default for Config {
             roles: Roles::default(),
             cache: CacheConfig::default(),
             plugins: Plugins::default(),
+            update: Update::default(),
             tdlib: Tdlib::default(),
             plugin: empty_table(),
         }
@@ -226,6 +230,59 @@ impl Plugins {
         };
         parse_log_level(raw)
     }
+}
+
+/// 默认的更新检查仓库：与 Cargo.toml 的 repository 同一个。
+pub const DEFAULT_UPDATE_REPO: &str = "CatMoeCircle/Fuyu-Bot";
+
+/// [update]：新版本检查（只读 GitHub 的 Releases API，不下载、不替换 exe）。
+///
+/// 检查只在面板里跑（启动一次、按 U 一次）；fuyubot run 与 Android 都不联网。
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+pub struct Update {
+    /// 关掉检查：Some(false) = 永不联网问版本。
+    pub enabled: Option<bool>,
+    /// 问哪个仓库（owner/repo）。不写 = DEFAULT_UPDATE_REPO。
+    pub repo: Option<String>,
+}
+
+impl Update {
+    /// 检查开着没有：配置优先，其次 FUYUBOT_UPDATE_CHECK（写 0 / false / no / off 算关）。
+    pub fn enabled(&self) -> bool {
+        if let Some(enabled) = self.enabled {
+            return enabled;
+        }
+        !switch_is_off(std::env::var("FUYUBOT_UPDATE_CHECK").ok().as_deref())
+    }
+
+    /// 仓库（owner/repo）：FUYUBOT_UPDATE_REPO 优先（临时换检查源不用改配置），
+    /// 其次配置，最后默认值。
+    pub fn repo(&self) -> String {
+        pick_update_repo(
+            std::env::var("FUYUBOT_UPDATE_REPO").ok().as_deref(),
+            self.repo.as_deref(),
+        )
+    }
+}
+
+/// 开关的纯逻辑：`0` / `false` / `no` / `off`（大小写与空格不敏感）= 关。
+pub fn switch_is_off(raw: Option<&str>) -> bool {
+    raw.map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|value| matches!(value.as_str(), "0" | "false" | "no" | "off"))
+}
+
+/// 仓库的纯逻辑：环境变量 → 配置 → 默认值（空串一律当没写）。
+pub fn pick_update_repo(env: Option<&str>, config: Option<&str>) -> String {
+    let clean = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    clean(env)
+        .or_else(|| clean(config))
+        .unwrap_or_else(|| DEFAULT_UPDATE_REPO.to_owned())
 }
 
 /// 面板 / 文档里按顺序展示的五档日志级别。
@@ -823,6 +880,15 @@ pub fn config_lines(config_path: &Path, root: &Path, config: &Config) -> Vec<Str
                 .filter(|value| !value.is_empty())
                 .unwrap_or("未配置（商店不可用）")
         ),
+        format!(
+            "[update]    enabled      = {}",
+            if config.update.enabled() {
+                "true"
+            } else {
+                "false"
+            }
+        ),
+        format!("[update]    repo         = {}", config.update.repo()),
         format!("[tdlib]     path         = {tdlib_path}"),
         format!(
             "[tdlib]     log_verbosity= {}",
@@ -1616,6 +1682,71 @@ mod tests {
             text.contains("dir = \"plugins\""),
             "原来那段不能被吃掉：{text}"
         );
+    }
+
+    /// [update]：模板里有这一段、默认开着、仓库有默认值，`fuyubot config` 也打得出来。
+    #[test]
+    fn the_update_section_has_defaults_and_shows_up_in_config_lines() {
+        let root = temp("config-update");
+        let path = root.join(CONFIG_FILE);
+        let config = Config::default();
+        assert!(config.update.enabled(), "默认开着更新检查");
+        assert_eq!(config.update.repo(), DEFAULT_UPDATE_REPO);
+
+        let mut custom = Config::default();
+        custom.update.repo = Some(" someone/else ".to_owned());
+        custom.update.enabled = Some(false);
+        assert!(!custom.update.enabled());
+        let lines = config_lines(&path, &root, &custom).join("\n");
+        assert!(
+            lines.contains("[update]    enabled      = false"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("[update]    repo         = someone/else"),
+            "{lines}"
+        );
+
+        assert!(
+            CONFIG_TEMPLATE.contains("enabled = true")
+                && CONFIG_TEMPLATE.contains("repo = \"CatMoeCircle/Fuyu-Bot\""),
+            "模板要带上 [update] 段：\n{CONFIG_TEMPLATE}"
+        );
+        // 模板必须解析得出来（多一个段不许把整份配置弄坏）。
+        let parsed: Config = toml::from_str(&render_template("demo", 1)).unwrap();
+        assert!(parsed.update.enabled(), "模板里默认是开的");
+    }
+
+    /// 开关与仓库的纯逻辑：环境变量优先、空串当没写、0/false/no/off 算关。
+    #[test]
+    fn update_switches_and_repos_follow_the_environment_first() {
+        assert!(!switch_is_off(None), "没设 = 开着");
+        for off in ["0", "false", "No", " OFF "] {
+            assert!(switch_is_off(Some(off)), "{off:?} 该算关");
+        }
+        for on in ["1", "true", "yes", ""] {
+            assert!(!switch_is_off(Some(on)), "{on:?} 不该算关");
+        }
+
+        assert_eq!(pick_update_repo(None, None), DEFAULT_UPDATE_REPO);
+        assert_eq!(
+            pick_update_repo(Some(" a/env "), Some("b/config")),
+            "a/env",
+            "环境变量优先"
+        );
+        assert_eq!(
+            pick_update_repo(Some("  "), Some("b/config")),
+            "b/config",
+            "环境变量是空串时退回配置"
+        );
+
+        // 配置里显式写了就以配置为准（这里不碰环境变量，避免并行测试互相干扰）。
+        let mut config = Config::default();
+        config.update.repo = Some(" owner/from-config ".to_owned());
+        config.update.enabled = Some(false);
+        assert!(!config.update.enabled(), "Some(false) 一定关");
+        config.update.enabled = Some(true);
+        assert!(config.update.enabled(), "Some(true) 一定开");
     }
 
     /// 凭据**不进配置树**：那棵树会整棵交给宿主运行时，插件 `get_config` 能读任意段。
