@@ -515,21 +515,13 @@ fn run_background(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .stderr(append()?);
     #[cfg(windows)]
     {
-        // DETACHED_PROCESS：子进程不要控制台（否则父进程退出 / 终端关掉会影响它）。
-        // 没做 Unix 的 setsid（std 不提供）——那边靠「stdio 都重定向了、
-        // 也不在终端的进程组前台」撑着，关终端发 SIGHUP 时可能被带走；要真守护进程再引守护库。
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        command.creation_flags(DETACHED_PROCESS);
         // ⚠️ 必须在 spawn 之前清：std 的 `Command` 用 `bInheritHandles = TRUE` 派生，
         // daemon 会把 launcher 从调用方继承来的 stdout / stderr 管道一起带走，
         // 调用方（面板的 `Command::output()`）就永远读不到 EOF。见模块文档。
         windows_handle_inheritance::clear_std_inherit();
     }
 
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("起不了后台进程: {e}"))?;
+    let mut child = spawn_daemon(&mut command)?;
     let pid = child.id();
 
     // 等它发布状态（拿上锁只说明进程活着：插件还没加载、登录还没走）。
@@ -557,6 +549,104 @@ fn run_background(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// 派生**与终端无关**的后台 daemon。
+///
+/// 只做「stdio 重定向 + DETACHED」不够，终端一关 bot 还会跟着走，两条平台各有一个坑：
+///
+/// - **Windows**：终端（Windows Terminal / VS Code / 网页终端）常把 shell 放进一个
+///   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的作业对象，关窗口 / 关页面时
+///   `TerminateJobObject` 会把作业里的**所有**进程一起杀掉。作业成员身份是**继承**的，
+///   `DETACHED_PROCESS` 只去掉控制台、脱不出作业——所以再加
+///   `CREATE_BREAKAWAY_FROM_JOB`。作业必须显式允许 breakaway（`JOB_OBJECT_LIMIT_BREAKAWAY_OK`），
+///   不允许时系统直接回 `ERROR_ACCESS_DENIED`：那就退回「只去控制台」的老行为，
+///   daemon 启动时会自己写一条警告（见 [`note_job_object`]）。
+/// - **Unix**：终端一挂断，内核给会话的**前台进程组**发 `SIGHUP`，没脱离终端的 daemon 会被
+///   顺手带走——这正是「关掉终端 bot 就停」的另一半。std 不导出 `setsid`，但 libc 本来就在
+///   链接线上，直接声明即可，不必为这一行引 `libc` crate。
+fn spawn_daemon(command: &mut std::process::Command) -> Result<std::process::Child, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        /// 子进程不要控制台（否则父进程退出 / 终端关掉会影响它）。
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        /// 从调用方的作业对象里脱离（要求作业允许 breakaway）。
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        /// Windows 的 `ERROR_ACCESS_DENIED`：作业不允许 breakaway 时 `CreateProcess` 就回它。
+        const ERROR_ACCESS_DENIED: i32 = 5;
+
+        command.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+                // 这个终端的作业对象不许脱离：连 CreateProcess 都被拒。
+                // 退回老路——现在能跑，但终端被关时 Windows 会连它一起结束，
+                // daemon 启动时会把原因写进日志，别让人以为是 bot 自己挂了。
+                command.creation_flags(DETACHED_PROCESS);
+            }
+            Err(error) => return Err(format!("起不了后台进程: {error}")),
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // SAFETY: `setsid` 是 async-signal-safe 的；fork 之后、exec 之前只能做这种
+        // 不分配内存、不拿锁的事，这里正好只有它。
+        unsafe {
+            command.pre_exec(|| {
+                // SAFETY: 无参数、无前置条件；失败（已经是会话首）不影响后续启动。
+                unsafe extern "C" {
+                    fn setsid() -> i32;
+                }
+                let _ = setsid();
+                Ok(())
+            });
+        }
+    }
+    command
+        .spawn()
+        .map_err(|error| format!("起不了后台进程: {error}"))
+}
+
+/// 实例还挂在终端的「随终端一起结束」作业对象里时，写一条警告。
+///
+/// 正常的后台实例由 [`spawn_daemon`] 用 `CREATE_BREAKAWAY_FROM_JOB` 派生，早就脱离终端；
+/// 只有终端的作业对象**不允许** breakaway 时才会走到这里。这时 bot 能正常跑，
+/// 但关掉终端 / 网页终端页时 Windows 会连它一起结束——至少要让日志说出原因。
+fn note_job_object() {
+    if in_job_object() {
+        cli!(
+            warn,
+            "本实例还在终端 / 沙箱的作业对象里：关掉那个终端（或网页终端页）时 Windows 会把它一起结束。\
+             想让实例独立存活，请在不会创建 kill-on-close job 的终端里启动，或交给系统服务 / 计划任务托管"
+        );
+    }
+}
+
+/// 当前进程是否属于**任意**作业对象。非 Windows 平台恒为 `false`。
+fn in_job_object() -> bool {
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+
+        unsafe extern "system" {
+            fn IsProcessInJob(process: *mut c_void, job: *mut c_void, result: *mut i32) -> i32;
+            fn GetCurrentProcess() -> *mut c_void;
+        }
+
+        let mut inside = 0i32;
+        // SAFETY: 两个调用都没有前置条件；`inside` 指向本栈上的 i32。
+        let ok =
+            unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut inside) } != 0;
+        return ok && inside != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -791,6 +881,8 @@ async fn run_async(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cli_api_id = checked_cli_api_id(args.api_id)?;
     // 直接调 `run_async` 的路径（测试 / 将来的嵌入方）也要有订阅者；重复调用只保留第一个。
     logging::init();
+    // 终端会不会把本实例一起带走？（Windows 上 kill-on-close 的作业对象）
+    note_job_object();
     // 启动时刻：写进状态文件给 `status` 算「已运行多久」。
     let started_at = instance::unix_now();
     // 项目根目录：`fuyubot.toml` 所在目录（找不到就是当前目录）。
