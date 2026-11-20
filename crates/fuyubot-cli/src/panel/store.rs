@@ -89,6 +89,8 @@ pub struct Store {
     index: Option<Index>,
     index_error: Option<String>,
     loading_index: bool,
+    /// 服务器回 304、本地却读不出缓存时，已经用「不带 ETag」重拉过一次（防止死循环）。
+    retried_without_etag: bool,
     /// 首帧自动拉一次索引（有 URL 才拉；`r` 手动刷新走同一个入口）。
     auto_loaded: bool,
 
@@ -159,6 +161,7 @@ impl Store {
             index: None,
             index_error: None,
             loading_index: false,
+            retried_without_etag: false,
             auto_loaded: false,
             installed: Vec::new(),
             last_scan: Instant::now(),
@@ -826,6 +829,8 @@ impl Store {
     /// 重新拉索引 + 重扫已安装目录。
     fn refresh(&mut self) {
         self.rescan();
+        // 用户主动按 r：允许再走一次「304 → 清缓存重拉」。
+        self.retried_without_etag = false;
         self.load_index();
     }
 
@@ -2101,9 +2106,13 @@ fn fetch_index(url: &str, etag: Option<&str>, cache_dir: &Path) -> Result<Option
     }
     let mut response = match request.call() {
         Ok(response) => response,
-        Err(ureq::Error::StatusCode(304)) => return Ok(None),
         Err(error) => return Err(http_error("索引地址", url, error)),
     };
+    // ⚠️ 304 是**正常响应**，不会变成 `Error::StatusCode`：ureq 3 只把 4xx / 5xx 当错误
+    // （`run.rs`：`is_client_error() || is_server_error()`），304 带着空 body 走 Ok 分支。
+    // 所以必须**先看状态码再读 body**——否则空 body 掉进 `parse_index`，报成
+    // 「索引不是合法 JSON：EOF while parsing a value at line 1 column 0」（2026 实测）。
+    let status = response.status().as_u16();
     let etag = response
         .headers()
         .get("etag")
@@ -2120,13 +2129,56 @@ fn fetch_index(url: &str, etag: Option<&str>, cache_dir: &Path) -> Result<Option
                 human_bytes(INDEX_MAX_BYTES)
             )
         })?;
+    let Some(bytes) = payload_or_not_modified(status, bytes, "索引地址", url)? else {
+        return Ok(None);
+    };
     let index = parse_index(&bytes)?;
     write_cache(cache_dir, url, &bytes, etag.as_deref());
     Ok(Some(index))
 }
 
+/// HTTP 304 的数值（`http::StatusCode::NOT_MODIFIED`，这里不引 http 依赖）。
+const HTTP_NOT_MODIFIED: u16 = 304;
+
+/// 把「响应体」翻成可解析的内容，或者一个说人话的错误。
+///
+/// 三种情况都必须分开：
+/// - **304**：`If-None-Match` 命中了，缓存仍有效，返回 `Ok(None)`；
+/// - **非 2xx**（3xx 漏过来的、或者关掉 `http_status_as_error` 时）：报状态码，别拿去当 JSON；
+/// - **0 字节**：服务器 / CDN 这次没给内容。绝不能交给 `serde_json`——它只会吐出
+///   `EOF while parsing a value at line 1 column 0`，既不像错误也不指出下一步
+///   （2026 用户报的就是这条）。
+fn payload_or_not_modified(
+    status: u16,
+    bytes: Vec<u8>,
+    what: &str,
+    url: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    if status == HTTP_NOT_MODIFIED {
+        return Ok(None);
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "{what} {url} 返回 HTTP {status}（不是 2xx / 304：地址错了 / 被重定向到登录页 / 服务端故障；按 r 重试或找上架方）"
+        ));
+    }
+    if bytes.is_empty() {
+        return Err(format!(
+            "{what} {url} 返回了 0 字节（HTTP {status}）：服务器 / CDN 这次没给内容（空文件、被代理截断或缓存还没生成）；按 r 重试，反复这样就要找上架方"
+        ));
+    }
+    Ok(Some(bytes))
+}
+
 /// 解析索引 JSON 并确认 schema 是本宿主认识的（1 = 全量，2 = 轻列表 + 分片）。
 fn parse_index(bytes: &[u8]) -> Result<Index, String> {
+    // 空输入走到 serde 只会得到「EOF while parsing a value at line 1 column 0」，
+    // 看不出是「服务器没给内容」；在入口就说清楚（`payload_or_not_modified` 是主防线）。
+    if bytes.is_empty() {
+        return Err(
+            "索引是空的（0 字节，不是 JSON）：服务器 / CDN 这次没给内容；按 r 重试".to_owned(),
+        );
+    }
     let index: Index = serde_json::from_slice(bytes)
         .map_err(|error| format!("索引不是合法 JSON：{error}（对照文档站「插件商店」的字段表）"))?;
     if index.schema != INDEX_SCHEMA_LEGACY && index.schema != INDEX_SCHEMA_SHARDED {
@@ -2205,7 +2257,8 @@ fn fetch_bytes(url: &str, limit: u64, label: &str) -> Result<Vec<u8>, String> {
         .get(url)
         .call()
         .map_err(|error| http_error(label, url, error))?;
-    response
+    let status = response.status().as_u16();
+    let bytes = response
         .body_mut()
         .with_config()
         .limit(limit)
@@ -2215,7 +2268,14 @@ fn fetch_bytes(url: &str, limit: u64, label: &str) -> Result<Vec<u8>, String> {
                 "读{label}失败：{error}（上限 {}，内容太大或连接断了）",
                 human_bytes(limit)
             )
-        })
+        })?;
+    match payload_or_not_modified(status, bytes, label, url)? {
+        Some(bytes) => Ok(bytes),
+        // 这两个请求都不带 If-None-Match，正常不会有 304。
+        None => Err(format!(
+            "{label} {url} 返回 304（未修改）但本地没有它的缓存：按 r 重试"
+        )),
+    }
 }
 
 // ── 本地缓存（索引 + ETag）────────────────────────────────────────
@@ -2403,6 +2463,7 @@ impl Store {
         match event {
             Event::Index(Ok(Some(index))) => {
                 self.loading_index = false;
+                self.retried_without_etag = false;
                 self.index_error = None;
                 self.apply_index(index, true);
             }
@@ -2414,8 +2475,16 @@ impl Store {
                     self.set_status(Status::Done(
                         "索引已是最新（304，用的是本地缓存）".to_owned(),
                     ));
+                } else if self.retried_without_etag {
+                    // 没带 If-None-Match 也回 304、本地又没缓存：再重拉就是死循环（每轮还起一个线程）。
+                    self.retried_without_etag = false;
+                    self.fail(
+                        "服务器回了 304 但本地没有可用的索引缓存（连不带 If-None-Match 的请求也这样）：\
+                         上架方的服务端有问题；按 r 重试或找上架方",
+                    );
                 } else {
                     // 缓存读不出来但服务器仍然回 304：清掉缓存，强制无 ETag 重拉一次。
+                    self.retried_without_etag = true;
                     clear_cache(&self.cache_dir);
                     self.load_index();
                 }
@@ -3563,6 +3632,60 @@ mod tests {
         assert!(error.contains("schema"), "{error}");
         let error = parse_index(b"{ not json").expect_err("坏 JSON 该被拒绝");
         assert!(error.contains("JSON"), "{error}");
+    }
+
+    #[test]
+    fn a_304_is_not_an_empty_index() {
+        // 回归：ureq 3 把 304 当**正常响应**返回（body 为空），旧代码却只在
+        // `Err(ureq::Error::StatusCode(304))` 上认 304——那条分支永远走不到，空 body 于是
+        // 掉进 serde_json，界面报「索引不是合法 JSON：EOF while parsing a value at line 1
+        // column 0」（2026 用户报障）。
+        let url = "https://example.com/index.json";
+        assert!(
+            payload_or_not_modified(HTTP_NOT_MODIFIED, Vec::new(), "索引地址", url)
+                .expect("304 不是错误")
+                .is_none(),
+            "304 必须表示「缓存仍有效」"
+        );
+
+        let fresh = payload_or_not_modified(200, INDEX_JSON.as_bytes().to_vec(), "索引地址", url)
+            .expect("200 + 正文该放行")
+            .expect("200 必须带回正文");
+        assert_eq!(
+            parse_index(&fresh).expect("正文该解析成功").schema,
+            INDEX_SCHEMA_LEGACY
+        );
+
+        // 0 字节：要指出「服务器没给内容」，不许甩 JSON 语法错。
+        let error =
+            payload_or_not_modified(200, Vec::new(), "索引地址", url).expect_err("空正文该被拒绝");
+        assert!(error.contains("0 字节"), "{error}");
+        assert!(!error.contains("JSON"), "{error}");
+        // 直接喂空字节给 parse_index 也不会再冒出 EOF 文案。
+        let error = parse_index(b"").expect_err("空索引该被拒绝");
+        assert!(error.contains("0 字节"), "{error}");
+
+        // 3xx 其它状态：先报状态码，别把重定向页当索引。
+        let error = payload_or_not_modified(302, b"<html>".to_vec(), "索引地址", url)
+            .expect_err("302 该被拒绝");
+        assert!(error.contains("302"), "{error}");
+        assert!(!error.contains("JSON"), "{error}");
+    }
+
+    #[test]
+    fn a_second_304_without_a_cache_stops_instead_of_looping() {
+        // 304 现在真的会走到 `Ok(None)`（以前那条分支是死代码）。没有缓存时清缓存重拉一次是对的，
+        // 但服务器若对**不带** If-None-Match 的请求也回 304，重拉就成了死循环（每轮还起一个线程）。
+        let mut store = Store::new(
+            temp("retry304"),
+            Some("https://example.com/index.json".to_owned()),
+        );
+        store.retried_without_etag = true;
+        store.handle_event(Event::Index(Ok(None)));
+        assert!(!store.loading_index, "不该再起线程重拉");
+        let error = store.error_text().expect("第二次 304 该报错");
+        assert!(error.contains("304"), "{error}");
+        assert!(!store.retried_without_etag, "报错后该复位，下次 r 还能再试");
     }
 
     #[test]
