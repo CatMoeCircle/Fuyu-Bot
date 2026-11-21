@@ -38,7 +38,10 @@ resolver = "3"
 # 0.1.8：TUI 登录改成全程模态——从发起登录到流程结束（bot token / 手机号 / 验证码 / 两步验证密码）
 # 按键全归登录弹窗，`1`–`6` / `q` / `s` 这些全局快捷键不再漏进来，敲 token 不会把面板跳走。
 # ABI 仍为 v6，0.1.7 的插件可继续加载。
-version = "0.1.8"
+# 0.1.9：TDLib 自己的日志改经宿主落盘（日志回调 + `logStreamEmpty` 关掉默认流），
+# 面板的进程内登录不再被 C 库写脏终端；Release 说明改成「更新内容 + 资产表」，
+# Android x86_64 不再标「模拟器」。ABI 仍为 v6，0.1.8 的插件可继续加载。
+version = "0.1.9"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
