@@ -1205,7 +1205,8 @@ impl HostRuntime {
     ///
     /// - `""` 由调用方先换算成「自己那段」（`plugin.<插件名>`）；
     /// - `plugin.fuyubot.music`（或 `[plugin.fuyubot.music]`）= 那个插件的段；
-    /// - `bot` / `telegram` / `tdlib` / `plugins` / `plugin` = 顶层段；
+    /// - 顶层段（`bot` / `telegram` / `command` / `roles` / `cache` / `plugins` /
+    ///   `update` / `tdlib` / `plugin`，见 [`TOP_LEVEL_SECTIONS`]）按路径读；
     /// - 其余裸名字按插件名处理（旧调用 `get_config("fuyubot.music", …)` 仍然有效）。
     ///
     /// `key` 为空 = 整段。命中返回 `Some(JSON)`，否则 `None`。
@@ -2261,6 +2262,16 @@ fn lookup_path<'a>(node: &'a Value, path: &str) -> Option<&'a Value> {
     Some(current)
 }
 
+/// `fuyubot.toml` 的顶层段名，与 `fuyubot-app` 里 `Config` 的顶层字段一一对应。
+///
+/// 这些名字在配置文件里是顶层表、不是插件名：插件可以按路径**读**，但永远只能写
+/// `plugin.*`（写配置会拒绝 `Section::Top`）。新增 `Config` 顶层字段时记得同步这里——
+/// 漏一个的后果不是报错，而是插件**读到「段不存在」拿到空值**，`[roles]` 就这样让插件
+/// 读不到主人过。
+const TOP_LEVEL_SECTIONS: &[&str] = &[
+    "bot", "telegram", "command", "roles", "cache", "plugins", "update", "tdlib", "plugin",
+];
+
 /// 配置段的寻址结果：与 `fuyubot.toml` 里的 `[段]` 一一对应。
 ///
 /// 分两类是因为**读写权限不同**：插件可以按路径读顶层（`[bot]` 之类，它本来就在那儿），
@@ -2268,7 +2279,8 @@ fn lookup_path<'a>(node: &'a Value, path: &str) -> Option<&'a Value> {
 enum Section<'a> {
     /// `[plugin.<名>]`：插件段。`name` 是去掉 `plugin.` 之后的部分（点分）。
     Plugin(&'a str),
-    /// 顶层段（`bot` / `telegram` / `tdlib` / `plugins` / `plugin` 本身）。
+    /// 顶层段（`bot` / `telegram` / `command` / `roles` / `cache` / `plugins` /
+    /// `update` / `tdlib` / `plugin` 本身，见 [`TOP_LEVEL_SECTIONS`]）。
     Top(&'a str),
 }
 
@@ -2288,10 +2300,7 @@ fn parse_section(raw: &str) -> Option<Section<'_>> {
         return (!rest.is_empty()).then_some(Section::Plugin(rest));
     }
     // 顶层段：这些名字在 `fuyubot.toml` 里是顶层表，不是插件。
-    if matches!(
-        trimmed,
-        "bot" | "telegram" | "plugins" | "tdlib" | "plugin" | "command"
-    ) {
+    if TOP_LEVEL_SECTIONS.contains(&trimmed) {
         return Some(Section::Top(trimmed));
     }
     // 其余按插件名（兼容 `get_config("fuyubot.music", …)` 这类旧写法）。
@@ -3951,10 +3960,12 @@ unsafe extern "C" fn api_cancel_wait(host: *mut c_void, handle: WaitHandle) {
 }
 
 /// 读配置：`section` 空 = **自己**那段（与 `set_config` 同一个默认），
-/// 非空 = 那个插件名（点路径，`fuyubot.manage` → `plugin.fuyubot.manage`）。
+/// 非空 = 配置文件里的段名（`[bot]` / `plugin.fuyubot.manage` / 裸插件名都认，
+/// 见 [`parse_section`]）。
 ///
-/// 顶层（`[bot]` / `[telegram]`）**不通过插件 API 暴露**：插件要的永远是插件自己的段，
-/// 读宿主凭据既不必要也不安全。宿主内部仍可直接 `read_config("")`。
+/// 顶层段**可读不可写**：`[bot]` / `[telegram]` / `[roles]` 这些是用户配置，插件按路径
+/// 读得到（`get_config("roles", "owners")` 读主人），写只允许 `plugin.*`。真正的凭据
+/// （`api_hash` / token）根本不在这棵配置树里，所以读顶层不等于读凭据。
 unsafe extern "C" fn api_get_config(
     host: *mut c_void,
     section: *const c_char,
@@ -4776,6 +4787,54 @@ mod tests {
 
         // 回到宿主根作用域（owner 0），没有名字 → 写失败。
         assert!(api.set_config("k", "1").is_err());
+    }
+
+    /// 顶层段**都读得到**，特别是 `[roles]`。
+    ///
+    /// 回归用例：`parse_section` 的顶层白名单漏了 `roles` 时，`get_config("roles", "owners")`
+    /// 被当成裸插件名（`plugin.roles`）去查，永远返回 `NULL`——插件于是报「没有配置主人」，
+    /// 而值好端端躺在配置树里。白名单与 `Config` 的顶层字段对不上就会重现这一类「静默读空」。
+    #[test]
+    fn top_level_sections_are_readable() {
+        let rt = runtime();
+        rt.install_config(
+            None,
+            serde_json::json!({
+                "bot": { "name": "demo" },
+                "telegram": { "account_type": "bot" },
+                "command": { "whitelist_only": true },
+                "roles": { "owners": [5895998976i64, "123"], "admins": [7] },
+                "cache": { "capacity": 100 },
+                "plugins": { "dir": "plugins" },
+                "update": { "enabled": false },
+                "tdlib": { "log_verbosity": 1 },
+            }),
+        );
+
+        // SAFETY: rt 活着。
+        let api = unsafe { fuyubot_abi::HostApi::from_raw(rt.vtable_ptr()) }.unwrap();
+
+        // 报告里的原话：读主人。JSON 数组原样返回，插件自己解析。
+        assert_eq!(
+            api.get_config("roles", "owners").unwrap(),
+            "[5895998976,\"123\"]"
+        );
+        // 带方括号的写法等价（剥掉 [ ] 之后同一个段名）。
+        assert_eq!(
+            api.get_config("[roles]", "owners").unwrap(),
+            "[5895998976,\"123\"]"
+        );
+        assert_eq!(api.get_config("roles", "admins").unwrap(), "[7]");
+        // 其余顶层段同理：漏一个就是同一类 bug。
+        assert_eq!(api.get_config("cache", "capacity").unwrap(), "100");
+        assert_eq!(api.get_config("update", "enabled").unwrap(), "false");
+        assert_eq!(api.get_config("bot", "name").unwrap(), "\"demo\"");
+        assert_eq!(
+            api.get_config("telegram", "account_type").unwrap(),
+            "\"bot\""
+        );
+        // 读得到不等于写得进：顶层归用户，跨插件写只收 `plugin.*`。
+        assert!(api.set_config_for("roles", "owners", "[1]").is_err());
     }
 
     /// 跨插件写：`set_config_for` 显式点名目标，落到**对方**的段与文件；
