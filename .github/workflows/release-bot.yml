@@ -34,6 +34,10 @@
 # `crates/fuyubot-tdlib/src/loader/vendored.rs` 的 ASSETS 表与
 # `crates/fuyubot-tdlib/build.rs` 的 `stage_next_to_binary`。
 #
+# **Release 说明 = 更新内容 + 资产表**：更新内容从「上一个版本 tag → 本次 tag」的提交生成
+# （发布 / CI 自身的提交不算用户可见更新）；下载怎么用写在 README 与文档站，不再堆在
+# Release 页面上。
+#
 # 中间产物（每平台一份 .tar.gz，内容已经是最终布局）只留在 Actions artifacts 里；
 # zip 只在 publish（Linux）里生成——Windows runner 的 bash 没有 zip 命令，
 # 别为它分叉。
@@ -640,6 +644,13 @@ jobs:
     if: ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_tag != '') && (needs.build.result == 'success' || needs.build-android.result == 'success' || needs.build-apk.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
+      # 更新内容要算「上一个版本 tag → 本次 tag」的提交，所以这一 job 也要有仓库与完整历史。
+      # 其它 job 只搬 artifact，不需要 checkout。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -690,35 +701,34 @@ jobs:
               name="${name%.*}"
               case "$ext:$name" in
                 apk:*-arm64-v8a)   label="Android（arm64-v8a，**APK**，开箱即用）" ;;
-                apk:*-x86_64)      label="Android（x86_64，**APK**，模拟器）" ;;
+                apk:*-x86_64)      label="Android（x86_64，**APK**）" ;;
                 zip:*-windows-x86_64)  label="Windows 10/11（x64）" ;;
                 zip:*-windows-aarch64) label="Windows 11（ARM64）" ;;
                 zip:*-linux-x86_64)    label="Linux（x86_64）" ;;
                 zip:*-linux-aarch64)   label="Linux（ARM64）" ;;
                 zip:*-macos-aarch64)   label="macOS（Apple Silicon）" ;;
                 zip:*-android-aarch64) label="Android（arm64-v8a，可执行文件）" ;;
-                zip:*-android-x86_64)  label="Android（x86_64，模拟器 / 可执行文件）" ;;
+                zip:*-android-x86_64)  label="Android（x86_64，可执行文件）" ;;
                 *)                 label="$name.$ext" ;;
               esac
               printf '| %s | `%s.%s` |\n' "$label" "$name" "$ext"
             done
           )"
-          notes=$(printf '%s\n' \
-            "## 下载" \
-            "" \
-            "每个平台一个 zip：**解压出来就是本体**（没有额外的一层目录），" \
-            "TDLib 动态库与可执行文件同级，内置插件（/start、/help、/plugins）在 \`plugins/<id>/\` 的插件包里。" \
-            "" \
-            "\`*-<abi>.apk\`（如 \`fuyubot-v0.1.3-arm64-v8a.apk\`）是**可直接安装的 Android 图形客户端**（界面在" \
-            "[FuyuBot-for-Android](https://github.com/CatMoeCircle/FuyuBot-for-Android)，" \
-            "内核由本仓同 tag 编出、随 APK 一起打包）。" \
-            "真机用 \`arm64-v8a\`，模拟器用 \`x86_64\`；两个 APK 只能装一个（包名相同）。" \
-            "" \
-            "| 系统 | 资产 |" \
-            "| --- | --- |" \
-            "$table" \
-            "" \
-            "脚本插件宿主（\`fuyubot-script\`）在 FuyuBot-Script 仓库的 Release 里单独发布。")
+          # 更新内容 = 上一个版本 tag 到本次 tag 的提交；发布 / CI 自身的提交不算用户可见更新。
+          prev="$(git tag --list 'v*' --sort=-v:refname | grep -vx "$TAG" | head -n 1 || true)"
+          changelog=""
+          if [[ -n "$prev" ]]; then
+            changelog="$(git log "$prev..$TAG" --no-merges --reverse --pretty='- %s' 2>/dev/null \
+              | grep -vE '^- (chore|ci)\(release\):' || true)"
+          fi
+          # Release 页面上只放「更新内容 + 资产表」；下载怎么用写在 README / 文档站。
+          notes_file="${RUNNER_TEMP:-/tmp}/release-notes.md"
+          {
+            if [[ -n "$changelog" ]]; then
+              printf '## 更新内容\n\n%s\n\n' "$changelog"
+            fi
+            printf '## 下载\n\n| 系统 | 资产 |\n| --- | --- |\n%s\n' "$table"
+          } > "$notes_file"
           # 资产表从实际产物拼，所以这里也按实际文件上传：没有 APK 的构建不该塞一个空通配符。
           # ⚠️ 别写成 `[[ ... ]] && assets+=(...)`：条件为假时整条 AND 列表返回 1，
           #    `set -e` 会当场把 publish 打死（这是 bash 的经典坑）。
@@ -738,8 +748,8 @@ jobs:
               # 用这次的子集覆盖它会把别的平台从下载表里抹掉。资产已经 --clobber 覆盖过了。
               echo "==> 部分重建：只替换资产，发布说明保持不动"
             else
-              gh release edit "$TAG" --notes "$notes" --repo "$GITHUB_REPOSITORY"
+              gh release edit "$TAG" --notes-file "$notes_file" --repo "$GITHUB_REPOSITORY"
             fi
           else
-            gh release create "$TAG" "${assets[@]}" --title "fuyubot $TAG" --notes "$notes" --repo "$GITHUB_REPOSITORY"
+            gh release create "$TAG" "${assets[@]}" --title "fuyubot $TAG" --notes-file "$notes_file" --repo "$GITHUB_REPOSITORY"
           fi
