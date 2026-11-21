@@ -29,12 +29,31 @@ pub type TdExecuteFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> *cons
 /// 而且**可以在建客户端之前就调**——所以它是「默认日志等级」的正确落点。
 pub type TdSetLogVerbosityFn = unsafe extern "C" fn(i32);
 
+/// TDLib 内部日志回调：`(verbosity_level, message)`。
+///
+/// `message` 是以 NUL 结尾的 UTF-8 字符串，**只在回调期间有效**（TDLib 随后就能
+/// 复用那块缓冲），回调里必须立刻拷走。
+pub type TdLogMessageCallbackFn = unsafe extern "C" fn(i32, *const c_char);
+
+/// 安装 / 替换 TDLib 的内部日志回调；传 `None` 恢复默认（stderr）。
+///
+/// `max_verbosity_level` 与 `td_set_log_verbosity_level` 是同一套数字：
+/// 0 致命 / 1 错误 / 2 警告 / 3 信息 / 4 调试 / 5 详细调试。
+///
+/// ⚠️ 回调是**追加**在默认日志流之后的：TDLib 先写默认流（stderr / 文件），再调
+/// 回调（`tdutils/td/utils/logging.cpp` 的 `LogInterface::append`）。所以要真正止住
+/// TDLib 往终端写，还得把默认流换成 `logStreamEmpty`——两步在 `fuyubot-tdlib::log`
+/// 里一起做，详见那边的模块文档。
+pub type TdSetLogMessageCallbackFn = unsafe extern "C" fn(i32, Option<TdLogMessageCallbackFn>);
+
 pub const SYM_CREATE: &str = "td_json_client_create";
 pub const SYM_DESTROY: &str = "td_json_client_destroy";
 pub const SYM_SEND: &str = "td_json_client_send";
 pub const SYM_RECEIVE: &str = "td_json_client_receive";
 pub const SYM_EXECUTE: &str = "td_json_client_execute";
 pub const SYM_SET_LOG_VERBOSITY: &str = "td_set_log_verbosity_level";
+/// 可选符号：老的 / 精简的 tdjson 可能没导出它。
+pub const SYM_SET_LOG_MESSAGE_CALLBACK: &str = "td_set_log_message_callback";
 
 /// 默认日志详细度：**1**。
 ///
@@ -54,6 +73,8 @@ pub struct TdApi {
     pub receive: TdReceiveFn,
     pub execute: TdExecuteFn,
     pub set_log_verbosity: TdSetLogVerbosityFn,
+    /// 可选：拿不到时 TDLib 的日志继续由它自己写 stderr（老库 / 精简构建）。
+    pub set_log_message_callback: Option<TdSetLogMessageCallbackFn>,
 }
 
 // C ABI 两侧的指针形状必须一致；不一致的话这里直接编译不过。
@@ -61,5 +82,5 @@ const _: () = {
     assert!(core::mem::size_of::<*const c_char>() == core::mem::size_of::<*mut c_void>());
     assert!(core::mem::align_of::<*const c_char>() == core::mem::align_of::<*mut c_void>());
     assert!(core::mem::size_of::<*mut c_void>() == core::mem::size_of::<usize>());
-    assert!(core::mem::size_of::<TdApi>() == 6 * core::mem::size_of::<usize>());
+    assert!(core::mem::size_of::<TdApi>() == 7 * core::mem::size_of::<usize>());
 };

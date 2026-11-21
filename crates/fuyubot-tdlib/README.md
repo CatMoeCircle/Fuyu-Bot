@@ -8,6 +8,7 @@ TDLib 接入层的**运行时半边**：加载原生库、跑 `td_receive` 循�
 
 - **`loader`** —— 按四级优先级定位并加载 `tdjson`：`TDLIB_TDJSON_PATH` → vendored → exe 同级目录 → Linux 带版本系统库 → 裸库名；vendored 资产表、版本协商、`open_library` 都在这儿。
 - **`client`** —— `TdClient`：`@extra` 注入 + `td_receive` 循环 + `ReceiveLoop` 停止把手 + `send_and_wait` 的 oneshot 等待。
+- **`log`** —— TDLib 内部日志的去处：`set_log_sink` 让宿主决定（CLI / Android 接进 `tracing`，TUI 期间落 `logs/fuyubot.log`）；没注册落点时退回 stderr，不再让 C 库直接写终端。
 - **`authorize`** —— 登录状态机（bot token / 手机号验证码 / 扫码），登录态由 TDLib 落进 `data/`。
 - **`session`** —— 一次会话的生命周期：`create`（只建客户端）→ `login`（走授权状态机 + `getMe`）→ `close`（关会话、等数据库刷盘）。宿主只决定「什么时候调」，登录流程在 CLI 与 Android JNI 之间只有这一份。
 

@@ -12,6 +12,7 @@
 pub mod authorize;
 pub mod client;
 pub mod loader;
+pub mod log;
 pub mod session;
 
 // 绑定层（类型、元数据、FFI 声明）整体来自 sys；模块名也一并挂到本 crate 根上，
@@ -33,4 +34,5 @@ pub use client::{
 pub use loader::{
     LibrarySource, LoadEnv, ResolvedLibrary, TDLIB_VERSION, TdlibLoadError, resolve, resolve_with,
 };
+pub use log::{LogSink, set_log_sink};
 pub use session::{GET_ME_BUDGET, LOGIN_BUDGET, Session, SessionError};

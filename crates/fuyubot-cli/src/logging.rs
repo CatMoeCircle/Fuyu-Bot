@@ -20,6 +20,10 @@
 //! （长行还会折行把底部顶乱）。面板运行期间用 [`enter_tui`] 把输出改到日志文件，
 //! 退出时 [`leave_tui`] 恢复；文件里的行不带 ANSI，日志页照常解析。
 //!
+//! TDLib **自己**的内部日志也走这条路：`fuyubot_tdlib::set_log_sink` 把它们转成
+//! `target = "fuyubot::tdlib"` 的 `tracing` 事件（接线在 `fuyubot-app`），所以
+//! C 库不再直接往 stderr 写——面板登录是进程内的，那几行原本会盖在界面上。
+//!
 //! **为什么不按级别过滤**：插件日志的门槛由 `HostRuntime::set_log_verbosity` 在源头挡，
 //! 那个值还能被 `.fuyubot/log-level` 运行期改；订阅者这边再挡一层就会两边不一致
 //! （调高门槛后事件根本到不了格式化器）。

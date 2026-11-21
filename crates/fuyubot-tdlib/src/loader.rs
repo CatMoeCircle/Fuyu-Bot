@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use libloading::Library;
 
 use crate::ffi::{
-    SYM_CREATE, SYM_DESTROY, SYM_EXECUTE, SYM_RECEIVE, SYM_SEND, SYM_SET_LOG_VERBOSITY, TdApi,
+    SYM_CREATE, SYM_DESTROY, SYM_EXECUTE, SYM_RECEIVE, SYM_SEND, SYM_SET_LOG_MESSAGE_CALLBACK,
+    SYM_SET_LOG_VERBOSITY, TdApi, TdSetLogMessageCallbackFn,
 };
 
 /// 编译期绑定的 TDLib 版本，来自 `[package.metadata.fuyubot] tdlib-version`。
@@ -469,7 +470,7 @@ fn siblings_to_preload(dir: &Path) -> Vec<PathBuf> {
     found.into_iter().map(|(_, _, path)| path).collect()
 }
 
-/// 解析 5 个符号。
+/// 解析 6 个符号（其中 `td_set_log_message_callback` **可选**）。
 ///
 /// # Safety
 /// `lib` 必须是已加载的 TDLib，且活到返回的 [`TdApi`] 不再被使用为止。
@@ -492,6 +493,12 @@ pub unsafe fn resolve_symbols(lib: &Library) -> Result<TdApi, TdlibLoadError> {
             receive: symbol(lib, SYM_RECEIVE)?,
             execute: symbol(lib, SYM_EXECUTE)?,
             set_log_verbosity: symbol(lib, SYM_SET_LOG_VERBOSITY)?,
+            // 可选：拿不到就继续让 TDLib 自己写 stderr（见 `TdClient::new`）。
+            // 不能因为缺少一个**日志**符号就拒绝整份库。
+            set_log_message_callback: lib
+                .get::<TdSetLogMessageCallbackFn>(SYM_SET_LOG_MESSAGE_CALLBACK)
+                .ok()
+                .map(|symbol| *symbol),
         })
     }
 }

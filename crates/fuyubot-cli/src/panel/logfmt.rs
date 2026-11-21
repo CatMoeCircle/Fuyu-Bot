@@ -5,7 +5,9 @@
 //! - **新格式**（`logging.rs` 产出，三条投递路各一个形状）：
 //!   - 宿主：`YYYY-MM-DD HH:MM:SS source LEVEL  message`
 //!   - 插件：`YYYY-MM-DD HH:MM:SS [plugins - 插件名] LEVEL  message`
-//!   - TDLib：`YYYY-MM-DD HH:MM:SS TDLib Update {json}`
+//!   - TDLib 更新：`YYYY-MM-DD HH:MM:SS TDLib Update {json}`
+//!   - TDLib 内部日志：`YYYY-MM-DD HH:MM:SS tdlib LEVEL  [ 3][t …] …`（经宿主
+//!     `tracing` 转发，source 含 `tdlib` 就归 `SourceKind::Tdlib`）
 //! - **旧四列格式**（`HH:MM:SS.mmm  LEVEL  source  message`）：升级前的日志还留在文件里。
 //! - **原样行**：TDLib C 库自己的 `[ 2][t …]`、`println!` 打到日志里的启动提示、panic 等。
 //!
@@ -193,7 +195,7 @@ fn classify_source(source: &str) -> SourceKind {
         "pipeline" => SourceKind::Pipeline,
         "update" => SourceKind::Update,
         "plugin" => SourceKind::Plugin,
-        // `fuyubot_tdlib::client` 这类 target 归 TDLib。
+        // `fuyubot::tdlib`（TDLib 内部日志转发）/ `fuyubot_tdlib::client` 这类 target 归 TDLib。
         source if source.contains("tdlib") => SourceKind::Tdlib,
         // 插件名是点分标识符（`fuyubot.start`）；带 `::` 的是别的 crate target。
         source if source.contains('.') && !source.contains("::") => SourceKind::Plugin,

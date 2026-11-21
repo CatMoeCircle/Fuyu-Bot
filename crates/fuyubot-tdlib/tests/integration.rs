@@ -559,3 +559,50 @@ fn library_is_still_mapped(name: &str) -> bool {
         .map(|maps| maps.contains(name))
         .unwrap_or(false)
 }
+
+/// TDLib 自己的内部日志必须经 `set_log_sink` 交出来，**而且默认流必须被关掉**。
+///
+/// 面板登录是进程内的（`fuyubot-app` 在 TUI 里起 `App`）：TDLib 原来那几行会直接
+/// 盖在 alternate screen 上，`logging::enter_tui` 拦不住。
+///
+/// ⚠️ 两件事分开验证，少一件都会退回「日志照样写终端」：
+/// - 回调装上了（`td_set_log_message_callback`）→ 日志能交给宿主；
+/// - 默认流换成了 `logStreamEmpty` → TDLib **不再自己写 stderr**（回调是追加的，
+///   光装回调时 `[ 3][t …]` 原样行照样出现，真库实测）。
+#[test]
+#[ignore = "需要真实 TDLib（TDLIB_TDJSON_PATH 或 vendored）"]
+fn tdlib_internal_logs_go_through_the_sink() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LINES: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_lines(_verbosity: i32, line: &str) {
+        if !line.is_empty() {
+            LINES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fuyubot_tdlib::set_log_sink(count_lines);
+    let client = TdClient::new().expect("加载 TDLib 失败");
+    let stream = client
+        .execute(serde_json::json!({ "@type": "getLogStream" }))
+        .expect("getLogStream 失败");
+    assert_eq!(
+        stream["@type"], "logStreamEmpty",
+        "TdClient::new 没把默认日志流换成空实现，stderr 还会被 TDLib 写：{stream}"
+    );
+    // 5 = 详细调试：默认 1 只在出错时才有行，「构造一次请求」碰不到确定性的错误。
+    client.set_log_verbosity(5);
+    let _ = client.send(serde_json::json!({ "@type": "getMe" }));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && LINES.load(Ordering::Relaxed) == 0 {
+        let _ = client.receive(Duration::from_millis(200));
+    }
+    // 收摊前把详细度放回去，别把整个测试进程的日志量一直抬着。
+    client.set_log_verbosity(1);
+    assert!(
+        LINES.load(Ordering::Relaxed) > 0,
+        "TDLib 一条内部日志都没经过回调：td_set_log_message_callback 没装上？"
+    );
+}

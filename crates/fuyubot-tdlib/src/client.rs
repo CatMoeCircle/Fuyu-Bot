@@ -237,6 +237,15 @@ impl TdClient {
         // SAFETY: 符号已解析，且这是 TDLib 允许在任何初始化之前调用的全局设置。
         unsafe { (api.set_log_verbosity)(crate::ffi::DEFAULT_LOG_VERBOSITY) };
 
+        // TDLib 自己的日志默认**直接写 stderr**：面板登录走的是进程内路径，那一行
+        // 会盖在 alternate screen 上，`logging::enter_tui` 也拦不住（不是 `tracing`
+        // 发的）。先装回调再建客户端：之后所有内部日志都交给宿主的落点
+        // （`crate::log`，CLI / Android 会转进 `tracing`，TUI 期间自然落文件）。
+        //
+        // 返回值记下来：只有回调确实装上了，才可以随后把 TDLib 的默认流关掉，
+        // 否则关完就真的没人收日志了。
+        let callback_installed = crate::log::install(&api, crate::ffi::DEFAULT_LOG_VERBOSITY);
+
         // SAFETY: 符号已解析；客户端句柄由 TDLib 分配。
         let raw = unsafe { (api.create)() };
         if raw.is_null() {
@@ -245,7 +254,7 @@ impl TdClient {
             return Err(TdlibLoadError::NullClientHandle.into());
         }
 
-        Ok(Self {
+        let client = Self {
             api,
             raw,
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -253,7 +262,15 @@ impl TdClient {
             next_id: AtomicU64::new(1),
             _lib: Some(lib),
             library_path: Some(resolved.target),
-        })
+        };
+
+        // 回调是**追加**在默认流之后的：默认流（stderr）不关，TUI 里照样会被 TDLib
+        // 写脏。换成 `logStreamEmpty` 之后，宿主的落点才是唯一出口。
+        if callback_installed {
+            crate::log::silence_default_stream(&client);
+        }
+
+        Ok(client)
     }
 
     /// 用现成的符号表构造，供测试注入替代实现。`raw` 必须是 TDLib 给的句柄。
@@ -283,8 +300,13 @@ impl TdClient {
     /// `0` = 只打致命错误，`1` = 加警告（默认），越大越啰嗦。
     pub fn set_log_verbosity(&self, level: i32) {
         // 负数没有意义（TDLib 会当 0 处理），但别静默吞掉调用方的意图——钳到 0。
+        let level = level.max(0);
+        // 回调的「最多报到哪一级」与详细度是同一个数字，必须一起抬：只调
+        // `set_log_verbosity` 的话，调高 `[tdlib] log_verbosity` 之后更细的日志
+        // 仍然会在回调那一层被挡掉。
+        crate::log::install(&self.api, level);
         // SAFETY: 符号在 new() 里已解析；这是 TDLib 的全局日志设置。
-        unsafe { (self.api.set_log_verbosity)(level.max(0)) };
+        unsafe { (self.api.set_log_verbosity)(level) };
     }
 
     /// 发起请求：注入 `@extra`、登记 pending、交给 `td_send`。
@@ -603,7 +625,37 @@ mod tests {
         std::ptr::null()
     }
 
+    unsafe extern "C" fn noop_send(_: *mut c_void, _: *const c_char) {}
+
     unsafe extern "C" fn noop_set_log_verbosity(_: i32) {}
+
+    /// 记录 `td_set_log_message_callback` 收到的上限（验证详细度同步）。
+    static CALLBACK_MAX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    unsafe extern "C" fn capture_set_log_callback(
+        max: i32,
+        _: Option<crate::ffi::TdLogMessageCallbackFn>,
+    ) {
+        CALLBACK_MAX.store(max, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 调高详细度时，回调的「最多报到哪一级」必须跟着抬——否则更细的日志
+    /// 仍然会在回调那一层被挡掉（这正是 `[tdlib] log_verbosity` 的语义）。
+    #[test]
+    fn set_log_verbosity_reinstalls_the_callback_with_the_new_level() {
+        let api = TdApi {
+            create: noop_create,
+            destroy: noop_destroy,
+            send: noop_send,
+            receive: noop_receive,
+            execute: noop_execute,
+            set_log_verbosity: noop_set_log_verbosity,
+            set_log_message_callback: Some(capture_set_log_callback),
+        };
+        let client = TdClient::from_parts(api, std::ptr::null_mut());
+        client.set_log_verbosity(3);
+        assert_eq!(CALLBACK_MAX.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn send_injects_and_records_extra() {
@@ -618,6 +670,7 @@ mod tests {
             receive: noop_receive,
             execute: noop_execute,
             set_log_verbosity: noop_set_log_verbosity,
+            set_log_message_callback: None,
         };
         let client = TdClient::from_parts(api, capture.as_ref() as *const Capture as *mut c_void);
 
@@ -699,6 +752,7 @@ mod tests {
             receive: noop_receive,
             execute: noop_execute,
             set_log_verbosity: noop_set_log_verbosity,
+            set_log_message_callback: None,
         };
         (Arc::new(TdClient::from_parts(api, raw)), sent)
     }
@@ -743,6 +797,7 @@ mod tests {
             receive: feed_receive,
             execute: noop_execute,
             set_log_verbosity: noop_set_log_verbosity,
+            set_log_message_callback: None,
         };
         (
             TdClient::from_parts(api, Box::into_raw(feed) as *mut c_void),

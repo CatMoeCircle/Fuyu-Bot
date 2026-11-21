@@ -60,6 +60,25 @@ pub enum AppError {
     PluginDir(PathBuf, std::io::Error),
 }
 
+/// TDLib 内部日志（`fuyubot-tdlib::log` 的回调）→ 宿主的 `tracing`。
+///
+/// 级别沿用 TDLib 的数字（0 致命 / 1 错误 / 2 警告 / 3 信息 / 4 调试 / 5 详细调试）。
+/// **没有全局订阅者时退回 stderr**（测试、或者别的宿主直接用库）：保持 TDLib 原本的
+/// 行为，不把日志静默吞掉——TUI 里一定有订阅者，所以那条路永远进文件。
+fn tdlib_log_sink(verbosity: i32, message: &str) {
+    if !tracing::dispatcher::has_been_set() {
+        eprintln!("[tdlib] {message}");
+        return;
+    }
+    match verbosity {
+        ..=1 => tracing::error!(target: "fuyubot::tdlib", "{message}"),
+        2 => tracing::warn!(target: "fuyubot::tdlib", "{message}"),
+        3 => tracing::info!(target: "fuyubot::tdlib", "{message}"),
+        4 => tracing::debug!(target: "fuyubot::tdlib", "{message}"),
+        _ => tracing::trace!(target: "fuyubot::tdlib", "{message}"),
+    }
+}
+
 /// 一次 `boot` 需要的全部输入。
 pub struct AppOptions {
     /// TDLib 的数据库 / 文件目录（`fuyubot.toml` 的 `[telegram].data_dir`）。
@@ -144,6 +163,12 @@ impl App {
             tdlib,
             host,
         } = options;
+
+        // TDLib 自己的日志默认**直接写 stderr**：面板登录走的是进程内路径，那几行
+        // 会盖在 alternate screen 上（不是 `tracing` 发的，`logging::enter_tui` 拦不住）。
+        // 把落点接到这里：CLI / Android 的订阅者会转进 `tracing`（TUI 期间就是
+        // `logs/fuyubot.log`）；没有订阅者的宿主由 `tdlib_log_sink` 退回 stderr。
+        fuyubot_tdlib::set_log_sink(tdlib_log_sink);
 
         // ① `TdClient::new()` 只认进程环境（loader 的优先级 1），没有注入点。
         // 在**起客户端之前**写一次、之后不再改：这是唯一能让它生效的杠杆。
